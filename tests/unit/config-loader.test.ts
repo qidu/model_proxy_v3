@@ -38,6 +38,7 @@ import {
   isScheduleAlias,
   applyDashboardConfigUpdate,
   toDashboardConfigPayload,
+  upsertModelTarget,
   type ProxyConfig,
   type TransformSet,
 } from '../../src/utils/config-loader.js';
@@ -1352,6 +1353,31 @@ describe('applyDashboardConfigUpdate per-model mode', () => {
     const entry = (payload.models.free as Record<string, unknown>)['glm-5.2-a'] as string[];
     assert.deepEqual(entry, ['glm-5.2', 'https://override.example', 'anthropic-messages']);
   });
+
+  it('toDashboardConfigPayload sanitizes an inline-table model entry into the same 3-element shape as an array entry', () => {
+    // Regression: entries written as an inline table (e.g. via the TUI/dashboard
+    // "Add target model" wizard — `bbb = {target=..., base_url=..., api_key=..., mode=...}`)
+    // were previously dropped entirely by sanitizeDashboardCategoryConfig, so the
+    // TUI's snapshot-based model test picker couldn't resolve their mode/base_url
+    // and silently fell back to wrong defaults (test failed there while the
+    // dashboard's own test, which reads the unsanitized config, succeeded).
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          bbb: {
+            target: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+            base_url: 'https://openrouter.ai/api/v1',
+            api_key: 'STORE_KEY_IN_SYSTEM',
+            mode: 'openai-responses',
+          },
+        },
+      },
+    };
+    const payload = toDashboardConfigPayload(cfg);
+    const entry = (payload.models.free as Record<string, unknown>).bbb as string[];
+    assert.deepEqual(entry, ['nvidia/nemotron-3-ultra-550b-a55b:free', 'https://openrouter.ai/api/v1', 'openai-responses']);
+    assert.ok(!JSON.stringify(entry).includes('STORE_KEY_IN_SYSTEM'), 'api_key must not leak into the sanitized payload');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1537,5 +1563,210 @@ budget_to_effort_high = 20000
     assert.equal((cat['m1'] as string[])[5], '16384');
     assert.equal((cat['m2'] as string[])[5], '4096');
     assert.equal((cat['m2'] as string[])[4], 't1', 'transforms slot preserved alongside max_tokens');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// upsertModelTarget — TUI "Add target" wizard persistence
+// ---------------------------------------------------------------------------
+// Locks in behavior for the 4-step wizard (target model id → api key → base url → upstream mode)
+// Pre-fills from existing entry; new entries get a category picker first.
+// Index 4 (transforms) and index 5 (max_tokens) must be preserved when editing.
+
+describe('upsertModelTarget', () => {
+  const baseConfig: ProxyConfig = {
+    models: {
+      free: {
+        base_url: 'https://default.example',
+        upstream_mode: 'openai-completions',
+        api_key: 'default-key',
+        'existing-model': [
+          'existing-target',  // index 0: target
+          'https://override.example',  // index 1: base_url
+          'override-key',  // index 2: api_key
+          'anthropic-messages',  // index 3: mode
+          'my-transforms',  // index 4: transforms
+          '16384',  // index 5: max_tokens
+        ],
+        'minimal-model': [
+          'minimal-target',
+          '',
+          '',
+          'openai-completions',
+        ],
+      } as any,
+      claude: {
+        base_url: 'https://api.anthropic.com',
+        'claude-model': [
+          'claude-target',
+          '',
+          'claude-key',
+          'anthropic-messages',
+        ],
+      } as any,
+    },
+  };
+
+  it('preserves index 4 (transforms) and index 5 (max_tokens) when editing an entry', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'existing-model', {
+      target: 'existing-target',
+      base_url: 'https://new-override.example',
+      api_key: 'new-key',
+      mode: 'gemini-generatecontent',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    assert.equal(entry[0], 'existing-target');
+    assert.equal(entry[1], 'https://new-override.example');
+    assert.equal(entry[2], 'new-key');
+    assert.equal(entry[3], 'gemini-generatecontent');
+    assert.equal(entry[4], 'my-transforms', 'transforms (index 4) must be preserved');
+    assert.equal(entry[5], '16384', 'max_tokens (index 5) must be preserved');
+  });
+
+  it('preserves index 4 and adds empty index 5 when max_tokens not set on existing entry', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://x',
+          'm1': ['t1', 'https://x', 'k', 'anthropic-messages', 'transforms-only'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'm1', {
+      target: 't1',
+      base_url: 'https://y',
+      api_key: 'k2',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
+    assert.equal(entry[4], 'transforms-only');
+    assert.equal(entry[5], '', 'index 5 becomes empty string when transforms exists but max_tokens does not');
+  });
+
+  it('preserves only index 5 when transforms is not set on existing entry', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://x',
+          'm1': ['t1', 'https://x', 'k', 'anthropic-messages', '', '8192'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'm1', {
+      target: 't1',
+      base_url: 'https://y',
+      api_key: 'k2',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
+    assert.equal(entry[4], '', 'empty string preserved when transforms was empty string');
+    assert.equal(entry[5], '8192', 'max_tokens (index 5) must be preserved');
+  });
+
+  it('creates new entry with 4 elements when no existing entry (no transforms/max_tokens)', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'new-model', {
+      target: 'new-target',
+      base_url: 'https://new.example',
+      api_key: 'new-key',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
+    assert.deepEqual(entry, ['new-target', 'https://new.example', 'new-key', 'anthropic-messages']);
+    assert.equal(entry.length, 4, 'new entry should have exactly 4 elements');
+  });
+
+  it('throws on invalid upstream mode', () => {
+    assert.throws(
+      () =>
+        upsertModelTarget(baseConfig, 'free', 'new-model', {
+          target: 't',
+          base_url: 'https://x',
+          api_key: 'k',
+          mode: 'invalid-mode',
+        }),
+      /Invalid upstream mode/,
+    );
+  });
+
+  it('accepts all three valid upstream modes', () => {
+    for (const mode of ['anthropic-messages', 'openai-responses', 'gemini-generatecontent'] as const) {
+      const next = upsertModelTarget(baseConfig, 'free', `model-${mode}`, {
+        target: 't',
+        base_url: 'https://x',
+        api_key: 'k',
+        mode,
+      });
+      const entry = (next.models!.free as Record<string, unknown>)[`model-${mode}`] as string[];
+      assert.equal(entry[3], mode);
+    }
+  });
+
+  it('throws when target model id is empty', () => {
+    assert.throws(
+      () =>
+        upsertModelTarget(baseConfig, 'free', 'new-model', {
+          target: '',
+          base_url: 'https://x',
+          api_key: 'k',
+          mode: 'openai-completions',
+        }),
+      /Target model id is required/,
+    );
+  });
+
+  it('creates category if it does not exist', () => {
+    const cfg: ProxyConfig = { models: {} };
+    const next = upsertModelTarget(cfg, 'newcat', 'm1', {
+      target: 't1',
+      base_url: 'https://x',
+      api_key: 'k',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.newcat as Record<string, unknown>)['m1'] as string[];
+    assert.deepEqual(entry, ['t1', 'https://x', 'k', 'anthropic-messages']);
+  });
+
+  it('does not mutate base config (immutability)', () => {
+    const originalEntry = (baseConfig.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    const originalBaseUrl = originalEntry[1];
+    upsertModelTarget(baseConfig, 'free', 'existing-model', {
+      target: 'existing-target',
+      base_url: 'https://changed.example',
+      api_key: 'changed',
+      mode: 'anthropic-messages',
+    });
+    const unchanged = (baseConfig.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    assert.equal(unchanged[1], originalBaseUrl, 'base config must not be mutated');
+  });
+
+  it('serializes and re-parses to identical entry (round-trip)', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'existing-model', {
+      target: 'updated-target',
+      base_url: 'https://updated.example',
+      api_key: 'updated-key',
+      mode: 'gemini-generatecontent',
+    });
+    const toml = serializeProxyConfigToml(next);
+    const reparsed = parseSimpleToml(toml);
+    const entry = (reparsed.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    assert.equal(entry[0], 'updated-target');
+    assert.equal(entry[1], 'https://updated.example');
+    assert.equal(entry[2], 'updated-key');
+    assert.equal(entry[3], 'gemini-generatecontent');
+    assert.equal(entry[4], 'my-transforms', 'transforms preserved through round-trip');
+    assert.equal(entry[5], '16384', 'max_tokens preserved through round-trip');
+  });
+
+  it('serializes and re-parses new 4-element entry correctly (round-trip)', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'brand-new', {
+      target: 'brand-new-target',
+      base_url: 'https://brand-new.example',
+      api_key: 'brand-new-key',
+      mode: 'openai-responses',
+    });
+    const toml = serializeProxyConfigToml(next);
+    const reparsed = parseSimpleToml(toml);
+    const entry = (reparsed.models!.free as Record<string, unknown>)['brand-new'] as string[];
+    assert.deepEqual(entry, ['brand-new-target', 'https://brand-new.example', 'brand-new-key', 'openai-responses']);
   });
 });

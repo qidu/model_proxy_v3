@@ -18,6 +18,7 @@ import {
   addCompositeAliasFromDashboard,
   addScheduleAliasFromDashboard,
   getDashboardSnapshot,
+  getModelTargetFromDashboard,
   removeCompositeAliasFromDashboard,
   removeCompositeTargetFromDashboard,
   removeScheduleAliasFromDashboard,
@@ -26,6 +27,7 @@ import {
   upsertCompositeTargetFromDashboard,
   upsertFusionOptionsFromDashboard,
   upsertGlobalTokenLimitFromDashboard,
+  upsertModelTargetFromDashboard,
   upsertScheduleTargetFromDashboard,
 } from './handlers/dashboard.js';
 import { getConfiguredModelIds, getCompositeAliasMode, type ScheduleWindow, type ScheduleDaysSpec } from './utils/config-loader.js';
@@ -33,7 +35,7 @@ import { buildHeatmap, renderHeatmapPanel, buildMonthlyHeatmap, renderMonthlyHea
 import { dumpTodayTokens, TOKEN_LOG_FILE, getActiveRequestCount, getTokensInWindowSince, getLiveTokens, blockTool, unblockTool, isToolBlocked, parseWindowSpec, getWindowCutoff } from './utils/dashboard-stats.js';
 import type { Env } from './types/shared.js';
 import type { ConfigValidationError } from './utils/config-loader.js';
-import type { ProxyConfig, FusionRole, FusionOptions } from './utils/config-loader.js';
+import type { ProxyConfig, FusionRole, FusionOptions, ModelTargetPatch } from './utils/config-loader.js';
 import { parseHumanTokenLimit, formatTokenLimit } from './utils/config-loader.js';
 import { formatApiKeyForUpstream } from './utils/routing.js';
 import { KEY_STORE_SERVICE, listSystemKeychainAccounts } from './utils/key-store.js';
@@ -1117,6 +1119,10 @@ class DashboardView implements Component {
       void this.app.openSystemKeysOverlay();
       return;
     }
+    if (matchesKey(data, 'm') || matchesKey(data, 'shift+m')) {
+      this.app.openModelTargetPicker();
+      return;
+    }
     if (matchesKey(data, 'shift+u')) {
       this.heatmapView = this.heatmapView === 'weekly' ? 'monthly' : 'weekly';
       this.invalidate();
@@ -1285,7 +1291,7 @@ class DashboardView implements Component {
     }
 
     lines.push('');
-    lines.push(`C ${dim('composite,fusion')}  S ${dim('schedule')}  T ${dim('models test')}  L ${dim('token limit')}  D ${dim('stats')}  P ${dim('tools list')}  h ${dim('help')}  ↑↓ ${dim('move')}`);
+    lines.push(`C ${dim('composite,fusion')}  S ${dim('schedule')}  T ${dim('models test')}  M ${dim('add target')}  L ${dim('token limit')}  D ${dim('stats')}  P ${dim('tools list')}  h ${dim('help')}  ↑↓ ${dim('move')}`);
     lines.push(this.message ? yellow(this.message) : dim('Ready'));
 
     return lines.map((line) => clip(line, width));
@@ -2154,6 +2160,210 @@ class DashboardApp {
     this.overlay.focus();
   }
 
+  /** Lists every `[models.*]` target across all categories, plus a "new target" entry. */
+  openModelTargetPicker(): void {
+    const snap = this.viewSnapshot();
+    if (!snap) return;
+    const NEW_TARGET = ' new';
+    const choices: SelectItem[] = [
+      { value: NEW_TARGET, label: '+ _input new target_', description: 'add a new [models.*] entry' },
+    ];
+    for (const [category, categoryConfig] of Object.entries(snap.config.models)) {
+      for (const [aliasKey, value] of Object.entries(categoryConfig || {})) {
+        if (aliasKey === 'upstream_mode' || aliasKey === 'base_url') continue;
+        if (!Array.isArray(value)) continue;
+        const [target] = value;
+        choices.push({
+          value: `${category} ${aliasKey}`,
+          label: `${category}.${aliasKey}`,
+          description: target || aliasKey,
+        });
+      }
+    }
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Add target',
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        if (item.value === NEW_TARGET) {
+          this.openPrompt('New target', 'alias key (client-facing name)', '', async (aliasKey) => {
+            const trimmed = aliasKey.trim();
+            if (!trimmed) {
+              this.view.setMessage('Alias key is required');
+              await this.refresh();
+              this.requestRender();
+              return;
+            }
+            this.openModelTargetWizard(undefined, trimmed);
+          });
+          return;
+        }
+        const [category, aliasKey] = item.value.split(' ');
+        this.openModelTargetWizard(category, aliasKey);
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage('add target cancelled');
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '70%', maxHeight: '50%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  /**
+   * Category ([models.*] section) picker — the last step when adding a
+   * brand-new target (editing keeps its existing category and never reaches
+   * this). Offers every existing category plus a "+ _input new category_"
+   * entry that prompts for a new section name. Esc anywhere in this step
+   * cancels the whole wizard, matching every other step.
+   */
+  private openModelCategoryPicker(onPicked: (category: string) => void): void {
+    const snap = this.viewSnapshot();
+    if (!snap) return;
+    const NEW_CATEGORY = ' new-category';
+    const categories = Object.keys(snap.config.models);
+    const choices: SelectItem[] = [
+      ...categories.map((category) => ({ value: category, label: category })),
+      { value: NEW_CATEGORY, label: '+ _input new category_', description: 'create a new [models.*] section' },
+    ];
+    const cancel = () => {
+      this.hideOverlay();
+      this.view.setMessage('add target cancelled');
+      this.requestRender();
+    };
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      'New target — category',
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        if (item.value === NEW_CATEGORY) {
+          this.openPrompt('New target — new category', 'category name (e.g. claude, gemini, free)', '', async (categoryName) => {
+            const trimmed = categoryName.trim();
+            if (!trimmed) {
+              cancel();
+              return;
+            }
+            onPicked(trimmed);
+          });
+          return;
+        }
+        onPicked(item.value);
+      },
+      cancel,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '40%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  /**
+   * Add/edit wizard for a `[models.<category>]` entry: target model id -> api
+   * key -> base url -> upstream mode -> (new targets only) category, then
+   * save. Esc at any step cancels the whole wizard (matches
+   * openCompositeRoutingPicker convention). When editing, `category` is
+   * already known and `getModelTargetFromDashboard` supplies the real
+   * (unsanitized) current values, including api_key — which may be the
+   * literal STORE_KEY_IN_SYSTEM sentinel; leaving it untouched keeps it
+   * as-is. When adding, `category` is undefined and the category picker
+   * (existing sections + "input new category") runs as the last step.
+   */
+  openModelTargetWizard(category: string | undefined, aliasKey: string): void {
+    const isEdit = category !== undefined;
+    const existing = isEdit ? getModelTargetFromDashboard(this.source.env, category, aliasKey) : undefined;
+    const current: ModelTargetPatch = existing ?? { target: aliasKey, base_url: '', api_key: '', mode: '' };
+    const label = isEdit ? `${category}.${aliasKey}` : aliasKey;
+
+    const save = (finalCategory: string, target: string, apiKeyValue: string, baseUrlValue: string, mode: string) => {
+      try {
+        upsertModelTargetFromDashboard(this.source.env, finalCategory, aliasKey, {
+          target,
+          api_key: apiKeyValue,
+          base_url: baseUrlValue.trim(),
+          mode,
+        });
+        this.view.setMessage(`${isEdit ? 'updated' : 'added'} ${finalCategory}.${aliasKey}`);
+        void this.refresh(true);
+        this.requestRender();
+      } catch (err) {
+        this.view.setMessage((err as Error).message, 2000);
+        void this.refresh();
+        this.requestRender();
+      }
+    };
+
+    this.openPrompt(
+      `${isEdit ? 'Edit' : 'Add'} ${bold(label)} — target model id`,
+      'upstream model id',
+      current.target,
+      async (targetValue) => {
+        const target = targetValue.trim();
+        if (!target) {
+          this.view.setMessage('Target model id is required');
+          await this.refresh();
+          this.requestRender();
+          return;
+        }
+        this.openPrompt(
+          `${isEdit ? 'Edit' : 'Add'} ${bold(label)} — api key`,
+          'api key (leave unchanged to keep current)',
+          current.api_key,
+          async (apiKeyValue) => {
+            this.openPrompt(
+              `${isEdit ? 'Edit' : 'Add'} ${bold(label)} — base url`,
+              'base url',
+              current.base_url,
+              async (baseUrlValue) => {
+                this.openModelModePicker(current.mode, (mode) => {
+                  if (category !== undefined) {
+                    save(category, target, apiKeyValue, baseUrlValue, mode);
+                    return;
+                  }
+                  this.openModelCategoryPicker((finalCategory) => {
+                    save(finalCategory, target, apiKeyValue, baseUrlValue, mode);
+                  });
+                });
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /** Upstream mode select for the model target wizard — the 3 closed TransformSchema values. */
+  private openModelModePicker(currentMode: string, onPicked: (mode: string) => void): void {
+    const choices: SelectItem[] = [
+      { value: 'anthropic-messages', label: 'anthropic-messages' },
+      { value: 'openai-responses', label: 'openai-responses' },
+      { value: 'gemini-generatecontent', label: 'gemini-generatecontent' },
+    ];
+    if (currentMode) {
+      const idx = choices.findIndex((c) => c.value === currentMode);
+      if (idx > 0) choices.unshift(...choices.splice(idx, 1));
+    }
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Upstream mode',
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        onPicked(item.value);
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage('add target cancelled');
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
   openTestModelPicker(): void {
     const choices = this.modelChoices();
     // Always offer the manual-entry option so the user can test a model id
@@ -2166,7 +2376,7 @@ class DashboardApp {
         category: 'manual',
         modelId: '',
         value: OTHER_MODEL_ID,
-        label: dim('Other model id…'),
+        label: dim('_input other model id_'),
         description: dim(this.wildcardModelHint('test a wildcard route')),
       },
     ];
@@ -2427,7 +2637,7 @@ class DashboardApp {
   async runModelTest(modelId: string): Promise<void> {
     const displayId = / [ÇƒÖ]$/.test(modelId) ? modelId.replace(/ [ÇƒÖ]$/, '').trim() : modelId;
     const snap = this.viewSnapshot();
-    const cfg = snap ? resolveModelTestConfig(snap.config, displayId, snap.compositeResolved) : undefined;
+    const cfg = snap ? resolveModelTestConfig(snap.config, displayId, snap.compositeResolved, this.proxyConfig) : undefined;
     const target = cfg?.directModel && cfg.directModel !== displayId ? `(${cfg.directModel})` : '';
     const schema = cfg?.upstreamMode ?? '?';
     const baseUrl = cfg?.targetUrl ? stripHttps(cfg.targetUrl) : '?';
@@ -2461,7 +2671,7 @@ class DashboardApp {
     // Always pass compositeResolved so composite/fusion aliases resolve correctly
     // regardless of whether they share a name with a model entry.
     const modelConfig = snapshot
-      ? resolveModelTestConfig(snapshot.config, actualModelId, snapshot.compositeResolved)
+      ? resolveModelTestConfig(snapshot.config, actualModelId, snapshot.compositeResolved, this.proxyConfig)
       : undefined;
 
     // The TUI always POSTs to the local proxy's /v1/messages endpoint. When we
@@ -3425,10 +3635,11 @@ class DashboardApp {
   }
 }
 
-function resolveModelTestConfig(
+export function resolveModelTestConfig(
   config: ProxyConfig,
   modelId: string,
   compositeResolved?: Array<{ alias: string; targets: Array<{ model: string; routeModel?: string; upstreamMode: string; targetUrl: string }> }>,
+  realConfig?: ProxyConfig | null,
 ): { upstreamMode: string; targetUrl: string; apiKey?: string; directModel?: string } | undefined {
   // Check composite aliases first
   if (compositeResolved) {
@@ -3469,6 +3680,17 @@ function resolveModelTestConfig(
       if (key === 'upstream_mode' || key === 'base_url' || key === 'api_key') continue;
       if (value === undefined) continue;
       if (key !== modelId) continue;
+      // The sanitized dashboard snapshot never carries a per-model api_key (it's
+      // stripped for display), so look it up from the real config via the same
+      // resolver the proxy/dashboard use, and use it as the fallback below —
+      // ahead of the proxy-wide default_upstream key, which belongs to a
+      // different model entirely and must not be sent as this model's key.
+      let realApiKey: string | undefined;
+      if (realConfig) {
+        try {
+          realApiKey = getModelRouteConfig(modelId, realConfig).apiKey;
+        } catch { /* fall through to other fallbacks below */ }
+      }
       // Check for per-model override in tuple [target, baseUrl, apiKey, mode]
       // (dashboard sanitizer strips 3rd element, so accept >= 2)
       if (Array.isArray(value) && value.length >= 2) {
@@ -3478,7 +3700,7 @@ function resolveModelTestConfig(
         return {
           upstreamMode: modelMode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
           targetUrl: modelBaseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
-          apiKey: categoryConfig.api_key || config.default_upstream?.default_api_key,
+          apiKey: realApiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
         };
       }
       // Inline-table form: e.g. "model" = {target = "...", base_url = "...", api_key = "...", mode = "..."}
@@ -3491,14 +3713,14 @@ function resolveModelTestConfig(
         return {
           upstreamMode: mode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
           targetUrl: baseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || 'http://localhost',
-          apiKey: apiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
+          apiKey: realApiKey || apiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
           directModel: target || undefined,
         };
       }
       return {
         upstreamMode: categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
         targetUrl: categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
-        apiKey: categoryConfig.api_key || config.default_upstream?.default_api_key,
+        apiKey: realApiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
       };
     }
   }

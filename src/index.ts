@@ -33,6 +33,7 @@ import {
   handleDashboardTestModel,
   handleDashboardToggleToolBlock,
   handleDashboardToolBlocklist,
+  handleDashboardUpsertModelTarget,
   handleDashboardUpsertScheduleTarget,
 } from './handlers/dashboard.js';
 import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget } from './utils/config-loader.js';
@@ -882,6 +883,16 @@ export default {
           const alias = decodeURIComponent(targetDeleteMatch[1]);
           const target = decodeURIComponent(targetDeleteMatch[2]);
           const response = handleDashboardRemoveScheduleTarget(env, alias, target);
+          return applyCorsHeaders(response, request, env);
+        }
+      }
+
+      {
+        const modelTargetMatch = path.match(/^\/dashboard\/api\/models\/([^/]+)\/([^/]+)$/);
+        if (modelTargetMatch && request.method === 'POST') {
+          const category = decodeURIComponent(modelTargetMatch[1]);
+          const aliasKey = decodeURIComponent(modelTargetMatch[2]);
+          const response = await handleDashboardUpsertModelTarget(request, env, category, aliasKey);
           return applyCorsHeaders(response, request, env);
         }
       }

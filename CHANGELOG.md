@@ -5,6 +5,127 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(tui): custom model test sent the wrong api key for plain `[models.*]` targets
+
+Testing a plain (non-composite) model target in the TUI's custom model test
+(e.g. `bbb`) could send the proxy-wide `default_upstream.default_api_key`
+upstream instead of the model's own key — a 401 from the upstream provider,
+even though the config and keychain were both correct and the dashboard's own
+"test" button worked fine for the same model.
+
+Root cause: the TUI's test resolver (`resolveModelTestConfig`) reads the
+sanitized dashboard snapshot (`snapshot.config`), where every model entry has
+already been reduced to `[target, base_url, mode]` with `api_key` stripped for
+display. For a model whose category has no category-level `api_key` (e.g. a
+one-off entry under its own `[models.<category>]` section), the resolver had
+no source for the entry's real key and fell through to
+`categoryConfig.api_key || config.default_upstream?.default_api_key` — both
+undefined-or-wrong for that entry — so `executeModelTest` sent the *proxy's*
+default key (a different provider/account entirely) instead of failing loud
+or using the model's own key.
+
+`resolveModelTestConfig` now also accepts the real, unsanitized `ProxyConfig`
+and uses `getModelRouteConfig(modelId, realConfig).apiKey` — the same resolver
+the dashboard's test button already uses — as the fallback ahead of
+`default_upstream`, for both the array and inline-table entry shapes.
+
+- `src/tui.ts`: `resolveModelTestConfig` (new `realConfig` param + api key
+  fallback), both call sites in `runModelTest`/`executeModelTest`; exported
+  the function (matches the existing `buildTestTextRequest`-style convention)
+  so it's unit-testable.
+- `tests/unit/tui.test.ts`: new file — regression tests asserting the real
+  per-model key is used instead of the wrong proxy-wide default.
+
+### fix(dashboard): inline-table `[models.*]` entries dropped from the sanitized snapshot
+
+An entry written as an inline table (e.g. `bbb = {target = "...", base_url = "...",
+api_key = "...", mode = "..."}` — the shape `upsertModelTarget`/the "Add target
+model" wizard writes) was silently dropped by `sanitizeDashboardCategoryConfig`,
+which only handled array- and string-shaped entries. The TUI's model-test picker
+reads this sanitized snapshot (`toDashboardConfigPayload` via `getDashboardSnapshot`),
+so testing such a model there found no config, fell back to wrong defaults
+(`anthropic-messages` mode, no api key), and failed — while the dashboard's own
+"test" button worked because `handleDashboardTestModel` resolves the model
+against the real, unsanitized config via `getModelRouteConfig`.
+
+`sanitizeDashboardCategoryConfig` now also converts object-shaped entries into
+the same 3-element `[target, base_url, mode]` shape used for arrays (`api_key`
+stripped either way).
+
+- `src/utils/config-loader.ts`: `sanitizeDashboardCategoryConfig` object branch.
+- `tests/unit/config-loader.test.ts`: regression test for the inline-table case.
+
+**TODO:** the "Add target model" wizard's API-key field (TUI `m` and dashboard)
+has no guardrail against a user typing/pasting the literal sentinel
+`STORE_KEY_IN_SYSTEM` by hand. Unlike `applySystemKeyStore`'s own store-pass
+(which only ever writes the sentinel after it has just stored a real plaintext
+key to the matching keychain account), a hand-typed sentinel is written
+verbatim with no keychain entry behind it. On next load, resolution keys off
+`<target>/<base_url>` and can silently succeed against an unrelated or stale
+keychain entry that happens to share that account (wrong key, no error) instead
+of failing loud — hit this exactly with `bbb` (`target =
+"nvidia/nemotron-3-ultra-550b-a55b:free"`, `base_url =
+"https://openrouter.ai/api/v1"`), which resolved to a stale key left over
+under that account and got rejected by OpenRouter; fixed by overwriting that
+keychain entry, no code change needed. Consider validating in the wizard (and/or
+`upsertModelTarget`) that a literal `STORE_KEY_IN_SYSTEM` is only accepted when
+a keychain entry already exists for the resulting `<target>/<base_url>` account.
+
+### feat(dashboard): 'Add target model' wizard in web dashboard
+
+Adds a web-dashboard equivalent of the TUI's "Add target" wizard (see the
+`feat(tui)` entry below): a new "Add target model" button, styled and
+structured like the existing "Add composite alias" wizard (step counter,
+Back/Next/Cancel, inline status-line validation, Esc-to-cancel-at-any-step).
+6 steps: alias key → target model id → api key → base url → upstream mode →
+category (pick an existing `[models.*]` section from a `<select>`, or
+choose "+ new category…" to type a new section name).
+
+Saves through a new dedicated endpoint backed by the same
+`upsertModelTargetFromDashboard` mutator the TUI wizard uses, rather than
+the generic whole-page config save — the whole-page path
+(`collectConfigPayload` → `PUT /dashboard/api/config`) intentionally never
+round-trips `transforms`/`max_tokens` (config-file-only fields) and this
+avoids touching that path at all; only the single new/edited entry is
+written. The existing per-category "Add model entry" quick-add
+(`openAddModelWizard`) is unchanged.
+
+- `src/handlers/dashboard.ts`: `handleDashboardUpsertModelTarget` handler,
+  new `modelTargetWizard` modal markup, `openAddModelTargetWizard()` client
+  wizard, `add-model-target` trigger button/click-dispatch branch.
+- `src/index.ts`: new route `POST /dashboard/api/models/:category/:aliasKey`.
+- Integration tests in `tests/integration/07_dashboard/dashboard_api.test.js`
+  (TC719 valid upsert round-trip, TC720 invalid-mode 400 rejection).
+
+### feat(tui): 'Add target' wizard bound to 'm' key
+
+Top-level `m` key in the TUI (Dashboard view) opens an "Add target" panel listing all
+`[models.*]` entries across categories. Selecting an existing entry opens a 4-step
+wizard (target model id → api key → base url → upstream mode) pre-filled with its
+current values for editing. Choosing "+ _input new target_" collects an alias key,
+then runs the same 4 steps, followed by a final category step: pick an existing
+`[models.*]` section from a list, or choose "+ _input new category_" to type a new
+section name. Saves to `proxy_config.toml` via the existing dashboard persistence
+path (`saveConfigMutation` → `loadProxyConfigFromPath` → `persistProxyConfigToPath`
+→ `clearProxyConfigCache`).
+
+- `src/utils/config-loader.ts`: new `upsertModelTarget` mutator preserving
+  indices 4 (transforms) and 5 (max_tokens) when editing, validating upstream
+  mode against the closed set (`anthropic-messages`, `openai-responses`,
+  `gemini-generatecontent`).
+- `src/handlers/dashboard.ts`: `upsertModelTargetFromDashboard` wrapper and
+  `getModelTargetFromDashboard` read helper (returns real api_key/mode since
+  the TUI only has the sanitized dashboard snapshot).
+- `src/tui.ts`: `openModelTargetPicker`, `openModelTargetWizard`,
+  `openModelCategoryPicker` (last step for new targets only, editing keeps its
+  existing category), `openModelModePicker` — callback-chained multi-step
+  flow using existing `ListOverlay` and `openPrompt` helpers. Esc at any step,
+  including the trailing category step, cancels the whole wizard.
+- Unit tests in `tests/unit/config-loader.test.ts` covering index 4-5 preservation,
+  invalid mode rejection, add shape, sentinel round-trip, and serialize/reparse.
+
+
+
 ### feat(build): `npm run build:native` single-file executable
 
 Adds a second distribution channel alongside the existing one. `npm run build`

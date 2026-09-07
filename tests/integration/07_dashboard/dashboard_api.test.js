@@ -405,6 +405,60 @@ async function testClearGlobalTokenLimit() {
   assert(response.body?.ok === true, 'Should return ok:true');
 }
 
+/**
+ * TC719: Upsert Model Target — Valid Patch
+ * Tests POST /dashboard/api/models/:category/:aliasKey (src/handlers/dashboard.ts
+ * handleDashboardUpsertModelTarget -> upsertModelTargetFromDashboard). Uses a
+ * fixed category/alias — upsertModelTarget is an upsert, so rerunning this test
+ * is idempotent and needs no cleanup.
+ */
+async function testUpsertModelTarget() {
+  const response = await sendRequest({
+    method: 'POST',
+    endpoint: '/dashboard/api/models/tc719-category/tc719-alias',
+    headers: DASHBOARD_AUTH_HEADERS,
+    body: {
+      target: 'tc719-target-model',
+      api_key: 'tc719-key',
+      base_url: 'https://tc719.example.com',
+      mode: 'anthropic-messages'
+    }
+  });
+
+  assert(response.status === 200, `Expected 200, got ${response.status}`);
+  const entry = response.body?.models?.['tc719-category']?.['tc719-alias'];
+  assert(Array.isArray(entry), 'models.tc719-category.tc719-alias should be an array');
+  assert(entry[0] === 'tc719-target-model', `Expected target 'tc719-target-model', got '${entry[0]}'`);
+  assert(entry[1] === 'https://tc719.example.com', `Expected base_url round-trip, got '${entry[1]}'`);
+  // Dashboard payload is sanitized to a 3-tuple [target, base_url, mode] —
+  // api_key (internal index 2) is stripped, so mode shifts to index 2. See
+  // sanitizeDashboardCategoryConfig in src/utils/config-loader.ts.
+  assert(entry[2] === 'anthropic-messages', `Expected mode 'anthropic-messages', got '${entry[2]}'`);
+}
+
+/**
+ * TC720: Upsert Model Target — Invalid Mode Rejected
+ * upsertModelTarget validates mode against the closed TransformSchema set
+ * (anthropic-messages / openai-responses / gemini-generatecontent) and throws
+ * for anything else — the handler surfaces that as a 400 with an error message.
+ */
+async function testUpsertModelTargetInvalidMode() {
+  const response = await sendRequest({
+    method: 'POST',
+    endpoint: '/dashboard/api/models/tc720-category/tc720-alias',
+    headers: DASHBOARD_AUTH_HEADERS,
+    body: {
+      target: 'tc720-target-model',
+      api_key: '',
+      base_url: '',
+      mode: 'not-a-real-mode'
+    }
+  });
+
+  assert(response.status === 400, `Expected 400, got ${response.status}`);
+  assert(typeof response.body?.error === 'string' && response.body.error.length > 0, 'Should return an error message');
+}
+
 module.exports = {
   testGetDashboardConfig,
   testGetDashboardConfigAuth,
@@ -422,7 +476,9 @@ module.exports = {
   testToggleToolBlockMissingName,
   testToggleToolBlockWhitespaceName,
   testSetGlobalTokenLimit,
-  testClearGlobalTokenLimit
+  testClearGlobalTokenLimit,
+  testUpsertModelTarget,
+  testUpsertModelTargetInvalidMode
 };
 
 if (require.main === module) {
@@ -442,6 +498,8 @@ if (require.main === module) {
     { name: 'TC715: Toggle Block Missing tool_name', fn: testToggleToolBlockMissingName },
     { name: 'TC716: Toggle Block Whitespace tool_name', fn: testToggleToolBlockWhitespaceName },
     { name: 'TC717: Set Global Token Limit', fn: testSetGlobalTokenLimit },
-    { name: 'TC718: Clear Global Token Limit', fn: testClearGlobalTokenLimit }
+    { name: 'TC718: Clear Global Token Limit', fn: testClearGlobalTokenLimit },
+    { name: 'TC719: Upsert Model Target', fn: testUpsertModelTarget },
+    { name: 'TC720: Upsert Model Target Invalid Mode', fn: testUpsertModelTargetInvalidMode }
   ]);
 }

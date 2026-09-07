@@ -14,6 +14,8 @@ import {
   toDashboardConfigPayload,
   upsertCompositeAliasLimit,
   upsertCompositeTarget,
+  upsertModelTarget,
+  ModelTargetPatch,
   upsertFusionOptions,
   FusionOptions,
   clearProxyConfigCache,
@@ -209,6 +211,41 @@ export function upsertCompositeTargetFromDashboard(
   );
 }
 
+export function upsertModelTargetFromDashboard(
+  env: Env,
+  category: string,
+  aliasKey: string,
+  patch: ModelTargetPatch,
+): ReturnType<typeof toDashboardConfigPayload> {
+  return saveConfigMutation(env, (baseConfig) => upsertModelTarget(baseConfig, category, aliasKey, patch));
+}
+
+/**
+ * Read the real (unsanitized) `[models.<category>]` entry for `aliasKey` —
+ * unlike `toDashboardConfigPayload`, this includes `api_key`. Used to prefill
+ * the TUI's edit wizard. Returns undefined when the entry doesn't exist
+ * (adding a new target).
+ */
+export function getModelTargetFromDashboard(
+  env: Env,
+  category: string,
+  aliasKey: string,
+): ModelTargetPatch | undefined {
+  const configPath = getConfigPathForWrite(env);
+  const baseConfig = loadProxyConfigFromPath(configPath);
+  const categoryConfig = baseConfig.models?.[category];
+  if (!categoryConfig || Array.isArray(categoryConfig)) return undefined;
+  const entry = categoryConfig[aliasKey];
+  if (!Array.isArray(entry)) return undefined;
+  const [target, base_url, api_key, mode] = entry;
+  return {
+    target: target ?? aliasKey,
+    base_url: base_url ?? '',
+    api_key: api_key ?? '',
+    mode: mode || categoryConfig.upstream_mode || '',
+  };
+}
+
 export function upsertCompositeAliasLimitFromDashboard(
   env: Env,
   alias: string,
@@ -330,6 +367,32 @@ export function handleDashboardRemoveScheduleTarget(
 ): Response {
   try {
     const payload = removeScheduleTargetFromDashboard(env, alias, target);
+    return jsonResponse(payload);
+  } catch (error) {
+    return jsonResponse({ error: (error as Error).message }, 400);
+  }
+}
+
+export async function handleDashboardUpsertModelTarget(
+  request: Request,
+  env: Env,
+  category: string,
+  aliasKey: string,
+): Promise<Response> {
+  try {
+    const body = await request.json() as Partial<ModelTargetPatch>;
+    if (typeof body.target !== 'string' || !body.target.trim()) {
+      return jsonResponse({ error: 'target is required' }, 400);
+    }
+    if (typeof body.mode !== 'string') {
+      return jsonResponse({ error: 'mode is required' }, 400);
+    }
+    const payload = upsertModelTargetFromDashboard(env, category, aliasKey, {
+      target: body.target,
+      api_key: typeof body.api_key === 'string' ? body.api_key : '',
+      base_url: typeof body.base_url === 'string' ? body.base_url : '',
+      mode: body.mode,
+    });
     return jsonResponse(payload);
   } catch (error) {
     return jsonResponse({ error: (error as Error).message }, 400);
@@ -582,6 +645,21 @@ export function handleDashboardPage(env: Env): Response {
         <div class="modal-actions">
           <button type="button" class="mini-btn" id="me-cancel">Cancel</button>
           <button type="button" class="mini-btn" id="me-submit">Create entry</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="modelTargetWizard" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-labelledby="mtWizTitle" aria-modal="true">
+        <button type="button" class="modal-close-x" id="mt-wiz-close-x" aria-label="Close wizard" title="Close (Esc)">×</button>
+        <div class="wizard-steps" id="mt-wiz-steps">Step 1 of 6</div>
+        <h3 id="mtWizTitle">Add target model — Step 1: Alias key</h3>
+        <div id="mt-wiz-body"></div>
+        <div class="modal-status" id="mt-wiz-status"></div>
+        <div class="modal-actions">
+          <button type="button" class="mini-btn" id="mt-wiz-cancel">Cancel</button>
+          <button type="button" class="mini-btn" id="mt-wiz-back" hidden>Back</button>
+          <button type="button" class="mini-btn" id="mt-wiz-submit">Next</button>
         </div>
       </div>
     </div>
@@ -1263,6 +1341,315 @@ export function handleDashboardPage(env: Env): Response {
 
         overlay.hidden = false;
         render();
+      }
+
+      // In-page wizard for adding a new [models.<category>] target model,
+      // styled and structured like openAddAliasWizard. Unlike
+      // openAddModelWizard (single-step, category fixed, no api_key/mode),
+      // this collects everything the config array can hold — alias key,
+      // target model id, api key, base url, upstream mode — and picks (or
+      // creates) the category as the final step. Saves through the
+      // dedicated POST /dashboard/api/models/:category/:aliasKey endpoint
+      // (backed by upsertModelTargetFromDashboard) rather than the generic
+      // whole-page PUT, so api_key round-trips correctly and any existing
+      // transforms/max_tokens on other entries are untouched.
+      function openAddModelTargetWizard() {
+        const overlay = document.getElementById('modelTargetWizard');
+        if (!overlay) return;
+
+        const stepsEl = document.getElementById('mt-wiz-steps');
+        const titleEl = document.getElementById('mtWizTitle');
+        const bodyEl = document.getElementById('mt-wiz-body');
+        const statusEl = document.getElementById('mt-wiz-status');
+        const cancelBtn = document.getElementById('mt-wiz-cancel');
+        const backBtn = document.getElementById('mt-wiz-back');
+        const submitBtn = document.getElementById('mt-wiz-submit');
+        const closeXBtn = document.getElementById('mt-wiz-close-x');
+        if (!stepsEl || !titleEl || !bodyEl || !statusEl || !cancelBtn || !backBtn || !submitBtn || !closeXBtn) return;
+
+        const TOTAL_STEPS = 6;
+        const MODES = ['anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
+        const state = { step: 1, aliasKey: '', target: '', apiKey: '', baseUrl: '', mode: MODES[0], category: '' };
+
+        function setStatus(msg, kind) {
+          statusEl.textContent = msg || '';
+          statusEl.className = 'modal-status' + (kind ? ' ' + kind : '');
+        }
+
+        function modelNameConflicts(name) {
+          const reserved = { upstream_mode: 1, base_url: 1, api_key: 1 };
+          if (!currentConfig.models) return false;
+          for (const [category, catCfg] of Object.entries(currentConfig.models)) {
+            if (category === 'list' || Array.isArray(catCfg)) continue;
+            if (!catCfg || typeof catCfg !== 'object') continue;
+            for (const key of Object.keys(catCfg)) {
+              if (reserved[key]) continue;
+              if (key.startsWith('_')) continue;
+              if (key === name) return true;
+            }
+          }
+          return false;
+        }
+
+        function renderStep1() {
+          state.step = 1;
+          stepsEl.textContent = 'Step 1 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 1: Alias key';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-alias-key">Alias key</label>' +
+            '<input type="text" id="mt-wiz-alias-key" placeholder="e.g. gpt-5-mini" autocomplete="off" />' +
+            '<div class="helper-text">Client-facing name — the key clients request under [models.&lt;category&gt;].</div>';
+          const el = document.getElementById('mt-wiz-alias-key');
+          if (el) { el.value = state.aliasKey; el.focus(); }
+          backBtn.hidden = true;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep2() {
+          state.step = 2;
+          stepsEl.textContent = 'Step 2 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 2: Target model id';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-target">Target model id</label>' +
+            '<input type="text" id="mt-wiz-target" placeholder="e.g. gpt-5-mini-2025-08-07" autocomplete="off" />' +
+            '<div class="helper-text">Upstream model id to map ' + escapeHtml(state.aliasKey) + ' to.</div>';
+          const el = document.getElementById('mt-wiz-target');
+          if (el) { el.value = state.target; el.focus(); }
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep3() {
+          state.step = 3;
+          stepsEl.textContent = 'Step 3 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 3: API key';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-api-key">API key (optional)</label>' +
+            '<input type="text" id="mt-wiz-api-key" placeholder="leave blank to use the category api_key" autocomplete="off" />' +
+            '<div class="helper-text">Leave blank to inherit the category&#39;s api_key.</div>';
+          const el = document.getElementById('mt-wiz-api-key');
+          if (el) { el.value = state.apiKey; el.focus(); }
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep4() {
+          state.step = 4;
+          stepsEl.textContent = 'Step 4 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 4: Base URL';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-base-url">Base URL (optional)</label>' +
+            '<input type="text" id="mt-wiz-base-url" placeholder="leave blank to use the category base_url" autocomplete="off" />' +
+            '<div class="helper-text">Leave blank to inherit the category&#39;s base_url.</div>';
+          const el = document.getElementById('mt-wiz-base-url');
+          if (el) { el.value = state.baseUrl; el.focus(); }
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep5() {
+          state.step = 5;
+          stepsEl.textContent = 'Step 5 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 5: Upstream mode';
+          bodyEl.innerHTML =
+            '<label>Upstream mode</label>' +
+            '<div class="mode-options" id="mt-wiz-mode-options">' +
+              MODES.map((m) => '<div class="mode-option" data-mode="' + m + '">' + m + '</div>').join('') +
+            '</div>';
+          bodyEl.querySelectorAll('#mt-wiz-mode-options .mode-option').forEach((el) => {
+            el.addEventListener('click', () => {
+              state.mode = el.getAttribute('data-mode');
+              bodyEl.querySelectorAll('#mt-wiz-mode-options .mode-option').forEach((o) => {
+                o.classList.toggle('selected', o.getAttribute('data-mode') === state.mode);
+              });
+              setStatus('');
+            });
+          });
+          bodyEl.querySelectorAll('#mt-wiz-mode-options .mode-option').forEach((o) => {
+            o.classList.toggle('selected', o.getAttribute('data-mode') === state.mode);
+          });
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep6() {
+          state.step = 6;
+          stepsEl.textContent = 'Step 6 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 6: Category';
+          const categories = Object.keys(currentConfig.models || {});
+          const optionsHtml = categories.map((c) => '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>').join('');
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-category">Category ([models.&lt;category&gt;] section)</label>' +
+            '<select id="mt-wiz-category">' + optionsHtml + '<option value="__new__">+ new category…</option></select>' +
+            '<div id="mt-wiz-new-category-row" hidden>' +
+              '<label for="mt-wiz-new-category">New category name</label>' +
+              '<input type="text" id="mt-wiz-new-category" placeholder="e.g. claude, gemini, free" autocomplete="off" />' +
+            '</div>';
+          const selectEl = document.getElementById('mt-wiz-category');
+          const newRowEl = document.getElementById('mt-wiz-new-category-row');
+          if (selectEl) {
+            selectEl.value = categories.includes(state.category) ? state.category : (categories[0] || '__new__');
+            newRowEl.hidden = selectEl.value !== '__new__';
+            selectEl.addEventListener('change', () => {
+              newRowEl.hidden = selectEl.value !== '__new__';
+              if (selectEl.value === '__new__') {
+                const newInput = document.getElementById('mt-wiz-new-category');
+                if (newInput) newInput.focus();
+              }
+              setStatus('');
+            });
+          }
+          backBtn.hidden = false;
+          var envLabel = ${JSON.stringify(env.VERSION || 'dev')} || 'dev';
+          submitBtn.textContent = 'Create target model (' + envLabel + ')';
+        }
+
+        function validateStep1() {
+          const el = document.getElementById('mt-wiz-alias-key');
+          if (!el) return null;
+          const aliasKey = (el.value || '').trim();
+          if (!aliasKey) {
+            setStatus('Alias key is required.', 'error');
+            el.focus();
+            return null;
+          }
+          if (modelNameConflicts(aliasKey)) {
+            setStatus('Alias key "' + aliasKey + '" already exists under [models.*].', 'error');
+            el.focus();
+            return null;
+          }
+          if (currentConfig.composite && currentConfig.composite[aliasKey]) {
+            setStatus('Alias key "' + aliasKey + '" conflicts with a composite alias — names must be unique.', 'error');
+            el.focus();
+            return null;
+          }
+          return aliasKey;
+        }
+
+        function validateStep2() {
+          const el = document.getElementById('mt-wiz-target');
+          if (!el) return null;
+          const target = (el.value || '').trim();
+          if (!target) {
+            setStatus('Target model id is required.', 'error');
+            el.focus();
+            return null;
+          }
+          return target;
+        }
+
+        function validateStep6() {
+          const selectEl = document.getElementById('mt-wiz-category');
+          if (!selectEl) return null;
+          if (selectEl.value !== '__new__') return selectEl.value;
+          const newInput = document.getElementById('mt-wiz-new-category');
+          const newCategory = newInput ? (newInput.value || '').trim() : '';
+          if (!newCategory) {
+            setStatus('New category name is required.', 'error');
+            if (newInput) newInput.focus();
+            return null;
+          }
+          return newCategory;
+        }
+
+        function close() {
+          if (overlay._mtWizKeydown) {
+            document.removeEventListener('keydown', overlay._mtWizKeydown);
+            overlay._mtWizKeydown = null;
+          }
+          overlay.hidden = true;
+          setStatus('');
+          configDirty = false;
+        }
+
+        function finalize() {
+          setStatus('Saving...');
+          submitBtn.disabled = true;
+          dashboardFetch('/dashboard/api/models/' + encodeURIComponent(state.category) + '/' + encodeURIComponent(state.aliasKey), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target: state.target, api_key: state.apiKey, base_url: state.baseUrl, mode: state.mode }),
+          }).then(async (res) => {
+            const result = await res.json();
+            submitBtn.disabled = false;
+            if (!res.ok) {
+              setStatus('Save failed: ' + (result.error || 'unknown error'), 'error');
+              return;
+            }
+            currentConfig.models = result.models || {};
+            currentConfig.composite = result.composite || {};
+            currentConfig.schedule = result.schedule || {};
+            renderConfigForm(currentConfig);
+            close();
+          }).catch((err) => {
+            submitBtn.disabled = false;
+            setStatus('Save failed: ' + (err && err.message ? err.message : err), 'error');
+          });
+        }
+
+        function onSubmit() {
+          setStatus('');
+          if (state.step === 1) {
+            const aliasKey = validateStep1();
+            if (!aliasKey) return;
+            state.aliasKey = aliasKey;
+            renderStep2();
+            return;
+          }
+          if (state.step === 2) {
+            const target = validateStep2();
+            if (!target) return;
+            state.target = target;
+            renderStep3();
+            return;
+          }
+          if (state.step === 3) {
+            const el = document.getElementById('mt-wiz-api-key');
+            state.apiKey = el ? (el.value || '').trim() : '';
+            renderStep4();
+            return;
+          }
+          if (state.step === 4) {
+            const el = document.getElementById('mt-wiz-base-url');
+            state.baseUrl = el ? (el.value || '').trim() : '';
+            renderStep5();
+            return;
+          }
+          if (state.step === 5) {
+            renderStep6();
+            return;
+          }
+          // step 6: finalize
+          const category = validateStep6();
+          if (!category) return;
+          state.category = category;
+          finalize();
+        }
+
+        function onBack() {
+          setStatus('');
+          if (state.step === 2) { renderStep1(); return; }
+          if (state.step === 3) { renderStep2(); return; }
+          if (state.step === 4) { renderStep3(); return; }
+          if (state.step === 5) { renderStep4(); return; }
+          if (state.step === 6) { renderStep5(); return; }
+        }
+
+        cancelBtn.onclick = function () { close(); };
+        backBtn.onclick = function () { onBack(); };
+        submitBtn.onclick = function () { onSubmit(); };
+        closeXBtn.onclick = function () { close(); };
+
+        overlay._mtWizKeydown = function (ev) {
+          if (ev.key === 'Escape' || ev.key === 'x' || ev.key === 'X') {
+            ev.preventDefault();
+            close();
+          }
+        };
+        document.addEventListener('keydown', overlay._mtWizKeydown);
+
+        overlay.hidden = false;
+        renderStep1();
       }
 
       // In-page wizard for adding a new model entry to a [models.<category>]
@@ -2030,7 +2417,9 @@ export function handleDashboardPage(env: Env): Response {
 
         const scheduleGlobalActions = '<div class="section-actions"><button type="button" class="mini-btn" data-action="add-schedule-alias"' + (isReadOnly ? ' disabled' : '') + '>Add schedule alias</button></div>';
 
-        configForm.innerHTML = modelBlocks
+        const modelTargetGlobalActions = '<div class="section-actions"><button type="button" class="mini-btn" data-action="add-model-target"' + (isReadOnly ? ' disabled' : '') + '>Add target model</button></div>';
+
+        configForm.innerHTML = modelTargetGlobalActions + modelBlocks
           + '<div class="config-divider"></div>' + compositeBlocks + compositeGlobalActions
           + '<div class="config-divider"></div>' + scheduleBlocks + scheduleGlobalActions;
       }
@@ -2296,6 +2685,14 @@ export function handleDashboardPage(env: Env): Response {
           // paused while the user fills the modal.
           configDirty = true;
           openAddModelWizard(category);
+          return;
+        }
+
+        if (action === 'add-model-target') {
+          // Mark dirty before opening the wizard so stats auto-reload is
+          // paused while the user fills the modal.
+          configDirty = true;
+          openAddModelTargetWizard();
           return;
         }
 

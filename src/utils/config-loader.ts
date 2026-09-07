@@ -3224,6 +3224,15 @@ function sanitizeDashboardCategoryConfig(categoryConfig: ModelCategoryConfig): D
       sanitized[key] = [value[0] || '', value[1] || '', value[3] || ''];
     } else if (typeof value === 'string') {
       sanitized[key] = value;
+    } else if (value && typeof value === 'object') {
+      // Inline-table entry (e.g. `bbb = {target = "...", base_url = "...", api_key = "...", mode = "..."}`).
+      // Same shape as the array case: [target, base_url, mode], api_key stripped.
+      const entry = value as Record<string, unknown>;
+      sanitized[key] = [
+        typeof entry.target === 'string' ? entry.target : '',
+        typeof entry.base_url === 'string' ? entry.base_url : '',
+        typeof entry.mode === 'string' ? entry.mode : '',
+      ];
     }
   }
 
@@ -4027,6 +4036,57 @@ export function removeCompositeTarget(baseConfig: ProxyConfig, alias: string, ta
 
   delete existingTargets[targetName];
   return nextConfig;
+}
+
+const MODEL_TARGET_UPSTREAM_MODES: TransformSchema[] = ['anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
+
+export interface ModelTargetPatch {
+  target: string;
+  base_url: string;
+  api_key: string;
+  mode: string;
+}
+
+/**
+ * Add or update a `[models.<category>]` entry. `aliasKey` is the client-facing
+ * name the entry is keyed under; `patch.target` is the upstream model id
+ * (index 0 of the on-disk array). Internal entries are
+ * `[target, base_url, api_key, mode, transforms, max_tokens]` — this function
+ * only owns indices 0-3 and carries indices 4-5 over unchanged when editing.
+ */
+export function upsertModelTarget(
+  baseConfig: ProxyConfig,
+  category: string,
+  aliasKey: string,
+  patch: ModelTargetPatch,
+): ProxyConfig {
+  const categoryName = assertNonEmptyCompositeName('alias', category);
+  const key = assertNonEmptyCompositeName('target model', aliasKey);
+  const target = patch.target.trim();
+  if (!target) {
+    throw new Error('Target model id is required');
+  }
+  if (!MODEL_TARGET_UPSTREAM_MODES.includes(patch.mode as TransformSchema)) {
+    throw new Error(`Invalid upstream mode: ${patch.mode} — must be one of ${MODEL_TARGET_UPSTREAM_MODES.join(', ')}`);
+  }
+
+  const nextModels: Record<string, ModelCategoryConfig | ModelArrayConfig> = { ...(baseConfig.models || {}) };
+  const existingCategory = nextModels[categoryName];
+  const nextCategory: ModelCategoryConfig = (existingCategory && !Array.isArray(existingCategory))
+    ? { ...existingCategory }
+    : {};
+
+  const existingEntry = nextCategory[key];
+  const [, , , , transforms, max_tokens] = Array.isArray(existingEntry) ? existingEntry : [];
+  const nextEntry: string[] = [target, patch.base_url, patch.api_key, patch.mode];
+  if (transforms !== undefined || max_tokens !== undefined) {
+    nextEntry.push(transforms ?? '', max_tokens ?? '');
+  }
+
+  nextCategory[key] = nextEntry;
+  nextModels[categoryName] = nextCategory;
+
+  return { ...baseConfig, models: nextModels };
 }
 
 function cloneScheduleConfig(schedule: ProxyConfig['schedule']): Record<string, ScheduleConfig> {
