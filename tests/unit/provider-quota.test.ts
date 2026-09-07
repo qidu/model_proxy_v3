@@ -46,6 +46,7 @@ describe('detectProvider', () => {
     assert.equal(detectProvider('https://api.kimi.com/coding/v1'), 'kimi');
     assert.equal(detectProvider('https://openrouter.ai/api/v1/chat/completions'), 'openrouter');
     assert.equal(detectProvider('https://open.bigmodel.cn/api/paas/v4'), 'zhipu');
+    assert.equal(detectProvider('https://api.qnaigc.com/v1'), 'qnaigc');
   });
 
   test('returns undefined for unknown hosts and bad URLs', () => {
@@ -188,6 +189,47 @@ describe('getModelQuota — zhipu', () => {
     const result = await getModelQuota({ targetUrl: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'sk-zp' });
     assert.equal(result.ok, false);
     assert.equal(result.kind, 'server_error');
+  });
+});
+
+describe('getModelQuota — qnaigc', () => {
+  test('5h + monthly windows: limit from subscription.credit_limit_per_*, usedPercent = consumed/(consumed+remaining)', async () => {
+    mockResponse.body = JSON.stringify({
+      status: true,
+      data: [{
+        subscription: { config_key: 'pro:max', level: 3, models: ['qwen/qwen-max', 'deepseek/deepseek-v3'], credit_limit_per_4h: 1000000, credit_limit_per_month: 30000000 },
+        // limit_credits deliberately differs from subscription.credit_limit_per_* to prove the
+        // subscription field wins, and consumed+remaining deliberately != limit_credits to prove
+        // usedPercent is derived from consumed/(consumed+remaining), not consumed/limit_credits.
+        usage_4h: { window_start: '2026-08-31T12:00:00+08:00', window_end: '2026-08-31T16:00:00+08:00', limit_credits: 999, consumed_credits: 250000, remaining_credits: 750000 },
+        usage_month: { window_start: '2026-08-14T00:00:00+08:00', window_end: '2026-09-14T00:00:00+08:00', limit_credits: 999, consumed_credits: 24800000, remaining_credits: 5200000 },
+      }],
+    });
+    const result = await getModelQuota({ targetUrl: 'https://api.qnaigc.com/v1', apiKey: 'sk-qn' });
+    assert.equal(result.ok, true);
+    assert.equal(result.provider, 'qnaigc');
+    assert.equal(result.windows?.fiveHour?.usedPercent, 25);
+    assert.equal(result.windows?.fiveHour?.remaining, 750000);
+    assert.equal(result.windows?.fiveHour?.limit, 1000000);
+    assert.equal(result.windows?.weekly?.usedPercent, 83);
+    assert.equal(result.windows?.weekly?.remaining, 5200000);
+    assert.equal(result.windows?.weekly?.limit, 30000000);
+    assert.equal(fetchCalls[0]?.url, 'https://api.qnaigc.com/v1/subscription/usage');
+    assert.equal(fetchCalls[0]?.headers.Authorization, 'Bearer sk-qn');
+  });
+
+  test('status=false → server_error', async () => {
+    mockResponse.body = JSON.stringify({ status: false, message: 'invalid token' });
+    const result = await getModelQuota({ targetUrl: 'https://api.qnaigc.com/v1', apiKey: 'sk-qn' });
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, 'server_error');
+  });
+
+  test('empty data array → parse error', async () => {
+    mockResponse.body = JSON.stringify({ status: true, data: [] });
+    const result = await getModelQuota({ targetUrl: 'https://api.qnaigc.com/v1', apiKey: 'sk-qn' });
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, 'parse');
   });
 });
 

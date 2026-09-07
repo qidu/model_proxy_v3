@@ -22,6 +22,12 @@
  *             Authorization: <key>   (raw, NO "Bearer " prefix)
  *             data.limits[]: unit==3 → 5h, unit==6 → weekly; percentage is
  *             the server-computed used %.
+ *   qnaigc    GET https://api.qnaigc.com/v1/subscription/usage        Bearer
+ *             data[0].usage_4h = 5h window; data[0].usage_month = monthly
+ *             window (reported in the `weekly` slot). limit is
+ *             subscription.credit_limit_per_4h / credit_limit_per_month;
+ *             usedPercent = consumed_credits / (consumed_credits +
+ *             remaining_credits); window_end is an ISO timestamp.
  *
  * Results are cached per (provider, apiKey) pair: 30s TTL on success,
  * exponential backoff 5s → 30min on failure (same policy as musage).
@@ -118,6 +124,12 @@ const PROVIDERS: Record<string, ProviderSpec> = {
     // Zhipu rejects "Bearer <key>" — the raw key goes in Authorization.
     authStyle: 'raw',
     parse: parseZhipuResponse,
+  },
+  qnaigc: {
+    hosts: ['api.qnaigc.com'],
+    usageUrl: 'https://api.qnaigc.com/v1/subscription/usage',
+    authStyle: 'bearer',
+    parse: parseQnaigcResponse,
   },
 };
 
@@ -294,6 +306,31 @@ function parseZhipuResponse(json: unknown): QuotaResult {
     resetsAt: parseEndTime(w.nextResetTime),
   } : null;
   return { ok: true, provider: 'zhipu', windows: { fiveHour: pick(fiveHr), weekly: pick(weekly) }, fetchedAt: Date.now() };
+}
+
+function parseQnaigcResponse(json: unknown): QuotaResult {
+  const obj = json as Record<string, any> | null;
+  if (!obj || typeof obj !== 'object') return err('qnaigc', 'parse', 'qnaigc 响应不是对象');
+  if (obj.status !== true) return err('qnaigc', 'server_error', 'qnaigc status!=true');
+  const entry = Array.isArray(obj.data) ? obj.data[0] : undefined;
+  if (!entry) return err('qnaigc', 'parse', 'data 字段为空');
+  const sub = entry.subscription || {};
+  const pick = (w: any, limitFromSub: number): QuotaWindow | null => {
+    if (!w || typeof limitFromSub !== 'number' || limitFromSub <= 0) return null;
+    const consumed = Number(w.consumed_credits) || 0;
+    const remaining = Number(w.remaining_credits) || 0;
+    const total = consumed + remaining;
+    return {
+      usedPercent: total > 0 ? Math.max(0, Math.round((consumed / total) * 100)) : null,
+      limit: limitFromSub,
+      remaining,
+      resetsAt: parseResetTime(w.window_end),
+    };
+  };
+  const fiveHour = pick(entry.usage_4h, sub.credit_limit_per_4h);
+  const monthly = pick(entry.usage_month, sub.credit_limit_per_month);
+  if (!fiveHour && !monthly) return err('qnaigc', 'parse', 'usage_4h / usage_month 都缺失');
+  return { ok: true, provider: 'qnaigc', windows: { fiveHour, weekly: monthly }, fetchedAt: Date.now() };
 }
 
 // ---------------------------------------------------------------------------
