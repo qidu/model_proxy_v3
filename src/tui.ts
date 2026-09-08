@@ -754,7 +754,7 @@ class CompositeAliasesOverlay implements Component, Focusable {
       // request and would otherwise show a stale value right after an edit.
       const windowDuration = aliasLimit?.duration ?? '';
       const aliasSummary = aliasLimit !== undefined && aliasLimit.num > 0
-        ? ` ${dim(fmt(windowUsed))} ${dim('/')} ${dim('(')}${dim(fmt(aliasLimit.num) + '/' + windowDuration)}${dim(')')}${dim(bold('└'))}`
+        ? ` ${dim(fmt(windowUsed))} ${dim('/')} ${dim('(')}${dim(fmt(aliasLimit.num) + '/' + windowDuration)}${dim(')')}${dim(bold('𝕋'))}`
         : '';
       const aliasMode = snap.config ? getCompositeAliasMode(alias, snap.config) : undefined;
       const aliasTag = aliasMode === 'fusion' ? dim(' ƒ') : aliasMode === 'coordinator' ? dim(' Ö') : dim(' Ç');
@@ -1216,7 +1216,7 @@ class DashboardView implements Component {
         if (ratio >= 1) limitColor = red;
         else if (ratio >= 0.8) limitColor = yellow;
       }
-      globalLimitSuffix = ` ${limitColor('(')}${limitColor(globalLimitDisplay)}${limitColor(')')}${limitColor(bold('└'))}]`;
+      globalLimitSuffix = ` ${limitColor('(')}${limitColor(globalLimitDisplay)}${limitColor(')')}${limitColor(bold('𝕋'))}]`;
     }
     const configFlagParts: string[] = [];
     if (snap.config.remote_auth_active) configFlagParts.push(bold('Ä'));
@@ -1844,7 +1844,7 @@ class DashboardApp {
       { value: 'help\0s', label: `  ${bold('S(s)').padEnd(6)} ${dim('Manage schedule aliases')} ${bold('$')}` },
       { value: 'help\0t', label: `  ${bold('T(t)').padEnd(6)} ${dim('Test custom models')}` },
       { value: 'help\0q', label: `  ${bold('Q(q)').padEnd(6)} ${dim('Show model quota / usage left')}` },
-      { value: 'help\0l', label: `  ${bold('L(l)').padEnd(6)} ${dim('Edit global token limit')} ${bold('└')}` },
+      { value: 'help\0l', label: `  ${bold('L(l)').padEnd(6)} ${dim('Edit global token limit')} ${bold('𝕋')}` },
       { value: 'help\0d', label: `  ${bold('D(d)').padEnd(6)} ${dim('View detailed statistics')}` },
       { value: 'help\0p', label: `  ${bold('P(p)').padEnd(6)} ${dim('Tools list and blocking')}` },
       { value: 'help\0k', label: `  ${bold('K(k)').padEnd(6)} ${dim('List api keys stored in system keychain')} ${bold('🔒')}` },
@@ -1859,11 +1859,11 @@ class DashboardApp {
       { value: 'help\0m', label: `  ${bold('m').padEnd(6)} ${dim('Add target model to alias')}` },
       { value: 'help\0f', label: `  ${bold('f').padEnd(6)} ${dim('Edit fusion options for alias')}` },
       { value: 'help\0e', label: `  ${bold('e').padEnd(6)} ${dim('Edit composite target config')}` },
-      { value: 'help\0cl', label: `  ${bold('l').padEnd(6)} ${dim('Set token limit for alias')} ${bold('└')}` },
+      { value: 'help\0cl', label: `  ${bold('l').padEnd(6)} ${dim('Set token limit for alias')} ${bold('𝕋')}` },
       { value: 'help\0cd', label: `  ${bold('d').padEnd(6)} ${dim('Delete alias or target model')}` },
       { value: 'help\0sep2', label: dim('─'.repeat(50)) },
       { value: 'help\0hdr2', label: dim('Markers') },
-      { value: 'help\0mk_limit', label: `  ${bold('└')}${dim('     Token limit (global / alias)')}` },
+      { value: 'help\0mk_limit', label: `  ${bold('𝕋')}${dim('     Token limit (global / alias)')}` },
       { value: 'help\0mk_composite', label: `  ${bold('Ç')}${dim('     Composite alias')}` },
       { value: 'help\0mk_fusion', label: `  ${bold('ƒ')}${dim('     Fusion alias')}` },
       { value: 'help\0mk_coordinator', label: `  ${bold('Ö')}${dim('     Coordinator alias')}` },
@@ -3603,7 +3603,7 @@ class DashboardApp {
             category,
             modelId: alias.alias,
             value: `${alias.alias} ${modeTag}`,
-            label: `${alias.alias} ${modeTag}`,
+            label: `${alias.alias} ${dim(modeTag)}`,
             description,
           });
         } else {
@@ -3612,7 +3612,7 @@ class DashboardApp {
             category,
             modelId: alias.alias,
             value: alias.alias,
-            label: `${alias.alias} ${modeTag}`,
+            label: `${alias.alias} ${dim(modeTag)}`,
             description,
           });
         }
