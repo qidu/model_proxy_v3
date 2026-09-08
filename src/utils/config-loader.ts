@@ -4038,7 +4038,7 @@ export function removeCompositeTarget(baseConfig: ProxyConfig, alias: string, ta
   return nextConfig;
 }
 
-const MODEL_TARGET_UPSTREAM_MODES: TransformSchema[] = ['anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
+const MODEL_TARGET_UPSTREAM_MODES: TransformSchema[] = ['openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
 
 export interface ModelTargetPatch {
   target: string;

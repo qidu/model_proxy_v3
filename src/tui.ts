@@ -2334,9 +2334,10 @@ class DashboardApp {
     );
   }
 
-  /** Upstream mode select for the model target wizard — the 3 closed TransformSchema values. */
+  /** Upstream mode select for the model target wizard — the 4 closed TransformSchema values. */
   private openModelModePicker(currentMode: string, onPicked: (mode: string) => void): void {
     const choices: SelectItem[] = [
+      { value: 'openai-completions', label: 'openai-completions' },
       { value: 'anthropic-messages', label: 'anthropic-messages' },
       { value: 'openai-responses', label: 'openai-responses' },
       { value: 'gemini-generatecontent', label: 'gemini-generatecontent' },

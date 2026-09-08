@@ -531,7 +531,7 @@ export function handleDashboardPage(env: Env): Response {
       #testResultPanel.error { background: #ffebee; border: 1px solid #ef9a9a; color: #b71c1c; }
       #testResultPanel.testing { background: #fff9c4; border: 1px solid #fff176; color: #e65100; }
       .result-usage { font-size: 12px; opacity: 0.8; }
-      .result-clear { float: right; background: none; border: none; cursor: pointer; font-size: 13px; padding: 0; color: inherit; opacity: 0.7; }
+      .result-clear { float: right; background: white; border: 1px; cursor: pointer; font-size: 13px; padding: 2px; color: inherit; opacity: 0.7; }
       .result-clear:hover { opacity: 1; }
       .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: flex-start; justify-content: center; z-index: 2000; padding-top: 6vh; }
       .modal-overlay[hidden] { display: none; }
@@ -1368,7 +1368,7 @@ export function handleDashboardPage(env: Env): Response {
         if (!stepsEl || !titleEl || !bodyEl || !statusEl || !cancelBtn || !backBtn || !submitBtn || !closeXBtn) return;
 
         const TOTAL_STEPS = 6;
-        const MODES = ['anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
+        const MODES = ['openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
         const state = { step: 1, aliasKey: '', target: '', apiKey: '', baseUrl: '', mode: MODES[0], category: '' };
 
         function setStatus(msg, kind) {
@@ -2581,15 +2581,15 @@ export function handleDashboardPage(env: Env): Response {
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
         if (success) {
           panel.className = 'success';
-          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">✗</button>'
+          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button>'
             + '<span class="result-model">✓ ' + escapeHtml(modelId) + '</span> '
             + '<span style="opacity:0.7">(' + status + ')</span>'
             + (usage ? ' <span class="result-usage">usage=' + escapeHtml(usage) + '</span>' : '')
             + (detail ? ' <span style="opacity:0.8">' + escapeHtml(detail) + '</span>' : '');
         } else {
           panel.className = 'error';
-          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">✗</button>'
-            + '<span class="result-model">✗ ' + escapeHtml(modelId) + '</span> '
+          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button>'
+            + '<span class="result-model">x ' + escapeHtml(modelId) + '</span> '
             + '<span style="opacity:0.7">(' + (status || '?') + ')</span>'
             + (detail ? ' — ' + escapeHtml(detail) : '');
         }
@@ -2616,7 +2616,7 @@ export function handleDashboardPage(env: Env): Response {
         const panel = document.getElementById('testResultPanel');
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
         panel.className = 'testing';
-        panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">✗</button> Testing ' + escapeHtml(modelId) + '…';
+        panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(modelId) + '…';
         panel.style.display = 'block';
 
         try {
@@ -2989,7 +2989,7 @@ export function handleDashboardPage(env: Env): Response {
         const blockedSet = new Set(blocked || []);
         tbody.innerHTML = rows.map((row) => {
           const isBlocked = blockedSet.has(row.tool_name);
-          const status = isBlocked ? '✗' : '·';
+          const status = isBlocked ? 'x' : '·';
           const statusCls = isBlocked ? 'status-blocked' : '';
           const rowCls = isBlocked ? 'tool-row blocked' : 'tool-row';
           const actionLabel = isBlocked ? 'Unblock' : 'Block';

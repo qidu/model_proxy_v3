@@ -5,6 +5,22 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(config): add `openai-completions` as the default upstream mode in the model target wizard
+
+Both the TUI (`m` key) and dashboard "Add target model" wizard now include
+`openai-completions` as the first/default choice in the upstream mode picker,
+moving it ahead of `anthropic-messages`. The validation set in
+`upsertModelTarget` is updated to match the full `TransformSchema` closed set.
+
+- `src/utils/config-loader.ts`: `MODEL_TARGET_UPSTREAM_MODES` now includes
+  `openai-completions` at index 0.
+- `src/tui.ts`: `openModelModePicker` choices reordered to match.
+- `src/handlers/dashboard.ts`: `MODES` array updated, `state.mode` defaults
+  to `openai-completions` automatically.
+- `tests/unit/config-loader.test.ts`: "accepts all three valid upstream modes"
+  test updated to four modes.
+- `tests/integration/07_dashboard/dashboard_api.test.js`: comment updated.
+
 ### feat(config): blank api_key in the model target wizard reuses a same-base_url keychain entry
 
 When the api-key field is left blank in the "Add target model" wizard (TUI `m`

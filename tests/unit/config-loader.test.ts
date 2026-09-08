@@ -1688,8 +1688,8 @@ describe('upsertModelTarget', () => {
     );
   });
 
-  it('accepts all three valid upstream modes', () => {
-    for (const mode of ['anthropic-messages', 'openai-responses', 'gemini-generatecontent'] as const) {
+  it('accepts all four valid upstream modes', () => {
+    for (const mode of ['openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent'] as const) {
       const next = upsertModelTarget(baseConfig, 'free', `model-${mode}`, {
         target: 't',
         base_url: 'https://x',
