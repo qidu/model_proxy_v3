@@ -1425,8 +1425,8 @@ export function handleDashboardPage(env: Env): Response {
           titleEl.textContent = 'Add target model — Step 3: API key';
           bodyEl.innerHTML =
             '<label for="mt-wiz-api-key">API key (optional)</label>' +
-            '<input type="text" id="mt-wiz-api-key" placeholder="leave blank to use the category api_key" autocomplete="off" />' +
-            '<div class="helper-text">Leave blank to inherit the category&#39;s api_key.</div>';
+            '<input type="text" id="mt-wiz-api-key" placeholder="leave blank to reuse a matching key or the category api_key" autocomplete="off" />' +
+            '<div class="helper-text">Leave blank to reuse another entry&#39;s system-stored key for the same base URL, else inherit the category&#39;s api_key.</div>';
           const el = document.getElementById('mt-wiz-api-key');
           if (el) { el.value = state.apiKey; el.focus(); }
           backBtn.hidden = false;

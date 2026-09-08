@@ -1,0 +1,3514 @@
+import { stdin, stdout } from 'process';
+import {
+  type Component,
+  type Focusable,
+  type OverlayHandle,
+  type SelectItem,
+  type SelectListLayoutOptions,
+  type SelectListTheme,
+  Input,
+  ProcessTerminal,
+  SelectList,
+  TUI,
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+} from '@earendil-works/pi-tui';
+import {
+  addCompositeAliasFromDashboard,
+  addScheduleAliasFromDashboard,
+  getDashboardSnapshot,
+  removeCompositeAliasFromDashboard,
+  removeCompositeTargetFromDashboard,
+  removeScheduleAliasFromDashboard,
+  removeScheduleTargetFromDashboard,
+  upsertCompositeAliasLimitFromDashboard,
+  upsertCompositeTargetFromDashboard,
+  upsertFusionOptionsFromDashboard,
+  upsertGlobalTokenLimitFromDashboard,
+  upsertScheduleTargetFromDashboard,
+} from './handlers/dashboard.js';
+import { getConfiguredModelIds, getCompositeAliasMode, type ScheduleWindow, type ScheduleDaysSpec } from './utils/config-loader.js';
+import { buildHeatmap, renderHeatmapPanel, buildMonthlyHeatmap, renderMonthlyHeatmapPanel } from './heatmap.js';
+import { dumpTodayTokens, TOKEN_LOG_FILE, getActiveRequestCount, getTokensInWindowSince, getLiveTokens, blockTool, unblockTool, isToolBlocked, parseWindowSpec, getWindowCutoff } from './utils/dashboard-stats.js';
+import type { Env } from './types/shared.js';
+import type { ConfigValidationError } from './utils/config-loader.js';
+import type { ProxyConfig, FusionRole, FusionOptions } from './utils/config-loader.js';
+import { parseHumanTokenLimit, formatTokenLimit } from './utils/config-loader.js';
+import { formatApiKeyForUpstream } from './utils/routing.js';
+import { KEY_STORE_SERVICE, listSystemKeychainAccounts } from './utils/key-store.js';
+import { getModelRouteConfig } from './utils/config-loader.js';
+import { getModelQuota, formatQuota, formatQuotaLeft, getUpstreamRateLimitLeft, getUpstreamRateLimitLeftForUrl, type QuotaResult } from './utils/provider-quota.js';
+
+const TEST_ENDPOINT = '/v1/messages';
+const TEST_TOOL_NAME = 'test_tool';
+const TEST_TOOL_DESCRIPTION = 'test tool';
+const TEST_TOOL_PROMPT = 'Use the test_tool and say hi.';
+const TEST_TOOL_SCHEMA = {
+  type: 'object',
+  properties: {
+    message: { type: 'string' },
+  },
+  required: ['message'],
+  additionalProperties: false,
+};
+
+function filterAndStringify(body: unknown): string {
+  if (Array.isArray(body)) return `[${body.map(filterAndStringify).join(',')}]`;
+  if (body && typeof body === 'object') {
+    const filtered = Object.fromEntries(
+      Object.entries(body as Record<string, unknown>)
+        .filter(([key]) => key !== 'id' && key !== 'session_id' && key !== 'request_id')
+        .map(([k, v]) => [k, filterAndStringify(v)]),
+    );
+    return JSON.stringify(filtered);
+  }
+  return JSON.stringify(body);
+}
+
+function formatTestResultDetail(responseBody: unknown): string {
+  if (!responseBody || typeof responseBody !== 'object') {
+    return String(responseBody);
+  }
+
+  const record = responseBody as Record<string, unknown>;
+  const errorDetails = extractErrorDetails(record);
+  const messageDetails = extractMessageDetails(record);
+  const toolDetails = extractToolDetails(record);
+  const lines: string[] = [];
+
+  if (errorDetails.length > 0) {
+    lines.push(`error: ${errorDetails.join(' | ')}`);
+  }
+
+  if (messageDetails.length > 0) {
+    lines.push(`message: ${messageDetails.join(' | ')}`);
+  }
+
+  if (toolDetails.length > 0) {
+    lines.push(`content: ${toolDetails.join(' | ')}`);
+  }
+
+  return lines.length > 0 ? lines.join(' | ') : filterAndStringify(responseBody);
+}
+
+type CompositeTargetConfig = { share?: number; primary?: boolean; fallback?: number; fusion?: number; coord?: number; role?: FusionRole };
+
+function sortCompositeTargets([aKey, aCfg]: [string, unknown], [bKey, bCfg]: [string, unknown]): number {
+  const a = (aCfg ?? {}) as CompositeTargetConfig;
+  const b = (bCfg ?? {}) as CompositeTargetConfig;
+  if (a.primary && !b.primary) return -1;
+  if (!a.primary && b.primary) return 1;
+  const shareA = a.share ?? 1;
+  const shareB = b.share ?? 1;
+  if (shareA !== shareB) return shareB - shareA;
+  if (shareA === 0) {
+    return (a.fallback ?? 0) - (b.fallback ?? 0);
+  }
+  return aKey.localeCompare(bKey);
+}
+
+// Fixed pipeline order for fusion target descriptions: synth -> judge -> panel.
+// Targets with no explicit role (or fusion weight only) are treated as panel members.
+function fusionRolePriority(cfg: CompositeTargetConfig | undefined): number {
+  if (cfg?.role === 'synth') return 0;
+  if (cfg?.role === 'judge') return 1;
+  return 2; // panel, or default/no role
+}
+
+// Orders resolved composite/fusion targets for display in description strings:
+// - composite: primary first, then share desc, then fallback asc (ties alphabetical)
+// - fusion: synth, then judge, then panel
+function orderCompositeTargetsForDisplay<T extends { model: string }>(
+  targets: T[],
+  aliasConfig: Record<string, unknown> | undefined,
+  isFusion: boolean,
+): T[] {
+  if (!aliasConfig) return targets;
+  const sorted = [...targets];
+  if (isFusion) {
+    sorted.sort((a, b) => fusionRolePriority(aliasConfig[a.model] as CompositeTargetConfig | undefined) - fusionRolePriority(aliasConfig[b.model] as CompositeTargetConfig | undefined));
+  } else {
+    sorted.sort((a, b) => sortCompositeTargets([a.model, aliasConfig[a.model]], [b.model, aliasConfig[b.model]]));
+  }
+  return sorted;
+}
+
+
+// Parse "[p]anel|[j]udge|[s]ynth [weight]" input for fusion targets.
+// Accepts short forms: p/j/s for panel/judge/synth.
+// Returns an error string on failure, or a patch object on success.
+function parseFusionTargetInput(value: string): { role?: FusionRole; fusion?: number } | string {
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return 'Enter: [p]anel / [j]udge / [s]ynth  [weight]';
+  const patch: { role?: FusionRole; fusion?: number } = {};
+
+  const rawRole = parts[0];
+  const roleNorm = rawRole === 'p' ? 'panel' : rawRole === 'j' ? 'judge' : rawRole === 's' ? 'synth' : rawRole;
+  if (roleNorm !== 'panel' && roleNorm !== 'judge' && roleNorm !== 'synth') {
+    return 'Role must be: panel/judge/synth (or p/j/s)';
+  }
+  patch.role = roleNorm as FusionRole;
+
+  if (parts.length >= 2) {
+    const n = Number(parts[1]);
+    if (!Number.isFinite(n) || n < 0) return 'Weight must be a non-negative number';
+    patch.fusion = n;
+  }
+  return patch;
+}
+
+function extractToolDetails(record: Record<string, unknown>): string[] {
+  const details: string[] = [];
+
+  const content = record.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      const typedBlock = block as Record<string, unknown>;
+      if (typedBlock.type === 'tool_use') {
+        const name = typeof typedBlock.name === 'string' ? typedBlock.name : 'tool';
+        const input = typedBlock.input !== undefined ? stringifyCompact(typedBlock.input) : '';
+        details.push(input ? `${name} ${input}` : name);
+      }
+    }
+  }
+
+  const toolCalls = record.tool_calls;
+  if (Array.isArray(toolCalls)) {
+    for (const call of toolCalls) {
+      if (!call || typeof call !== 'object') continue;
+      const typedCall = call as Record<string, unknown>;
+      const functionCall = typedCall.function;
+      if (functionCall && typeof functionCall === 'object') {
+        const fn = functionCall as Record<string, unknown>;
+        const name = typeof fn.name === 'string' ? fn.name : 'tool';
+        const args = fn.arguments !== undefined ? stringifyCompact(fn.arguments) : '';
+        details.push(args ? `${name} ${args}` : name);
+      } else {
+        const name = typeof typedCall.name === 'string' ? typedCall.name : 'tool';
+        const args = typedCall.arguments !== undefined ? stringifyCompact(typedCall.arguments) : '';
+        details.push(args ? `${name} ${args}` : name);
+      }
+    }
+  }
+
+  const outputs = record.outputs;
+  if (Array.isArray(outputs)) {
+    for (const output of outputs) {
+      if (!output || typeof output !== 'object') continue;
+      const typedOutput = output as Record<string, unknown>;
+      if (typedOutput.type === 'function_call') {
+        const name = typeof typedOutput.name === 'string' ? typedOutput.name : 'tool';
+        const args = typedOutput.arguments !== undefined ? stringifyCompact(typedOutput.arguments) : '';
+        details.push(args ? `${name} ${args}` : name);
+      }
+    }
+  }
+
+  return details;
+}
+
+function extractErrorDetails(record: Record<string, unknown>): string[] {
+  const details: string[] = [];
+
+  const error = record.error;
+  if (error) {
+    if (typeof error === 'string') {
+      details.push(error.trim());
+    } else if (typeof error === 'object') {
+      const errObj = error as Record<string, unknown>;
+      const message = errObj.message;
+      const type = errObj.type;
+      if (typeof message === 'string' && message.trim()) {
+        details.push(message.trim());
+      } else if (typeof type === 'string' && type.trim()) {
+        details.push(type.trim());
+      }
+    }
+  }
+
+  return details;
+}
+
+function extractMessageDetails(record: Record<string, unknown>): string[] {
+  const details: string[] = [];
+  const content = record.content;
+  if (Array.isArray(content)) {
+    const texts: string[] = [];
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      const typedBlock = block as Record<string, unknown>;
+      if (typedBlock.type === 'text' && typeof typedBlock.text === 'string' && typedBlock.text.trim()) {
+        texts.push(typedBlock.text.trim());
+      }
+    }
+    if (texts.length > 0) {
+      details.push(texts.join(' '));
+    }
+  }
+
+  if (typeof record.output_text === 'string' && record.output_text.trim()) {
+    details.push(record.output_text.trim());
+  }
+
+  if (details.length === 0) {
+    const fallback = record.message;
+    if (typeof fallback === 'string' && fallback.trim()) {
+      details.push(fallback.trim());
+    }
+  }
+
+  return details;
+}
+
+function stringifyCompact(value: unknown): string {
+  try {
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    return text.length > 180 ? `${text.slice(0, 180)}…` : text;
+  } catch {
+    return String(value);
+  }
+}
+
+function buildClaudeToolRequest(): Record<string, unknown> {
+  return {
+    messages: [{ role: 'user', content: TEST_TOOL_PROMPT }],
+    max_tokens: 128,
+    tools: [{ name: TEST_TOOL_NAME, description: TEST_TOOL_DESCRIPTION, input_schema: TEST_TOOL_SCHEMA }],
+    tool_choice: { type: 'tool', name: TEST_TOOL_NAME },
+  };
+}
+
+// `max_tokens` is rejected by the OpenAI Responses API ("Unsupported parameter:
+// 'max_tokens' is not supported"), which expects `max_completion_tokens` instead.
+// Map the parameter name per upstream mode so the test request is accepted as-is.
+export function maxTokensField(upstreamMode: string): string {
+  return upstreamMode === 'openai-responses' ? 'max_completion_tokens' : 'max_tokens';
+}
+
+function buildOpenAIToolRequest(upstreamMode: string): Record<string, unknown> {
+  return {
+    messages: [{ role: 'user', content: TEST_TOOL_PROMPT }],
+    [maxTokensField(upstreamMode)]: 128,
+    tools: [{
+      type: 'function',
+      function: {
+        name: TEST_TOOL_NAME,
+        description: TEST_TOOL_DESCRIPTION,
+        parameters: TEST_TOOL_SCHEMA,
+      },
+    }],
+    tool_choice: 'auto',
+  };
+}
+
+function generateTestKey(): string {
+  // Must be pure hex so the local privacy filter (hash-detect) can detect it.
+  const chars = '0123456789abcdefABCDEF';
+  const len = 8 + Math.floor(Math.random() * 25); // 8..32
+  let key = '';
+  for (let i = 0; i < len; i++) {
+    key += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return key;
+}
+
+function appendTestKeys(body: Record<string, unknown>): Record<string, unknown> {
+  const count = 1 + Math.floor(Math.random() * 3); // 1..3
+  const keys = Array.from({ length: count }, generateTestKey);
+  const keyBlock = '\n\n' + keys.join('\n');
+  const messages = body.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return body;
+  const first = messages[0] as Record<string, unknown>;
+  if (typeof first.content !== 'string') return body;
+  const newMessages = [{ ...first, content: first.content + keyBlock }, ...messages.slice(1)];
+  return { ...body, messages: newMessages };
+}
+
+const TEST_TEXT_PROMPT = 'Reply with one short sentence.';
+
+export function buildTestTextRequest(upstreamMode: string): Record<string, unknown> {
+  // Plain text, non-streaming — safe for fusion (panel responses must be text, not tool-call blobs,
+  // and stream:false ensures the synth response is a buffered JSON body the TUI can parse).
+  return {
+    messages: [{ role: 'user', content: TEST_TEXT_PROMPT }],
+    [maxTokensField(upstreamMode)]: 32,
+    stream: false,
+  };
+}
+
+export function buildTestToolRequest(upstreamMode: string): Record<string, unknown> {
+  if (upstreamMode === 'openai-completions' ||
+      upstreamMode === 'openai-responses' ||
+      upstreamMode === 'gemini-generatecontent' ||
+      upstreamMode === 'gemini-interactions') {
+    return buildOpenAIToolRequest(upstreamMode);
+  }
+
+  const request = buildClaudeToolRequest();
+  // No `thinking` block here. The TUI test is a liveness probe for the model
+  // route, not a feature exercise. anthropic-messages upstreams that speak
+  // the protocol natively (real Claude) accept the omission; compat shims
+  // (e.g. DeepSeek's /anthropic endpoint) may reject or misinterpret the
+  // `{"type": "adaptive"}` shape and surface 400s like
+  // "Thinking mode does not support this tool_choice" when combined with a
+  // forced `tool_choice`. See docs/deepseek_thinking.md.
+  return request;
+}
+
+export type DashboardSource = {
+  env: Env;
+  loadConfig: (forceReload?: boolean) => Promise<ProxyConfig>;
+  readOnly: boolean;
+};
+
+type Selection =
+  | { kind: 'alias'; alias: string }
+  | { kind: 'target'; alias: string; target: string }
+  | { kind: 'model'; category: string; modelId: string }
+  | null;
+
+
+type ModelChoice = SelectItem & {
+  category: string;
+  modelId: string;
+};
+
+
+function fg(code: number, text: string): string {
+  return `\u001b[${code}m${text}\u001b[0m`;
+}
+function rgbFg(r: number, g: number, b: number, text: string): string {
+  return `\u001b[38;2;${r};${g};${b}m${text}\u001b[0m`;
+}
+function bold(text: string): string { return fg(1, text); }
+function dim(text: string): string { return fg(2, text); }
+function green(text: string): string { return fg(32, text); }
+function yellow(text: string): string { return fg(33, text); }
+function red(text: string): string { return fg(31, text); }
+function lightWhite(text: string): string { return fg(97, text); }
+function gray(text: string): string { return fg(90, text); }
+function darkGray(text: string): string { return rgbFg(110, 110, 110, text); } // #6e6e6e
+function lightBlue(text: string): string { return rgbFg(144, 202, 249, text); }  // #90caf9
+function mediumBlue(text: string): string { return rgbFg(66, 165, 245, text); }   // #42a5f5
+function lightGreen(text: string): string { return rgbFg(165, 214, 167, text); }  // #a5d6a7
+function mediumGreen(text: string): string { return rgbFg(102, 187, 106, text); } // #66bb6a
+function clip(text: string, width: number): string {
+  return width <= 0 ? '' : truncateToWidth(text, width, '');
+}
+function pad(text: string, width: number): string {
+  const current = visibleWidth(text);
+  if (current >= width) return clip(text, width);
+  return text + ' '.repeat(width - current);
+}
+function alignRight(text: string, width: number): string {
+  const current = visibleWidth(text);
+  if (current >= width) return clip(text, width);
+  return ' '.repeat(width - current) + text;
+}
+function titleCase(value: string): string {
+  return value
+    .split(/[_-]/g)
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+function fmt(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+function fmtSeconds(ms: number): string {
+  return (ms / 1000).toFixed(2);
+}
+function stripCompletions(s: string): string {
+  return s.replace(/^.*-(completions|messages|generatecontent|interactions|responses)$/, '$1');
+}
+function stripHttps(s: string): string {
+  return s.replace(/^https?:\/\//, '');
+}
+
+function frame(title: string, body: string[], width: number, maxWidth = 88): string[] {
+  const boxWidth = Math.min(Math.max(width, 10), maxWidth);
+  const inner = Math.max(1, boxWidth - 2);
+  const lines: string[] = [];
+  lines.push(`┌${'─'.repeat(inner)}┐`);
+  lines.push(`│${pad(title, inner)}│`);
+  for (const line of body) {
+    lines.push(`│${pad(line, inner)}│`);
+  }
+  lines.push(`└${'─'.repeat(inner)}┘`);
+  return lines;
+}
+
+const SELECT_LIST_THEME: SelectListTheme = {
+  selectedPrefix: (text) => green(text),
+  selectedText: (text) => green(text),
+  description: (text) => dim(text),
+  scrollInfo: (text) => dim(text),
+  noMatch: (text) => dim(text),
+};
+
+class PromptOverlay implements Component, Focusable {
+  focused = false;
+  private readonly input = new Input();
+
+  constructor(
+    private readonly title: string,
+    private readonly prompt: string,
+    initialValue: string,
+    private readonly onSubmit: (value: string) => void,
+    private readonly onCancel: () => void,
+  ) {
+    this.input.setValue(initialValue);
+    this.input.onSubmit = (value) => this.onSubmit(value);
+    this.input.onEscape = () => this.onCancel();
+  }
+
+  handleInput(data: string): void {
+    this.input.handleInput(data);
+  }
+
+  invalidate(): void {
+    this.input.invalidate();
+  }
+
+  render(width: number): string[] {
+    this.input.focused = this.focused;
+    const innerWidth = Math.max(1, Math.min(width - 2, 76));
+    const bodyWidth = Math.max(1, innerWidth - 2);
+    const inputLine = this.input.render(bodyWidth)[0] ?? '';
+    return frame(this.title, [clip(this.prompt, bodyWidth), clip(inputLine, bodyWidth), dim('Enter submit  Esc cancel')], innerWidth);
+  }
+}
+
+/** Strip the Ç/ƒ/Ö marker suffix used for duplicate disambiguation. */
+function stripModelMarker(value: string): string {
+  return / [ÇƒÖ]$/.test(value) ? value.replace(/ [ÇƒÖ]$/, '').trim() : value;
+}
+
+/** Per-row quota data for the 'Model Quota' picker, keyed by choice value. */
+interface QuotaPickerEntry {
+  result?: QuotaResult;
+  /** Anthropic 5h utilization left (e.g. "58%") when passively recorded. */
+  headerLeft?: string | null;
+}
+
+/** Row suffix for the quota picker list, e.g. " (7472/20000, 63%)". */
+function quotaListSuffix(entry: QuotaPickerEntry): string {
+  if (entry.result?.ok && entry.result.balance) {
+    const symbol = entry.result.balance.currency === 'CNY' ? '¥' : '$';
+    return ` (${symbol}${entry.result.balance.amount.toFixed(2)})`;
+  }
+  const w = entry.result?.ok ? entry.result.windows?.fiveHour ?? entry.result.windows?.weekly : undefined;
+  if (w) {
+    if (w.remainingPercent != null) return ` (${w.remainingPercent}%)`;
+    if (w.remaining != null) {
+      const usage = typeof w.limit === 'number' && w.limit > 0 ? `/${w.limit}` : '';
+      const pct = w.usedPercent != null ? `, ${w.usedPercent}%` : '';
+      return ` (${w.remaining}${usage}${pct})`;
+    }
+  }
+  return entry.headerLeft ? ` (${entry.headerLeft})` : '';
+}
+
+/** Bottom status line for the currently highlighted picker row. */
+function quotaStatusLine(entry: QuotaPickerEntry): string {
+  const r = entry.result;
+  const label = lightWhite('Quota:');
+  if (r?.ok) return `${label} ${green(formatQuota(r))}`;
+  if (r && !r.ok && r.kind !== 'unsupported') {
+    return `${label} ${yellow(`⚠ ${r.kind}: ${(r.message ?? '').slice(0, 60)}`)}`;
+  }
+  // unsupported / unresolvable — fall back to the anthropic 5h header value.
+  if (entry.headerLeft) return `${label} ${green(`${entry.headerLeft} 5h left`)}`;
+  return `${label} ${dim('no usage data')}`;
+}
+
+class ListOverlay implements Component {
+  private readonly list: SelectList;
+  private readonly onExtraKey: ((data: string) => boolean) | undefined;
+  private status: string | null = null;
+
+  constructor(
+    title: string,
+    subtitle: string,
+    items: SelectItem[],
+    onSelect: (item: SelectItem) => void,
+    onCancel: () => void,
+    maxVisible = 8,
+    onExtraKey?: (data: string) => boolean,
+    layout?: SelectListLayoutOptions,
+    maxWidth = 78,
+    onSelectionChange?: (item: SelectItem) => void,
+  ) {
+    // Default layout matches the prior inline config so non-test callers
+    // (delete confirms, schedule windows, …) keep their existing column
+    // width. Pass a layout to override per-call (e.g. narrower primary
+    // column for the Test custom model picker).
+    this.list = new SelectList(items, maxVisible, SELECT_LIST_THEME, {
+      truncatePrimary: ({ text, maxWidth }) => clip(text, maxWidth),
+      ...layout,
+    });
+    this.list.onSelect = onSelect;
+    this.list.onCancel = onCancel;
+    if (onSelectionChange) this.list.onSelectionChange = onSelectionChange;
+    this.title = title;
+    this.subtitle = subtitle;
+    this.onExtraKey = onExtraKey;
+    this.maxWidth = maxWidth;
+  }
+
+  private readonly title: string;
+  private subtitle: string;
+  private readonly maxWidth: number;
+
+  setSubtitle(subtitle: string): void {
+    this.subtitle = subtitle;
+    this.invalidate();
+  }
+
+  /** Optional status line rendered below the list (e.g. live quota preview). */
+  setStatus(status: string | null): void {
+    this.status = status;
+    this.invalidate();
+  }
+
+  handleInput(data: string): void {
+    if (this.onExtraKey && this.onExtraKey(data)) return;
+    this.list.handleInput(data);
+  }
+
+  invalidate(): void {
+    this.list.invalidate();
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, Math.min(width - 2, this.maxWidth));
+    const bodyWidth = Math.max(1, innerWidth - 2);
+    const listLines = this.list.render(bodyWidth).map((line) => clip(line, bodyWidth));
+    const body = [clip(this.subtitle, bodyWidth), ...listLines];
+    if (this.status !== null) body.push(clip(this.status, bodyWidth));
+    return frame(this.title, body, innerWidth, this.maxWidth);
+  }
+}
+
+class CompositeAliasesOverlay implements Component, Focusable {
+  focused = false;
+  private snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>> | null = null;
+  private message = 'Ready';
+  private selectionIndex = 0;
+  private scrollOffset = 0;
+
+  constructor(private readonly app: DashboardApp) {}
+
+  // Usage-left suffix per target model (e.g. "58%", "72", "¥43.97"),
+  // computed by DashboardApp.refreshCompositeQuota; only targets whose
+  // route hits a supported usage provider get an entry.
+  private quotaLeft = new Map<string, string>();
+
+  setQuotaLeft(left: Map<string, string>): void {
+    this.quotaLeft = left;
+  }
+
+  setSnapshot(snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>> | null): void {
+    this.snapshot = snapshot;
+    const total = this.selectionCount();
+    if (this.selectionIndex >= total) {
+      this.selectionIndex = Math.max(0, total - 1);
+    }
+  }
+
+  setMessage(message: string, _holdMs = 0): void {
+    this.message = message;
+  }
+
+  focusAlias(alias: string): void {
+    const index = this.selections().findIndex((selection) => selection?.kind === 'alias' && selection.alias === alias);
+    if (index >= 0) {
+      this.selectionIndex = index;
+    }
+  }
+
+  bumpSelection(delta: number): void {
+    const total = this.selectionCount();
+    if (total === 0) return;
+    this.selectionIndex = Math.max(0, Math.min(total - 1, this.selectionIndex + delta));
+  }
+
+  selectCurrent(): Selection {
+    return this.selections()[this.selectionIndex] ?? null;
+  }
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, 'escape')) {
+      this.app.closeOverlay();
+      return;
+    }
+    if (matchesKey(data, 'ctrl+c')) {
+      this.app.stopAndExit();
+      return;
+    }
+    if (matchesKey(data, 'ctrl+u')) {
+      this.app.dumpTokens();
+      return;
+    }
+    if (matchesKey(data, 'r')) {
+      void this.app.refresh(false, true);
+      return;
+    }
+    if (matchesKey(data, 'down') || matchesKey(data, 'j')) {
+      this.bumpSelection(1);
+      this.app.requestRender();
+      return;
+    }
+    if (matchesKey(data, 'up') || matchesKey(data, 'k')) {
+      this.bumpSelection(-1);
+      this.app.requestRender();
+      return;
+    }
+
+    const selected = this.selectCurrent();
+    if (matchesKey(data, 'a') || matchesKey(data, 'shift+a')) {
+      this.app.openAddAliasPrompt();
+      return;
+    }
+    if ((matchesKey(data, 'l') || matchesKey(data, 'shift+l')) && selected?.kind === 'alias') {
+      this.app.openEditAliasLimitPrompt(selected.alias);
+      return;
+    }
+    if ((matchesKey(data, 'f') || matchesKey(data, 'shift+f')) && selected?.kind === 'alias') {
+      this.app.openEditFusionOptionsPrompt(selected.alias);
+      return;
+    }
+    if (matchesKey(data, 'm') || matchesKey(data, 'shift+m')) {
+      const alias = selected?.kind === 'alias' ? selected.alias : selected?.kind === 'target' ? selected.alias : undefined;
+      if (alias) {
+        this.app.openTargetPicker(alias);
+      } else {
+        this.setMessage('Select an alias first');
+        this.app.requestRender();
+      }
+      return;
+    }
+    if ((matchesKey(data, 'e') || matchesKey(data, 'shift+e')) && selected?.kind === 'target') {
+      this.app.openEditTargetPrompt(selected.alias, selected.target);
+      return;
+    }
+    if ((matchesKey(data, 'd') || matchesKey(data, 'shift+d')) && selected?.kind === 'target') {
+      this.app.openDeleteConfirm(selected.alias, selected.target);
+      return;
+    }
+    if ((matchesKey(data, 'd') || matchesKey(data, 'shift+d')) && selected?.kind === 'alias') {
+      this.app.openDeleteAliasConfirm(selected.alias);
+      return;
+    }
+    if (matchesKey(data, 'enter') || matchesKey(data, 'return')) {
+      this.setMessage(selected ? `${selected.kind} selected` : '');
+      this.app.requestRender();
+      return;
+    }
+  }
+
+  render(width: number): string[] {
+    const snap = this.snapshot;
+    const toolbar = `a ${dim('add alias')} m ${dim('add target')} f ${dim('edit fusion')} e ${dim('edit composite')} l ${dim('limit')} d ${dim('del')} Esc ${dim('hide')} ↑↓ ${dim('move')} `;
+
+    if (!snap) {
+      return frame('Edit Composite Aliases Config', [toolbar, 'Loading…'], width).map((line) => clip(line, width));
+    }
+
+    const compositeErrors = (snap.config.config_errors ?? []).filter((e) => e.path.startsWith('composite.'));
+
+    const selections = this.selections();
+    const selected = selections[this.selectionIndex] ?? null;
+    const composites = Object.entries(snap.config.composite).sort(([a, aTargets], [b, bTargets]) => {
+      const aEmpty = Object.entries(aTargets || {}).filter(([k]) => k !== 'token_limit' && k !== 'fusion_options').length === 0;
+      const bEmpty = Object.entries(bTargets || {}).filter(([k]) => k !== 'token_limit' && k !== 'fusion_options').length === 0;
+      if (aEmpty !== bEmpty) return aEmpty ? 1 : -1;
+      return a.localeCompare(b);
+    });
+    const modelTimingMap = new Map((snap.requestStats.model_timings || []).map((t) => [t.endpoint, t]));
+
+    // Build full body lines (no toolbar/status yet — those are fixed outside the scroll window)
+    const bodyLines: string[] = [];
+    // Track which body line each selection item starts on, for scroll-follow
+    const selectionLineIndex: number[] = [];
+
+    if (!composites.length) bodyLines.push(dim('  none'));
+    for (const [alias, targets] of composites) {
+      const selectedAlias = selected?.kind === 'alias' && selected.alias === alias;
+      const prefix = selectedAlias ? green('▶') : dim('│');
+      const typedTargets = targets as { token_limit?: { num: number; duration: string }; fusion_options?: unknown } | undefined;
+      const aliasLimit = typedTargets?.token_limit;
+      const win = snap.compositeLimitWindows?.[alias];
+      const windowUsed = win?.accumulator ?? 0;
+      // Display the configured limit duration (updates immediately on edit), not
+      // the in-memory window's duration, which only re-syncs on the next proxy
+      // request and would otherwise show a stale value right after an edit.
+      const windowDuration = aliasLimit?.duration ?? '';
+      const aliasSummary = aliasLimit !== undefined && aliasLimit.num > 0
+        ? ` ${dim(fmt(windowUsed))} ${dim('/')} ${dim('(')}${dim(fmt(aliasLimit.num) + '/' + windowDuration)}${dim(')')}${dim(bold('𝕋'))}`
+        : '';
+      const aliasMode = snap.config ? getCompositeAliasMode(alias, snap.config) : undefined;
+      const aliasTag = aliasMode === 'fusion' ? dim(' ƒ') : aliasMode === 'coordinator' ? dim(' Ö') : dim(' Ç');
+      const hasError = compositeErrors.some((e) => e.path === `composite.${alias}`);
+      const errorMark = hasError ? red(' x') : '';
+      // Record this alias's line index for selections array
+      selectionLineIndex.push(bodyLines.length);
+      bodyLines.push(`  ${prefix} ${bold(alias)}${aliasTag}${errorMark}${aliasSummary}`);
+      const entries = Object.entries(targets || {}).filter(([target]) => target !== 'token_limit' && target !== 'fusion_options');
+      if (!entries.length) bodyLines.push(`    ${dim('(empty)')}`);
+      const targetRouteModel = new Map<string, string | undefined>();
+      const resolvedAlias = snap.compositeResolved.find((r) => r.alias === alias);
+      if (resolvedAlias) {
+        for (const t of resolvedAlias.targets) {
+          targetRouteModel.set(t.model, t.routeModel);
+        }
+      }
+      for (const [target, cfg] of entries.sort(sortCompositeTargets)) {
+        const selectedTarget = selected?.kind === 'target' && selected.alias === alias && selected.target === target;
+        const mark = selectedTarget ? green('▶') : dim('·');
+        const typedCfg = cfg as CompositeTargetConfig | undefined;
+        const isCoordTarget = typedCfg?.coord !== undefined;
+        const isFusionTarget = !isCoordTarget && (typedCfg?.fusion !== undefined || typedCfg?.role !== undefined);
+        const summary = isCoordTarget
+          ? `coord:${typedCfg?.coord ?? 1}${typedCfg?.role ? ` ${typedCfg.role}` : ''}`
+          : isFusionTarget
+          ? `${typedCfg?.role ?? 'panel'}${typedCfg?.fusion !== undefined ? `:${typedCfg.fusion}` : ''}`
+          : typedCfg?.primary
+          ? `${typedCfg?.share ?? '-'} Primary`
+          : `${typedCfg?.share ?? '-'}${typedCfg?.fallback === 0 ? ' Fallback' : typedCfg?.fallback !== undefined ? ` FB${typedCfg.fallback}` : ''}`;
+        const timingKey = targetRouteModel.get(target) ?? target;
+        const timing = modelTimingMap.get(timingKey);
+        const timingStr = timing ? ` ${dim('[')}${dim(fmtSeconds(timing.min_time_ms))}${dim('/')}${dim(fmtSeconds(timing.avg_time_ms))}${dim('/')}${dim(fmtSeconds(timing.max_time_ms))}${dim('s]')}` : '';
+        const left = this.quotaLeft.get(target);
+        const leftStr = left !== undefined ? ` ${dim(`(${left} left)`)}` : '';
+        // Record this target's line index for selections array
+        selectionLineIndex.push(bodyLines.length);
+        bodyLines.push(`  ${dim('│')} ${mark} ${clip(target, 22)} ${dim(summary)}${timingStr}${leftStr}`);
+      }
+    }
+
+    // Fixed lines outside the scroll window: toolbar (top) + blank + status (bottom)
+    // frame() adds title + top border + bottom border = 3 extra lines
+    const fixedLines = 3 /* frame borders + title */ + 1 /* toolbar */ + 1 /* blank */ + 1 /* status */;
+    const termRows = this.app.getTerminalRows();
+    const maxHeight = Math.max(3, Math.floor(termRows * 0.7));
+    const viewportHeight = Math.max(1, maxHeight - fixedLines);
+
+    // Scroll to keep selected item visible
+    const selectedBodyLine = selectionLineIndex[this.selectionIndex] ?? 0;
+    if (selectedBodyLine < this.scrollOffset) {
+      this.scrollOffset = selectedBodyLine;
+    } else if (selectedBodyLine >= this.scrollOffset + viewportHeight) {
+      this.scrollOffset = selectedBodyLine - viewportHeight + 1;
+    }
+    this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, Math.max(0, bodyLines.length - viewportHeight)));
+
+    const visibleBody = bodyLines.slice(this.scrollOffset, this.scrollOffset + viewportHeight);
+    const scrollIndicator = bodyLines.length > viewportHeight
+      ? dim(` ${this.scrollOffset + 1}-${Math.min(this.scrollOffset + viewportHeight, bodyLines.length)}/${bodyLines.length}`)
+      : '';
+    const defaultStatus = compositeErrors.length > 0
+      ? red(`Config error: ${compositeErrors[0].path} — ${compositeErrors[0].message}`)
+      : dim('Ready');
+    // Treat the initial 'Ready' sentinel as "no active message" so composite
+    // config errors can replace it in the status bar.
+    const hasActiveMessage = this.message && this.message !== 'Ready';
+    const statusLine = (hasActiveMessage ? yellow(this.message) : defaultStatus) + scrollIndicator;
+
+    const allLines = [toolbar, ...visibleBody, '', statusLine];
+    return frame('Edit Composite Aliases Config', allLines, width).map((line) => clip(line, width));
+  }
+
+  private selections(): Selection[] {
+    const snap = this.snapshot;
+    if (!snap) return [];
+    const out: Selection[] = [];
+    for (const alias of Object.keys(snap.config.composite).sort((a, b) => {
+      const aTargets = snap.config.composite[a];
+      const bTargets = snap.config.composite[b];
+      const aEmpty = Object.entries(aTargets || {}).filter(([k]) => k !== 'token_limit' && k !== 'fusion_options').length === 0;
+      const bEmpty = Object.entries(bTargets || {}).filter(([k]) => k !== 'token_limit' && k !== 'fusion_options').length === 0;
+      if (aEmpty !== bEmpty) return aEmpty ? 1 : -1;
+      return a.localeCompare(b);
+    })) {
+      out.push({ kind: 'alias', alias });
+      const targetEntries = Object.entries(snap.config.composite?.[alias] || {}).filter(([k]) => k !== 'token_limit' && k !== 'fusion_options');
+      for (const [target] of targetEntries.sort(sortCompositeTargets)) {
+        out.push({ kind: 'target', alias, target });
+      }
+    }
+    return out;
+  }
+
+  private selectionCount(): number {
+    return this.selections().length;
+  }
+}
+
+class ScheduleAliasesOverlay implements Component, Focusable {
+  focused = false;
+  private snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>> | null = null;
+  private message = 'Ready';
+  private selectionIndex = 0;
+  private scrollOffset = 0;
+
+  constructor(private readonly app: DashboardApp) {}
+
+  setSnapshot(snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>> | null): void {
+    this.snapshot = snapshot;
+    const total = this.selectionCount();
+    if (this.selectionIndex >= total) {
+      this.selectionIndex = Math.max(0, total - 1);
+    }
+  }
+
+  setMessage(message: string, _holdMs = 0): void {
+    this.message = message;
+  }
+
+  focusAlias(alias: string): void {
+    const index = this.selections().findIndex((selection) => selection?.kind === 'alias' && selection.alias === alias);
+    if (index >= 0) {
+      this.selectionIndex = index;
+    }
+  }
+
+  bumpSelection(delta: number): void {
+    const total = this.selectionCount();
+    if (total === 0) return;
+    this.selectionIndex = Math.max(0, Math.min(total - 1, this.selectionIndex + delta));
+  }
+
+  selectCurrent(): Selection {
+    return this.selections()[this.selectionIndex] ?? null;
+  }
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, 'escape')) {
+      this.app.closeOverlay();
+      return;
+    }
+    if (matchesKey(data, 'ctrl+c')) {
+      this.app.stopAndExit();
+      return;
+    }
+    if (matchesKey(data, 'ctrl+u')) {
+      this.app.dumpTokens();
+      return;
+    }
+    if (matchesKey(data, 'r')) {
+      void this.app.refresh(false, true);
+      return;
+    }
+    if (matchesKey(data, 'down') || matchesKey(data, 'j')) {
+      this.bumpSelection(1);
+      this.app.requestRender();
+      return;
+    }
+    if (matchesKey(data, 'up') || matchesKey(data, 'k')) {
+      this.bumpSelection(-1);
+      this.app.requestRender();
+      return;
+    }
+
+    const selected = this.selectCurrent();
+    if (matchesKey(data, 'a')) {
+      this.app.openAddScheduleAliasPrompt();
+      return;
+    }
+    if (matchesKey(data, 'm') && selected?.kind === 'alias') {
+      this.app.openAddScheduleTargetPrompt(selected.alias);
+      return;
+    }
+    if (matchesKey(data, 'e') && selected?.kind === 'target') {
+      this.app.openEditScheduleWindowsPrompt(selected.alias, selected.target);
+      return;
+    }
+    if (matchesKey(data, 'd')) {
+      if (selected?.kind === 'target') {
+        this.app.openDeleteScheduleTargetConfirm(selected.alias, selected.target);
+      } else if (selected?.kind === 'alias') {
+        this.app.openDeleteScheduleAliasConfirm(selected.alias);
+      } else {
+        this.setMessage('Select an alias or target first');
+        this.app.requestRender();
+      }
+      return;
+    }
+    if (matchesKey(data, 'enter') || matchesKey(data, 'return')) {
+      this.setMessage(selected ? `${selected.kind} selected` : '');
+      this.app.requestRender();
+      return;
+    }
+  }
+
+  render(width: number): string[] {
+    const snap = this.snapshot;
+    const toolbar = `A ${dim('add alias')} M ${dim('add target')} E ${dim('edit windows')} D ${dim('del')} Esc ${dim('hide')} ↑↓ ${dim('move')} `;
+
+    if (!snap) {
+      return frame('Edit Schedule Aliases Config', [toolbar, 'Loading…'], width).map((line) => clip(line, width));
+    }
+
+    const selections = this.selections();
+    const selected = selections[this.selectionIndex] ?? null;
+    const scheduleMap = (snap.config.schedule || {}) as Record<string, Record<string, ScheduleWindow[]>>;
+    const schedules = Object.keys(scheduleMap).sort();
+
+    const bodyLines: string[] = [];
+    const selectionLineIndex: number[] = [];
+
+    if (!schedules.length) bodyLines.push(dim('  none'));
+    for (const alias of schedules) {
+      const targets = scheduleMap[alias] || {};
+      const selectedAlias = selected?.kind === 'alias' && selected.alias === alias;
+      const prefix = selectedAlias ? green('▶') : dim('│');
+      selectionLineIndex.push(bodyLines.length);
+      bodyLines.push(`  ${prefix} ${bold(alias)}`);
+      const targetNames = Object.keys(targets).sort();
+      if (targetNames.length === 0) bodyLines.push(`    ${dim('(empty)')}`);
+      for (const target of targetNames) {
+        const selectedTarget = selected?.kind === 'target' && selected.alias === alias && selected.target === target;
+        const mark = selectedTarget ? green('▶') : dim('·');
+        const windows = Array.isArray(targets[target]) ? targets[target] : [];
+        const summary = windows.length === 0
+          ? dim('fallback')
+          : windows.map((w) => {
+              const from = typeof w?.from === 'number' ? w.from : 0;
+              const to = typeof w?.to === 'number' ? w.to : 24;
+              const days = w?.days === 'weekday' ? '[weekdays]'
+                : w?.days === 'weekend' ? '[weekend]'
+                : Array.isArray(w?.days) && w.days.length > 0 ? `[${w.days.join(',')}]` : '';
+              return `${from}-${to}${days}`;
+            }).join(' ');
+        selectionLineIndex.push(bodyLines.length);
+        bodyLines.push(`  ${dim('│')} ${mark} ${clip(target, 26)} ${dim(summary)}`);
+      }
+    }
+
+    const fixedLines = 3 /* frame borders + title */ + 1 /* toolbar */ + 1 /* blank */ + 1 /* status */;
+    const termRows = this.app.getTerminalRows();
+    const maxHeight = Math.max(3, Math.floor(termRows * 0.7));
+    const viewportHeight = Math.max(1, maxHeight - fixedLines);
+
+    const selectedBodyLine = selectionLineIndex[this.selectionIndex] ?? 0;
+    if (selectedBodyLine < this.scrollOffset) {
+      this.scrollOffset = selectedBodyLine;
+    } else if (selectedBodyLine >= this.scrollOffset + viewportHeight) {
+      this.scrollOffset = selectedBodyLine - viewportHeight + 1;
+    }
+    this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, Math.max(0, bodyLines.length - viewportHeight)));
+
+    const visibleBody = bodyLines.slice(this.scrollOffset, this.scrollOffset + viewportHeight);
+    const scrollIndicator = bodyLines.length > viewportHeight
+      ? dim(` ${this.scrollOffset + 1}-${Math.min(this.scrollOffset + viewportHeight, bodyLines.length)}/${bodyLines.length}`)
+      : '';
+    const statusLine = (this.message ? yellow(this.message) : dim('Ready')) + scrollIndicator;
+
+    const allLines = [toolbar, ...visibleBody, '', statusLine];
+    return frame('Edit Schedule Aliases Config', allLines, width).map((line) => clip(line, width));
+  }
+
+  private selections(): Selection[] {
+    const snap = this.snapshot;
+    if (!snap) return [];
+    const scheduleMap = (snap.config.schedule || {}) as Record<string, Record<string, unknown>>;
+    const out: Selection[] = [];
+    for (const alias of Object.keys(scheduleMap).sort()) {
+      out.push({ kind: 'alias', alias });
+      const targets = scheduleMap[alias] || {};
+      for (const target of Object.keys(targets).sort()) {
+        out.push({ kind: 'target', alias, target });
+      }
+    }
+    return out;
+  }
+
+  private selectionCount(): number {
+    return this.selections().length;
+  }
+}
+
+class DashboardView implements Component {
+  private snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>> | null = null;
+  private message = 'Ready';
+  private messageUntil = 0;
+  private lastTime = '';
+  private configStatus: 'normal' | 'changed' | 'saved' = 'normal';
+  private configStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  private heatmapView: 'weekly' | 'monthly' = 'weekly';
+
+  constructor(private readonly app: DashboardApp, private readonly onInvalidate: () => void) {}
+
+  setConfigStatus(status: 'changed' | 'saved'): void {
+    this.configStatus = status;
+    if (this.configStatusTimer) clearTimeout(this.configStatusTimer);
+    // Revert to 'normal' after 3 seconds for 'saved', 5 seconds for 'changed'
+    const ms = status === 'saved' ? 3000 : 5000;
+    this.configStatusTimer = setTimeout(() => {
+      this.configStatus = 'normal';
+      this.invalidate();
+    }, ms);
+    this.invalidate();
+  }
+
+  setSnapshot(snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>> | null): void {
+    this.snapshot = snapshot;
+    this.invalidate();
+  }
+
+  setMessage(message: string, holdMs = 1000): void {
+    this.message = message;
+    this.messageUntil = holdMs === -1 ? -1 : holdMs > 0 ? Date.now() + holdMs : 0;
+    this.invalidate();
+  }
+
+  shouldPreserveMessage(): boolean {
+    return this.messageUntil === -1 || this.messageUntil > Date.now();
+  }
+
+  invalidate(): void {
+    this.onInvalidate();
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, 'ctrl+c')) {
+      this.app.stopAndExit();
+      return;
+    }
+    if (matchesKey(data, 'r')) {
+      void this.app.refresh(false, true);
+      return;
+    }
+    if (matchesKey(data, 't') || matchesKey(data, 'shift+t')) {
+      void this.app.openTestModelPicker();
+      return;
+    }
+    if (matchesKey(data, 'shift+c') || matchesKey(data, 'c')) {
+      this.app.openCompositeAliasesOverlay();
+      return;
+    }
+    if (matchesKey(data, 'shift+s') || matchesKey(data, 's')) {
+      this.app.openScheduleAliasesOverlay();
+      return;
+    }
+    if (matchesKey(data, 'l') || matchesKey(data, 'shift+l')) {
+      void this.app.openEditGlobalTokenLimitPrompt();
+      return;
+    }
+    if (matchesKey(data, 'd') || matchesKey(data, 'shift+d')) {
+      this.app.openStatisticsOverlay();
+      return;
+    }
+    if (matchesKey(data, 'p') || matchesKey(data, 'shift+p')) {
+      this.app.openToolBlocklistOverlay();
+      return;
+    }
+    if (matchesKey(data, 'k') || matchesKey(data, 'shift+k')) {
+      void this.app.openSystemKeysOverlay();
+      return;
+    }
+    if (matchesKey(data, 'shift+u')) {
+      this.heatmapView = this.heatmapView === 'weekly' ? 'monthly' : 'weekly';
+      this.invalidate();
+      return;
+    }
+    if (matchesKey(data, 'q') || matchesKey(data, 'shift+q')) {
+      this.app.openQuotaPicker();
+      return;
+    }
+    if (matchesKey(data, 'h')) {
+      this.app.openHelpOverlay();
+      return;
+    }
+  }
+
+  render(width: number): string[] {
+    const snap = this.snapshot;
+    const date = new Date();
+    const now = date.toLocaleTimeString('en-US', { hour12: false });
+    if (now !== this.lastTime) {
+      this.lastTime = now;
+    }
+    const sec = date.getSeconds();
+    const hourminTime = this.lastTime.slice(0, -2);
+    const activeRequests = getActiveRequestCount();
+    let secondsTime: string;
+    let inflightIndicator: string;
+    if (activeRequests > 0) {
+      // Cycle through shading blocks (light -> solid) while requests are in
+      // flight, instead of the idle color-cycling seconds display.
+      const shadeFrames = ['░', '▒', '▓', '█'];
+      const shade = shadeFrames[Math.floor(sec) % shadeFrames.length];
+      secondsTime = lightWhite(this.lastTime.slice(-2));
+      inflightIndicator = ` ${green(shade)}`;
+    } else {
+      // Idle: seconds display resets to the normal (non-blinking) color.
+      secondsTime = lightWhite(this.lastTime.slice(-2));
+      inflightIndicator = '  ';
+    }
+    const lines: string[] = [];
+    // 🔒 — every api_key in the local config file is a STORE_KEY_IN_SYSTEM
+    // sentinel (keys live in the OS keychain; see help markers).
+    const lockSuffix = snap?.config.api_keys_in_system_store ? '🔒 ' : '';
+    lines.push(bold('Proxy TUI') + dim(`  ${hourminTime}`) + `${secondsTime}${inflightIndicator}` + ` ${lockSuffix}` + dim(`${this.app.getVersion()}`));
+    lines.push(dim('─'.repeat(Math.max(0, width))));
+
+    if (!snap) {
+      lines.push('Loading…');
+      return lines.map((line) => clip(line, width));
+    }
+
+    const toolStats = snap.toolStats || [];
+    const fixedContentLines = 37; // header(2) + config(1) + heatmap(4) + blank(1) + customModelsHeader(1) + topModels(7) + tools(7) + endpoints(7) + footer(2) + message(1) + blanks(3)
+    const termRows = (this.app as unknown as { getTerminalRows: () => number }).getTerminalRows();
+    const maxCustomModelRows = Math.max(3, termRows - fixedContentLines);
+    let configIndicator: string;
+    if (this.configStatus === 'changed') {
+      configIndicator = red('(changed)');
+    } else if (this.configStatus === 'saved') {
+      configIndicator = lightBlue('(saved)');
+    } else {
+      configIndicator = snap.config.read_only ? yellow('(read-only)') : dim('(unchanged)');
+    }
+    const cfgMeta = snap.config as unknown as { config_errors?: unknown[]; config_warnings?: unknown[] };
+    const errCount = cfgMeta.config_errors?.length ?? 0;
+    const warnCount = cfgMeta.config_warnings?.length ?? 0;
+    const cfgSuffix = errCount > 0 ? red(` (${errCount} errors)`) : warnCount > 0 ? yellow(` (${warnCount} warnings)`) : '';
+    lines.push(`${dim('Config:')} ${dim(snap.config.config_path ?? 'memory')} ${configIndicator}${cfgSuffix}`);
+    const isMonthly = this.heatmapView === 'monthly';
+    const tokenHeatmap = isMonthly
+      ? buildMonthlyHeatmap(snap.tokenHeatmapMonthly)
+      : buildHeatmap(snap.tokenHeatmap);
+    const heatmapRowFilter = termRows < 40 ? [1, 3, 5] : undefined; // show Mon/Wed/Fri in small terminals
+    const tokenHeatmapLines = (isMonthly
+      ? renderMonthlyHeatmapPanel(tokenHeatmap, { title: 'Tokens Panel' })
+      : renderHeatmapPanel(tokenHeatmap, { title: 'Tokens Panel', rowFilter: heatmapRowFilter })
+    ).split('\n');
+    const globalLimit = snap.config.global_token_limit;
+    const globalLimitDisplay = globalLimit ? globalLimit.trim().replace(/\s+/, '/') : '';
+    let globalLimitSuffix = '';
+    if (globalLimitDisplay) {
+      const parsedGlobal = globalLimit ? parseHumanTokenLimit(globalLimit.trim()) : null;
+      let windowTotal = 0;
+      if (parsedGlobal) {
+        const cutoff = getWindowCutoff(parseWindowSpec(parsedGlobal.duration));
+        windowTotal = getTokensInWindowSince(cutoff);
+      }
+      let limitColor: (s: string) => string = dim;
+      if (parsedGlobal && parsedGlobal.num > 0) {
+        const ratio = windowTotal / parsedGlobal.num;
+        if (ratio >= 1) limitColor = red;
+        else if (ratio >= 0.8) limitColor = yellow;
+      }
+      globalLimitSuffix = ` ${limitColor('(')}${limitColor(globalLimitDisplay)}${limitColor(')')}${limitColor(bold('𝕋'))}]`;
+    }
+    const configFlagParts: string[] = [];
+    if (snap.config.remote_auth_active) configFlagParts.push(bold('Ä'));
+    if (snap.config.remote_recording_active) configFlagParts.push(bold('®'));
+    if (snap.config.privacy_filter_active) configFlagParts.push(bold('℗'));
+    const configFlagsSuffix = configFlagParts.length ? ` ${configFlagParts.join(' ')}` : '';
+    const live = getActiveRequestCount() > 0 ? getLiveTokens() : null;
+    const liveParts = live ? [
+      live.input > 0 ? `${dim('↑')} ${fmt(live.input)}` : '',
+      live.output > 0 ? `${dim('↓')} ${fmt(live.output)}` : '',
+    ].filter(Boolean) : [];
+    const liveSuffix = liveParts.join(' ');
+    const tokenHeader = `${bold('Tokens Panel')} [${fmt(tokenHeatmap.totalValues)}${globalLimitSuffix}${globalLimitSuffix ? '' : ']'}${configFlagsSuffix}`;
+    const tokenPanelWidth = Math.max(...tokenHeatmapLines.map((line) => visibleWidth(line)));
+    tokenHeatmapLines[0] = liveSuffix
+      ? `${tokenHeader}${' '.repeat(Math.max(1, tokenPanelWidth - 1 - visibleWidth(tokenHeader) - visibleWidth(liveSuffix)))}${liveSuffix}`
+      : tokenHeader;
+    lines.push(...tokenHeatmapLines);
+
+    const keysDetected = snap.privacyKeysDetected ?? 0;
+    if (keysDetected > 0) {
+      const keysLabel = dim('filtered Keys: ') + fmt(keysDetected);
+      lines.push(alignRight(keysLabel, tokenPanelWidth - 1));
+    }
+    else {
+      lines.push('');
+    }
+
+    const customModels = this.customModels();
+    lines.push(`${bold('Custom Models')} (${fmt(customModels.length)})`);
+    const modelTimingMap = new Map((snap.requestStats.model_timings || []).map((t) => [t.endpoint, t]));
+    if (!customModels.length) {
+      lines.push(dim('  none'));
+    } else {
+      const shownModels = customModels.slice(0, maxCustomModelRows);
+      const hiddenCount = customModels.length - shownModels.length;
+      for (const row of shownModels) {
+        const tag = row.category === 'fusion' ? 'ƒ' : row.category === 'coordinator' ? 'Ö' : row.category === 'composite' ? 'Ç' : dim(titleCase(row.category));
+        const extra = row.description ? ` ${dim(row.description)}` : '';
+        const timing = modelTimingMap.get(row.routeModel ?? row.modelId);
+        const timingStr = timing ? ` ${dim('[')}${dim(fmtSeconds(timing.min_time_ms))}${dim('/')}${dim(fmtSeconds(timing.avg_time_ms))}${dim('/')}${dim(fmtSeconds(timing.max_time_ms))}${dim('s]')}` : '';
+        lines.push(`  ${dim(row.modelId)} ${tag}${extra}${timingStr}`);
+      }
+      if (hiddenCount > 0) {
+        lines.push(dim(`  ... +${hiddenCount} more. press`) + ' C' + dim(' to config composite models, alias.'));
+      }
+    }
+    lines.push(`${bold('Top Models')} (${fmt(snap.modelStats.length)})`);
+    lines.push(dim(`  ${'model'.padEnd(32)}req   failed | token in    cached    wrote     out     total`));
+    for (const row of snap.modelStats.slice(0, 5)) {
+      lines.push(
+        `  ${(row.model.split('/').pop() || row.model).padEnd(30)}${alignRight(fmt(row.requests), 5)} ${alignRight(fmt(row.failed_requests), 8)}  ${alignRight(fmt(row.input_tokens), 8)}  ${alignRight(fmt(row.cached_tokens), 8)} ${alignRight(fmt(row.cache_written_tokens), 8)} ${alignRight(fmt(row.output_tokens), 8)}  ${alignRight(fmt(row.total_tokens), 8)}`,
+      );
+    }
+
+    lines.push('');
+    lines.push(`${bold('Tools Used')} (${fmt(toolStats.length)})`);
+    lines.push(dim(`  ${'tool'.padEnd(32)}in req     in resp     total len`));
+    for (const row of toolStats.slice(0, 5)) {
+      lines.push(`  ${row.tool_name.padEnd(30)}${alignRight(fmt(row.in_requests), 7)}   ${alignRight(fmt(row.in_responses), 8)}   ${alignRight(fmt(row.in_request_chars), 10)}`);
+    }
+
+    lines.push('');
+    lines.push(`${bold('Top Endpoints')} (${fmt(snap.requestStats.endpoints.length)})`);
+    lines.push(dim(`  ${'endpoint'.padEnd(32)}req   min(s)   avg(s)   max(s)`));
+    const endpointRows = new Map(snap.requestStats.endpoints.map((row) => [row.endpoint, row]));
+    for (const row of snap.requestStats.endpoint_timings.slice(0, 5)) {
+      const requestRow = endpointRows.get(row.endpoint);
+      lines.push(
+        `  ${row.endpoint.padEnd(30)}${alignRight(fmt(requestRow?.requests ?? 0), 5)} ${alignRight(fmtSeconds(row.min_time_ms), 8)} ${alignRight(fmtSeconds(row.avg_time_ms), 8)} ${alignRight(fmtSeconds(row.max_time_ms), 8)}`,
+      );
+    }
+
+    lines.push('');
+    lines.push(`C ${dim('composite,fusion')}  S ${dim('schedule')}  T ${dim('models test')}  L ${dim('token limit')}  D ${dim('stats')}  P ${dim('tools list')}  h ${dim('help')}  ↑↓ ${dim('move')}`);
+    lines.push(this.message ? yellow(this.message) : dim('Ready'));
+
+    return lines.map((line) => clip(line, width));
+  }
+
+  private customModels(): Array<{ category: string; modelId: string; description?: string; routeModel?: string; empty?: boolean }> {
+    const snap = this.snapshot;
+    if (!snap) return [];
+    const seen = new Set<string>();
+    const models: Array<{ category: string; modelId: string; description?: string; routeModel?: string; empty?: boolean }> = [];
+
+    for (const [category, categoryConfig] of Object.entries(snap.config.models)) {
+      for (const [key, value] of Object.entries(categoryConfig || {})) {
+        if (key === 'upstream_mode' || key === 'base_url' || key === 'api_key') continue;
+        if (value === undefined || seen.has(key)) continue;
+        seen.add(key);
+        const routeModel = Array.isArray(value) && value.length >= 1 && typeof value[0] === 'string' ? value[0] : undefined;
+        models.push({ category, modelId: key, routeModel });
+      }
+    }
+
+    // Add composite aliases — skip if same name already exists as a model
+    if (snap.compositeResolved) {
+      for (const alias of snap.compositeResolved) {
+        if (seen.has(alias.alias)) continue; // model with same name already added
+        seen.add(alias.alias);
+        const aliasMode = snap.config ? getCompositeAliasMode(alias.alias, snap.config) : undefined;
+        const isFusion = aliasMode === 'fusion';
+        const aliasConfig = snap.config.composite?.[alias.alias] as Record<string, unknown> | undefined;
+        const orderedTargets = orderCompositeTargetsForDisplay(alias.targets, aliasConfig, isFusion);
+        const targets = orderedTargets.map((t) => t.model || t.routeModel || '?').join(' · ');
+        const category = aliasMode === 'coordinator' ? 'coordinator' : isFusion ? 'fusion' : 'composite';
+        models.push({ category, modelId: alias.alias, description: `(${targets})`, empty: alias.targets.length === 0 });
+      }
+    }
+
+    // Sort: non-empty composite/fusion first; empty composite/fusion and other
+    // (specific or wildcard) models sink to the bottom, both groups alphabetical.
+    return models.sort((a, b) => {
+      const aTop = (a.category === 'fusion' || a.category === 'composite' || a.category === 'coordinator') && !a.empty;
+      const bTop = (b.category === 'fusion' || b.category === 'composite' || b.category === 'coordinator') && !b.empty;
+      if (aTop && !bTop) return -1;
+      if (!aTop && bTop) return 1;
+      return a.modelId.localeCompare(b.modelId);
+    });
+  }
+}
+
+class DashboardApp {
+  private readonly terminal = new ProcessTerminal();
+  private readonly tui = new TUI(this.terminal);
+  private readonly view = new DashboardView(this, () => this.scheduleRender());
+  private overlay: OverlayHandle | null = null;
+  private compositeOverlay: CompositeAliasesOverlay | null = null;
+  private scheduleOverlay: ScheduleAliasesOverlay | null = null;
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private hourlyDumpTimer: ReturnType<typeof setInterval> | null = null;
+  private modelTestTimer: ReturnType<typeof setInterval> | null = null;
+  private modelTestTimerActive = false;
+  private compositeQuotaRefreshing = false;
+  /** Live state of the open 'Model Quota' picker — set by openQuotaPicker,
+   *  cleared by closeOverlay/its close callbacks, and rebuilt from the
+   *  refresh() loop (refreshQuotaPicker) so open rows track new upstream
+   *  responses (e.g. the passively recorded anthropic 5h utilization). */
+  private quotaPickerState: {
+    overlay: ListOverlay;
+    choices: SelectItem[];
+    /** Base description (before the quota suffix) per choice value. */
+    baseDescription: Map<string, string>;
+    /** Latest quota entries, refreshed while the picker is open. */
+    data: Map<string, QuotaPickerEntry>;
+    /** Value of the currently highlighted row. */
+    highlighted: string | null;
+  } | null = null;
+  private quotaPickerRefreshing = false;
+  private modelTestInProgress = false;
+  // Set by togglePeriodicModelTest / stop() to abort an in-flight test-all
+  // batch. The for-loop in runAllCustomModelTests checks it between models;
+  // the AbortController interrupts the current fetch so the loop doesn't
+  // have to wait for it to time out.
+  private modelTestAborted = false;
+  private modelTestAbortController: AbortController | null = null;
+  private lastDumpedTotalTokens = -1;
+  private lastRefreshTotalTokens = -1;
+  private lastDumpedDate = '';
+  private stopped = false;
+  private refreshing = false;
+  private pendingMutationRefresh = false;
+  private renderPending = false;
+  private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  private titleTimer: ReturnType<typeof setInterval> | null = null;
+  // Cached unsanitized ProxyConfig (includes api_key). The snapshot config
+  // is the sanitized dashboard payload which strips api_key, so we keep
+  // the raw config here for test-request auth header construction.
+  private proxyConfig: ProxyConfig | null = null;
+
+  constructor(private readonly source: DashboardSource) {}
+
+  getVersion(): string { return this.source.env.VERSION || 'dev'; }
+
+  async start(): Promise<() => void> {
+    this.tui.addChild(this.view);
+    this.tui.setFocus(this.view);
+    this.tui.addInputListener((data) => {
+      if (matchesKey(data, 'ctrl+c')) {
+        this.stopAndExit();
+        return { consume: true };
+      }
+      if (matchesKey(data, 'ctrl+u')) {
+        this.dumpTokens();
+        return { consume: true };
+      }
+      return undefined;
+    });
+    this.tui.start();
+    await this.refresh();
+    this.refreshTimer = setInterval(() => {
+      void this.refresh();
+    }, 500);
+    // Dedicated 1s ticker for the terminal title activity dot — independent of
+    // the debounced render loop so the '·'/'.' alternation always updates
+    // exactly once per second while requests are in flight.
+    this.titleTimer = setInterval(() => this.updateTerminalTitle(), 1000);
+    this.hourlyDumpTimer = setInterval(() => {  // every 30 min
+      const today = new Date().toISOString().slice(0, 10);
+      const dayChanged = today !== this.lastDumpedDate;
+      if (!dayChanged && this.lastRefreshTotalTokens === this.lastDumpedTotalTokens) return;
+      this.lastDumpedTotalTokens = this.lastRefreshTotalTokens;
+      this.lastDumpedDate = today;
+      dumpTodayTokens();
+      this.view.setMessage(`auto-dumped tokens -> ${TOKEN_LOG_FILE}`);
+    }, 30 * 60 * 1000);
+    return () => this.stop();
+  }
+
+  dumpTokens(): void {
+    if (this.lastRefreshTotalTokens === this.lastDumpedTotalTokens) {
+      this.view.setMessage('no new tokens to dump');
+      this.requestRender();
+      return;
+    }
+    this.lastDumpedTotalTokens = this.lastRefreshTotalTokens;
+    this.lastDumpedDate = new Date().toISOString().slice(0, 10);
+    dumpTodayTokens();
+    this.view.setMessage(`dumped tokens -> ${TOKEN_LOG_FILE}`);
+    this.requestRender();
+  }
+
+  requestRender(): void {
+    this.scheduleRender();
+  }
+
+  private lastTerminalTitle: string | null = null;
+
+  private updateTerminalTitle(): void {
+    const inflight = getActiveRequestCount();
+    // Alternate the activity dot every second while requests are in flight:
+    // '·' on even seconds, '.' on odd, matching the in-TUI header indicator.
+    // When idle, fall back to the plain title.
+    const activityChar = inflight > 0 ? (new Date().getSeconds() % 2 === 0 ? '·' : '.') : '';
+    const title = activityChar ? `Proxy V3 ${activityChar}` : 'Proxy V3';
+    // Terminals repaint the title bar on every OSC 0 write, even when the
+    // content is unchanged — skip identical writes so rapid renders (this is
+    // called from both the 1s ticker and every scheduled render) don't flicker.
+    if (title === this.lastTerminalTitle) return;
+    this.lastTerminalTitle = title;
+    stdout.write(`\x1b]0;${title}\x07`);
+  }
+
+  private scheduleRender(): void {
+    if (this.renderPending) return;
+    this.renderPending = true;
+    if (this.renderTimer) clearTimeout(this.renderTimer);
+    this.renderTimer = setTimeout(() => {
+      this.renderPending = false;
+      this.updateTerminalTitle();
+      this.tui.requestRender();
+    }, 100);
+  }
+
+  async refresh(fromMutation = false, forceReload = false): Promise<void> {
+    if (this.refreshing) {
+      // A mutation save must not be silently dropped — mark it pending so the
+      // in-flight refresh loop picks it up as a forced reload immediately after.
+      if (fromMutation) this.pendingMutationRefresh = true;
+      return;
+    }
+    if (fromMutation) this.view.setConfigStatus('changed');
+    this.refreshing = true;
+    try {
+      const effectiveForceReload = forceReload || fromMutation;
+      const proxyConfig = await this.source.loadConfig(effectiveForceReload);
+      this.proxyConfig = proxyConfig;
+      const validationErrors = (proxyConfig as unknown as { _validationErrors?: ConfigValidationError[]; _validationWarnings?: ConfigValidationError[] })._validationErrors;
+      const validationWarnings = (proxyConfig as unknown as { _validationWarnings?: ConfigValidationError[] })._validationWarnings;
+      const snapshot = getDashboardSnapshot(proxyConfig, this.source.env);
+      this.lastRefreshTotalTokens = snapshot.modelStats.reduce((sum, m) => sum + m.total_tokens, 0);
+      this.view.setSnapshot(snapshot);
+      this.compositeOverlay?.setSnapshot(snapshot);
+      this.scheduleOverlay?.setSnapshot(snapshot);
+      void this.refreshCompositeQuota(proxyConfig);
+      void this.refreshQuotaPicker();
+      if (fromMutation) this.view.setConfigStatus('saved');
+      // When this refresh is triggered by a save action, don't override the
+      // success message the save flow sets right after this returns. The
+      // periodic refresh (fromMutation=false) will still surface any real
+      // errors that persist after the save.
+      if (fromMutation) {
+        // skip message update — save flow will set its own
+      } else if (!this.view.shouldPreserveMessage()) {
+        // Idle: surface existing config errors/warnings, else 'Ready'.
+        if (validationErrors && validationErrors.length > 0) {
+          const first = validationErrors[0];
+          this.view.setMessage(`Config error: ${first.path} — ${first.message}`, 6000);
+        } else if (validationWarnings && validationWarnings.length > 0) {
+          const first = validationWarnings[0];
+          this.view.setMessage(`Config warning: ${first.path} — ${first.message}`, 2000);
+        } else {
+          this.view.setMessage('Ready');
+        }
+      }
+    } catch (error) {
+      this.view.setMessage((error as Error).message, 2000);
+    } finally {
+      this.refreshing = false;
+      if (this.pendingMutationRefresh) {
+        this.pendingMutationRefresh = false;
+        void this.refresh(true);
+      }
+    }
+  }
+
+  getTerminalRows(): number {
+    return this.tui.terminal.rows;
+  }
+
+  openAddAliasPrompt(): void {
+    this.openPrompt('Add alias', 'Alias name:', '', async (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      addCompositeAliasFromDashboard(this.source.env, trimmed);
+      await this.refresh(true);
+      this.compositeOverlay?.focusAlias(trimmed);
+      this.openModePicker(trimmed, (mode) => {
+        if (mode === null) return;
+        if (mode === 'fusion') {
+          // Fusion: open the per-target picker with the fusion branch, then
+          // prompt for fusion_options once at least one target exists (or
+          // immediately — both work, the per-target picker seeds the first
+          // role/fusion fields).
+          this.openTargetPicker(trimmed, 'fusion');
+          this.view.setMessage(`alias ${trimmed} created — choose fusion_options next (press F)`);
+          this.requestRender();
+          return;
+        }
+        this.openTargetPicker(trimmed, mode);
+      });
+    });
+  }
+
+  openModePicker(alias: string, onPicked: (mode: 'composite' | 'fusion' | 'coordinator' | null) => void): void {
+    const choices: SelectItem[] = [
+      { value: 'composite', label: 'composite  Ç', description: 'share / primary / fallback routing' },
+      { value: 'fusion', label: 'fusion  ƒ', description: 'panel / judge / synth with fusion_options' },
+      { value: 'coordinator', label: 'coordinator  Ö', description: 'planner / executor stages with coord weight' },
+    ];
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      `Mode for ${bold(alias)}`,
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        const mode = item.value === 'fusion' || item.value === 'coordinator' ? item.value : 'composite';
+        onPicked(mode);
+        this.compositeOverlay?.focusAlias(alias);
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage('mode pick cancelled');
+        this.compositeOverlay?.focusAlias(alias);
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '40%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openCompositeAliasesOverlay(): void {
+    if (this.compositeOverlay) {
+      if (this.overlay) {
+        this.closeOverlay();
+      } else {
+        this.overlay = this.tui.showOverlay(this.compositeOverlay, { width: '80%', maxHeight: '70%', anchor: 'center' });
+        this.compositeOverlay.setSnapshot(this.viewSnapshot());
+        this.tui.setFocus(this.compositeOverlay);
+        this.requestRender();
+      }
+      return;
+    }
+    this.closeOverlay();
+    const overlay = new CompositeAliasesOverlay(this);
+    this.compositeOverlay = overlay;
+    this.overlay = this.tui.showOverlay(overlay, { width: '80%', maxHeight: '70%', anchor: 'center' });
+    overlay.setSnapshot(this.viewSnapshot());
+    this.tui.setFocus(overlay);
+    this.requestRender();
+  }
+
+  openScheduleAliasesOverlay(): void {
+    if (this.scheduleOverlay) {
+      if (this.overlay) {
+        this.closeOverlay();
+      } else {
+        this.overlay = this.tui.showOverlay(this.scheduleOverlay, { width: '80%', maxHeight: '70%', anchor: 'center' });
+        this.scheduleOverlay.setSnapshot(this.viewSnapshot());
+        this.tui.setFocus(this.scheduleOverlay);
+        this.requestRender();
+      }
+      return;
+    }
+    this.closeOverlay();
+    const overlay = new ScheduleAliasesOverlay(this);
+    this.scheduleOverlay = overlay;
+    this.overlay = this.tui.showOverlay(overlay, { width: '80%', maxHeight: '70%', anchor: 'center' });
+    overlay.setSnapshot(this.viewSnapshot());
+    this.tui.setFocus(overlay);
+    this.requestRender();
+  }
+
+  openStatisticsOverlay(): void {
+    const snap = this.viewSnapshot();
+    if (!snap) return;
+
+    const formatStatRow = (name: string, values: string[], columnCount = 7): string => {
+      const cols = [...values, ...Array(Math.max(0, columnCount - values.length)).fill('-')].slice(0, columnCount);
+      return `  ${name.padEnd(30)}${alignRight(cols[0] ?? '-', 5)} ${alignRight(cols[1] ?? '-', 8)}  ${alignRight(cols[2] ?? '-', 8)}${cols[3] !== undefined ? `  ${alignRight(cols[3], 8)}` : ''}${cols[4] !== undefined ? ` ${alignRight(cols[4], 8)}` : ''}${cols[5] !== undefined ? ` ${alignRight(cols[5], 8)}` : ''}${cols[6] !== undefined ? `  ${alignRight(cols[6], 8)}` : ''}`;
+    };
+    const shortToolName = (name: string): string => name.length <= 24 ? name : `${name.slice(0, 3)}...${name.slice(-18)}`;
+    const section = (title: string, count: number): SelectItem => ({
+      value: `${title}\0header`,
+      label: dim(`${title} (${fmt(count)})`),
+    });
+    const separator = (value: string): SelectItem => ({ value, label: dim('─'.repeat(98)) });
+
+    const endpointRows = new Map(snap.requestStats.endpoints.map((row) => [row.endpoint, row]));
+    const items: SelectItem[] = [
+      section('Top Models', snap.modelStats.length),
+      { value: 'models\0columns', label: dim(`  ${'model'.padEnd(32)}req   failed | token in    cached    wrote     out     total`) },
+      ...snap.modelStats.map((row) => ({
+        value: `model\0${row.model}`,
+        label: formatStatRow(row.model.split('/').pop() || row.model, [
+          fmt(row.requests),
+          fmt(row.failed_requests),
+          fmt(row.input_tokens),
+          fmt(row.cached_tokens),
+          fmt(row.cache_written_tokens),
+          fmt(row.output_tokens),
+          fmt(row.total_tokens),
+        ]),
+      })),
+      separator('separator\0tools'),
+      section('Tools Used', (snap.toolStats || []).length),
+      { value: 'tools\0columns', label: dim(`  ${'tool'.padEnd(32)}in req  in resp | total len`) },
+      ...(snap.toolStats || []).map((row) => ({
+        value: `tool\0${row.tool_name}`,
+        label: formatStatRow(shortToolName(row.tool_name), [fmt(row.in_requests), fmt(row.in_responses), fmt(row.in_request_chars)], 3),
+      })),
+      separator('separator\0endpoints'),
+      section('Top Endpoints', snap.requestStats.endpoints.length),
+      { value: 'endpoints\0columns', label: dim(`  ${'endpoint'.padEnd(32)}req   min(s) |   avg(s)   max(s)        -        -        -`) },
+      ...snap.requestStats.endpoint_timings.map((row) => {
+        const requestRow = endpointRows.get(row.endpoint);
+        return {
+          value: `endpoint\0${row.endpoint}`,
+          label: formatStatRow(row.endpoint, [fmt(requestRow?.requests ?? 0), fmtSeconds(row.min_time_ms), fmtSeconds(row.avg_time_ms), fmtSeconds(row.max_time_ms)]),
+        };
+      }),
+    ];
+
+    if (this.overlay) this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Statistics Data',
+      `↑↓ ${dim('move')}  D/Esc ${dim('close')}`,
+      items,
+      () => {},
+      () => {
+        this.hideOverlay();
+        this.requestRender();
+      },
+      20,
+      (data) => {
+        if (matchesKey(data, 'd') || matchesKey(data, 'shift+d')) {
+          this.hideOverlay();
+          this.requestRender();
+          return true;
+        }
+        return false;
+      },
+      undefined,
+      110,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '98%', maxHeight: '70%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openToolBlocklistOverlay(): void {
+    const snap = this.viewSnapshot();
+    if (!snap) return;
+
+    // SelectList stores a reference to the items array and re-reads `label`
+    // on every render, so we extend SelectItem with the source fields we need
+    // to rebuild the label after a toggle. Avoids the destructive
+    // re-open-inside-Enter-handler that broke key input.
+    type ToolItem = SelectItem & {
+      tool_name: string;
+      agent_prefix: string;
+      agent_ua: string;
+      in_requests: number;
+      in_responses: number;
+      in_request_chars: number;
+    };
+
+    // Format both agent dimensions so rows that used to collapse to the same
+    // label (e.g. "claude-cli") remain distinguishable.
+    const formatAgent = (item: ToolItem): string => {
+      if (item.agent_prefix || item.agent_ua) {
+        const p = item.agent_prefix && item.agent_prefix !== 'unknown' ? item.agent_prefix : '-';
+        const u = item.agent_ua && item.agent_ua !== 'unknown' ? item.agent_ua : '-';
+        if (p === u && p !== '-') return `${p}/=`;
+        return `${p}/${u}`;
+      }
+      return (item as unknown as { agent?: string }).agent || 'unknown';
+    };
+
+    // Prefix character conveys block state (✗ = blocked, · = active) without
+    // embedded ANSI color codes — embedded resets would terminate the theme's
+    // `selectedText: green(...)` wrap mid-line and break the selected-line
+    // highlighting that the Test custom model list gets for free.
+    const formatLabel = (item: ToolItem): string => {
+      const name = item.tool_name.length <= 21 ? item.tool_name : `${item.tool_name.slice(0, 3)}...${item.tool_name.slice(-15)}`;
+      return `${isToolBlocked(item.tool_name) ? '✗' : '·'} ${name.padEnd(28)}${formatAgent(item).padEnd(14)}${alignRight(fmt(item.in_requests), 4)} ${alignRight(fmt(item.in_responses), 5)} ${alignRight(fmt(item.in_request_chars), 10)}`;
+    };
+
+    const items: ToolItem[] = (snap.agentToolStats || []).map((e) => ({
+      // Unique key combines all three dims so the same tool_name from
+      // different (prefix, ua) pairs is selectable independently.
+      value: `${e.tool_name}\0${e.agent_prefix}\0${e.agent_ua}`,
+      tool_name: e.tool_name,
+      agent_prefix: e.agent_prefix,
+      agent_ua: e.agent_ua,
+      in_requests: e.in_requests,
+      in_responses: e.in_responses,
+      in_request_chars: e.in_request_chars,
+      label: '',
+    }));
+    for (const item of items) item.label = formatLabel(item);
+
+    if (items.length === 0) {
+      this.view.setMessage('No tools recorded');
+      this.requestRender();
+      return;
+    }
+
+    if (this.overlay) this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Tools Statitic and tool blocklist',
+      `↑↓ ${dim('move')}  Enter ${dim('toggle block')}  P/Esc ${dim('close')}`,
+      items,
+      (item) => {
+        const t = item as ToolItem;
+        if (isToolBlocked(t.tool_name)) {
+          unblockTool(t.tool_name);
+        } else {
+          blockTool(t.tool_name);
+        }
+        // In-place label refresh — the same `items` reference is held by
+        // the SelectList, and render() re-reads `item.label` each call.
+        t.label = formatLabel(t);
+        this.requestRender();
+      },
+      () => {
+        this.hideOverlay();
+        this.requestRender();
+      },
+      12,
+      (data) => {
+        if (matchesKey(data, 'p')) {
+          this.hideOverlay();
+          this.requestRender();
+          return true;
+        }
+        return false;
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '90%', maxHeight: '70%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  /** 'K' — list api-key accounts stored in the system keychain (TUI-only hotkey). */
+  async openSystemKeysOverlay(): Promise<void> {
+    let accounts: string[];
+    try {
+      accounts = await listSystemKeychainAccounts();
+    } catch (err) {
+      this.view.setMessage((err as Error).message, 4000);
+      this.requestRender();
+      return;
+    }
+    if (accounts.length === 0) {
+      this.view.setMessage(`no keys stored in system keychain (service ${KEY_STORE_SERVICE})`, 4000);
+      this.requestRender();
+      return;
+    }
+    const items: SelectItem[] = accounts.map((account) => {
+      const slash = account.indexOf('/');
+      const target = account.slice(0, slash);
+      const baseUrl = slash === -1 ? '' : account.slice(slash + 1);
+      return { value: `syskey\0${account}`, label: `  ${target.padEnd(28)} ${dim(baseUrl)}` };
+    });
+    if (this.overlay) this.hideOverlay();
+    const overlay = new ListOverlay(
+      `System Keychain Keys (${KEY_STORE_SERVICE})`,
+      `Esc/k ${dim('close')}`,
+      items,
+      () => {},
+      () => {
+        this.hideOverlay();
+        this.requestRender();
+      },
+      14,
+      (data) => {
+        if (matchesKey(data, 'k')) {
+          this.hideOverlay();
+          this.requestRender();
+          return true;
+        }
+        return false;
+      },
+      undefined,
+      60,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '70%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openHelpOverlay(): void {
+    const items: SelectItem[] = [
+      { value: 'help\0c', label: `  ${bold('C(c)').padEnd(6)} ${dim('Manage composite')} ${bold('Ç')}${dim(' and fusion')} ${bold('ƒ')}${dim(' aliases')}` },
+      { value: 'help\0s', label: `  ${bold('S(s)').padEnd(6)} ${dim('Manage schedule aliases')} ${bold('$')}` },
+      { value: 'help\0t', label: `  ${bold('T(t)').padEnd(6)} ${dim('Test custom models')}` },
+      { value: 'help\0q', label: `  ${bold('Q(q)').padEnd(6)} ${dim('Show model quota / usage left')}` },
+      { value: 'help\0l', label: `  ${bold('L(l)').padEnd(6)} ${dim('Edit global token limit')} ${bold('𝕋')}` },
+      { value: 'help\0d', label: `  ${bold('D(d)').padEnd(6)} ${dim('View detailed statistics')}` },
+      { value: 'help\0p', label: `  ${bold('P(p)').padEnd(6)} ${dim('Tools list and blocking')}` },
+      { value: 'help\0k', label: `  ${bold('K(k)').padEnd(6)} ${dim('List api keys stored in system keychain')} ${bold('🔒')}` },
+      { value: 'help\0u', label: `  ${bold('Shift+u').padEnd(6)} ${dim('Toggle weekly and monthly heatmap')}` },
+      { value: 'help\0ctrlu', label: `  ${bold('Ctrl+u').padEnd(6)} ${dim('Dump today tokens to file')}` },
+      { value: 'help\0h', label: `  ${bold('h').padEnd(6)} ${dim('Show this help')}` },
+      { value: 'help\0r', label: `  ${bold('r').padEnd(6)} ${dim('Reload config and refresh dashboard')}` },
+      { value: 'help\0ctrlc', label: `  ${bold('Ctrl+c').padEnd(6)} ${dim('Quit')}` },
+      { value: 'help\0sep1', label: dim('─'.repeat(50)) },
+      { value: 'help\0hdr', label: dim('Composite aliases overlay') },
+      { value: 'help\0a', label: `  ${bold('a').padEnd(6)} ${dim('Add a new composite alias')}` },
+      { value: 'help\0m', label: `  ${bold('m').padEnd(6)} ${dim('Add target model to alias')}` },
+      { value: 'help\0f', label: `  ${bold('f').padEnd(6)} ${dim('Edit fusion options for alias')}` },
+      { value: 'help\0e', label: `  ${bold('e').padEnd(6)} ${dim('Edit composite target config')}` },
+      { value: 'help\0cl', label: `  ${bold('l').padEnd(6)} ${dim('Set token limit for alias')} ${bold('𝕋')}` },
+      { value: 'help\0cd', label: `  ${bold('d').padEnd(6)} ${dim('Delete alias or target model')}` },
+      { value: 'help\0sep2', label: dim('─'.repeat(50)) },
+      { value: 'help\0hdr2', label: dim('Markers') },
+      { value: 'help\0mk_limit', label: `  ${bold('𝕋')}${dim('     Token limit (global / alias)')}` },
+      { value: 'help\0mk_composite', label: `  ${bold('Ç')}${dim('     Composite alias')}` },
+      { value: 'help\0mk_fusion', label: `  ${bold('ƒ')}${dim('     Fusion alias')}` },
+      { value: 'help\0mk_coordinator', label: `  ${bold('Ö')}${dim('     Coordinator alias')}` },
+      { value: 'help\0mk_auth', label: `  ${bold('Ä')}${dim('     Remote authentication active (auth_server)')}` },
+      { value: 'help\0mk_recording', label: `  ${bold('®')}${dim('     Remote recording active (record_server)')}` },
+      { value: 'help\0mk_privacy', label: `  ${bold('℗')}${dim('     Privacy filter active (filter_mode)')}` },
+      { value: 'help\0mk_lock', label: `  ${bold('🔒')}${dim('     All config api_keys stored in system keychain (store_key_in_system)')}` },
+      { value: 'help\0mk_schedule', label: `  ${bold('$')}${dim('     Schedule alias')}` },
+    ];
+
+    if (this.overlay) this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Hotkeys',
+      `Esc/h ${dim('close')}`,
+      items,
+      () => {},
+      () => {
+        this.hideOverlay();
+        this.requestRender();
+      },
+      19,
+      (data) => {
+        if (matchesKey(data, 'h')) {
+          this.hideOverlay();
+          this.requestRender();
+          return true;
+        }
+        return false;
+      },
+      undefined,
+      60,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '50%', maxHeight: '70%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openEditAliasLimitPrompt(alias: string): void {
+    const snapshot = this.viewSnapshot();
+    const current = snapshot?.config.composite?.[alias]?.token_limit;
+    const defaultValue = current
+      ? `${formatTokenLimit(current.num)} ${current.duration}`
+      : '';
+    this.openPrompt(
+      `Token limit for ${bold(alias)}`,
+      'Format: <num[K|M|B|T]> <1h|1d|1w|1m>  (e.g. 50K 1d, 1.5M 1h, 100000 1w)  blank clears',
+      defaultValue,
+      async (value) => {
+        const trimmed = value.trim();
+        if (trimmed.length === 0) {
+          upsertCompositeAliasLimitFromDashboard(this.source.env, alias, null);
+          await this.refresh(true);
+          this.compositeOverlay?.focusAlias(alias);
+          this.view.setMessage(`cleared ${alias} token limit`);
+          this.requestRender();
+          return;
+        }
+        const parsed = parseHumanTokenLimit(trimmed);
+        if (!parsed) {
+          this.view.setMessage('Invalid. Use: <num> <1h|1d|1w|1m>  e.g. 50K 1d');
+          await this.refresh();
+          this.compositeOverlay?.focusAlias(alias);
+          this.requestRender();
+          return;
+        }
+        upsertCompositeAliasLimitFromDashboard(this.source.env, alias, trimmed);
+        await this.refresh(true);
+        this.compositeOverlay?.focusAlias(alias);
+        this.view.setMessage(`updated ${alias} token limit: ${formatTokenLimit(parsed.num)} ${parsed.duration}`);
+        this.requestRender();
+      },
+    );
+  }
+
+  openEditGlobalTokenLimitPrompt(): void {
+    const snapshot = this.viewSnapshot();
+    const current = snapshot?.config.global_token_limit;
+    const defaultValue = current ?? '';
+    this.openPrompt(
+      `${bold('Global')} token limit`,
+      'Format: <num[K|M|B|T]> <1h|1d|1w|1m>  (e.g. 1.1B 1d, 50K 1h)  blank clears',
+      defaultValue,
+      async (value) => {
+        const trimmed = value.trim();
+        if (trimmed.length === 0) {
+          upsertGlobalTokenLimitFromDashboard(this.source.env, null);
+          await this.refresh(true);
+          this.view.setMessage('cleared global token limit');
+          this.requestRender();
+          return;
+        }
+        const parsed = parseHumanTokenLimit(trimmed);
+        if (!parsed) {
+          this.view.setMessage('Invalid. Use: <num> <1h|1d|1w|1m>  e.g. 1.1B 1d');
+          await this.refresh();
+          this.requestRender();
+          return;
+        }
+        upsertGlobalTokenLimitFromDashboard(this.source.env, trimmed);
+        await this.refresh(true);
+        this.view.setMessage(`global token limit: ${formatTokenLimit(parsed.num)} ${parsed.duration}`);
+        this.requestRender();
+      },
+    );
+  }
+
+  openEditFusionOptionsPrompt(alias: string): void {
+    const snapshot = this.viewSnapshot();
+    const cur = (snapshot?.config.composite?.[alias] as { fusion_options?: FusionOptions } | undefined)?.fusion_options ?? {};
+    const opts: FusionOptions = { ...cur };
+
+    // Step 5 of 5 — save
+    const save = async () => {
+      upsertFusionOptionsFromDashboard(this.source.env, alias, Object.keys(opts).length ? opts : null);
+      await this.refresh(true);
+      this.compositeOverlay?.focusAlias(alias);
+      this.view.setMessage(`updated ${alias} fusion_options`);
+      this.requestRender();
+    };
+
+    // Step 4/5: max_concurrent
+    const stepMaxConcurrent = () => {
+      const def = opts.max_concurrent !== undefined ? String(opts.max_concurrent) : '';
+      this.openPrompt(`Step 4/5 max_concurrent for ${bold(alias)}`, 'max parallel panel calls  (blank = all)', def, async (v) => {
+        const t = v.trim();
+        if (t === '') { delete opts.max_concurrent; } else {
+          const n = Number(t);
+          if (!Number.isFinite(n) || n < 1) { this.view.setMessage('Must be a number ≥ 1'); await this.refresh(); return; }
+          opts.max_concurrent = n;
+        }
+        await save();
+      });
+    };
+
+    // Step 3/5: expose_metadata
+    const stepExposeMetadata = () => {
+      const def = opts.expose_metadata !== undefined ? String(opts.expose_metadata) : '';
+      this.openPrompt(`Step 3/5 expose_metadata for ${bold(alias)}`, 'attach fusion_metadata to response  true / false  (blank = default true)', def, async (v) => {
+        const t = v.trim();
+        if (t === '') { delete opts.expose_metadata; }
+        else if (t === 'true') { opts.expose_metadata = true; }
+        else if (t === 'false') { opts.expose_metadata = false; }
+        else { this.view.setMessage('Must be true or false'); await this.refresh(); return; }
+        stepMaxConcurrent();
+      });
+    };
+
+    // Step 2/5: judge_required
+    const stepJudgeRequired = () => {
+      const def = opts.judge_required !== undefined ? String(opts.judge_required) : '';
+      this.openPrompt(`Step 2/5 judge_required for ${bold(alias)}`, 'abort if judge fails  true / false  (blank = default false)', def, async (v) => {
+        const t = v.trim();
+        if (t === '') { delete opts.judge_required; }
+        else if (t === 'true') { opts.judge_required = true; }
+        else if (t === 'false') { opts.judge_required = false; }
+        else { this.view.setMessage('Must be true or false'); await this.refresh(); return; }
+        stepExposeMetadata();
+      });
+    };
+
+    // Step 1/5: min_panel  (also sets panel_timeout_ms inline as step 1b)
+    const stepPanelTimeout = () => {
+      const def = opts.panel_timeout_ms !== undefined ? String(opts.panel_timeout_ms) : '';
+      this.openPrompt(`Step 1b/5 panel_timeout_ms for ${bold(alias)}`, 'per-panel wall-clock ms  (blank = default 60000)', def, async (v) => {
+        const t = v.trim();
+        if (t === '') { delete opts.panel_timeout_ms; } else {
+          const n = Number(t);
+          if (!Number.isFinite(n) || n <= 0) { this.view.setMessage('Must be a positive number'); await this.refresh(); return; }
+          opts.panel_timeout_ms = n;
+        }
+        stepJudgeRequired();
+      });
+    };
+
+    const def = opts.min_panel !== undefined ? String(opts.min_panel) : '';
+    this.openPrompt(`Step 1/5 min_panel for ${bold(alias)}`, 'min successful panel responses to proceed  (blank = default 1)', def, async (v) => {
+      const t = v.trim();
+      if (t === '') { delete opts.min_panel; } else {
+        const n = Number(t);
+        if (!Number.isFinite(n) || n < 1) { this.view.setMessage('Must be a number ≥ 1'); await this.refresh(); return; }
+        opts.min_panel = n;
+      }
+      stepPanelTimeout();
+    });
+  }
+
+  openTargetPicker(alias: string, forceMode?: 'composite' | 'fusion' | 'coordinator'): void {
+    const snap = this.viewSnapshot();
+    const aliasCfg = snap?.config.composite?.[alias] as { token_limit?: unknown; fusion_options?: unknown } | undefined;
+    // An alias is "empty" when it has zero target entries — getCompositeAliasMode
+    // would otherwise report 'share' for any existing alias even with no targets,
+    // so we can't rely on a detectedMode === undefined check alone.
+    const isEmptyAlias = Object.keys(aliasCfg || {}).filter((k) => k !== 'token_limit' && k !== 'fusion_options').length === 0;
+    if (!forceMode && isEmptyAlias) {
+      this.openModePicker(alias, (mode) => {
+        if (mode === null) return;
+        this.openTargetPicker(alias, mode);
+      });
+      return;
+    }
+
+    const choices = this.modelChoices();
+    if (choices.length === 0) {
+      this.view.setMessage('No custom models available');
+      this.requestRender();
+      return;
+    }
+
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      `Add target to ${bold(alias)}`,
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        const aliasMode = forceMode ?? (snap?.config ? getCompositeAliasMode(alias, snap.config) : undefined);
+        const aliasIsCoordinator = aliasMode === 'coordinator';
+        const aliasFusion = aliasMode === 'fusion';
+        if (aliasIsCoordinator) {
+          this.openPrompt(`Add ${item.value} to ${alias} (coordinator)`, '[p]lanner / [e]xecutor  [coord]', 'p 1', async (value) => {
+            const parts = value.trim().split(/\s+/).filter(Boolean);
+            if (parts.length < 1 || parts.length > 2) {
+              this.view.setMessage('Use: p|planner / e|executor  [coord]');
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+              return;
+            }
+            const [roleText, coordText] = parts;
+            const roleNorm = roleText === 'p' ? 'planner' : roleText === 'e' ? 'executor' : roleText;
+            if (roleNorm !== 'planner' && roleNorm !== 'executor') {
+              this.view.setMessage('Role must be planner, executor, p, or e');
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+              return;
+            }
+            const coord = coordText !== undefined ? Number(coordText) : 1;
+            if (Number.isNaN(coord) || coord <= 0) {
+              this.view.setMessage('Coord must be a positive number');
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+              return;
+            }
+            try {
+              upsertCompositeTargetFromDashboard(this.source.env, alias, item.value, { coord, role: roleNorm as 'planner' | 'executor', share: null, fallback: null, primary: false });
+              await this.refresh(true);
+              this.compositeOverlay?.focusAlias(alias);
+              this.view.setMessage(`added ${item.value} to ${alias}`);
+              this.requestRender();
+            } catch (err) {
+              this.view.setMessage((err as Error).message, 2000);
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+            }
+          });
+          return;
+        }
+        if (aliasFusion) {
+          this.openPrompt(`Add ${item.value} to ${alias} (fusion)`, '[p]anel / [j]udge / [s]ynth  [weight]', 'p 1', async (value) => {
+            const patch = parseFusionTargetInput(value);
+            if (typeof patch === 'string') {
+              this.view.setMessage(patch);
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+              return;
+            }
+            try {
+              upsertCompositeTargetFromDashboard(this.source.env, alias, item.value, { ...patch, share: null, fallback: null, primary: false });
+              await this.refresh(true);
+              this.compositeOverlay?.focusAlias(alias);
+              this.view.setMessage(`added ${item.value} to ${alias}`);
+              this.requestRender();
+            } catch (err) {
+              this.view.setMessage((err as Error).message, 2000);
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+            }
+          });
+          return;
+        }
+        this.openCompositeRoutingPicker(alias, item.value, undefined);
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage('add target cancelled');
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '70%', maxHeight: '50%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openTestModelPicker(): void {
+    const choices = this.modelChoices();
+    // Always offer the manual-entry option so the user can test a model id
+    // that's only reachable via a wildcard routing entry (e.g. "claude-*")
+    // and therefore doesn't appear in the concrete model list above.
+    const OTHER_MODEL_ID = '\u0000other';
+    const allChoices: ModelChoice[] = [
+      ...choices,
+      {
+        category: 'manual',
+        modelId: '',
+        value: OTHER_MODEL_ID,
+        label: dim('Other model id…'),
+        description: dim(this.wildcardModelHint('test a wildcard route')),
+      },
+    ];
+
+    const subtitle = this.testPickerSubtitle();
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Test Custom models and Composite Aliases',
+      subtitle,
+      allChoices,
+      (item) => {
+        this.hideOverlay();
+        if (item.value === OTHER_MODEL_ID) {
+          this.openPrompt(
+            'Test Custom models and Composite Aliases',
+            this.wildcardModelHint('model id'),
+            '',
+            (value) => {
+              const modelId = value.trim();
+              if (!modelId) {
+                this.view.setMessage('test cancelled');
+                this.requestRender();
+                return;
+              }
+              void this.runModelTest(modelId);
+            },
+          );
+          return;
+        }
+        void this.runModelTest(item.value as string);
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage('test cancelled');
+        this.requestRender();
+      },
+      8,
+      (data) => {
+        if (matchesKey(data, 'w')) {
+          this.togglePeriodicModelTest();
+          this.hideOverlay();
+          return true;
+        }
+        return false;
+      },
+      // Narrow primary column by 7 chars (32 → 25) so the description
+      // (avg timing + category · mode · base URL) starts closer to the
+      // model label, e.g. "deepseek-v4-flash     [2.50s] Default …".
+      { minPrimaryColumnWidth: 25, maxPrimaryColumnWidth: 25 },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '70%', maxHeight: '50%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  /**
+   * Fetch quota data for every model in the picker (getModelQuota's 30s cache
+   * keeps provider load bounded). Keyed by choice value — including the
+   * Ç/ƒ/Ö duplicate marker — so lookup from onSelectionChange is direct.
+   */
+  private async buildQuotaData(choices: { value: string }[]): Promise<Map<string, QuotaPickerEntry>> {
+    const data = new Map<string, QuotaPickerEntry>();
+    if (!this.proxyConfig) return data;
+    const seen = new Set<string>();
+    // Models sharing the same (targetUrl, apiKey) hit the same provider
+    // account, so their quota is identical — fetch it once per credential
+    // pair and reuse the result instead of one getModelQuota call per model.
+    const quotaByCredential = new Map<string, Promise<QuotaResult> | QuotaResult>();
+    for (const choice of choices) {
+      const modelId = stripModelMarker(choice.value);
+      if (seen.has(modelId)) continue;
+      seen.add(modelId);
+      // The 5h utilization header is recorded under the upstream model name
+      // (route.modelAlias, e.g. codelite → code-lite-pi), not the config key,
+      // so resolve the route once and look the recording up by that name.
+      // Models sharing (targetUrl, apiKey) share the same quota pool, so fall
+      // back to the host-keyed recording when this specific alias hasn't been
+      // hit recently (same fallback the dashboard's per-base-URL column uses).
+      let route: ReturnType<typeof getModelRouteConfig> | undefined;
+      try {
+        route = getModelRouteConfig(modelId, this.proxyConfig);
+      } catch { /* route resolution failure — header-based value only */ }
+      const headerLeft = getUpstreamRateLimitLeft(route?.modelAlias || modelId)
+        ?? (route ? getUpstreamRateLimitLeftForUrl(route.targetUrl) : null);
+      const entry: QuotaPickerEntry = { headerLeft };
+      if (route) {
+        const credentialKey = `${route.targetUrl}:${route.apiKey ?? ''}`;
+        try {
+          let pending = quotaByCredential.get(credentialKey);
+          if (!pending) {
+            pending = getModelQuota(route);
+            quotaByCredential.set(credentialKey, pending);
+          }
+          entry.result = await pending;
+        } catch { /* quota fetch failure — header-based value only */ }
+      }
+      data.set(choice.value, entry);
+    }
+    return data;
+  }
+
+  async openQuotaPicker(): Promise<void> {
+    const choices = this.modelChoices(false);
+    if (choices.length === 0) {
+      this.view.setMessage('no custom models configured');
+      this.requestRender();
+      return;
+    }
+    this.hideOverlay();
+    this.view.setMessage('loading quota …', -1);
+    this.requestRender();
+    const quotaData = await this.buildQuotaData(choices);
+    this.view.setMessage('');
+    // Base descriptions before the quota suffix is appended, so the live
+    // refresh (refreshQuotaPicker) can rebuild descriptions without
+    // duplicating the suffix.
+    const baseDescription = new Map(choices.map((c) => [c.value, c.description ?? ''] as const));
+    for (const choice of choices) {
+      choice.description += quotaListSuffix(quotaData.get(choice.value) ?? {});
+    }
+    const overlay = new ListOverlay(
+      'Model Quota (usage left)',
+      `↑/↓ ${dim('move')}  Esc ${dim('close')}`,
+      choices,
+      () => {
+        this.quotaPickerState = null;
+        this.hideOverlay();
+        this.requestRender();
+      },
+      () => {
+        this.quotaPickerState = null;
+        this.hideOverlay();
+        this.view.setMessage('quota cancelled');
+        this.requestRender();
+      },
+      8,
+      undefined,
+      { minPrimaryColumnWidth: 25, maxPrimaryColumnWidth: 25 },
+      undefined,
+      (item) => {
+        const state = this.quotaPickerState;
+        if (!state) return;
+        state.highlighted = item.value;
+        overlay.setStatus(quotaStatusLine(state.data.get(item.value) ?? {}));
+      },
+    );
+    // Show the initially highlighted row's quota without waiting for a move.
+    const first = choices[0];
+    if (first) overlay.setStatus(quotaStatusLine(quotaData.get(first.value) ?? {}));
+    this.quotaPickerState = { overlay, choices, baseDescription, data: quotaData, highlighted: first?.value ?? null };
+    this.overlay = this.tui.showOverlay(overlay, { width: '70%', maxHeight: '50%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  /**
+   * Live-refresh the open 'Model Quota' picker from the 500ms refresh loop
+   * (same pattern as refreshCompositeQuota): rebuild the quota entries —
+   * getModelQuota's 30s cache keeps provider load bounded, and the
+   * anthropic-5h header lookups are plain map reads — so row suffixes and the
+   * highlighted row's status line track recordings from new upstream
+   * responses while the picker is open.
+   */
+  private async refreshQuotaPicker(): Promise<void> {
+    const state = this.quotaPickerState;
+    if (!state || this.quotaPickerRefreshing) return;
+    this.quotaPickerRefreshing = true;
+    try {
+      state.data = await this.buildQuotaData(state.choices);
+      for (const choice of state.choices) {
+        choice.description = (state.baseDescription.get(choice.value) ?? '') + quotaListSuffix(state.data.get(choice.value) ?? {});
+      }
+      if (state.highlighted !== null) {
+        state.overlay.setStatus(quotaStatusLine(state.data.get(state.highlighted) ?? {}));
+      }
+      state.overlay.invalidate();
+      this.requestRender();
+    } finally {
+      this.quotaPickerRefreshing = false;
+    }
+  }
+
+  /**
+   * Compute the usage-left suffix map for every target model referenced by
+   * composite aliases and push it into the Composite Aliases overlay. Called
+   * from refresh() — getModelQuota's 30s cache keeps provider load bounded
+   * even though refresh runs every 500ms.
+   */
+  private async refreshCompositeQuota(proxyConfig: ProxyConfig): Promise<void> {
+    const overlay = this.compositeOverlay;
+    if (!overlay || this.compositeQuotaRefreshing) return;
+    const targets = new Set<string>();
+    for (const aliasConfig of Object.values(proxyConfig.composite ?? {})) {
+      for (const [key, value] of Object.entries(aliasConfig ?? {})) {
+        if (key === 'token_limit' || key === 'fusion_options' || key.startsWith('_') || value === null || typeof value !== 'object') continue;
+        targets.add(key);
+      }
+    }
+    if (targets.size === 0) return;
+    this.compositeQuotaRefreshing = true;
+    try {
+      const left = new Map<string, string>();
+      // Targets sharing the same (targetUrl, apiKey) hit the same provider
+      // account, so their quota is identical — fetch it once per credential
+      // pair and reuse the result instead of one getModelQuota call per target.
+      const quotaByCredential = new Map<string, Promise<QuotaResult> | QuotaResult>();
+      for (const target of targets) {
+        try {
+          const route = getModelRouteConfig(target, proxyConfig);
+          const credentialKey = `${route.targetUrl}:${route.apiKey ?? ''}`;
+          let pending = quotaByCredential.get(credentialKey);
+          if (!pending) {
+            pending = getModelQuota(route);
+            quotaByCredential.set(credentialKey, pending);
+          }
+          const result = await pending;
+          // Usage-provider quota first; anthropic-routed models without one
+          // fall back to the passively recorded 5h utilization header (keyed
+          // by the upstream model name, e.g. codelite → code-lite-pi), then
+          // to the host-keyed recording shared by all models on that
+          // (targetUrl, apiKey) pair.
+          const text = formatQuotaLeft(result)
+            ?? getUpstreamRateLimitLeft(route.modelAlias || target)
+            ?? getUpstreamRateLimitLeftForUrl(route.targetUrl);
+          if (text) left.set(target, text);
+        } catch (e) {
+          // Route resolution failure (e.g. alias cycle) — surface once per
+          // target rather than dropping it silently.
+          left.set(target, `⚠ ${(e as Error).message.slice(0, 20)}`);
+        }
+      }
+      overlay.setQuotaLeft(left);
+      this.requestRender();
+    } finally {
+      this.compositeQuotaRefreshing = false;
+    }
+  }
+
+  private testPickerSubtitle(): string {
+    const pHint = this.modelTestTimerActive
+      ? `W ${dim('stop test timer')}`
+      : `W ${dim('test all (30m)')}`;
+    return `↑/↓ ${dim('move')}  Enter ${dim('test')}  ${pHint}  Esc ${dim('cancel')}`;
+  }
+
+  private wildcardModelHint(prefix: string): string {
+    const wildcards: string[] = [];
+    const models = this.viewSnapshot()?.config.models || {};
+    for (const categoryConfig of Object.values(models)) {
+      if (Array.isArray(categoryConfig)) continue;
+      for (const [key, value] of Object.entries(categoryConfig || {})) {
+        if (!Array.isArray(value) || (key !== '*' && !key.endsWith('-*'))) continue;
+        wildcards.push(key);
+      }
+    }
+    if (wildcards.length === 0) return `${prefix} (e.g. one matched by a wildcard route)`;
+    return `${prefix} (${Array.from(new Set(wildcards)).sort().join(', ')})`;
+  }
+
+  async runModelTest(modelId: string): Promise<void> {
+    const displayId = / [ÇƒÖ]$/.test(modelId) ? modelId.replace(/ [ÇƒÖ]$/, '').trim() : modelId;
+    const snap = this.viewSnapshot();
+    const cfg = snap ? resolveModelTestConfig(snap.config, displayId, snap.compositeResolved) : undefined;
+    const target = cfg?.directModel && cfg.directModel !== displayId ? `(${cfg.directModel})` : '';
+    const schema = cfg?.upstreamMode ?? '?';
+    const baseUrl = cfg?.targetUrl ? stripHttps(cfg.targetUrl) : '?';
+    this.view.setMessage(`testing ${displayId}${target} ${schema} at ${baseUrl} …`, -1);
+    this.requestRender();
+    const result = await this.executeModelTest(modelId);
+    if (!result) return;
+    if (!result.ok) {
+      this.view.setMessage(`${red(`test failed ${result.modelId} (${result.status ?? '?'})`)} ${dim(result.detail)}`, 6000);
+    } else {
+      this.view.setMessage(`${green(`${result.modelId} OK (${result.status})`)} ${dim(`usage=${result.usage} ${result.detail}`)}`, 6000);
+    }
+    this.requestRender();
+  }
+
+  // Lower-level test runner. Returns the outcome without touching the message line,
+  // so a batch run can compose its own progress display.
+  private async executeModelTest(modelId: string): Promise<{
+    ok: boolean;
+    modelId: string;
+    status?: number;
+    usage: string;
+    detail: string;
+  } | null> {
+    // Strip Ç/ƒ/Ö marker suffix if present (used only for duplicate disambiguation in the picker)
+    const actualModelId = / [ÇƒÖ]$/.test(modelId) ? modelId.replace(/ [ÇƒÖ]$/, '').trim() : modelId;
+    const port = this.source.env.PORT || '8788';
+    const endpoint = `http://127.0.0.1:${port}${TEST_ENDPOINT}`;
+    const snapshot = this.viewSnapshot();
+
+    // Always pass compositeResolved so composite/fusion aliases resolve correctly
+    // regardless of whether they share a name with a model entry.
+    const modelConfig = snapshot
+      ? resolveModelTestConfig(snapshot.config, actualModelId, snapshot.compositeResolved)
+      : undefined;
+
+    // The TUI always POSTs to the local proxy's /v1/messages endpoint. When we
+    // can resolve the target's upstream mode we build the matching request
+    // schema; when we cannot, fall back to anthropic-messages (the proxy's
+    // primary protocol — /v1/messages natively speaks Claude) so the test
+    // still exercises a valid body shape rather than an arbitrary one.
+    const upstreamMode = modelConfig?.upstreamMode || 'anthropic-messages';
+    const isFusionAlias = !!(snapshot?.config.composite?.[actualModelId] as { fusion_options?: unknown } | undefined)?.fusion_options;
+    const requestBody = appendTestKeys(isFusionAlias ? buildTestTextRequest(upstreamMode) : buildTestToolRequest(upstreamMode));
+    // For fusion aliases, send directly to the resolved panel target model (bypass fusion pipeline)
+    const testModelId = modelConfig?.directModel ?? actualModelId;
+    const isComposite = snapshot?.compositeResolved?.some((a) => a.alias === actualModelId) ?? false;
+    const testLabel = isComposite
+      ? `${actualModelId} ${modelConfig?.targetUrl ? stripHttps(modelConfig.targetUrl) : '?'}`
+      : actualModelId;
+
+    const fullRequestBody = { ...requestBody, model: testModelId };
+
+    // Build auth headers for the local /v1/messages call.
+    // The proxy requires at least one of Authorization/x-api-key/x-goog-api-key
+    // (see src/index.ts auth check), and the same header is forwarded upstream,
+    // so we reuse the model's configured key, formatted per upstream mode:
+    //   anthropic-messages  -> x-api-key: <key>
+    //   openai-completions  -> Authorization: Bearer <key>
+    //   gemini-*            -> x-goog-api-key: <key>
+    // For composite aliases we fall back to the proxy-wide default_api_key
+    // (read from the unsanitized config).
+    const testApiKey = modelConfig?.apiKey || this.proxyConfig?.default_upstream?.default_api_key;
+    const authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (testApiKey) {
+      Object.assign(authHeaders, formatApiKeyForUpstream(testApiKey, upstreamMode));
+    } else {
+      Object.assign(authHeaders, formatApiKeyForUpstream('unconfigured-test-key', upstreamMode));
+    }
+
+    // Debug log test request/response to /tmp/test_model.log (LOG_LEVEL=debug)
+    if (process.env.LOG_LEVEL === 'debug') {
+      try {
+        const fs = await import('fs');
+        fs.writeFileSync('/tmp/test_model.log',
+          `[${new Date().toISOString()}] test model request (tui)\n` +
+          `target: ${endpoint}\n` +
+          `upstreamMode: ${upstreamMode}\n` +
+          `modelId: ${actualModelId}\n` +
+          `request body:\n${JSON.stringify(fullRequestBody, null, 2)}\n`,
+        );
+      } catch (_e) { /* ignore */ }
+    }
+
+    this.modelTestAbortController = new AbortController();
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify(fullRequestBody),
+        signal: this.modelTestAbortController.signal,
+      });
+
+      const contentType = response.headers.get('content-type') || '';
+      const responseBody = contentType.includes('application/json') ? await response.json() : await response.text();
+
+      // Append response to debug log (LOG_LEVEL=debug)
+      if (process.env.LOG_LEVEL === 'debug') {
+        try {
+          const fs = await import('fs');
+          const responseText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody, null, 2);
+          fs.appendFileSync('/tmp/test_model.log',
+            `response status: ${response.status}\n` +
+            `response body:\n${responseText}\n` +
+            `---\n`,
+          );
+        } catch (_e) { /* ignore */ }
+      }
+      const usage = typeof responseBody === 'object' && responseBody !== null && 'usage' in responseBody
+        ? JSON.stringify((responseBody as Record<string, unknown>).usage ?? {})
+        : 'n/a';
+      const detailText = formatTestResultDetail(responseBody).split('\n').map((l) => l.length > 60 ? `${l.slice(0, 60)}…` : l).join(' | ');
+
+      return {
+        ok: response.ok,
+        modelId: testLabel,
+        status: response.status,
+        usage,
+        detail: detailText,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        modelId: testLabel,
+        usage: 'n/a',
+        detail: (error as Error).message,
+      };
+    } finally {
+      this.modelTestAbortController = null;
+    }
+  }
+
+  // Run a test against every custom model in sequence. Composes a single
+  // progress line (`testing 3/12 — code-small ...`) that updates per model.
+  async runAllCustomModelTests(opts: { announce?: boolean } = {}): Promise<void> {
+    if (this.modelTestInProgress) {
+      this.view.setMessage('test-all already in progress');
+      this.requestRender();
+      return;
+    }
+    const choices = this.modelChoices();
+    if (choices.length === 0) {
+      this.view.setMessage('No custom models available');
+      this.requestRender();
+      return;
+    }
+    this.modelTestInProgress = true;
+    this.modelTestAborted = false;
+    if (opts.announce) {
+      this.view.setMessage(`test-all: starting ${choices.length} models...`);
+      this.requestRender();
+    }
+    let passed = 0;
+    let failed = 0;
+    for (let i = 0; i < choices.length; i++) {
+      if (this.modelTestAborted) break;
+      const choice = choices[i];
+      this.view.setMessage(`test-all: ${i + 1}/${choices.length} — ${choice.value}...`);
+      this.requestRender();
+      const result = await this.executeModelTest(choice.value);
+      // The abort can land mid-fetch; don't count the interrupted model.
+      if (this.modelTestAborted) break;
+      if (result?.ok) passed++;
+      else failed++;
+    }
+    if (this.modelTestAborted) {
+      this.view.setMessage(`test-all: aborted (${passed} ok / ${failed} failed so far)`, 6000);
+    } else {
+      const summary = `test-all: ${passed} ok / ${failed} failed / ${choices.length} total`;
+      this.view.setMessage(this.modelTestTimerActive ? `${green(summary)} (next in 30m)` : summary, 6000);
+    }
+    this.requestRender();
+    this.modelTestInProgress = false;
+  }
+
+  // Toggle a 30-minute recurring test-all loop. `P` flips it on; the first
+  // run starts immediately so the user gets feedback right away. Flipping
+  // it off also aborts any in-flight batch via the abort flag + controller.
+  togglePeriodicModelTest(): void {
+    if (this.modelTestTimerActive) {
+      if (this.modelTestTimer) clearInterval(this.modelTestTimer);
+      this.modelTestTimer = null;
+      this.modelTestTimerActive = false;
+      this.modelTestAborted = true;
+      if (this.modelTestAbortController) this.modelTestAbortController.abort();
+      this.view.setMessage('test-all: periodic timer stopped');
+      this.requestRender();
+      return;
+    }
+    this.modelTestTimerActive = true;
+    this.view.setMessage('test-all: starting (will repeat every 30m)');
+    this.requestRender();
+    void this.runAllCustomModelTests();
+    this.modelTestTimer = setInterval(() => {
+      if (this.stopped) return;
+      void this.runAllCustomModelTests();
+    }, 30 * 60 * 1000);
+  }
+
+  openEditTargetPrompt(alias: string, target: string): void {
+    const snapshot = this.viewSnapshot();
+    const aliasMode = snapshot?.config ? getCompositeAliasMode(alias, snapshot.config) : undefined;
+    const aliasConfig = snapshot?.config.composite?.[alias] as { fusion_options?: FusionOptions } | undefined;
+    const isCoordinator = aliasMode === 'coordinator';
+    if (isCoordinator) {
+      const current = snapshot?.config.composite?.[alias]?.[target] as CompositeTargetConfig | undefined;
+      const defaultRole = current?.role === 'executor' ? 'e' : 'p';
+      const defaultValue = [
+        defaultRole,
+        current?.coord !== undefined ? String(current.coord) : '1',
+      ].join(' ');
+      this.openPrompt(`Edit ${alias}.${bold(target)} (coordinator)`, '[p]lanner / [e]xecutor  [coord]', defaultValue, async (value) => {
+        const parts = value.trim().split(/\s+/).filter(Boolean);
+        if (parts.length < 1 || parts.length > 2) {
+          this.view.setMessage('Use: p|planner / e|executor  [coord]');
+          await this.refresh();
+          this.compositeOverlay?.focusAlias(alias);
+          this.requestRender();
+          return;
+        }
+        const [roleText, coordText] = parts;
+        const roleNorm = roleText === 'p' ? 'planner' : roleText === 'e' ? 'executor' : roleText;
+        if (roleNorm !== 'planner' && roleNorm !== 'executor') {
+          this.view.setMessage('Role must be planner, executor, p, or e');
+          await this.refresh();
+          this.compositeOverlay?.focusAlias(alias);
+          this.requestRender();
+          return;
+        }
+        const coord = coordText !== undefined ? Number(coordText) : 1;
+        if (Number.isNaN(coord) || coord <= 0) {
+          this.view.setMessage('Coord must be a positive number');
+          await this.refresh();
+          this.compositeOverlay?.focusAlias(alias);
+          this.requestRender();
+          return;
+        }
+        try {
+          upsertCompositeTargetFromDashboard(this.source.env, alias, target, { coord, role: roleNorm as 'planner' | 'executor', share: null, fallback: null, primary: false });
+          this.view.setMessage(`updated ${alias}.${target}`);
+          await this.refresh(true);
+          this.compositeOverlay?.focusAlias(alias);
+        } catch (err) {
+          this.view.setMessage((err as Error).message, 2000);
+          await this.refresh();
+          this.compositeOverlay?.focusAlias(alias);
+          this.requestRender();
+        }
+      });
+      return;
+    }
+    const isFusion = aliasMode === 'fusion';
+    if (isFusion) {
+      const current = this.viewSnapshot()?.config.composite?.[alias]?.[target] as CompositeTargetConfig | undefined;
+      const defaultRole = current?.role === 'judge' ? 'j' : current?.role === 'synth' ? 's' : 'p';
+      const defaultValue = [
+        defaultRole,
+        current?.fusion !== undefined ? String(current.fusion) : '',
+      ].filter(Boolean).join(' ');
+      this.openPrompt(`Edit ${alias}.${bold(target)} (fusion)`, '[p]anel / [j]udge / [s]ynth  [weight]', defaultValue, async (value) => {
+        const patch = parseFusionTargetInput(value);
+        if (typeof patch === 'string') {
+          this.view.setMessage(patch);
+          await this.refresh();
+          return;
+        }
+        try {
+          upsertCompositeTargetFromDashboard(this.source.env, alias, target, { ...patch, share: null, fallback: null, primary: false });
+          this.view.setMessage(`updated ${alias}.${target}`);
+          await this.refresh(true);
+        } catch (err) {
+          this.view.setMessage((err as Error).message, 2000);
+          await this.refresh();
+        }
+      });
+      return;
+    }
+    const currentCfg = this.viewSnapshot()?.config.composite?.[alias]?.[target] as CompositeTargetConfig | undefined;
+    this.openCompositeRoutingPicker(alias, target, currentCfg);
+  }
+
+  // Step 1: pick routing type (fallback default, primary); Step 2: prompt for share [fallback_n].
+  // Used by both openTargetPicker (add) and openEditTargetPrompt (edit).
+  // Pass `currentCfg` when editing an existing target; undefined when adding new.
+  openCompositeRoutingPicker(alias: string, target: string, currentCfg: CompositeTargetConfig | undefined): void {
+    const isEdit = currentCfg !== undefined;
+    const defaultRouting = currentCfg?.primary ? 'primary' : 'fallback';
+    const choices: SelectItem[] = [
+      { value: 'fallback', label: 'fallback', description: 'non-primary target, used when primary is at capacity' },
+      { value: 'primary', label: 'primary', description: 'preferred target, receives traffic first' },
+    ];
+    // Put the current/default choice first
+    if (defaultRouting === 'primary') choices.reverse();
+    this.hideOverlay();
+    const routingOverlay = new ListOverlay(
+      `${isEdit ? 'Edit' : 'Add'} ${alias}.${bold(target)} — routing type`,
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        const isPrimary = item.value === 'primary';
+        const currentShare = currentCfg?.share !== undefined ? String(currentCfg.share) : '1';
+        const currentFallback = !isPrimary && currentCfg?.fallback !== undefined ? String(currentCfg.fallback) : '';
+        const promptHint = isPrimary ? 'share' : 'share [fallback_n]';
+        const defaultVal = isPrimary ? currentShare : [currentShare, currentFallback].join(' ').trimEnd();
+        this.openPrompt(
+          `${isEdit ? 'Edit' : 'Add'} ${alias}.${bold(target)} (${item.value})`,
+          promptHint,
+          defaultVal,
+          async (value) => {
+            const parts = value.trim().split(/\s+/).filter(Boolean);
+            if (parts.length < 1 || parts.length > (isPrimary ? 1 : 2)) {
+              this.view.setMessage(isPrimary ? 'Use: share' : 'Use: share [fallback_n]');
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+              return;
+            }
+            const share = Number(parts[0]);
+            if (Number.isNaN(share)) {
+              this.view.setMessage('Share must be a number');
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+              return;
+            }
+            const fallbackN = parts[1] !== undefined ? Number(parts[1]) : undefined;
+            if (parts[1] !== undefined && Number.isNaN(fallbackN)) {
+              this.view.setMessage('Fallback must be a number');
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+              return;
+            }
+            try {
+              upsertCompositeTargetFromDashboard(this.source.env, alias, target, {
+                share,
+                primary: isPrimary ? true : false,
+                fallback: isPrimary ? undefined : fallbackN,
+              });
+              this.view.setMessage(`${isEdit ? 'updated' : 'added'} ${alias}.${target}`);
+              await this.refresh(true);
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+            } catch (err) {
+              this.view.setMessage((err as Error).message, 2000);
+              await this.refresh();
+              this.compositeOverlay?.focusAlias(alias);
+              this.requestRender();
+            }
+          },
+        );
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage(`${isEdit ? 'edit' : 'add'} target cancelled`);
+        this.compositeOverlay?.focusAlias(alias);
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(routingOverlay, { width: '60%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openDeleteConfirm(alias: string, target: string): void {
+    // Capture the composite overlay instance BEFORE closeOverlay() nulls it out —
+    // closeOverlay() destroys the reference, so we need the live instance to
+    // re-show it from the dialog callbacks.
+    const compositeToRestore = this.compositeOverlay;
+    this.closeOverlay();
+    const overlay = new ListOverlay(
+      `Delete ${alias}.${target}?`,
+      'Enter confirm  Esc cancel',
+      [
+        { value: 'yes', label: 'Yes', description: 'Delete target' },
+        { value: 'no', label: 'No', description: 'Cancel' },
+      ],
+      (item) => {
+        this.closeOverlay();
+        if (item.value === 'yes') {
+          removeCompositeTargetFromDashboard(this.source.env, alias, target);
+          this.view.setMessage(`deleted ${alias}.${target}`);
+          void this.refresh(true);
+        } else {
+          this.view.setMessage('delete cancelled');
+          void this.refresh();
+        }
+        if (compositeToRestore) this.showCompositeOverlayInstance(compositeToRestore);
+      },
+      () => {
+        this.closeOverlay();
+        this.view.setMessage('delete cancelled');
+        if (compositeToRestore) this.showCompositeOverlayInstance(compositeToRestore);
+        this.requestRender();
+      },
+      2,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '50%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openDeleteAliasConfirm(alias: string): void {
+    const compositeToRestore = this.compositeOverlay;
+    this.closeOverlay();
+    const overlay = new ListOverlay(
+      `Delete composite alias ${alias}?`,
+      'Enter confirm  Esc cancel',
+      [
+        { value: 'yes', label: 'Yes', description: 'Delete alias and all targets' },
+        { value: 'no', label: 'No', description: 'Cancel' },
+      ],
+      (item) => {
+        this.closeOverlay();
+        if (item.value === 'yes') {
+          try {
+            removeCompositeAliasFromDashboard(this.source.env, alias);
+            this.view.setMessage(`deleted composite alias ${alias}`);
+            void this.refresh(true);
+          } catch (err) {
+            this.view.setMessage((err as Error).message, 2000);
+            void this.refresh();
+          }
+        } else {
+          this.view.setMessage('delete cancelled');
+          void this.refresh();
+        }
+        if (compositeToRestore) this.showCompositeOverlayInstance(compositeToRestore);
+      },
+      () => {
+        this.closeOverlay();
+        this.view.setMessage('delete cancelled');
+        if (compositeToRestore) this.showCompositeOverlayInstance(compositeToRestore);
+        this.requestRender();
+      },
+      2,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '55%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openAddScheduleAliasPrompt(): void {
+    this.openPrompt('Add schedule alias', 'Alias name:', '', async (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      try {
+        addScheduleAliasFromDashboard(this.source.env, trimmed);
+        await this.refresh(true);
+        this.scheduleOverlay?.focusAlias(trimmed);
+        this.view.setMessage(`added schedule alias ${trimmed}`);
+      } catch (error) {
+        this.view.setMessage((error as Error).message, 2000);
+        await this.refresh();
+        this.scheduleOverlay?.focusAlias(trimmed);
+      }
+    });
+  }
+
+  openAddScheduleTargetPrompt(alias: string): void {
+    // Schedule targets pick a resolved model by time-of-day window; the target
+    // can be a concrete custom model or a composite alias (both are returned by
+    // `getConfiguredModelIds`), but not a wildcard routing pattern (e.g. "*",
+    // "claude-*") or the schedule alias itself (self-reference).
+    const snapshot = this.viewSnapshot();
+    if (!snapshot || !this.proxyConfig) return;
+    const configuredIds = getConfiguredModelIds(this.proxyConfig);
+    const existing = new Set(Object.keys(((snapshot.config.schedule || {}) as Record<string, Record<string, unknown>>)[alias] || {}));
+    const choices: SelectItem[] = configuredIds
+      .filter((id) => !existing.has(id) && id !== alias && id !== '*' && !id.endsWith('-*'))
+      .sort()
+      .map((id) => ({ value: id, label: id }));
+
+    if (choices.length === 0) {
+      this.view.setMessage('No additional configured models available');
+      this.requestRender();
+      return;
+    }
+
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      `Add target to ${bold(alias)}`,
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        // Default to one full-day window; user can edit afterwards with `e`.
+        void (async () => {
+          try {
+            upsertScheduleTargetFromDashboard(this.source.env, alias, item.value, [{ from: 0, to: 24 }]);
+            await this.refresh(true);
+            this.showScheduleOverlay();
+            this.scheduleOverlay?.focusAlias(alias);
+            this.view.setMessage(`added ${item.value} to ${alias}`);
+          } catch (error) {
+            this.view.setMessage((error as Error).message, 2000);
+            await this.refresh();
+            this.showScheduleOverlay();
+            this.scheduleOverlay?.focusAlias(alias);
+          }
+          this.requestRender();
+        })();
+      },
+      () => {
+        this.hideOverlay();
+        this.showScheduleOverlay();
+        this.requestRender();
+      },
+      8,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '40%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  // Step wizard for editing a schedule target's window list, one window at a
+  // time (from -> to -> days), instead of a single JSON-blob prompt. Days is a
+  // 3-way pick (Weekdays / Weekend / Every day) rather than free text — any
+  // day value other than "weekday"/"weekend" is normalized to "every day" by
+  // the config layer, so the editor doesn't offer anything else to keep it simple.
+  // Editing always replaces the whole window list, matching prior JSON-prompt behavior.
+  openEditScheduleWindowsPrompt(alias: string, target: string): void {
+    const snapshot = this.viewSnapshot();
+    const existing = ((snapshot?.config.schedule || {}) as Record<string, Record<string, ScheduleWindow[]>>)[alias]?.[target] ?? [];
+    const existingSummary = existing.length === 0
+      ? 'currently: fallback'
+      : `currently: ${existing.map((w) => {
+          const from = typeof w?.from === 'number' ? w.from : 0;
+          const to = typeof w?.to === 'number' ? w.to : 24;
+          const days = w?.days === 'weekday' ? ' weekdays' : w?.days === 'weekend' ? ' weekend' : '';
+          return `${from}-${to}${days}`;
+        }).join(', ')}`;
+    const windows: ScheduleWindow[] = [];
+
+    const finish = async () => {
+      this.hideOverlay();
+      try {
+        upsertScheduleTargetFromDashboard(this.source.env, alias, target, windows);
+        await this.refresh(true);
+        this.view.setMessage(windows.length === 0 ? `${alias}.${target} = fallback` : `updated ${alias}.${target} (${windows.length} window${windows.length === 1 ? '' : 's'})`);
+      } catch (error) {
+        this.view.setMessage((error as Error).message, 2000);
+        await this.refresh();
+      }
+      this.showScheduleOverlay();
+      this.scheduleOverlay?.focusAlias(alias);
+      this.requestRender();
+    };
+
+    const cancel = () => {
+      this.hideOverlay();
+      this.showScheduleOverlay();
+      this.scheduleOverlay?.focusAlias(alias);
+      this.view.setMessage('edit cancelled');
+      this.requestRender();
+    };
+
+    const askAddAnother = (windowNum: number) => {
+      this.hideOverlay();
+      const overlay = new ListOverlay(
+        `${alias}.${target} — window ${windowNum} saved`,
+        `${windows.length} window${windows.length === 1 ? '' : 's'} configured so far`,
+        [
+          { value: 'add', label: 'Add another window' },
+          { value: 'save', label: 'Save and close' },
+        ],
+        (item) => {
+          if (item.value === 'add') {
+            collectFrom(windowNum + 1);
+          } else {
+            void finish();
+          }
+        },
+        () => void finish(),
+        2,
+      );
+      this.overlay = this.tui.showOverlay(overlay, { width: '50%', maxHeight: '30%', anchor: 'center' });
+      this.overlay.focus();
+    };
+
+    const collectDays = (windowNum: number, from: number | undefined, to: number | undefined) => {
+      this.hideOverlay();
+      const overlay = new ListOverlay(
+        `Window ${windowNum} for ${bold(alias)}.${target} — days`,
+        `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('every day')}`,
+        [
+          { value: 'everyday', label: 'Every day', description: 'default — no days restriction' },
+          { value: 'weekday', label: 'Weekdays', description: 'Mon-Fri' },
+          { value: 'weekend', label: 'Weekend', description: 'Sat-Sun' },
+        ],
+        (item) => {
+          const window: ScheduleWindow = {};
+          if (from !== undefined) window.from = from;
+          if (to !== undefined) window.to = to;
+          if (item.value === 'weekday' || item.value === 'weekend') window.days = item.value as ScheduleDaysSpec;
+          windows.push(window);
+          askAddAnother(windowNum);
+        },
+        () => {
+          const window: ScheduleWindow = {};
+          if (from !== undefined) window.from = from;
+          if (to !== undefined) window.to = to;
+          windows.push(window);
+          askAddAnother(windowNum);
+        },
+        3,
+      );
+      this.overlay = this.tui.showOverlay(overlay, { width: '50%', maxHeight: '30%', anchor: 'center' });
+      this.overlay.focus();
+    };
+
+    const collectTo = (windowNum: number, from: number | undefined) => {
+      this.hideOverlay();
+      const overlay = new PromptOverlay(
+        `Window ${windowNum} for ${bold(alias)}.${target}`,
+        'to (hour 0-24, blank = 24)',
+        '',
+        (value) => {
+          const t = value.trim();
+          let to: number | undefined;
+          if (t !== '') {
+            const n = Number(t);
+            if (!Number.isFinite(n) || n < 0 || n > 24) {
+              this.view.setMessage('to must be between 0 and 24');
+              cancel();
+              return;
+            }
+            if (from !== undefined && n <= from) {
+              this.view.setMessage('to must be greater than from');
+              cancel();
+              return;
+            }
+            to = n;
+          }
+          collectDays(windowNum, from, to);
+        },
+        cancel,
+      );
+      this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '40%', anchor: 'center' });
+      this.overlay.focus();
+    };
+
+    const collectFrom = (windowNum: number) => {
+      this.hideOverlay();
+      const overlay = new PromptOverlay(
+        `Window ${windowNum} for ${bold(alias)}.${target}`,
+        'from (hour 0-24, blank = 0)',
+        '',
+        (value) => {
+          const t = value.trim();
+          let from: number | undefined;
+          if (t !== '') {
+            const n = Number(t);
+            if (!Number.isFinite(n) || n < 0 || n > 24) {
+              this.view.setMessage('from must be between 0 and 24');
+              cancel();
+              return;
+            }
+            from = n;
+          }
+          collectTo(windowNum, from);
+        },
+        cancel,
+      );
+      this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '40%', anchor: 'center' });
+      this.overlay.focus();
+    };
+
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      `Edit ${bold(alias)}.${target}`,
+      `${dim(existingSummary)}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      [
+        { value: 'windows', label: 'Configure time windows', description: 'add one or more from/to/days windows' },
+        { value: 'fallback', label: 'Set as fallback', description: 'always eligible when no window matches (empty window list)' },
+      ],
+      (item) => {
+        if (item.value === 'fallback') {
+          void finish();
+        } else {
+          collectFrom(1);
+        }
+      },
+      cancel,
+      2,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openDeleteScheduleAliasConfirm(alias: string): void {
+    const scheduleToRestore = this.scheduleOverlay;
+    this.closeOverlay();
+    const overlay = new ListOverlay(
+      `Delete schedule.${alias}?`,
+      'Enter confirm  Esc cancel',
+      [
+        { value: 'yes', label: 'Yes', description: 'Delete alias' },
+        { value: 'no', label: 'No', description: 'Cancel' },
+      ],
+      (item) => {
+        this.closeOverlay();
+        if (item.value === 'yes') {
+          try {
+            removeScheduleAliasFromDashboard(this.source.env, alias);
+            this.view.setMessage(`deleted schedule.${alias}`);
+            void this.refresh(true);
+          } catch (error) {
+            this.view.setMessage((error as Error).message, 2000);
+            void this.refresh();
+          }
+        } else {
+          this.view.setMessage('delete cancelled');
+          void this.refresh();
+        }
+        if (scheduleToRestore) this.showScheduleOverlayInstance(scheduleToRestore);
+      },
+      () => {
+        this.closeOverlay();
+        this.view.setMessage('delete cancelled');
+        if (scheduleToRestore) this.showScheduleOverlayInstance(scheduleToRestore);
+        this.requestRender();
+      },
+      2,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '50%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  openDeleteScheduleTargetConfirm(alias: string, target: string): void {
+    const scheduleToRestore = this.scheduleOverlay;
+    this.closeOverlay();
+    const overlay = new ListOverlay(
+      `Delete schedule.${alias}.${target}?`,
+      'Enter confirm  Esc cancel',
+      [
+        { value: 'yes', label: 'Yes', description: 'Delete target' },
+        { value: 'no', label: 'No', description: 'Cancel' },
+      ],
+      (item) => {
+        this.closeOverlay();
+        if (item.value === 'yes') {
+          try {
+            removeScheduleTargetFromDashboard(this.source.env, alias, target);
+            this.view.setMessage(`deleted schedule.${alias}.${target}`);
+            void this.refresh(true);
+          } catch (error) {
+            this.view.setMessage((error as Error).message, 2000);
+            void this.refresh();
+          }
+        } else {
+          this.view.setMessage('delete cancelled');
+          void this.refresh();
+        }
+        if (scheduleToRestore) this.showScheduleOverlayInstance(scheduleToRestore);
+      },
+      () => {
+        this.closeOverlay();
+        this.view.setMessage('delete cancelled');
+        if (scheduleToRestore) this.showScheduleOverlayInstance(scheduleToRestore);
+        this.requestRender();
+      },
+      2,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '50%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.refreshTimer = null;
+    if (this.titleTimer) clearInterval(this.titleTimer);
+    this.titleTimer = null;
+    if (this.hourlyDumpTimer) clearInterval(this.hourlyDumpTimer);
+    this.hourlyDumpTimer = null;
+    if (this.modelTestTimer) clearInterval(this.modelTestTimer);
+    this.modelTestTimer = null;
+    this.modelTestTimerActive = false;
+    this.modelTestAborted = true;
+    if (this.modelTestAbortController) this.modelTestAbortController.abort();
+    this.closeOverlay();
+    stdout.write('\x1b]0;\x07'); // clear terminal title on exit
+    this.lastTerminalTitle = null;
+    this.tui.stop();
+  }
+
+  stopAndExit(): void {
+    this.stop();
+    process.exit(0);
+  }
+
+  closeOverlay(): void {
+    this.overlay?.hide();
+    this.overlay = null;
+    this.compositeOverlay = null;
+    this.scheduleOverlay = null;
+    this.quotaPickerState = null;
+    this.tui.setFocus(this.view);
+  }
+
+  private hideOverlay(): void {
+    this.overlay?.hide();
+    this.overlay = null;
+    this.tui.setFocus(this.view);
+  }
+
+  private showCompositeOverlay(): void {
+    if (this.compositeOverlay) this.showCompositeOverlayInstance(this.compositeOverlay);
+  }
+
+  // Re-show a previously-captured composite overlay instance. Used by callbacks
+  // that need to restore the panel after closeOverlay() has nulled the field.
+  private showCompositeOverlayInstance(overlay: CompositeAliasesOverlay): void {
+    if (this.overlay) return;
+    this.overlay = this.tui.showOverlay(overlay, { width: '80%', maxHeight: '70%', anchor: 'center' });
+    overlay.setSnapshot(this.viewSnapshot());
+    this.compositeOverlay = overlay;
+    this.tui.setFocus(overlay);
+  }
+
+  private showScheduleOverlay(): void {
+    if (this.scheduleOverlay) this.showScheduleOverlayInstance(this.scheduleOverlay);
+  }
+
+  // Re-show a previously-captured schedule overlay instance. Used by callbacks
+  // that need to restore the panel after closeOverlay() has nulled the field.
+  private showScheduleOverlayInstance(overlay: ScheduleAliasesOverlay): void {
+    if (this.overlay) return;
+    this.overlay = this.tui.showOverlay(overlay, { width: '80%', maxHeight: '70%', anchor: 'center' });
+    overlay.setSnapshot(this.viewSnapshot());
+    this.scheduleOverlay = overlay;
+    this.tui.setFocus(overlay);
+  }
+
+  private openPrompt(
+    title: string,
+    prompt: string,
+    initialValue: string,
+    onSubmit: (value: string) => Promise<void> | void,
+  ): void {
+    const restoreCompositeOverlay = this.compositeOverlay !== null;
+    const restoreScheduleOverlay = this.scheduleOverlay !== null;
+    this.hideOverlay();
+    const overlay = new PromptOverlay(
+      title,
+      prompt,
+      initialValue,
+      (value) => {
+        void (async () => {
+          try {
+            this.hideOverlay();
+            await onSubmit(value);
+            if (restoreCompositeOverlay) {
+              this.showCompositeOverlay();
+            }
+            if (restoreScheduleOverlay) {
+              this.showScheduleOverlay();
+            }
+            this.requestRender();
+          } catch (error) {
+            this.view.setMessage((error as Error).message, 2000);
+            await this.refresh();
+          }
+        })();
+      },
+      () => {
+        this.hideOverlay();
+        if (restoreCompositeOverlay) {
+          this.showCompositeOverlay();
+        }
+        if (restoreScheduleOverlay) {
+          this.showScheduleOverlay();
+        }
+        this.view.setMessage('cancelled');
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '40%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  private modelChoices(includeTiming = true): ModelChoice[] {
+    const snapshot = this.viewSnapshot();
+    if (!snapshot) return [];
+    const seenNames = new Set<string>();
+    const choices: ModelChoice[] = [];
+    // Index per-model timings by the resolved model name (the same key used
+    // by recordModelTiming → requestModelTimingStats). Lets us prefix the
+    // description with an "Xs avg" marker when stats are available.
+    const modelTimingMap = new Map(
+      ((snapshot.requestStats?.model_timings) || []).map((t) => [t.endpoint, t])
+    );
+
+    for (const [category, categoryConfig] of Object.entries(snapshot.config.models)) {
+      for (const [key, value] of Object.entries(categoryConfig || {})) {
+        if (key === 'upstream_mode' || key === 'base_url' || key === 'api_key') continue;
+        if (value === undefined || seenNames.has(key)) continue;
+        // Skip wildcard model entries (e.g. "*", "claude-*", "gemini-*").
+        // They are routing patterns, not concrete model names, so they can't
+        // be tested directly via the proxy's /v1/messages endpoint.
+        if (key === '*' || key.endsWith('-*')) continue;
+        seenNames.add(key);
+        // Cast to string[] since runtime config may have 4 elements [target, base_url, api_key, mode]
+        // even though DashboardModelArrayConfig is typed as [string, string].
+        const arr = Array.isArray(value) ? value as string[] : null;
+        const modelUrl = arr && arr.length >= 2 && arr[1]
+          ? arr[1]
+          : (categoryConfig.base_url || '-');
+        // Dashboard sanitized format: [target, base_url, mode] (3 elements, mode at index 2)
+        const modelMode = arr && arr.length >= 3 && arr[2]
+          ? arr[2]
+          : undefined;
+        const resolvedMode = modelMode || categoryConfig.upstream_mode || 'openai-completions';
+        // Timing is keyed by the resolved upstream model name (routeModel =
+        // arr[0], e.g. `moonshotai/kimi-k2.6`), with a fallback to the
+        // config key. Same convention used by 'Edit Composite Aliases
+        // Config' (tui.ts:~658) and the 'Custom Models' panel (tui.ts:~1057),
+        // so the avg shown here matches what those views already display.
+        const routeModel = arr && arr.length >= 1 && typeof arr[0] === 'string' ? arr[0] : undefined;
+        const timing = modelTimingMap.get(routeModel ?? key);
+        // Leading stat prefix in the description (e.g. "[2.50s] ") when
+        // this model has at least one observed timing sample. Keeps the rest
+        // of the description (category · mode · base URL) unchanged.
+        const avgPrefix = includeTiming && timing && timing.count > 0
+          ? `[${(timing.avg_time_ms / 1000).toFixed(2)}s] `
+          : '';
+        choices.push({
+          category,
+          modelId: key,
+          value: key,
+          label: key,
+          description: `${avgPrefix}${titleCase(category)} · ${stripCompletions(resolvedMode)} · ${stripHttps(modelUrl)}`,
+        });
+      }
+    }
+
+    // Add composite aliases — if same name as a model, add with a marker suffix (Ç/ƒ/Ö) to differentiate
+    if (snapshot.compositeResolved) {
+      for (const alias of snapshot.compositeResolved) {
+        if (alias.targets.length === 0) continue;
+        const aliasMode = snapshot.config ? getCompositeAliasMode(alias.alias, snapshot.config) : undefined;
+        const isFusion = aliasMode === 'fusion';
+        const isCoordinator = aliasMode === 'coordinator';
+        const modeTag = isFusion ? 'ƒ' : isCoordinator ? 'Ö' : 'Ç';
+        const category = isCoordinator ? 'coordinator' : isFusion ? 'fusion' : 'composite';
+        const isDuplicate = seenNames.has(alias.alias);
+        const aliasConfig = snapshot.config.composite?.[alias.alias] as Record<string, unknown> | undefined;
+        const orderedTargets = orderCompositeTargetsForDisplay(alias.targets, aliasConfig, isFusion);
+        const targets = orderedTargets.map((t) => t.model || t.routeModel || '?').join(' · ');
+        // Leading avg-time stat for the primary (composite) or synth (fusion)
+        // target — orderedTargets[0] is whichever of those sorts first per
+        // orderCompositeTargetsForDisplay. Look up by routeModel with model
+        // fallback to match the convention in Edit Composite Aliases Config.
+        const leadTarget = orderedTargets[0];
+        const leadRouteModel = leadTarget?.routeModel ?? leadTarget?.model;
+        const leadTiming = leadRouteModel ? modelTimingMap.get(leadRouteModel) : undefined;
+        const avgPrefix = includeTiming && leadTiming && leadTiming.count > 0
+          ? `[${(leadTiming.avg_time_ms / 1000).toFixed(2)}s] `
+          : '';
+        const description = `${avgPrefix}${targets}`;
+        if (isDuplicate) {
+          // Same name already added as a model — add marker suffix (Ç/ƒ/Ö) to make value unique
+          choices.push({
+            category,
+            modelId: alias.alias,
+            value: `${alias.alias} ${modeTag}`,
+            label: `${alias.alias} ${dim(modeTag)}`,
+            description,
+          });
+        } else {
+          seenNames.add(alias.alias);
+          choices.push({
+            category,
+            modelId: alias.alias,
+            value: alias.alias,
+            label: `${alias.alias} ${dim(modeTag)}`,
+            description,
+          });
+        }
+      }
+    }
+
+    // Sort: composite/fusion first, then by value (which is now unique)
+    return choices.sort((a, b) => {
+      const aComposite = a.category === 'fusion' || a.category === 'composite' || a.category === 'coordinator';
+      const bComposite = b.category === 'fusion' || b.category === 'composite' || b.category === 'coordinator';
+      if (aComposite && !bComposite) return -1;
+      if (!aComposite && bComposite) return 1;
+      const cmp = a.value.localeCompare(b.value);
+      return cmp !== 0 ? cmp : a.label.localeCompare(b.label);
+    });
+  }
+
+  viewSnapshot(): Awaited<ReturnType<typeof getDashboardSnapshot>> | null {
+    return (this.view as unknown as { snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>> | null }).snapshot;
+  }
+}
+
+function resolveModelTestConfig(
+  config: ProxyConfig,
+  modelId: string,
+  compositeResolved?: Array<{ alias: string; targets: Array<{ model: string; routeModel?: string; upstreamMode: string; targetUrl: string }> }>,
+): { upstreamMode: string; targetUrl: string; apiKey?: string; directModel?: string } | undefined {
+  // Check composite aliases first
+  if (compositeResolved) {
+    const alias = compositeResolved.find((a) => a.alias === modelId);
+    if (alias && alias.targets.length > 0) {
+      // Pick best target: for fusion aliases use a panel target; for normal composites use primary > share > fallback order
+      const aliasConfig = config.composite?.[modelId];
+      let bestName: string | undefined;
+      let isFusion = false;
+      if (aliasConfig) {
+        isFusion = !!(aliasConfig as { fusion_options?: unknown }).fusion_options;
+        const entries = Object.entries(aliasConfig).filter(
+          ([k]) => k !== 'token_limit' && k !== 'fusion_options' && !k.startsWith('_'),
+        ) as Array<[string, CompositeTargetConfig]>;
+        if (isFusion) {
+          // Prefer panel targets (fusion > 0 or role === 'panel' or role omitted)
+          const panel = entries.filter(([, v]) => v.role === 'panel' || (v.fusion !== undefined && v.fusion > 0) || (v.role === undefined && v.fusion === undefined));
+          bestName = (panel.length > 0 ? panel : entries)[0]?.[0];
+        } else {
+          entries.sort(sortCompositeTargets);
+          bestName = entries[0]?.[0];
+        }
+      }
+      const found = bestName ? alias.targets.find((t) => t.model === bestName) : undefined;
+      const best = found ?? alias.targets[0];
+      // For fusion aliases, send the test directly to the panel target model to avoid
+      // triggering the full fusion pipeline (judge/synth steps would fail the format check).
+      // Use the proxy-side model name (best.model) so the proxy resolves its route + API key,
+      // NOT best.routeModel (which is the upstream model id and lacks proxy routing/key).
+      return { upstreamMode: best.upstreamMode, targetUrl: best.targetUrl, directModel: isFusion ? best.model : undefined };
+    }
+  }
+
+  // Check model configs
+  for (const categoryConfig of Object.values(config.models || {})) {
+    if (Array.isArray(categoryConfig)) continue;
+    for (const [key, value] of Object.entries(categoryConfig || {})) {
+      if (key === 'upstream_mode' || key === 'base_url' || key === 'api_key') continue;
+      if (value === undefined) continue;
+      if (key !== modelId) continue;
+      // Check for per-model override in tuple [target, baseUrl, apiKey, mode]
+      // (dashboard sanitizer strips 3rd element, so accept >= 2)
+      if (Array.isArray(value) && value.length >= 2) {
+        const modelBaseUrl = value[1] as string | undefined;
+        // Dashboard sanitized format: [target, base_url, mode] (3 elements, mode at index 2)
+        const modelMode = (value.length >= 3 ? value[2] : undefined) as string | undefined;
+        return {
+          upstreamMode: modelMode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
+          targetUrl: modelBaseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
+          apiKey: categoryConfig.api_key || config.default_upstream?.default_api_key,
+        };
+      }
+      // Inline-table form: e.g. "model" = {target = "...", base_url = "...", api_key = "...", mode = "..."}
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const entry = value as Record<string, unknown>;
+        const mode = typeof entry.mode === 'string' ? entry.mode : undefined;
+        const baseUrl = typeof entry.base_url === 'string' ? entry.base_url : undefined;
+        const apiKey = typeof entry.api_key === 'string' ? entry.api_key : undefined;
+        const target = typeof entry.target === 'string' ? entry.target : undefined;
+        return {
+          upstreamMode: mode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
+          targetUrl: baseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || 'http://localhost',
+          apiKey: apiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
+          directModel: target || undefined,
+        };
+      }
+      return {
+        upstreamMode: categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
+        targetUrl: categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
+        apiKey: categoryConfig.api_key || config.default_upstream?.default_api_key,
+      };
+    }
+  }
+  return undefined;
+}
+
+export function startTUI(source: DashboardSource): () => void {
+  if (!stdin.isTTY || !stdout.isTTY) return () => {};
+
+  const app = new DashboardApp(source);
+  void app.start();
+  return () => app.stop();
+}

@@ -5,6 +5,55 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(config): blank api_key in the model target wizard reuses a same-base_url keychain entry
+
+When the api-key field is left blank in the "Add target model" wizard (TUI `m`
+and dashboard), `upsertModelTarget` now first scans sibling entries within the
+*same category* for one already storing `STORE_KEY_IN_SYSTEM` whose effective
+base_url (entry's own, falling back to the category's) matches this entry's —
+using the same base_url prefix-relation scoring the keychain best-effort
+resolver uses (`scoreBaseUrlMatch`, extracted from `key-store.ts`'s
+`scoreAccountMatch`; target-name similarity intentionally not considered
+here, only base_url). If a match is found, the new entry adopts the sentinel
+so it resolves from the same keychain account instead of silently landing on
+the category's plaintext `api_key` (previous blank behavior, still the
+fallback when no match is found). Editing an entry never matches against
+itself, so clearing a previously-plaintext key by blanking the field still
+clears it rather than resurrecting a sentinel.
+
+- `src/utils/key-store.ts`: new exported `scoreBaseUrlMatch` (base_url-only
+  half of `scoreAccountMatch`, reused by both).
+- `src/utils/config-loader.ts`: `upsertModelTarget` — same-category
+  `STORE_KEY_IN_SYSTEM` lookup on blank `api_key`.
+- `src/handlers/dashboard.ts`: wizard step-3 helper text updated to mention
+  the new blank-key behavior.
+- `tests/unit/config-loader.test.ts`: regression tests for same-base_url
+  match, category-base_url-fallback match, no-match (stays blank),
+  cross-category isolation, and self-exclusion on edit.
+
+### fix(config): reject hand-typed `STORE_KEY_IN_SYSTEM` sentinel in the model target wizard
+
+Closes the TODO left in the `feat(config)` entry below. The "Add target model"
+wizard's api-key field (TUI `m` and dashboard) had no guardrail against a user
+typing/pasting the literal sentinel `STORE_KEY_IN_SYSTEM` by hand. Unlike
+`applySystemKeyStore`'s own store-pass (which only ever writes the sentinel
+right after storing a real plaintext key to the matching keychain account), a
+hand-typed sentinel was written verbatim with no keychain entry behind it. On
+next load, resolution keys off `<target>/<base_url>` and could silently
+succeed against an unrelated or stale keychain entry sharing that account
+(wrong key, no error) instead of failing loud.
+
+`upsertModelTarget` now throws when `patch.api_key === STORE_KEY_IN_SYSTEM`
+unless the entry being edited already held that exact sentinel (the
+"leave unchanged" edit path, which is backed by a real keychain entry). Both
+the TUI wizard and the dashboard wizard call this same function, so the
+guardrail applies to both without duplicating the check.
+
+- `src/utils/config-loader.ts`: `upsertModelTarget` — compare `patch.api_key`
+  against the existing entry's index-2 value before accepting the sentinel.
+- `tests/unit/config-loader.test.ts`: regression tests for add, edit-not-
+  previously-sentinel (both throw), and edit-already-sentinel (allowed).
+
 ### fix(tui): custom model test sent the wrong api key for plain `[models.*]` targets
 
 Testing a plain (non-composite) model target in the TUI's custom model test

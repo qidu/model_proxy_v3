@@ -292,6 +292,26 @@ function normalizeBaseUrl(url: string): string {
 }
 
 /**
+ * base_url-only compatibility score between two base_urls: exact match beats
+ * a prefix relation (e.g. "https://x/api" vs "https://x/api/anthropic",
+ * longer shared prefix ranks higher); -1 when unrelated. Shared by
+ * scoreAccountMatch (adds target-name tiebreak, for keychain account lookup)
+ * and upsertModelTarget's same-category STORE_KEY_IN_SYSTEM base_url match
+ * (target-name intentionally not considered there).
+ */
+export function scoreBaseUrlMatch(wantedBaseUrl: string, candidateBaseUrl: string): number {
+  const bw = normalizeBaseUrl(wantedBaseUrl);
+  const bc = normalizeBaseUrl(candidateBaseUrl);
+  if (bw === bc) {
+    return 1_000_000;
+  }
+  if (bw.startsWith(bc) || bc.startsWith(bw)) {
+    return 100_000 + Math.min(bw.length, bc.length);
+  }
+  return -1;
+}
+
+/**
  * Compatibility score between a wanted account and a candidate account.
  * Returns -1 when the base_urls are unrelated (no fallback allowed);
  * otherwise base_url match dominates and target-name similarity tiebreaks.
@@ -299,17 +319,8 @@ function normalizeBaseUrl(url: string): string {
 function scoreAccountMatch(wanted: string, candidate: string): number {
   const w = splitAccount(wanted);
   const c = splitAccount(candidate);
-  const bw = normalizeBaseUrl(w.baseUrl);
-  const bc = normalizeBaseUrl(c.baseUrl);
-
-  let baseScore: number;
-  if (bw === bc) {
-    baseScore = 1_000_000;
-  } else if (bw.startsWith(bc) || bc.startsWith(bw)) {
-    // Prefix relation (e.g. "https://x/api" vs "https://x/api/anthropic");
-    // longer shared base ranks higher.
-    baseScore = 100_000 + Math.min(bw.length, bc.length);
-  } else {
+  const baseScore = scoreBaseUrlMatch(w.baseUrl, c.baseUrl);
+  if (baseScore < 0) {
     return -1;
   }
 

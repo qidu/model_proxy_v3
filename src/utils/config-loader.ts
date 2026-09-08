@@ -14,7 +14,7 @@ import { buildConsulKvUrl, parseConsulConfig } from './consul-loader.js';
 import type { ConsulKvEntry } from './consul-loader.js';
 import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
 import { createLogger } from './logger.js';
-import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, STORE_KEY_IN_SYSTEM } from './key-store.js';
+import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
 
 // Check if we're running in Node.js environment
 const isNodeEnvironment = (typeof process !== 'undefined' && process.versions?.node) ||
@@ -4077,8 +4077,44 @@ export function upsertModelTarget(
     : {};
 
   const existingEntry = nextCategory[key];
-  const [, , , , transforms, max_tokens] = Array.isArray(existingEntry) ? existingEntry : [];
-  const nextEntry: string[] = [target, patch.base_url, patch.api_key, patch.mode];
+  const [, , existingApiKey, , transforms, max_tokens] = Array.isArray(existingEntry) ? existingEntry : [];
+  // The sentinel is only ever safe when it already sat in this exact slot
+  // (edit, left untouched) — applySystemKeyStore backs it with a real
+  // keychain entry in that case. A hand-typed sentinel (add, or edit where
+  // it wasn't already that value) has no such entry and would resolve
+  // against whatever stale/unrelated keychain item happens to share the
+  // account (wrong key, no error) instead of failing loud. See CHANGELOG.
+  if (patch.api_key === STORE_KEY_IN_SYSTEM && existingApiKey !== STORE_KEY_IN_SYSTEM) {
+    throw new Error(
+      `api_key cannot be the literal "${STORE_KEY_IN_SYSTEM}" — that sentinel is only written by the system key store` +
+      ` after it stores a real key; type the actual key instead.`,
+    );
+  }
+  // Blank api_key: before falling through to empty (→ category api_key at
+  // resolve time), check sibling entries in this same category for one
+  // already backed by the system keychain (STORE_KEY_IN_SYSTEM) whose
+  // effective base_url (entry base_url, falling back to the category's)
+  // matches this entry's — same base_url-only scoring the keychain
+  // best-effort resolver uses, target name intentionally not considered.
+  // If found, adopt the sentinel so this entry resolves from the same
+  // keychain account instead of silently landing on category api_key.
+  let apiKey = patch.api_key;
+  if (!apiKey.trim()) {
+    const categoryBaseUrl = nextCategory.base_url ?? '';
+    const wantedBaseUrl = patch.base_url || categoryBaseUrl;
+    let bestScore = -1;
+    for (const [siblingKey, siblingEntry] of Object.entries(nextCategory)) {
+      if (siblingKey === key || !Array.isArray(siblingEntry) || siblingEntry.length < 3) continue;
+      if (siblingEntry[2] !== STORE_KEY_IN_SYSTEM) continue;
+      const siblingBaseUrl = (siblingEntry[1] as string) || categoryBaseUrl;
+      const score = scoreBaseUrlMatch(wantedBaseUrl, siblingBaseUrl);
+      if (score > bestScore) bestScore = score;
+    }
+    if (bestScore >= 0) {
+      apiKey = STORE_KEY_IN_SYSTEM;
+    }
+  }
+  const nextEntry: string[] = [target, patch.base_url, apiKey, patch.mode];
   if (transforms !== undefined || max_tokens !== undefined) {
     nextEntry.push(transforms ?? '', max_tokens ?? '');
   }
