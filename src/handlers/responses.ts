@@ -531,7 +531,7 @@ async function handleAsAnthropicMessages(
   route?: ModelRouteConfig,
   upstreamMode?: string,
 ): Promise<Response> {
-  const completionsRequest = convertResponsesToChatCompletions(requestBody, model);
+  const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger, requestId });
   let claudeBody: Record<string, unknown> = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
 
   // before_upstream: apply declared transforms to the upstream-format body.
@@ -611,7 +611,7 @@ async function handleAsGemini(
   env?: Env,
   upstreamMode?: string
 ): Promise<Response> {
-  const completionsRequest = convertResponsesToChatCompletions(requestBody, model);
+  const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger, requestId });
   const claudeBody = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
 
   logger.debug(requestId, `Responses->${upstreamMode}: ${JSON.stringify(claudeBody).substring(0, 500)}`);
@@ -731,7 +731,7 @@ async function handleAsCompletions(
   }
 
   // Convert Responses API request to Chat Completions format
-  const completionsRequest = convertResponsesToChatCompletions(effectiveBody, model);
+  const completionsRequest = convertResponsesToChatCompletions(effectiveBody, model, { logger, requestId });
 
   // Inject stored reasoning_content onto any assistant messages that have tool_calls
   // whose IDs were recorded from a prior thinking-mode response (DeepSeek requires
@@ -1284,7 +1284,7 @@ export async function handleResponsesInputTokensRequest(
 
   if (upstreamMode === 'openai-completions') {
     // Convert to completions format, call with max_tokens=1, extract prompt_tokens from usage
-    const completionsRequest = convertResponsesToChatCompletions(requestBody, model);
+    const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger: activeLogger, requestId });
     let countRequest: Record<string, unknown> = { ...completionsRequest, max_tokens: 1, stream: false };
 
     activeLogger.debug(requestId, `input_tokens -> completions count: ${JSON.stringify(countRequest).substring(0, 500)}`);
@@ -1408,7 +1408,7 @@ export async function handleResponsesCompactRequest(
 
   if (upstreamMode === 'openai-completions') {
     // Convert to chat completions, call upstream, wrap as CompactedResponse
-    let completionsRequest: Record<string, unknown> = convertResponsesToChatCompletions(requestBody, model) as unknown as Record<string, unknown>;
+    let completionsRequest: Record<string, unknown> = convertResponsesToChatCompletions(requestBody, model, { logger: activeLogger, requestId }) as unknown as Record<string, unknown>;
 
     activeLogger.debug(requestId, `Compact -> completions: ${JSON.stringify(completionsRequest).substring(0, 500)}`);
 

@@ -19,6 +19,16 @@ deepseek-v4-anth = {target = "deepseek-v4-flash", base_url = "https://api.deepse
 #     last so its stream=true takes precedence.
 my-sse-only-model = {target = "actual-model-id", base_url = "https://api.example.com", api_key = "sk-***", transforms = "max_tokens_rename,sse_to_completions"}
 
+# EXPERIMENTAL — read the hazards below before copying this entry.
+# Lets a Responses-API client that uses programmatic tool calling reach an
+# openai-completions upstream. Without the transform such a request is refused
+# with 400 invalid_request_error ("Item type 'program' ... cannot be converted"),
+# because program/program_output have no Chat Completions equivalent.
+# The transform downgrades them onto an ordinary `node` function call instead.
+# Enable only against an upstream whose behavior you have verified — the
+# projection is lossy in two ways (see transforms.program_to_node_downgrade).
+kimi-k3 = {target = "kimi-k3-turbo", base_url = "https://api.example.com", api_key = "sk-***", transforms = "program_to_node_downgrade"}
+
 
 [transforms.deepseek_v4_comp_compat]
 schema = "openai-completions"
@@ -84,6 +94,30 @@ before_upstream.ops = [
   {op = "set", path = "stream_options", value = {include_usage = true}},
 ]
 after_upstream.builtins = ["assemble_sse_chunks"]
+
+# Downgrade Responses programmatic tool calling (program / program_output items)
+# onto an ordinary `node` function call, so an openai-completions upstream can
+# carry a conversation that would otherwise be rejected with a 400.
+#   program        {code, fingerprint, type} -> function_call `node`, arguments = those 3
+#   program_output {result, status, type}    -> function_call_output, output = those 3
+# call_id is preserved so the call and its result stay paired.
+#
+# Runs at before_conversion (not before_upstream): the items must be rewritten
+# while the body is still in Responses schema, before the converter sees them.
+#
+# EXPERIMENTAL / OPT-IN — two known hazards, neither fixable at this layer:
+#   1. `fingerprint` is an opaque replay token the spec says must be
+#      round-tripped. Here it becomes a `node` argument, and `arguments` is
+#      authored by the UPSTREAM model on the next turn — it will copy a stale
+#      value, invent one, or omit it. Assume replay is unreliable.
+#   2. Projecting onto `node` would otherwise invent a tool the client never
+#      declared. The builtin therefore only projects when the request already
+#      declares a `node` tool; otherwise it warns and leaves the items for the
+#      converter to reject (the safe default).
+# See docs/transforms-reference.md#project_program_to_node_tool--downgrade-programmatic-tool-calling
+[transforms.program_to_node_downgrade]
+schema = "openai-responses"
+before_conversion.builtins = ["project_program_to_node_tool"]
 
 [transform_defaults]
 openai-completions = ["max_tokens_rename"]

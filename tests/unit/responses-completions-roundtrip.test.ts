@@ -449,6 +449,27 @@ describe('convertInputItemsToMessages', () => {
     assert.equal(msgs[1].tool_call_id, 'c1');
   });
 
+  it('tolerates a function_call_output with a caller field and no call_id (new spec fields)', () => {
+    // OpenAI's spec now allows `caller` (Direct/Program attribution) on
+    // function_call_output, and call_id is now optional/nullable. Neither is
+    // read by the converter, so this just locks in that unknown/absent fields
+    // don't break conversion.
+    const msgs = convertInputItemsToMessages([
+      { type: 'function_call', call_id: 'c1', name: 'search', arguments: '{"q":"x"}' },
+      {
+        type: 'function_call_output',
+        call_id: 'c1',
+        output: 'result',
+        caller: { type: 'direct' },
+      },
+    ]);
+
+    assert.equal(msgs.length, 2);
+    assert.equal(msgs[1].role, 'tool');
+    assert.equal(msgs[1].content, 'result');
+    assert.equal(msgs[1].tool_call_id, 'c1');
+  });
+
   it('converts array-form function_call_output text parts to a string', () => {
     const msgs = convertInputItemsToMessages([
       {
@@ -524,5 +545,91 @@ describe('convertInputItemsToMessages', () => {
     ]);
 
     assert.equal(msgs[0].role, 'system');
+  });
+
+  it('warns (not silently drops) on an unrecognized item type', () => {
+    // The Responses API item union keeps growing. An item this converter does
+    // not know still emits no message, but must be reported rather than
+    // vanishing from the upstream conversation — CLAUDE.md rule 8 (fail loud).
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    const msgs = convertInputItemsToMessages(
+      [{ type: 'computer_call_output', id: 'x1', call_id: 'c1', output: {} }],
+      { logger, requestId: 'req-1' },
+    );
+
+    assert.equal(msgs.length, 0, 'unrecognized item emits no message');
+    assert.equal(warnings.length, 1, 'exactly one warning for the dropped item');
+    assert.match(warnings[0], /unrecognized input item type: computer_call_output/);
+  });
+
+  it('rejects a program item with a 400 ValidationError rather than degrading it', () => {
+    // `program` carries a flat `code` string plus an opaque `fingerprint` the
+    // spec says must be round-tripped. Chat Completions can carry neither, so
+    // converting would silently break program replay upstream. Refuse instead.
+    assert.throws(
+      () => convertInputItemsToMessages([
+        { type: 'program', id: 'p1', call_id: 'c1', code: 'console.log(1)', fingerprint: 'fp-abc' },
+      ]),
+      (err: any) => {
+        assert.equal(err.name, 'ValidationError');
+        assert.equal(err.status, 400, 'surfaces to the client as a 400, not a 500');
+        assert.equal(err.type, 'invalid_request_error');
+        assert.match(err.message, /program/);
+        assert.match(err.message, /openai-responses/, 'points at the passthrough upstream as the fix');
+        return true;
+      },
+    );
+  });
+
+  it('rejects a program_output item with a 400 ValidationError', () => {
+    assert.throws(
+      () => convertInputItemsToMessages([
+        { type: 'program_output', id: 'o1', call_id: 'c1', result: '42', status: 'completed' },
+      ]),
+      (err: any) => {
+        assert.equal(err.name, 'ValidationError');
+        assert.equal(err.status, 400);
+        assert.match(err.message, /program_output/);
+        return true;
+      },
+    );
+  });
+
+  it('rejects a program item even when it is buried among valid items', () => {
+    // The reject must not depend on position — a mid-conversation program item
+    // is exactly the replay case that would otherwise be silently flattened.
+    assert.throws(
+      () => convertInputItemsToMessages([
+        { type: 'message', role: 'user', content: 'hi' },
+        { type: 'program', id: 'p1', call_id: 'c1', code: 'x()', fingerprint: 'fp' },
+        { type: 'message', role: 'assistant', content: 'done' },
+      ]),
+      (err: any) => err.name === 'ValidationError' && err.status === 400,
+    );
+  });
+
+  it('does not warn for recognized item types that intentionally emit nothing', () => {
+    // `additional_tools` and `reasoning` are consumed elsewhere and emit no
+    // message by design — they must not be reported as dropped.
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    convertInputItemsToMessages(
+      [
+        { type: 'additional_tools', role: 'developer', tools: [] },
+        { type: 'message', role: 'user', content: 'hi' },
+      ],
+      { logger, requestId: 'req-2' },
+    );
+
+    assert.deepEqual(warnings, [], 'no warnings for recognized types');
   });
 });

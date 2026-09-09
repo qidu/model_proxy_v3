@@ -3,14 +3,35 @@
  */
 
 import { OpenAIRequest, OpenAIMessage, OpenAIToolCall, OpenAIContent, OpenAIContentPart } from '../types/openai.js';
+import { Logger } from '../utils/logger.js';
 import { stringify } from '../utils/stringify.js';
+import { ValidationError } from '../utils/errors.js';
+
+/**
+ * Reports input items this converter did not recognize. The Responses API item
+ * union keeps growing (e.g. `program` / `program_output` for programmatic tool
+ * calling, `mcp_approval_response`, `computer_call_output`), and an unhandled
+ * item would otherwise be dropped from the upstream conversation with no trace.
+ */
+export interface ConversionWarnings {
+  logger?: Logger;
+  requestId?: string;
+}
+
+function warnUnhandledItem(type: string, warn?: ConversionWarnings): void {
+  warn?.logger?.warn(
+    warn.requestId ?? '',
+    `[responses->completions] dropped unrecognized input item type: ${type || '(missing type)'}`
+  );
+}
 
 /**
  * Convert OpenAI Responses API request to Chat Completions request
  */
 export function convertResponsesToChatCompletions(
   responsesRequest: Record<string, unknown>,
-  model: string
+  model: string,
+  warn?: ConversionWarnings
 ): OpenAIRequest {
   const messages: OpenAIMessage[] = [];
 
@@ -49,7 +70,7 @@ export function convertResponsesToChatCompletions(
           additionalTools.push(...(item.tools as Array<Record<string, unknown>>));
         }
       }
-      messages.push(...convertInputItemsToMessages(inputItems));
+      messages.push(...convertInputItemsToMessages(inputItems, warn));
     } else {
       // Object input - treat as user message
       messages.push({
@@ -172,7 +193,7 @@ export function convertResponsesToChatCompletions(
  * require a tool_use block's tool_result to immediately follow the single
  * message that emitted it.
  */
-export function convertInputItemsToMessages(items: Array<Record<string, unknown>>): OpenAIMessage[] {
+export function convertInputItemsToMessages(items: Array<Record<string, unknown>>, warn?: ConversionWarnings): OpenAIMessage[] {
   const allMessages: OpenAIMessage[] = [];
   let pendingReasoningContent: string | null = null;
 
@@ -247,7 +268,7 @@ export function convertInputItemsToMessages(items: Array<Record<string, unknown>
       continue;
     }
 
-    const msgs = convertInputItemToMessages(item, pendingReasoningContent);
+    const msgs = convertInputItemToMessages(item, pendingReasoningContent, warn);
     if (item.type === 'message') {
       pendingReasoningContent = null;
     }
@@ -294,7 +315,7 @@ function extractAssistantMessageParts(item: Record<string, unknown>): { text: st
 /**
  * Convert a single input item to one or more messages
  */
-function convertInputItemToMessages(item: Record<string, unknown>, pendingReasoningContent?: string | null): OpenAIMessage[] {
+function convertInputItemToMessages(item: Record<string, unknown>, pendingReasoningContent?: string | null, warn?: ConversionWarnings): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
   const role = item.role as string;
   const type = item.type as string;
@@ -372,6 +393,22 @@ function convertInputItemToMessages(item: Record<string, unknown>, pendingReason
       content: item.output != null ? convertResponsesContentToCompletions(item.output) : '',
       tool_call_id: item.call_id as string,
     });
+  } else if (type === 'program' || type === 'program_output') {
+    // Programmatic tool calling has no Chat Completions equivalent: `program`
+    // carries a flat JavaScript `code` string (not per-tool structured calls we
+    // could map onto `tool_calls`), and its `fingerprint` is an opaque replay
+    // token the spec says "must be round-tripped" — there is nowhere in a
+    // `messages` array to carry it. Flattening to text would yield a
+    // conversation that looks intact while silently breaking program replay
+    // upstream, so refuse the request instead of degrading it.
+    throw new ValidationError(
+      `Item type '${type}' (programmatic tool calling) cannot be converted to the Chat Completions API. ` +
+      `Use an 'openai-responses' upstream to pass these items through unmodified.`
+    );
+  } else {
+    // Unrecognized item type — emit nothing, but say so rather than dropping
+    // conversation content silently.
+    warnUnhandledItem(type, warn);
   }
 
   return messages;

@@ -195,6 +195,102 @@ describe('Tier-1 op: map_value', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tier-2 built-in: project_program_to_node_tool
+// ---------------------------------------------------------------------------
+
+describe('Tier-2 builtin: project_program_to_node_tool', () => {
+  const set: TransformSet = {
+    name: 'program_node',
+    schema: 'openai-responses',
+    before_conversion: { builtins: ['project_program_to_node_tool'] },
+  };
+  const ctx = makeCtx([set], 'before_conversion');
+  const nodeTool = { type: 'function', name: 'node', parameters: {} };
+
+  it('projects a program item onto a node function_call carrying code and fingerprint', () => {
+    const body = {
+      tools: [nodeTool],
+      input: [{ type: 'program', id: 'p1', call_id: 'c1', code: 'return 1+1', fingerprint: 'fp-abc' }],
+    };
+    const out = runHook('before_conversion', payload(body), ctx).body;
+    const items = out.input as Record<string, unknown>[];
+
+    assert.equal(items.length, 1);
+    assert.equal(items[0].type, 'function_call');
+    assert.equal(items[0].name, 'node');
+    assert.equal(items[0].call_id, 'c1', 'call_id is preserved so the output can pair with it');
+    assert.deepEqual(JSON.parse(items[0].arguments as string), {
+      code: 'return 1+1', fingerprint: 'fp-abc', type: 'program',
+    });
+  });
+
+  it('projects a program_output item onto a function_call_output carrying result and status', () => {
+    const body = {
+      tools: [nodeTool],
+      input: [{ type: 'program_output', id: 'o1', call_id: 'c1', result: '2', status: 'completed' }],
+    };
+    const out = runHook('before_conversion', payload(body), ctx).body;
+    const items = out.input as Record<string, unknown>[];
+
+    assert.equal(items[0].type, 'function_call_output');
+    assert.equal(items[0].call_id, 'c1');
+    assert.deepEqual(JSON.parse(items[0].output as string), {
+      result: '2', status: 'completed', type: 'program_output',
+    });
+  });
+
+  it('leaves program items untouched when no node tool is declared', () => {
+    // Without a declared `node` tool the projection would invent a capability
+    // the upstream was never given, so the builtin declines and lets the
+    // converter reject the request instead.
+    const body = {
+      tools: [{ type: 'function', name: 'search', parameters: {} }],
+      input: [{ type: 'program', id: 'p1', call_id: 'c1', code: 'x()', fingerprint: 'fp' }],
+    };
+    const out = runHook('before_conversion', payload(body), ctx).body;
+    const items = out.input as Record<string, unknown>[];
+
+    assert.equal(items[0].type, 'program', 'item is left for the converter to reject');
+  });
+
+  it('accepts a completions-style node tool declaration', () => {
+    const body = {
+      tools: [{ type: 'function', function: { name: 'node', parameters: {} } }],
+      input: [{ type: 'program', id: 'p1', call_id: 'c1', code: 'x()', fingerprint: 'fp' }],
+    };
+    const out = runHook('before_conversion', payload(body), ctx).body;
+    assert.equal((out.input as Record<string, unknown>[])[0].type, 'function_call');
+  });
+
+  it('preserves surrounding items and their order', () => {
+    const body = {
+      tools: [nodeTool],
+      input: [
+        { type: 'message', role: 'user', content: 'hi' },
+        { type: 'program', id: 'p1', call_id: 'c1', code: 'x()', fingerprint: 'fp' },
+        { type: 'program_output', id: 'o1', call_id: 'c1', result: 'ok', status: 'completed' },
+        { type: 'message', role: 'assistant', content: 'done' },
+      ],
+    };
+    const out = runHook('before_conversion', payload(body), ctx).body;
+    const items = out.input as Record<string, unknown>[];
+
+    assert.equal(items.length, 4);
+    assert.deepEqual(items.map(i => i.type),
+      ['message', 'function_call', 'function_call_output', 'message']);
+  });
+
+  it('is a no-op for requests with no program items', () => {
+    const body = {
+      tools: [nodeTool],
+      input: [{ type: 'message', role: 'user', content: 'hi' }],
+    };
+    const out = runHook('before_conversion', payload(body), ctx).body;
+    assert.deepEqual(out.input, [{ type: 'message', role: 'user', content: 'hi' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tier-2 built-in: lowercase_tool_schema_types
 // ---------------------------------------------------------------------------
 

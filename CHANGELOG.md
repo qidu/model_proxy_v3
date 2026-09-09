@@ -5,6 +5,88 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(responses): reject programmatic tool calling on completions upstreams, with an opt-in downgrade transform
+
+Follow-up to a review of the refreshed Responses API spec
+(`docs/openai-response-final.md` vs the older `docs/openai-response.md`). The
+line diff is ~370k lines but almost entirely reordering noise — sections were
+retitled and resorted (old: Create, Retrieve, Delete, Cancel, Compact; new:
+Cancel, Compact, Create, Delete, Get). The substantive changes:
+
+- **`FunctionCallOutput`**: `call_id` went from required `string` to optional
+  `string or null`, and the item gained `caller` (`Direct` / `Program`
+  attribution), `name`, and `namespace`. Additive — the converter ignores the
+  new fields, and an absent `call_id` correctly yields `undefined`. No code
+  change needed; a regression test locks the tolerance in.
+- **`ResponseOutputItem` union grew** from "17 more" to "25 more" variants:
+  `FunctionCallOutput`, `ComputerCallOutput`, `LocalShellCallOutput`,
+  `McpApprovalResponse`, and `CustomToolCallOutput` are now valid *output*
+  items, not input-only.
+- **New `program` / `program_output` items** (programmatic tool calling) —
+  absent from the old spec. See below.
+- **`previous_response_id`, `conversation`, `context_management` /
+  `compact_threshold`**: only `| null` nullability added, no functional
+  change. `ResponseCompactionItem` was inlined as `Compaction { encrypted_content,
+  type, id }` (dropping `created_by`) — cosmetic.
+- Lower priority, not acted on: `moderation`, `prompt_cache_options` /
+  `prompt_cache_diagnostics` (`prompt_cache_retention` now deprecated), three
+  new error codes, two new `incomplete_details.reason` values, and nine new
+  shell/steer streaming events.
+
+**Unrecognized input items are no longer dropped silently.**
+`convertInputItemToMessages` had no fallback branch, so any item type it did
+not know vanished from the upstream conversation with no trace (CLAUDE.md rule
+8). It now logs a warning naming the dropped type. `convertResponsesToChatCompletions`
+and `convertInputItemsToMessages` take an optional trailing
+`ConversionWarnings { logger?, requestId? }` argument; existing two-argument
+callers are unaffected.
+
+**`program` / `program_output` are rejected with a 400 rather than converted.**
+`program` carries a flat JavaScript `code` string (no structured sub-calls to
+map onto `tool_calls`) plus a `fingerprint` the spec says "must be
+round-tripped" — and a Chat Completions `messages` array has nowhere to carry
+an opaque replay token. Flattening to text or to a synthetic tool call would
+produce a conversation that looks intact while silently breaking program
+replay upstream, so the converter throws `ValidationError` (400,
+`invalid_request_error`) pointing at the `openai-responses` passthrough
+upstream instead. No handler plumbing was needed: `createErrorResponse`
+already maps `ClaudeProxyError.status`.
+
+Reachability was traced before adding the reject: only a *client* can put
+these items on the completions path. `handleAsPassthrough` never writes to the
+conversation store and never parses the response body, and all four
+`saveConversation` / `appendConversationThreadItems` call sites live in
+`handleAsCompletions`, storing output items the proxy itself constructs
+(`message`, `function_call`, `reasoning` only). Stored replay cannot
+reintroduce a `program` item.
+
+**New opt-in built-in `project_program_to_node_tool`** downgrades these items
+onto an ordinary `node` function call for testing against upstreams where you
+have verified the behavior. It runs at `before_conversion`, so the converter
+never sees the original items and the 400 remains the default. The projection
+is lossy in two documented ways — `fingerprint` becomes a model-authored
+argument (breaking round-tripping), and it would otherwise invent a tool the
+client never declared, so it only fires when a `node` tool is already
+declared. See [docs/transforms-reference.md](./docs/transforms-reference.md#project_program_to_node_tool--downgrade-programmatic-tool-calling).
+
+- `src/converters/responses-to-completions.ts`: `ConversionWarnings` param,
+  warn-on-unrecognized fallback, `program`/`program_output` reject.
+- `src/handlers/responses.ts`: passes `{ logger, requestId }` at all five
+  `convertResponsesToChatCompletions` call sites.
+- `src/utils/config-loader.ts`: registers `project_program_to_node_tool` in
+  `BuiltinName` / `BUILTIN_NAMES`.
+- `src/utils/request-transform.ts`: implements the built-in.
+- `docs/transforms-reference.md`: built-in table row + reference section.
+- `tests/unit/responses-completions-roundtrip.test.ts`: `caller`/optional
+  `call_id` tolerance, warn-vs-drop, and three reject tests (both item types,
+  plus mid-conversation position).
+- `tests/unit/request-transform.test.ts`: six tests for the built-in
+  (both projections, tool-declaration gating in both tool shapes, order
+  preservation, no-op).
+
+`tests/unit/responses-conversation-state.test.ts` needed no changes — the
+conversation-state fields had no functional spec change.
+
 ### fix(responses): handle array-form `function_call_output.output` when converting to Chat Completions
 
 Per the Responses API schema, `function_call_output.output` can be a string

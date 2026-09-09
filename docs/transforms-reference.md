@@ -109,6 +109,7 @@ Built-ins are declared in the `builtins` list of a hook slot. They run **before*
 | `ensure_tool_config_cache_ttl` | `anthropic-messages` | Translates Anthropic-native prompt caching on the system prompt into the litellm/Bedrock-bridge convention. Reads `cache_control` from `body.system` content blocks (the array-of-blocks shape — a plain-string `system` is ignored), then appends `{location:"tool_config", control:{...}}` to `body.cache_control_injection_points` when no `tool_config` entry already exists (caller-provided entries win). The serialized body is reordered so `cache_control_injection_points` lands after `tools`. No-op when `system` is absent, is a plain string, or carries no block-level `cache_control`. |
 | `ensure_trailing_user_message` | `anthropic-messages` | While `body.messages` ends with a non-`user` role (`assistant`, `system`, or anything else), pops that message outright, repeating until the array ends on `user` (or is empty). Covers both real Anthropic "assistant message prefill" (trailing `role:"assistant"`) and a trailing inline `role:"system"` message (some clients emit an agent-definitions block as a `system`-role message in `messages`, in addition to the normal top-level `system` field). Some Anthropic-compatible upstreams reject either case with the same 400 "This model does not support assistant message prefill." Emits one `LOG_LEVEL=trace` line per stripped message (`[ensure_trailing_user_message] stripped trailing <role> message: ...`) showing exactly what was removed. No-op when `messages` is empty/absent or already ends with `role:"user"`. |
 | `restore_client_model_alias` | any (`response_egress` only) | Rewrites the response body's `model` field back to the alias the client originally requested, undoing the request-side alias→target rewrite. Applies to both the buffered JSON body and each `chat.completion.chunk` SSE event. **Opt-in per route** — see [restore_client_model_alias](#restore_client_model_alias--echo-the-requested-alias-back-to-the-client) below for why this isn't a default. |
+| `project_program_to_node_tool` | `openai-responses` (`before_conversion` only) | Downgrades Responses `program` / `program_output` items (programmatic tool calling) into an ordinary `node` function call so an `openai-completions` upstream can carry them, instead of the request being rejected with a 400. **Lossy and opt-in — experimental.** Only projects when the request already declares a `node` tool. See [project_program_to_node_tool](#project_program_to_node_tool--downgrade-programmatic-tool-calling) below for the two known hazards before enabling it. |
 
 ### Built-in example
 
@@ -259,6 +260,76 @@ sub-target actually served the request.
 
 No-op when the response body has no `model` field, or when the resolving
 context has no client-requested model name to restore.
+
+---
+
+### `project_program_to_node_tool` — downgrade programmatic tool calling
+
+**Experimental, lossy, opt-in.** Enable this only to test against an upstream
+whose behavior you have verified; the default (a 400) is the safe path.
+
+The Responses API's programmatic tool calling produces two item types that
+have no Chat Completions equivalent:
+
+| Item | Fields |
+|------|--------|
+| `program` | `id`, `call_id`, `code` (JavaScript source), `fingerprint`, `type` |
+| `program_output` | `id`, `call_id`, `result`, `status`, `type` |
+
+Both appear in *responses* (as `ResponseOutputItem` variants) **and** in
+*requests* (the create-response `input` union accepts output-item types so a
+client can replay a prior turn as history). By default, an `openai-completions`
+route rejects them:
+
+```
+400 invalid_request_error
+Item type 'program' (programmatic tool calling) cannot be converted to the
+Chat Completions API. Use an 'openai-responses' upstream to pass these items
+through unmodified.
+```
+
+That is the correct default, because the conversion cannot be done losslessly
+(see hazards below). Attaching this built-in downgrades them instead:
+
+```toml
+[transforms.program_node]
+schema = "openai-responses"
+before_conversion.builtins = ["project_program_to_node_tool"]
+
+[models.my-model]
+transforms = "program_node"
+```
+
+The projection, applied at `before_conversion` so the converter never sees the
+original items:
+
+| Responses item | → | Chat Completions |
+|---|---|---|
+| `program {code, fingerprint, type}` | → | `function_call` named `node`, `arguments = {code, fingerprint, type}` |
+| `program_output {result, status, type}` | → | `function_call_output`, `output = {result, status, type}` |
+
+`call_id` is carried through both so the call and its result stay paired, and
+surrounding items keep their order.
+
+**Hazard 1 — `fingerprint` round-tripping breaks.** The spec documents
+`fingerprint` as an opaque replay token that "must be round-tripped". Here it
+becomes a `node` argument, and `arguments` is a field the *upstream model*
+authors on the next turn. Since that model has never seen a real fingerprint,
+it will copy the stale value, invent one, or omit it — and a stale fingerprint
+looks valid. The spec does not document what the platform does with a bad
+fingerprint, so assume replay is unreliable. This is inherent to the
+projection, not a fixable bug: the value originates from the Responses
+platform, and this mapping hands authorship to something that cannot know it.
+
+**Hazard 2 — inventing an undeclared tool.** Projecting onto `node` gives the
+upstream an assistant turn calling a tool the client never declared. Strict
+upstreams may reject the request; lenient ones may conclude `node` is
+available and start calling it, with no executor behind it. To contain this,
+the built-in **only projects when the request already declares a `node` tool**
+(either `{name: "node"}` or `{function: {name: "node"}}`). Otherwise it logs a
+warning and leaves the items alone, so the converter's 400 still applies.
+
+No-op when `input` is absent or contains no `program`/`program_output` items.
 
 ---
 
