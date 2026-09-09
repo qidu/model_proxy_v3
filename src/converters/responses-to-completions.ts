@@ -28,6 +28,7 @@ export function convertResponsesToChatCompletions(
 
   // Convert input items to messages
   const input = responsesRequest.input;
+  let additionalTools: Array<Record<string, unknown>> = [];
   if (input) {
     if (typeof input === 'string') {
       // Simple text input - treat as user message
@@ -37,7 +38,18 @@ export function convertResponsesToChatCompletions(
       });
     } else if (Array.isArray(input)) {
       // Array of input items — use the stateful converter to thread reasoning across turns
-      messages.push(...convertInputItemsToMessages(input as Array<Record<string, unknown>>));
+      const inputItems = input as Array<Record<string, unknown>>;
+      // `{ type: "additional_tools", role: "developer", tools: [...] }` items declare
+      // extra tools for this turn. Chat Completions has no per-item tool scoping —
+      // only one flat request-level `tools` array — so collect them here and merge
+      // into the top-level `tools` conversion below (same flat→nested handling,
+      // same function-tools-only filter as `responsesRequest.tools`).
+      for (const item of inputItems) {
+        if (item.type === 'additional_tools' && Array.isArray(item.tools)) {
+          additionalTools.push(...(item.tools as Array<Record<string, unknown>>));
+        }
+      }
+      messages.push(...convertInputItemsToMessages(inputItems));
     } else {
       // Object input - treat as user message
       messages.push({
@@ -72,13 +84,19 @@ export function convertResponsesToChatCompletions(
   if (responsesRequest.response_format !== undefined) {
     completionsRequest.response_format = responsesRequest.response_format as { type: 'text' | 'json_object' };
   }
-  if (responsesRequest.tools !== undefined) {
+  // Combine top-level `tools` with any `additional_tools` input items (developer-
+  // supplied extra tools for this turn — see the `input` loop above).
+  const allTools = [
+    ...(Array.isArray(responsesRequest.tools) ? (responsesRequest.tools as Array<Record<string, unknown>>) : []),
+    ...additionalTools,
+  ];
+  if (allTools.length > 0) {
     // Responses API function tools use a flat format:
     //   { type: "function", name: "fn", description?: "...", parameters: {...} }
     // Chat Completions uses a nested format:
     //   { type: "function", function: { name: "fn", description?: "...", parameters: {...} } }
-    // Non-function Responses API tools (web_search_preview, file_search, etc.) are dropped.
-    const converted = (responsesRequest.tools as Array<Record<string, unknown>>)
+    // Non-function Responses API tools (web_search_preview, file_search, mcp, etc.) are dropped.
+    const converted = allTools
       .filter(t => t.type === 'function')
       .map(t => {
         if (t.function != null) {
@@ -280,6 +298,12 @@ function convertInputItemToMessages(item: Record<string, unknown>, pendingReason
   const messages: OpenAIMessage[] = [];
   const role = item.role as string;
   const type = item.type as string;
+
+  if (type === 'additional_tools') {
+    // Developer-supplied extra tools for this turn — consumed by the tools
+    // merge in convertResponsesToChatCompletions above. Emit nothing here.
+    return messages;
+  }
 
   if (type === 'reasoning') {
     // Standalone reasoning output item — consumed by convertInputItemsToMessages above.

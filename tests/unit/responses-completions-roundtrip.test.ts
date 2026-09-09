@@ -220,6 +220,66 @@ describe('convertResponsesToChatCompletions', () => {
     assert.equal(out.tools!.length, 1);
   });
 
+  it('merges tools from an `additional_tools` input item into the request tools', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              { type: 'function', name: 'lookup', description: 'Lookup', parameters: { type: 'object' } },
+            ],
+          },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+    );
+
+    assert.equal(out.tools!.length, 1);
+    assert.equal(out.tools![0].type, 'function');
+    assert.equal((out.tools![0] as any).function.name, 'lookup');
+    // The additional_tools item itself must not produce a message.
+    assert.equal(out.messages.length, 1);
+    assert.equal(out.messages[0].role, 'user');
+  });
+
+  it('combines top-level tools with additional_tools tools, and still drops non-function ones', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          { type: 'additional_tools', role: 'developer', tools: [{ type: 'function', name: 'extra', parameters: {} }] },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+        tools: [
+          { type: 'function', name: 'search', parameters: {} },
+          { type: 'web_search_preview' },
+        ],
+      },
+      'model',
+    );
+
+    assert.equal(out.tools!.length, 2);
+    const names = out.tools!.map(t => (t as any).function.name).sort();
+    assert.deepEqual(names, ['extra', 'search']);
+  });
+
+  it('ignores an additional_tools item with a missing or non-array tools field', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          { type: 'additional_tools', role: 'developer' },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+    );
+
+    assert.equal(out.tools, undefined);
+    assert.equal(out.messages.length, 1);
+  });
+
   it('maps tool_choice { type: "function", name: "fn" } to nested format', () => {
     const out = convertResponsesToChatCompletions(
       { input: 'hi', tool_choice: { type: 'function', name: 'fn' } },

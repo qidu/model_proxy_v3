@@ -5,6 +5,30 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(responses): handle `additional_tools` input items when converting to Chat Completions
+
+The Responses API lets a request declare extra tools for a turn via an input
+item shaped `{ type: "additional_tools", role: "developer", tools: [...] }`
+(role is always `"developer"`). This item type was previously unhandled:
+`convertInputItemToMessages` silently dropped it (no branch matched), and its
+`tools` were never forwarded upstream — so tools declared this way were
+invisible to `openai-completions`/`anthropic-messages`/gemini-mode upstreams
+(the passthrough `openai-responses` path already worked, since native
+Responses API upstreams understand the item natively).
+
+`convertResponsesToChatCompletions` now collects `tools` from every
+`additional_tools` input item and merges them with the request's top-level
+`tools` before the existing flat→nested conversion runs — same
+function-tools-only filter as `tools` already had (non-function types like
+`mcp`, `web_search`, `code_interpreter` are dropped, matching existing
+behavior for the top-level field). The `additional_tools` item itself still
+emits no message, now via an explicit branch instead of falling through.
+
+- `src/converters/responses-to-completions.ts`: collect + merge `additional_tools`
+  tools; explicit no-op branch in `convertInputItemToMessages`.
+- `tests/unit/responses-completions-roundtrip.test.ts`: regression tests for
+  merging, combining with top-level `tools`, and a missing/malformed `tools` field.
+
 ### feat(config): add `openai-completions` as the default upstream mode in the model target wizard
 
 Both the TUI (`m` key) and dashboard "Add target model" wizard now include
