@@ -5,6 +5,22 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): handle array-form `function_call_output.output` when converting to Chat Completions
+
+Per the Responses API schema, `function_call_output.output` can be a string
+or an array of `input_text`/`input_image`/`input_file` parts, not just a
+string. `convertInputItemToMessages` was blindly casting it to `string`,
+which silently mangled array-form tool output (e.g. image results) sent
+upstream.
+
+Now reuses the existing `convertResponsesContentToCompletions` helper (same
+union already handled for message content) instead of the unchecked cast.
+
+- `src/converters/responses-to-completions.ts`: `function_call_output` branch
+  now converts `output` via `convertResponsesContentToCompletions`.
+- `tests/unit/responses-completions-roundtrip.test.ts`: regression tests for
+  array-form text-only and text+image output.
+
 ### feat(responses): handle `additional_tools` input items when converting to Chat Completions
 
 The Responses API lets a request declare extra tools for a turn via an input

@@ -364,10 +364,12 @@ function convertInputItemToMessages(item: Record<string, unknown>, pendingReason
     }
     messages.push(assistantMsg);
   } else if (type === 'function_call_output') {
-    // Tool result — map to a tool message
+    // Tool result — map to a tool message. `output` can be a string or an
+    // array of input_text/input_image/input_file parts (same union as
+    // message content), so reuse the shared converter instead of assuming string.
     messages.push({
       role: 'tool',
-      content: item.output as string ?? '',
+      content: item.output != null ? convertResponsesContentToCompletions(item.output) : '',
       tool_call_id: item.call_id as string,
     });
   }

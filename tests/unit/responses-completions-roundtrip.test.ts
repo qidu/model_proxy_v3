@@ -449,6 +449,40 @@ describe('convertInputItemsToMessages', () => {
     assert.equal(msgs[1].tool_call_id, 'c1');
   });
 
+  it('converts array-form function_call_output text parts to a string', () => {
+    const msgs = convertInputItemsToMessages([
+      {
+        type: 'function_call_output',
+        call_id: 'c1',
+        output: [{ type: 'input_text', text: 'result' }],
+      },
+    ]);
+
+    assert.equal(msgs[0].role, 'tool');
+    assert.equal(msgs[0].content, 'result');
+  });
+
+  it('converts array-form function_call_output with an image to content parts', () => {
+    const msgs = convertInputItemsToMessages([
+      {
+        type: 'function_call_output',
+        call_id: 'c1',
+        output: [
+          { type: 'input_text', text: 'see image' },
+          { type: 'input_image', image_url: 'https://example.com/x.png' },
+        ],
+      },
+    ]);
+
+    assert.equal(msgs[0].role, 'tool');
+    assert.ok(Array.isArray(msgs[0].content));
+    const parts = msgs[0].content as Array<Record<string, unknown>>;
+    assert.equal(parts[0].type, 'text');
+    assert.equal(parts[0].text, 'see image');
+    assert.equal(parts[1].type, 'image_url');
+    assert.deepEqual(parts[1].image_url, { url: 'https://example.com/x.png' });
+  });
+
   it('attaches pending reasoning_content to the next assistant turn', () => {
     const msgs = convertInputItemsToMessages([
       { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'deep thought' }] },
