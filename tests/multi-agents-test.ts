@@ -232,8 +232,27 @@ wire_api = "responses"
       model,
       modelReasoningEffort: "low",
     });
-    const result = await thread.run(prompt);
-    console.log("Codex result:", result.finalResponse ?? result);
+    // const result = await thread.run(prompt);
+    // console.log("Codex result:", result.finalResponse ?? result);
+
+    const { events } = await thread.runStreamed(prompt);
+    for await (const event of events) {
+      switch (event.type) {
+        case "item.started":
+          break;
+        case "item.completed":
+          if (event.item?.type === 'command_execution') {
+            console.log(`  ${event.item.command}`);
+            console.log(`  (aggregated_output length: ${event.item.aggregated_output.length})`);
+          }
+          break;
+        case "turn.completed":
+            console.log("Usage:", event.usage);
+            break;
+        default:
+            //console.log(event);
+      }
+    }
   } catch (error) {
     console.error("Codex failed:", error);
   }
