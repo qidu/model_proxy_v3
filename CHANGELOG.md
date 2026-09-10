@@ -5,6 +5,44 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(config): one unresolvable `STORE_KEY_IN_SYSTEM` sentinel no longer blocks startup
+
+Previously, if any single `api_key` sentinel could not be resolved from the OS
+keychain (no exact account and no best-effort base_url match), `applySystemKeyStore`
+threw a fatal `KeyStoreError` that aborted the entire config load — so one missing
+key stopped *every* model from loading and the proxy from starting (and, in TUI
+mode, left the screen stuck on "Loading…"; see the next entry).
+
+An unresolvable sentinel now skips just that slot instead of failing everything
+(Rule 8: fail loud, not fail-everything):
+
+- `src/utils/key-store.ts`: the resolve pass clears the offending slot to `''`
+  (identical to "not configured" — every consumer falls back through the normal
+  `api_key` chain: per-entry → section → `default_upstream.default_api_key` →
+  caller/user key), logs `[key-store] … no key was found …`, and collects it in a
+  new `unresolved` list. `applySystemKeyStore` now returns
+  `{ config, unresolved }`. The keychain itself being unavailable (`loadKeytar`
+  failure) and Consul/Apollo sentinels remain fatal `KeyStoreError`s.
+- `src/utils/config-loader.ts`: appends each `unresolved` entry to
+  `_validationErrors`, so it surfaces in the TUI message line, the dashboard
+  status bar (`config_errors`), and the console.
+- `tests/unit/key-store.test.ts`: the two "fails loud" tests now assert the slot
+  is cleared + reported (and that other slots still resolve) instead of rejecting.
+- Docs updated: `README.md`, `docs/configuration-reference.md`.
+
+### fix(tui): surface config-load errors on the initial "Loading…" screen
+
+If the first `loadConfig()` call at TUI startup threw (e.g. a
+`KeyStoreError` for an unresolvable `STORE_KEY_IN_SYSTEM` sentinel), the
+`refresh()` catch block recorded the error via `view.setMessage(...)`, but
+the header render returned early on `!snapshot` before ever reading that
+message — so the TUI looked permanently stuck on "Loading…" with no visible
+diagnostic (and `console.error` is silenced in TUI mode).
+
+- `src/tui.ts`: `DashboardView`'s render now appends the current message
+  (if set and not the default `'Ready'`) below `'Loading…'` while no
+  snapshot has loaded yet.
+
 ### fix(responses): flatten `namespace`-wrapped tools and best-effort convert `custom` tools when merging `additional_tools`
 
 The `additional_tools` merge added in the previous entry only kept entries

@@ -1171,6 +1171,9 @@ class DashboardView implements Component {
 
     if (!snap) {
       lines.push('Loading…');
+      if (this.message && this.message !== 'Ready') {
+        lines.push(yellow(this.message));
+      }
       return lines.map((line) => clip(line, width));
     }
 

@@ -3,7 +3,8 @@
  *
  * Covers: store pass (keychain accounts per target/category/default_upstream),
  * file rewrite (sentinel replacement + .bak backup + comment preservation),
- * resolve pass (sentinel → key, missing entry fatal), no-op when flag off,
+ * resolve pass (sentinel → key; a missing entry is reported + slot cleared, not fatal),
+ * no-op when flag off,
  * and withTimeout (the bound wrapped around findCredentials — see key-store.ts
  * comment above FIND_CREDENTIALS_TIMEOUT_MS: a real hang there was observed).
  *
@@ -100,7 +101,7 @@ describe('applySystemKeyStore', () => {
   it('is a no-op when store_key_in_system is not true', async () => {
     const keytar = makeMockKeytar();
     const config = parseSimpleToml(SAMPLE_TOML.replace('store_key_in_system = true', ''));
-    const result = await applySystemKeyStore(config, { keytarImpl: keytar });
+    const { config: result } = await applySystemKeyStore(config, { keytarImpl: keytar });
     assert.equal(keytar.calls.length, 0);
     assert.equal(result.models?.claude && !Array.isArray(result.models.claude) ? result.models.claude.api_key : '', 'sk-cat-111');
   });
@@ -226,7 +227,7 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
     assert.equal(glm['glm-5.3-anth']![2], 'sk-exact-base-KEY');
   });
 
-  it('still fails loud when no similar base_url exists in the keychain', async () => {
+  it('reports (not throws) when no similar base_url exists in the keychain, and clears the slot', async () => {
     const toml = `[general]
 store_key_in_system = true
 
@@ -239,14 +240,13 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
     ]));
     const config = parseSimpleToml(toml);
 
-    await assert.rejects(
-      applySystemKeyStore(config, { keytarImpl: keytar }),
-      (err: Error & { fatal?: boolean }) => {
-        assert.equal(err.fatal, true);
-        assert.match(err.message, /glm-5\.3-anth\/https:\/\/open\.bigmodel\.cn\/api\/anthropic/);
-        return true;
-      },
-    );
+    const { config: result, unresolved } = await applySystemKeyStore(config, { keytarImpl: keytar });
+
+    assert.equal(unresolved.length, 1);
+    assert.equal(unresolved[0].location, 'models.glm.glm-5.3-anth[2]');
+    assert.match(unresolved[0].message, /glm-5\.3-anth\/https:\/\/open\.bigmodel\.cn\/api\/anthropic/);
+    const glm = result.models!.glm as { 'glm-5.3-anth'?: string[] };
+    assert.equal(glm['glm-5.3-anth']![2], '', 'unresolved slot cleared instead of left as the sentinel');
   });
 
   it('marks the config for the TUI 🔒 indicator once keys are in the keychain', async () => {
@@ -265,24 +265,25 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
 
     // Flag off → no marker.
     const plainConfig = parseSimpleToml(SAMPLE_TOML.replace('store_key_in_system = true', ''));
-    const untouched = await applySystemKeyStore(plainConfig, { keytarImpl: makeMockKeytar() });
+    const { config: untouched } = await applySystemKeyStore(plainConfig, { keytarImpl: makeMockKeytar() });
     assert.equal(toDashboardConfigPayload(untouched).api_keys_in_system_store, false);
   });
 
-  it('fails loud when a sentinel has no keychain entry', async () => {
+  it('reports (not throws) when a sentinel has no keychain entry, and clears just that slot', async () => {
     const sentinelToml = SAMPLE_TOML.replace('sk-cat-111', STORE_KEY_IN_SYSTEM);
     const keytar = makeMockKeytar(); // empty keychain
     const config = parseSimpleToml(sentinelToml);
 
-    await assert.rejects(
-      applySystemKeyStore(config, { keytarImpl: keytar }),
-      (err: Error & { fatal?: boolean }) => {
-        assert.equal(err.fatal, true);
-        assert.match(err.message, /models\.claude\.api_key/);
-        assert.match(err.message, /claude\/https:\/\/api\.claude\.dev/);
-        return true;
-      },
-    );
+    const { config: result, unresolved } = await applySystemKeyStore(config, { keytarImpl: keytar });
+
+    assert.equal(unresolved.length, 1);
+    assert.equal(unresolved[0].location, 'models.claude.api_key');
+    assert.match(unresolved[0].message, /claude\/https:\/\/api\.claude\.dev/);
+    const claude = result.models!.claude as { api_key?: string };
+    assert.equal(claude.api_key, '', 'unresolved slot cleared instead of left as the sentinel');
+    // Other slots (default_upstream, gpt entry) still resolve normally —
+    // one bad sentinel does not block the rest of the config.
+    assert.equal(result.default_upstream!.default_api_key, 'sk-default-000');
   });
 
   it('stores plaintext keys and resolves them in the same load (fresh migration)', async () => {

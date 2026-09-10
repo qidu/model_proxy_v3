@@ -2523,10 +2523,20 @@ export async function loadProxyConfig(env: Env): Promise<ProxyConfig> {
     // and resolve existing sentinels back to real keys. LOCAL FILE SOURCE
     // ONLY (PROXY_CONFIG_PATH) — the feature is skipped for Consul/Apollo
     // configs, which cannot be rewritten and must not touch the keychain.
-    // Throws a fatal error when the keychain is unavailable or a sentinel
-    // cannot be resolved — no silent fallback.
+    // Throws a fatal error when the keychain itself is unavailable (affects
+    // every sentinel); an individual sentinel that can't be resolved is
+    // instead cleared to '' and reported below — one bad key must not block
+    // every other model from loading (Rule 8: fail loud, not fail everything).
     if (configPath && !configConsul && !configApollo) {
-      config = await applySystemKeyStore(config, { configPath });
+      const keyStoreResult = await applySystemKeyStore(config, { configPath });
+      config = keyStoreResult.config;
+      if (keyStoreResult.unresolved.length > 0) {
+        const meta = config as unknown as { _validationErrors?: ConfigValidationError[] };
+        meta._validationErrors = [
+          ...(meta._validationErrors ?? []),
+          ...keyStoreResult.unresolved.map((u) => ({ path: u.location, message: u.message })),
+        ];
+      }
     } else {
       if (config.general?.store_key_in_system === true) {
         console.warn('[key-store] store_key_in_system is only supported for local PROXY_CONFIG_PATH configs — ignoring it (Consul/Apollo source)');

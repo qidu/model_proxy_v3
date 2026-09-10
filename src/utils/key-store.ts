@@ -14,8 +14,11 @@
  *
  * This is a local/dev-host feature: the keytar native addon requires an OS
  * keychain (no Docker/distroless, no Cloudflare Workers). When the feature is
- * enabled but the keychain is unavailable, the error is fatal — no silent
- * fallback.
+ * enabled but the keychain itself is unavailable, the error is fatal — no
+ * silent fallback (it would affect every key). An individual sentinel that
+ * has no matching keychain entry is NOT fatal: that one slot is cleared to
+ * `''` (== "not configured", so the normal api_key fallback chain applies) and
+ * reported, so the rest of the config still loads and the proxy still starts.
  *
  * Scope: ONLY configured api_key values of `[models.*]` targets (and
  * `[default_upstream].default_api_key`) in the local `proxy_config.toml` file.
@@ -162,6 +165,14 @@ export interface ApplySystemKeyStoreOptions {
   keytarImpl?: KeytarLike;
 }
 
+/** One api_key slot whose sentinel could not be resolved from the keychain
+ *  (location + reason), recorded instead of thrown so config load can skip
+ *  just that slot and keep going. */
+export interface UnresolvedKeySentinel {
+  location: string;
+  message: string;
+}
+
 /**
  * Apply the system key store to a freshly parsed config (mutates in place):
  *
@@ -172,17 +183,22 @@ export interface ApplySystemKeyStoreOptions {
  *    plaintext key literal is replaced with `"STORE_KEY_IN_SYSTEM"`
  *    (targeted text replacement; comments and layout are preserved).
  * 3. Resolve pass — every `STORE_KEY_IN_SYSTEM` sentinel is replaced
- *    in-memory with the key fetched from the keychain. A missing keychain
- *    entry is fatal.
+ *    in-memory with the key fetched from the keychain. A slot whose sentinel
+ *    cannot be resolved is cleared to `''` (same as "not configured" — every
+ *    consumer of these slots falls back to the next key in the chain, or to
+ *    caller-supplied/user_key auth) and recorded in the returned
+ *    `unresolved` list instead of failing the whole config load; the
+ *    keychain itself being unavailable (`loadKeytar` failure) is still fatal,
+ *    since that affects every sentinel, not just one.
  *
  * No-op when `store_key_in_system` is not true or outside Node.js.
  */
 export async function applySystemKeyStore(
   config: ProxyConfig,
   opts: ApplySystemKeyStoreOptions = {},
-): Promise<ProxyConfig> {
+): Promise<{ config: ProxyConfig; unresolved: UnresolvedKeySentinel[] }> {
   if (!isNodeEnvironment || config.general?.store_key_in_system !== true) {
-    return config;
+    return { config, unresolved: [] };
   }
 
   const keytar = await loadKeytar(opts);
@@ -216,6 +232,7 @@ export async function applySystemKeyStore(
   // similarity as tiebreaker — e.g. wanted "glm-5.3-anth/https://…/api/anthropic"
   // can fall back to "glm-5.3/https://…/api". Every fallback use is warned.
   let resolvedCount = 0;
+  const unresolved: UnresolvedKeySentinel[] = [];
   for (const slot of slots) {
     if (slot.get() !== STORE_KEY_IN_SYSTEM) continue;
     const exact = await keytar.getPassword(KEY_STORE_SERVICE, slot.account);
@@ -234,10 +251,15 @@ export async function applySystemKeyStore(
       resolved = await findBestEffortKey(keytar, slot.account);
     }
     if (!resolved) {
-      throw new KeyStoreError(
-        `${slot.location} is "${STORE_KEY_IN_SYSTEM}" but no key was found in the system keychain` +
-        ` (service "${KEY_STORE_SERVICE}", account "${slot.account}" — exact and best-effort base_url match)`,
-      );
+      // Unresolvable sentinel: clear this one slot (same as "not configured"
+      // — downstream `||` fallback chains treat '' like undefined) and record
+      // it instead of throwing, so the rest of the config still loads.
+      const message = `${slot.location} is "${STORE_KEY_IN_SYSTEM}" but no key was found in the system keychain` +
+        ` (service "${KEY_STORE_SERVICE}", account "${slot.account}" — exact and best-effort base_url match)`;
+      console.error(`[key-store] ${message}`);
+      slot.set('');
+      unresolved.push({ location: slot.location, message });
+      continue;
     }
     if (resolved.account !== slot.account) {
       console.warn(`[key-store] exact keychain account "${slot.account}" not found — using best-effort match "${resolved.account}"`);
@@ -254,7 +276,7 @@ export async function applySystemKeyStore(
     (config as ProxyConfig & { _api_keys_in_system_store?: boolean })._api_keys_in_system_store = true;
   }
 
-  return config;
+  return { config, unresolved };
 }
 
 /**

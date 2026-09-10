@@ -456,7 +456,10 @@ The full field-by-field reference lives in
   sentinels; sentinels are resolved from the keychain on every later load, silently, as
   long as the same `node` binary/path keeps reading them — a Node upgrade or a different
   binary path can trigger a one-time OS keychain prompt or a fatal `KeyStoreError` if
-  access is denied. Scope:
+  keychain *access* is denied. A single sentinel with no matching keychain entry is not
+  fatal: that slot is cleared (treated as unconfigured, so the normal api_key fallback
+  applies) and reported as a config error in the TUI/dashboard/console, letting the rest
+  of the models load and the proxy start. Scope:
   configured api_keys of `[models.*]` targets (and `default_upstream.default_api_key`)
   in the local `proxy_config.toml` only — ignored for Consul/Apollo sources, N/A for
   composite aliases, and caller/user keys from request headers are never stored.
