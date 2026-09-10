@@ -603,6 +603,7 @@ models you trust. See `src/agent-tools.ts` for the exact checks.
 4. `Pi`
 5. `Codex`
 6. `opencode`
+7. `model_proxy_v3` (For over 90% of its lifecycle, it functions as a local LLM gateway and continuously improves itself with CC and models.)
 
 ## License
 
