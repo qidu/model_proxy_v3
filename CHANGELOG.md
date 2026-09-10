@@ -5,6 +5,31 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): flatten `namespace`-wrapped tools and best-effort convert `custom` tools when merging `additional_tools`
+
+The `additional_tools` merge added in the previous entry only kept entries
+with `type === 'function'`. Per `docs/openai-response-final.md`,
+`AdditionalTools.tools[]` also allows `Namespace` (`{ type: "namespace", name,
+tools: [...] }`, grouping `function`/`custom` tools under a shared name) and
+bare `Custom` tools — both were silently dropped, matching CLAUDE.md rule 8
+("fail loud") only for the wrapper, not its contents. A real client request
+with 3 namespaces / 11 tools converted to zero upstream tools.
+
+- **`flattenNamespaces`** recursively unwraps `namespace` entries (namespaces
+  can nest) before the existing `function`/`custom` filter runs. Chat
+  Completions has no namespace concept, so the grouping is discarded and only
+  the leaf tools remain.
+- **`custom` tools are best-effort converted to `function` tools** with a
+  permissive `{ input: string }` parameter schema, since Chat Completions has
+  no unconstrained-text tool type and `custom` tools carry no `parameters` to
+  translate. A warning is logged (`warn?.logger`) naming the tool, since the
+  model now sees a structured-argument tool instead of free text.
+
+- `src/converters/responses-to-completions.ts`: `flattenNamespaces` helper,
+  `custom` → `function` conversion with warning.
+- `tests/unit/responses-completions-roundtrip.test.ts`: recursive namespace
+  flattening test, custom-tool conversion + warning test.
+
 ### feat(responses): reject programmatic tool calling on completions upstreams, with an opt-in downgrade transform
 
 Follow-up to a review of the refreshed Responses API spec

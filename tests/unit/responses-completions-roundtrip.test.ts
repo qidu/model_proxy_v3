@@ -280,6 +280,83 @@ describe('convertResponsesToChatCompletions', () => {
     assert.equal(out.messages.length, 1);
   });
 
+  it('flattens namespace-wrapped tools (recursively) from additional_tools into the flat tools array', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'outer',
+                description: '',
+                tools: [
+                  { type: 'function', name: 'inner_fn', parameters: { type: 'object' } },
+                  {
+                    type: 'namespace',
+                    name: 'nested',
+                    description: '',
+                    tools: [{ type: 'function', name: 'deep_fn', parameters: {} }],
+                  },
+                ],
+              },
+            ],
+          },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+    );
+
+    const names = out.tools!.map(t => (t as any).function.name).sort();
+    assert.deepEqual(names, ['deep_fn', 'inner_fn']);
+  });
+
+  it('best-effort converts a custom tool to a function tool and warns', () => {
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'functions',
+                description: '',
+                tools: [{ type: 'custom', name: 'exec', description: 'Run a command' }],
+              },
+            ],
+          },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+      { logger, requestId: 'req-1' },
+    );
+
+    assert.equal(out.tools!.length, 1);
+    const tool = out.tools![0] as any;
+    assert.equal(tool.type, 'function');
+    assert.equal(tool.function.name, 'exec');
+    assert.equal(tool.function.description, 'Run a command');
+    assert.deepEqual(tool.function.parameters, {
+      type: 'object',
+      properties: { input: { type: 'string' } },
+      required: ['input'],
+    });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /best-effort converting custom tool 'exec'/);
+  });
+
   it('maps tool_choice { type: "function", name: "fn" } to nested format', () => {
     const out = convertResponsesToChatCompletions(
       { input: 'hi', tool_choice: { type: 'function', name: 'fn' } },

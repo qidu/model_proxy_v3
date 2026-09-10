@@ -26,6 +26,23 @@ function warnUnhandledItem(type: string, warn?: ConversionWarnings): void {
 }
 
 /**
+ * Recursively flattens `{ type: "namespace", tools: [...] }` entries (which group
+ * `function`/`custom` tools under a shared name) into a flat list of tools. Chat
+ * Completions has no namespace concept, so namespace grouping is discarded.
+ */
+function flattenNamespaces(tools: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const flat: Array<Record<string, unknown>> = [];
+  for (const t of tools) {
+    if (t.type === 'namespace' && Array.isArray(t.tools)) {
+      flat.push(...flattenNamespaces(t.tools as Array<Record<string, unknown>>));
+    } else {
+      flat.push(t);
+    }
+  }
+  return flat;
+}
+
+/**
  * Convert OpenAI Responses API request to Chat Completions request
  */
 export function convertResponsesToChatCompletions(
@@ -106,20 +123,39 @@ export function convertResponsesToChatCompletions(
     completionsRequest.response_format = responsesRequest.response_format as { type: 'text' | 'json_object' };
   }
   // Combine top-level `tools` with any `additional_tools` input items (developer-
-  // supplied extra tools for this turn — see the `input` loop above).
-  const allTools = [
+  // supplied extra tools for this turn — see the `input` loop above). `namespace`
+  // tools group `function`/`custom` tools under a shared name — flatten them into
+  // the same flat list before conversion (Chat Completions has no namespace concept).
+  const allTools = flattenNamespaces([
     ...(Array.isArray(responsesRequest.tools) ? (responsesRequest.tools as Array<Record<string, unknown>>) : []),
     ...additionalTools,
-  ];
+  ]);
   if (allTools.length > 0) {
     // Responses API function tools use a flat format:
     //   { type: "function", name: "fn", description?: "...", parameters: {...} }
     // Chat Completions uses a nested format:
     //   { type: "function", function: { name: "fn", description?: "...", parameters: {...} } }
-    // Non-function Responses API tools (web_search_preview, file_search, mcp, etc.) are dropped.
+    // `custom` tools (unconstrained-text tools, no `parameters`) are best-effort
+    // converted to function tools with a permissive string-input schema, since
+    // Chat Completions has no equivalent tool type.
+    // Other non-function Responses API tools (web_search_preview, file_search, mcp, etc.) are dropped.
     const converted = allTools
-      .filter(t => t.type === 'function')
+      .filter(t => t.type === 'function' || t.type === 'custom')
       .map(t => {
+        if (t.type === 'custom') {
+          warn?.logger?.warn(
+            warn.requestId ?? '',
+            `[responses->completions] best-effort converting custom tool '${t.name as string}' to a function tool (unconstrained-text input has no Chat Completions equivalent)`
+          );
+          return {
+            type: 'function' as const,
+            function: {
+              name: t.name as string,
+              ...(t.description != null ? { description: t.description as string } : {}),
+              parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] },
+            },
+          };
+        }
         if (t.function != null) {
           // Already in Chat Completions nested format — pass through as-is
           return t as unknown as { type: 'function'; function: { name: string; description?: string; parameters: any } };

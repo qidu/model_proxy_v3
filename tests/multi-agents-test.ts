@@ -67,6 +67,7 @@ const PROXY_BASE = process.env.PROXY_BASE || "http://127.0.0.1:7777";
 const WORK_DIR = "./tests/";
 
 const MODELS = [
+  "kimi-k3-qn",
   "deepseek-v4-comp",               // deepseek via openai-completions
   "deepseek-v4-anth",               // deepseek via anthropic-messages
   "max-m3-comp",                    // minimax via openai-completions
