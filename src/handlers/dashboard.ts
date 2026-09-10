@@ -439,6 +439,11 @@ export function handleDashboardPage(env: Env): Response {
       .alias-message.success { color: #2e7d32; }
 
       .config-block { border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-top: 10px; }
+      .config-block h3 { position: relative; padding-right: 34px; }
+      .config-block-title { background: #fff; padding: 3px 8px; border-radius: 4px; }
+      .config-block.collapsed > *:not(h3) { display: none; }
+      .collapse-btn { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); width: 22px; height: 22px; padding: 0; font-size: 12px; line-height: 1; color: #555; background: #fff; border: 1px solid #bdbdbd; border-radius: 4px; cursor: pointer; }
+      .collapse-btn:hover { background: #f5f5f5; }
       .config-row { display: grid; grid-template-columns: 260px 1fr 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
       .config-row label { font-weight: 600; }
       input[type="text"], input[type="number"], select {
@@ -464,12 +469,12 @@ export function handleDashboardPage(env: Env): Response {
       .sched-window-row select { width: auto; min-width: 110px; }
       .row-actions { display: flex; gap: 8px; align-items: center; }
       .mini-btn { padding: 4px 8px; font-size: 12px; justify-self: start; width: auto; }
-      .test-btn { padding: 4px 8px; font-size: 12px; background: #e8f5e9; border: 1px solid #a5d6a7; color: #2e7d32; }
+      .test-btn { padding: 4px 8px; font-size: 12px; background: #e8f5e9; border: 1px solid #a5d6a7; color: #2e7d32c7; }
       .test-btn:hover { background: #c8e6c9; }
       .test-btn.testing { background: #fff9c4; border-color: #fff176; color: #f57f17; }
       .test-btn.error-result { background: #ffebee; border-color: #ef9a9a; color: #c62828; }
       .test-btn.success-result { background: #e8f5e9; border-color: #a5d6a7; color: #2e7d32; }
-      .danger { background: #fff9c454; border: 1px solid #ffebee; }
+      .danger { background: ##fff9c350; border: 1px solid #fff176; }
       .section-actions { margin-top: 8px; }
       /* Tool blocklist */
       tr.tool-row.blocked { background: #fff1f1; }
@@ -2044,6 +2049,11 @@ export function handleDashboardPage(env: Env): Response {
       // in-flight change. Cleared after the next successful loadConfig().
       let configDirty = false;
 
+      // Block ids (e.g. "models.claude", "composite.fast") the user has
+      // collapsed. Kept here so the periodic loadConfig() re-render preserves
+      // the collapsed state instead of popping every section back open.
+      const collapsedBlockIds = new Set();
+
       function getAliasUsed(aliasName) {
         const resolved = compositeResolved.find(r => r.alias === aliasName);
         if (!resolved) return 0;
@@ -2373,6 +2383,10 @@ export function handleDashboardPage(env: Env): Response {
         }).join('');
       }
 
+      function collapseButtonHtml(collapsed) {
+        return '<button type="button" class="collapse-btn" data-action="toggle-collapse" title="Collapse / expand" aria-expanded="' + (collapsed ? 'false' : 'true') + '">' + (collapsed ? '▸' : '▾') + '</button>';
+      }
+
       function renderConfigForm(config) {
         const modelBlocks = Object.entries(config.models || {}).map(([categoryName, category]) => {
           const disabledAttr = isReadOnly ? ' disabled' : '';
@@ -2387,7 +2401,9 @@ export function handleDashboardPage(env: Env): Response {
 
           rows.push('<div class="section-actions"><button type="button" class="mini-btn" data-action="add-model" data-category="' + escapeHtml(categoryName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add model entry</button></div>');
 
-          return '<div class="config-block"><h3>models.' + escapeHtml(categoryName) + '</h3>' + rows.join('') + '</div>';
+          const blockId = 'models.' + categoryName;
+          const collapsed = collapsedBlockIds.has(blockId);
+          return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">models.' + escapeHtml(categoryName) + '</span>' + collapseButtonHtml(collapsed) + '</h3>' + rows.join('') + '</div>';
         }).join('');
 
         const compositeBlocks = Object.entries(config.composite || {}).map(([aliasName, targets]) => {
@@ -2401,14 +2417,18 @@ export function handleDashboardPage(env: Env): Response {
           const isCoordHead = aliasKeys.some((k) => { const c = (targets || {})[k] || {}; return typeof c.coord === 'number' && c.coord > 0; });
           const isFusionHead = !isCoordHead && !!targets.fusion_options;
           const aliasTypeTag = isCoordHead ? ' <span style="font-size:11px;color:#555;"><b>Ö</b></span>' : isFusionHead ? ' <span style="font-size:11px;color:#555;"><b>ƒ</b></span>' : ' <span style="font-size:11px;color:#555;"><b>Ç</b></span>';
-          return '<div class="config-block"><h3>composite.' + escapeHtml(aliasName) + aliasTypeTag + errorMark + '</h3>' + rows + '</div>';
+          const blockId = 'composite.' + aliasName;
+          const collapsed = collapsedBlockIds.has(blockId);
+          return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">composite.' + escapeHtml(aliasName) + '</span>' + aliasTypeTag + errorMark + collapseButtonHtml(collapsed) + '</h3>' + rows + '</div>';
         }).join('');
 
         const compositeGlobalActions = '<div class="section-actions"><button type="button" class="mini-btn" data-action="add-composite-alias"' + (isReadOnly ? ' disabled' : '') + '>Add composite alias</button></div>';
 
         const scheduleBlocks = Object.entries(config.schedule || {}).map(([aliasName, targets]) => {
           const rows = scheduleAliasRows(aliasName, targets);
-          return '<div class="config-block"><h3>schedule.' + escapeHtml(aliasName) + '</h3>' + rows
+          const blockId = 'schedule.' + aliasName;
+          const collapsed = collapsedBlockIds.has(blockId);
+          return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">schedule.' + escapeHtml(aliasName) + '</span>' + collapseButtonHtml(collapsed) + '</h3>' + rows
             + '<div class="section-actions">'
             + '<button type="button" class="mini-btn" data-action="add-schedule-target" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add target</button>'
             + ' <button type="button" class="mini-btn danger" data-action="remove-schedule-alias" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Remove alias</button>'
@@ -2660,6 +2680,19 @@ export function handleDashboardPage(env: Env): Response {
         }
         if (target.dataset.action === 'test-composite') {
           void testModel(target.dataset.alias);
+          return;
+        }
+
+        // Collapse/expand a config block. Handled before the read-only guard
+        // because it is a pure view toggle (no config mutation).
+        if (target.dataset.action === 'toggle-collapse') {
+          const block = target.closest('.config-block');
+          if (!block || !block.dataset.blockId) return;
+          const collapsed = block.classList.toggle('collapsed');
+          if (collapsed) collapsedBlockIds.add(block.dataset.blockId);
+          else collapsedBlockIds.delete(block.dataset.blockId);
+          target.textContent = collapsed ? '▸' : '▾';
+          target.setAttribute('aria-expanded', String(!collapsed));
           return;
         }
 
