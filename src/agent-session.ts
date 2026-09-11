@@ -414,16 +414,32 @@ export async function gatherSkillCandidates(
   globalSkillsDir: string = GLOBAL_SKILLS_DIR,
   lockPath: string = SKILL_LOCK_PATH,
 ): Promise<SkillCandidate[]> {
-  const env = new NodeExecutionEnv({ cwd: workDir });
-  const projectSkillsDir = resolve(workDir, '.pi/skills');
-  const { skills, diagnostics } = await loadSkills(env, [projectSkillsDir, globalSkillsDir]);
-  for (const diag of diagnostics) {
-    console.log(dim(`[skills] ${diag.code}: ${diag.message} (${diag.path})`));
+  // @earendil-works/pi-agent-core's loadSkills() walks directories via
+  // NodeExecutionEnv, which resolves paths with node:path (backslashes on
+  // win32), then hands them to its internal relativeEnvPath() — that function
+  // does naive "/"-string slicing instead of path.relative(), so on win32 it
+  // never strips the root prefix and passes a raw absolute Windows path into
+  // the `ignore` package, which throws `RangeError: path should be a
+  // path.relative()d string`. This reproduces on any real skill directory,
+  // not just edge cases, so pi-scoped skill loading is disabled on win32
+  // until upstream fixes it (lock-file-based other-agent candidates below
+  // don't go through loadSkills(), so they're unaffected and stay enabled).
+  // Tracked upstream against pi-agent-core.
+  let piScoped: SkillCandidate[] = [];
+  if (process.platform === 'win32') {
+    console.log(dim('[skills] pi-scoped skill loading disabled on win32 (upstream pi-agent-core bug: relativeEnvPath mishandles backslash paths) — see agent-session.ts gatherSkillCandidates.'));
+  } else {
+    const env = new NodeExecutionEnv({ cwd: workDir });
+    const projectSkillsDir = resolve(workDir, '.pi/skills');
+    const { skills, diagnostics } = await loadSkills(env, [projectSkillsDir, globalSkillsDir]);
+    for (const diag of diagnostics) {
+      console.log(dim(`[skills] ${diag.code}: ${diag.message} (${diag.path})`));
+    }
+    piScoped = skills.map((skill) => ({
+      item: { value: skill.name, label: skill.name, description: 'pi' },
+      skill,
+    }));
   }
-  const piScoped: SkillCandidate[] = skills.map((skill) => ({
-    item: { value: skill.name, label: skill.name, description: 'pi' },
-    skill,
-  }));
   const otherAgent = await gatherOtherAgentCandidates(new Set(piScoped.map((c) => c.item.value)), lockPath);
   return [...piScoped, ...otherAgent];
 }

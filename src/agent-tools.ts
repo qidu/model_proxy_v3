@@ -283,7 +283,15 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
           timedOut = true;
         }, BASH_TIMEOUT_MS);
         const child = execFile(
-          '/bin/sh',
+          // 'sh' (PATH-resolved) rather than the hardcoded '/bin/sh': execFile
+          // calls the OS spawn API directly, bypassing any shell's own path
+          // translation, so an absolute POSIX path isn't valid on Windows even
+          // under Git Bash — Node fails the spawn (ENOENT) before the command
+          // ever runs. Bare 'sh' resolves via PATH on both Unix (always
+          // present) and Windows with Git for Windows installed (this file
+          // already assumes POSIX shell syntax throughout — see the rm/mv
+          // denylist patterns below — so this doesn't add a new dependency).
+          'sh',
           ['-c', params.command],
           { cwd: workDir, timeout: BASH_TIMEOUT_MS, maxBuffer: BASH_MAX_BUFFER, signal },
           (error, stdout, stderr) => {
@@ -295,6 +303,18 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
             const signal = (error as (NodeJS.ErrnoException & { signal?: string }) | null)?.signal;
             if (error && signal) {
               rejectPromise(new Error(`Command was killed by signal ${signal} (not a timeout): ${params.command}`));
+              return;
+            }
+            // A real (nonzero) exit sets error.code to the numeric exit code
+            // (matching child.exitCode) — that's a normal outcome the caller
+            // must still see via stdout/stderr/exit code, not a rejection. A
+            // spawn failure (bad executable, EPERM, missing shell, etc.) sets
+            // error.code to an errno *string* (e.g. 'ENOENT') instead, and
+            // child.exitCode to a negative libuv errno rather than null —
+            // silently resolving that as if it were a real exit code (Rule 8:
+            // fail loud) previously reported success with a nonsense code.
+            if (error && typeof error.code === 'string') {
+              rejectPromise(new Error(`Failed to run command: ${error.message}`));
               return;
             }
             resolvePromise({ stdout, stderr, code: child.exitCode });

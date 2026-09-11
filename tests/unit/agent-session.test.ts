@@ -27,6 +27,16 @@ import type { ProxyConfig } from '../../src/utils/config-loader.js';
  * throw".
  */
 
+// gatherSkillCandidates disables pi-scoped skill loading (loadSkills()) on
+// win32 (upstream @earendil-works/pi-agent-core bug: relativeEnvPath does
+// "/"-string slicing instead of path.relative(), so it hands the `ignore`
+// package a raw absolute backslash path and throws — reproduces on any real
+// skill directory, not just edge cases). Lock-file-based other-agent
+// candidates don't go through loadSkills() and are unaffected. Tests that
+// load a real pi-scoped skill assert the win32-disabled behavior instead of
+// the real-loading behavior on that platform.
+const IS_WIN32 = process.platform === 'win32';
+
 let workDir: string;
 let globalSkillsDir: string;
 let lockFilePath: string;
@@ -68,6 +78,10 @@ describe('gatherSkillCandidates', () => {
 
     const result = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
 
+    if (IS_WIN32) {
+      assert.deepEqual(result, []);
+      return;
+    }
     assert.equal(result.length, 1);
     assert.equal(result[0].item.value, 'global-skill');
     assert.equal(result[0].item.description, 'pi');
@@ -81,6 +95,10 @@ describe('gatherSkillCandidates', () => {
 
     const result = await gatherSkillCandidates(workDir, resolve(globalSkillsDir, 'does-not-exist'), lockFilePath);
 
+    if (IS_WIN32) {
+      assert.deepEqual(result, []);
+      return;
+    }
     assert.equal(result.length, 1);
     assert.equal(result[0].item.value, 'project-skill');
     assert.equal(result[0].item.description, 'pi');
@@ -95,6 +113,10 @@ describe('gatherSkillCandidates', () => {
 
     const result = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
 
+    if (IS_WIN32) {
+      assert.deepEqual(result, []);
+      return;
+    }
     assert.equal(result.length, 2);
     const names = result.map((c) => c.item.value).sort();
     assert.deepEqual(names, ['global-skill', 'project-skill']);
@@ -111,6 +133,8 @@ describe('gatherSkillCandidates', () => {
 
     const result = await gatherSkillCandidates(workDir, resolve(globalSkillsDir, 'does-not-exist'), lockFilePath);
 
+    // Other-agent candidates come from the lock file, not loadSkills(), so
+    // they're unaffected by the win32 guard — this holds on every platform.
     assert.equal(result.length, 1);
     assert.equal(result[0].item.value, 'other-skill');
     assert.equal(result[0].item.description, 'needs install — some-org/some-pkg');
@@ -127,6 +151,15 @@ describe('gatherSkillCandidates', () => {
 
     const result = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
 
+    if (IS_WIN32) {
+      // shared-skill can't be seen as pi-scoped (loadSkills() is disabled), so
+      // it no longer dedupes and both lock-file entries surface as other-agent.
+      assert.equal(result.length, 2);
+      const names = result.map((c) => c.item.value).sort();
+      assert.deepEqual(names, ['other-skill', 'shared-skill']);
+      for (const c of result) assert.ok(c.installSource);
+      return;
+    }
     assert.equal(result.length, 2);
     const names = result.map((c) => c.item.value).sort();
     assert.deepEqual(names, ['other-skill', 'shared-skill']);
@@ -146,6 +179,10 @@ describe('gatherSkillCandidates', () => {
 
     const result = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
 
+    if (IS_WIN32) {
+      assert.deepEqual(result, []);
+      return;
+    }
     assert.equal(result.length, 1);
     assert.equal(result[0].item.value, 'global-skill');
   });
@@ -156,6 +193,10 @@ describe('gatherSkillCandidates', () => {
 
     const result = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
 
+    if (IS_WIN32) {
+      assert.deepEqual(result, []);
+      return;
+    }
     assert.equal(result.length, 1);
     assert.equal(result[0].item.value, 'global-skill');
   });
@@ -183,6 +224,12 @@ describe('loadSelectedSkills', () => {
     const candidates = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
     const result = await loadSelectedSkills(workDir, candidates, new Set(['skill-a']));
 
+    if (IS_WIN32) {
+      // gatherSkillCandidates() returns [] on win32, so there's no
+      // "skill-a" candidate to select — nothing to load or format.
+      assert.equal(result, '');
+      return;
+    }
     assert.match(result, /name="skill-a"/);
     assert.match(result, /Body A\./);
     assert.ok(!result.includes('skill-b'));
@@ -195,6 +242,10 @@ describe('loadSelectedSkills', () => {
     const candidates = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
     const result = await loadSelectedSkills(workDir, candidates, new Set(['skill-a', 'skill-b']));
 
+    if (IS_WIN32) {
+      assert.equal(result, '');
+      return;
+    }
     assert.match(result, /name="skill-a"/);
     assert.match(result, /Body A\./);
     assert.match(result, /name="skill-b"/);

@@ -19,6 +19,26 @@ import { createAgentTools } from '../../src/agent-tools.js';
 // scratch dir under this repo's own tests/unit, neither allowed root.
 const OUTSIDE_ROOT = resolve('tests/unit/.agent-tools-outside-scratch');
 
+// fs.symlinkSync requires elevated privileges (or Developer Mode) to create
+// symlinks as a regular user on Windows — unlike Unix, where any user can
+// `ln -s`. Probed once at module load (create+delete a throwaway symlink) so
+// the symlink-escape tests below can skip cleanly with a clear reason on a
+// machine without that privilege, instead of failing on an unrelated EPERM.
+const CAN_SYMLINK = (() => {
+  const probeDir = mkdtempSync(join(tmpdir(), 'agent-tools-symlink-probe-'));
+  const target = join(probeDir, 'target');
+  const link = join(probeDir, 'link');
+  writeFileSync(target, '');
+  try {
+    symlinkSync(target, link);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+})();
+
 let workDir: string;
 
 beforeEach(() => {
@@ -94,7 +114,11 @@ describe('read_file', () => {
     );
   });
 
-  it('blocks a read that escapes via a symlink inside workDir', async () => {
+  it('blocks a read that escapes via a symlink inside workDir', async (t) => {
+    if (!CAN_SYMLINK) {
+      t.skip('symlink creation not permitted on this machine (needs admin or Developer Mode on Windows)');
+      return;
+    }
     const tools = createAgentTools(workDir);
     const readFileTool = getTool(tools, 'read_file');
     const secret = join(OUTSIDE_ROOT, 'secret.txt');
@@ -153,7 +177,11 @@ describe('write_file', () => {
   // reporting success on an in-scope path while clobbering a file outside both
   // allowed roots. The agent can plant that symlink itself (`ln -s` is on no
   // denylist), making it a self-contained bypass of the whole confinement.
-  it('blocks a write that escapes via a symlinked file inside workDir, leaving the target intact', async () => {
+  it('blocks a write that escapes via a symlinked file inside workDir, leaving the target intact', async (t) => {
+    if (!CAN_SYMLINK) {
+      t.skip('symlink creation not permitted on this machine (needs admin or Developer Mode on Windows)');
+      return;
+    }
     const tools = createAgentTools(workDir);
     const writeFileTool = getTool(tools, 'write_file');
     const outsideTarget = join(OUTSIDE_ROOT, 'protected.txt');
@@ -167,7 +195,11 @@ describe('write_file', () => {
     assert.equal(readFileSync(outsideTarget, 'utf-8'), 'ORIGINAL', 'symlink target must not be overwritten');
   });
 
-  it('blocks a write through a symlinked parent directory inside workDir', async () => {
+  it('blocks a write through a symlinked parent directory inside workDir', async (t) => {
+    if (!CAN_SYMLINK) {
+      t.skip('symlink creation not permitted on this machine (needs admin or Developer Mode on Windows)');
+      return;
+    }
     const tools = createAgentTools(workDir);
     const writeFileTool = getTool(tools, 'write_file');
     // The leaf doesn't exist yet (the usual write_file case) — the escape is
@@ -296,7 +328,12 @@ describe('bash — Section 12 rm/mv path confinement', () => {
     const tmpFile = join(tmpdir(), `agent-tools-test-rm-${process.pid}.txt`);
     writeFileSync(tmpFile, 'x');
 
-    await bashTool.execute('t1', { command: `rm ${tmpFile}` });
+    // Single-quoted: on win32 the command runs under Git Bash's sh -c, which
+    // treats an unquoted backslash (from a Windows-native tmpdir() path) as
+    // its own escape character and strips it, mangling the path before rm
+    // ever sees it. Quoting is what a real shell-safe command would do
+    // anyway, so this isn't a workaround specific to the test.
+    await bashTool.execute('t1', { command: `rm '${tmpFile}'` });
 
     assert.equal(existsSync(tmpFile), false);
   });
@@ -406,7 +443,17 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 // 60s test. The behavior that changed is what happens on a *non*-timeout
 // kill, which is fast and meaningful to assert directly.
 describe('bash — timeout vs. non-timeout kill', () => {
-  it('does not misreport an externally-signaled kill as a timeout', async () => {
+  it('does not misreport an externally-signaled kill as a timeout', async (t) => {
+    // On win32 the shell is Git Bash/MSYS2's sh, which doesn't deliver
+    // `kill -TERM $$` as a real POSIX signal Node can observe: execFile's
+    // error.signal stays null and error.code comes back as an MSYS2-specific
+    // numeric encoding rather than a real exit code, so the command resolves
+    // instead of rejecting. This is a platform capability gap in Git Bash's
+    // signal emulation, not a bug in the bash tool.
+    if (process.platform === 'win32') {
+      t.skip('Git Bash/MSYS2 does not surface self-delivered signals to Node on win32');
+      return;
+    }
     const tools = createAgentTools(workDir);
     const bashTool = getTool(tools, 'bash');
 

@@ -5,6 +5,131 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### test(agent-tools): quote a spliced tmp-path in the /tmp/ rm test; skip the signal-kill test on win32
+
+Two follow-on test fixes after switching the bash tool's shell to bare `'sh'`
+(previous entry):
+
+- "allows rm on a path under the real /tmp/ tree" spliced `tmpdir()`'s
+  Windows-native backslash path unquoted into the command string
+  (`` `rm ${tmpFile}` ``). On win32 the command runs under Git Bash's
+  `sh -c`, which treats an unquoted backslash as its own shell escape
+  character and strips it, so `rm` received a mangled path and silently did
+  nothing — the file survived and the assertion failed. Fixed by
+  single-quoting the path (`` `rm '${tmpFile}'` ``), which is what a real
+  shell-safe command would do regardless of platform — not a
+  Windows-specific workaround. Every other test in this file that splices an
+  absolute path into a command is wrapped in `assert.rejects()`, where the
+  path-escape check rejects the command from its raw string before it ever
+  reaches `sh -c` — so backslash-mangling never mattered for those; this is
+  the one test where the command is expected to actually execute.
+- "does not misreport an externally-signaled kill as a timeout" relies on
+  `kill -TERM $$` delivering a real POSIX signal that `execFile` surfaces via
+  `error.signal`. Git Bash/MSYS2's `sh` doesn't do that: `error.signal` stays
+  `null` and `error.code` comes back as an MSYS2-specific numeric encoding,
+  so the command resolves instead of rejecting. This is a platform capability
+  gap in Git Bash's signal emulation, not a bash-tool bug, so the test is
+  skipped on `win32` via `t.skip(...)` with the reason recorded instead of
+  being weakened or deleted.
+
+### fix(agent-tools): bash tool hardcoded `/bin/sh`, which doesn't resolve via `execFile` on Windows
+
+`execFile` calls the OS spawn API directly — it doesn't go through any
+shell's own path translation, so an absolute POSIX path like `/bin/sh` isn't
+valid on Windows even with Git Bash installed, and the spawn fails with
+`ENOENT` before the command ever runs (surfaced honestly as of the previous
+fix below, instead of silently misreporting success).
+
+- `src/agent-tools.ts`: changed the bash tool's `execFile('/bin/sh', ...)` to
+  `execFile('sh', ...)`, resolving the executable via `PATH` instead. `sh` is
+  always present on Unix and, on Windows, resolves to Git for Windows'
+  `sh.exe` when installed — this file already assumes POSIX shell syntax
+  throughout (see the rm/mv denylist patterns), so relying on a POSIX shell
+  being on `PATH` isn't a new dependency, just no longer hardcoded to a
+  POSIX-only absolute path. (Deliberately not `'bash'`: Windows ships a WSL
+  `bash.exe` shim in `System32` with no `sh.exe` equivalent, which could
+  shadow Git Bash's `bash.exe` depending on `PATH` order — `'sh'` has no such
+  ambiguity.)
+- Fixes 5 of the 7 tests in `tests/unit/agent-tools.test.ts` that were still
+  failing after the fail-loud fix below.
+
+### fix(agent-tools): bash tool silently "succeeded" on a spawn failure instead of failing loud
+
+The `bash` tool's `execFile` callback only rejected the promise when it
+detected a timeout or a signal kill; any other `error` (e.g. the child
+process failing to spawn at all) fell through to
+`resolvePromise({ stdout, stderr, code: child.exitCode })` — reporting
+success with whatever nonsense `child.exitCode` held, rather than surfacing
+the real failure (Rule 8: fail loud, never swallow errors).
+
+Concretely: on a machine where the hardcoded `/bin/sh` executable can't be
+spawned (`ENOENT`), Node sets `child.exitCode` to the *negative libuv errno*
+(`-4058` for `ENOENT`) instead of `null`, and the old code returned that as
+if it were a real command exit code — so every `bash` call silently reported
+`exit code: -4058` and empty stdout instead of erroring, and any test
+asserting "does not reject" on a normal command passed for the wrong reason.
+
+- `src/agent-tools.ts`: the callback now distinguishes a real exit (execFile
+  sets `error.code` to the *numeric* exit code, matching `child.exitCode`)
+  from a spawn failure (`error.code` is an errno *string* like `'ENOENT'`,
+  `child.exitCode` is a negative libuv number) — `typeof error.code ===
+  'string'` now rejects with a clear `Failed to run command: <message>`
+  instead of resolving.
+- This is a general correctness fix (any spawn failure on any platform —
+  bad executable, `EACCES`, etc. — now surfaces honestly), not specific to
+  the `/bin/sh` case. Whether/how to make the bash tool's shell executable
+  itself resolve on Windows is a separate, not-yet-decided question — see
+  the now-honest failures in `tests/unit/agent-tools.test.ts` ("bash —
+  normal execution", "bash — Section 12 rm/mv path confinement", "bash —
+  timeout vs. non-timeout kill") for the current state on a Windows
+  machine where `/bin/sh` doesn't resolve via `execFile`.
+
+### test(agent-tools): skip symlink-escape tests when the OS won't allow creating symlinks
+
+Three `write_file`/`read_file` path-confinement tests create a symlink
+(`fs.symlinkSync`) to prove the escape-via-symlink case is actually blocked.
+On Windows, `symlinkSync` throws `EPERM: operation not permitted` for a
+non-elevated user without Developer Mode enabled — an OS privilege gate, not
+a bug in `src/agent-tools.ts` or the tests. This left the tests failing (not
+skipping) with a misleading `EPERM`, on any Windows machine without that
+privilege.
+
+- `tests/unit/agent-tools.test.ts`: added a `CAN_SYMLINK` capability probe
+  (create+delete one throwaway symlink at module load) and each of the three
+  symlink-based tests now calls `t.skip(...)` with a clear reason and
+  returns early when the probe failed, instead of calling `symlinkSync` and
+  failing on the resulting `EPERM`.
+- No change to `src/agent-tools.ts` — the path-confinement logic under test
+  is unaffected; only test *setup* (symlink creation) needed the guard.
+- To actually exercise these tests locally on Windows: enable Developer Mode
+  (Settings → Privacy & security → For developers) or run the test command
+  elevated.
+
+### fix(agent-session): disable pi-scoped skill loading on win32 (upstream `ignore` crash)
+
+`gatherSkillCandidates` (agent-session skills picker) crashed on Windows for
+any skills directory containing real files, not just malformed-lock-file edge
+cases — `RangeError: path should be a path.relative()d string` from the
+`ignore` package.
+
+Root cause is upstream, in `@earendil-works/pi-agent-core`'s `loadSkills()`:
+its `NodeExecutionEnv` resolves paths with `node:path` (backslashes on
+win32), then `skills.js`'s internal `relativeEnvPath()` strips the root
+prefix via naive `"/"`-string slicing instead of `path.relative()` — on
+win32 that never matches, so a raw absolute Windows path gets passed to
+`ignore().ignores(...)`, which throws.
+
+- `src/agent-session.ts`: `gatherSkillCandidates` now skips the `loadSkills()`
+  call on `process.platform === 'win32'` (logs why via the existing
+  `[skills]` diagnostic line) and returns no pi-scoped candidates on that
+  platform. Lock-file-based other-agent candidates (`gatherOtherAgentCandidates`)
+  don't go through `loadSkills()` and are unaffected.
+- `tests/unit/agent-session.test.ts`: tests that load a real pi-scoped skill
+  now branch on `IS_WIN32` and assert the disabled-on-win32 behavior on that
+  platform, and the real-loading behavior elsewhere.
+- Tracked upstream against `@earendil-works/pi-agent-core`; revisit once
+  fixed there.
+
 ### fix(config): one unresolvable `STORE_KEY_IN_SYSTEM` sentinel no longer blocks startup
 
 Previously, if any single `api_key` sentinel could not be resolved from the OS
