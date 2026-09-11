@@ -13,7 +13,7 @@ import { addForwardedHeaders, normalizeOpenAIAuthHeaders } from '../utils/routin
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
-import { convertResponsesToChatCompletions, getNamespaceMap, NAMESPACE_SEPARATOR } from '../converters/responses-to-completions.js';
+import { convertResponsesToChatCompletions, getNamespaceMap, NamespaceMap } from '../converters/responses-to-completions.js';
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../converters/completions-to-responses.js';
 import { getConversation, saveConversation, normalizeInputToItems, getConversationThreadItems, appendConversationThreadItems } from '../utils/conversation-store.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
@@ -864,14 +864,14 @@ function streamCompletionsAsResponses(
   logger?: Logger,
   onComplete?: (responseId: string, outputItems: unknown[], completedResponse?: Record<string, unknown>) => void,
   conversationId?: string,
-  namespaceMap?: Map<string, string>
+  namespaceMap?: NamespaceMap
 ): Response {
   // Given a possibly-flattened tool name, restores the original `name`/`namespace`
   // split recorded by convertResponsesToChatCompletions, if it was a namespaced tool.
   const splitNamespace = (flatName: string): { name: string; namespace?: string } => {
-    const namespace = namespaceMap?.get(flatName);
-    if (!namespace) return { name: flatName };
-    return { name: flatName.slice(namespace.replace(/\./g, NAMESPACE_SEPARATOR).length + NAMESPACE_SEPARATOR.length), namespace };
+    const entry = namespaceMap?.get(flatName);
+    if (!entry) return { name: flatName };
+    return { name: entry.name, namespace: entry.namespace };
   };
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
   const itemId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;

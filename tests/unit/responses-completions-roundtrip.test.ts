@@ -314,8 +314,40 @@ describe('convertResponsesToChatCompletions', () => {
     assert.deepEqual(names, ['outer_Z_inner_fn', 'outer_Z_nested_Z_deep_fn']);
 
     const namespaceMap = getNamespaceMap(out);
-    assert.equal(namespaceMap?.get('outer_Z_inner_fn'), 'outer');
-    assert.equal(namespaceMap?.get('outer_Z_nested_Z_deep_fn'), 'outer.nested');
+    assert.deepEqual(namespaceMap?.get('outer_Z_inner_fn'), { name: 'inner_fn', namespace: 'outer' });
+    assert.deepEqual(namespaceMap?.get('outer_Z_nested_Z_deep_fn'), { name: 'deep_fn', namespace: 'outer.nested' });
+  });
+
+  it('shortens a flattened name over the 64-char function.name limit and round-trips it', () => {
+    const ns = 'a'.repeat(40);
+    const toolName = 'b'.repeat(40);
+    const out = convertResponsesToChatCompletions(
+      {
+        tools: [
+          { type: 'namespace', name: ns, description: '', tools: [{ type: 'function', name: toolName, parameters: { type: 'object' } }] },
+        ],
+        input: [{ type: 'message', role: 'user', content: 'hi' }],
+      },
+      'model',
+    );
+
+    const flatName = (out.tools![0] as any).function.name as string;
+    assert.equal(flatName.length, 64, `expected a 64-char shortened name, got ${flatName.length}`);
+    const namespaceMap = getNamespaceMap(out);
+    assert.deepEqual(namespaceMap?.get(flatName), { name: toolName, namespace: ns });
+
+    const completion = {
+      id: 'chatcmpl-long', object: 'chat.completion' as const, created: 1700000000, model: 'model',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: flatName, arguments: '{}' } }] },
+        finish_reason: 'tool_calls' as const,
+      }],
+    };
+    const responsesResponse = convertCompletionsToResponses(completion, 'model', namespaceMap);
+    const fnCall = responsesResponse.output.find(o => o.type === 'function_call')!;
+    assert.equal(fnCall.name, toolName);
+    assert.equal((fnCall as any).namespace, ns);
   });
 
   it('restores the original name/namespace split on the function_call output item', () => {
@@ -407,7 +439,7 @@ describe('convertResponsesToChatCompletions', () => {
     });
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /best-effort converting custom tool 'functions_Z_exec'/);
-    assert.equal(getNamespaceMap(out)?.get('functions_Z_exec'), 'functions');
+    assert.deepEqual(getNamespaceMap(out)?.get('functions_Z_exec'), { name: 'exec', namespace: 'functions' });
   });
 
   it('maps tool_choice { type: "function", name: "fn" } to nested format', () => {

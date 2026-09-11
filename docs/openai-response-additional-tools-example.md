@@ -80,13 +80,18 @@ flattened recursively (`flattenNamespaces`), and each leaf tool is **renamed
 to `<namespace>_Z_<tool>`** with nesting joined by `_Z_` at every level (e.g.
 `collaboration_Z_spawn_agent`, `outer_Z_nested_Z_deep_fn`). Prefixing avoids
 collisions when two namespaces contain a same-named tool, and preserves enough
-information to reverse the mapping. `custom` tools are best-effort converted
+information to reverse the mapping. Flattened names longer than 64 chars (the
+`function.name` limit imposed by Chat Completions/Anthropic/Gemini) are
+shortened to a readable truncated head plus a per-request counter (e.g.
+`<head>_1`). `custom` tools are best-effort converted
 to `function` tools with a permissive `{ input: string }` parameter schema
 (logged as a warning), since Chat Completions has no namespace or
 unconstrained-text tool concept.
 
-The flattening pass also records a `Map<flatName, namespacePath>` (path joined
-with `.`, e.g. `outer_Z_nested_Z_deep_fn` → `outer.nested`). It is attached to the
+The flattening pass also records a `Map<flatName, { name, namespace? }>` (the
+`namespace` path joined with `.`, e.g. `outer_Z_nested_Z_deep_fn` →
+`{ name: 'deep_fn', namespace: 'outer.nested' }`), so the original bare name is
+recovered by lookup even when the flat name was shortened. It is attached to the
 returned `OpenAIRequest` as a non-enumerable `__namespaceMap` property and read
 back with `getNamespaceMap(request)`. When the upstream calls a flattened tool,
 `convertCompletionsToResponses` (and the streaming transform) look the name up
@@ -95,5 +100,5 @@ plus the original `namespace` path — restoring the spec shape documented in
 `docs/openai-response-final.md`. Tools that did not come from a namespace are
 emitted unchanged (bare `name`, no `namespace` field).
 
-See `CHANGELOG.md` ("fix(responses): prefix flattened namespace tool names...")
+See `CHANGELOG.md` ("fix(responses): shorten flattened namespace tool names...")
 for details.

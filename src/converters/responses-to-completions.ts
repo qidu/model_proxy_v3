@@ -56,6 +56,36 @@ if (configuredNamespaceSeparator && !NAMESPACE_SEPARATOR_PATTERN.test(configured
 export const NAMESPACE_SEPARATOR = configuredNamespaceSeparator || DEFAULT_NAMESPACE_SEPARATOR;
 
 /**
+ * Chat Completions (and Anthropic/Gemini) restrict `function.name` to 64 chars
+ * in addition to the `[a-zA-Z0-9_-]` charset. A flattened name can exceed this
+ * when namespace + tool names are long, so over-long names are shortened (see
+ * {@link shortenFlatName}) and the map records the original split.
+ */
+const MAX_FUNCTION_NAME_LENGTH = 64;
+
+/**
+ * How to restore a flattened tool name back to the Responses API shape:
+ * the bare tool `name` and its optional dot-joined `namespace` path.
+ */
+export interface NamespaceMapEntry {
+  name: string;
+  namespace?: string;
+}
+
+export type NamespaceMap = Map<string, NamespaceMapEntry>;
+
+/**
+ * Shortens an over-long flattened tool name to fit `MAX_FUNCTION_NAME_LENGTH`
+ * while staying identifiable: a readable truncated head plus a per-request
+ * monotonic counter (`<head>_<counter>`), so distinct long names never collide.
+ */
+function shortenFlatName(flatName: string, counter: { value: number }): string {
+  counter.value += 1;
+  const suffix = `_${counter.value}`;
+  return `${flatName.slice(0, MAX_FUNCTION_NAME_LENGTH - suffix.length)}${suffix}`;
+}
+
+/**
  * Recursively flattens `{ type: "namespace", name, tools: [...] }` entries
  * (which group `function`/`custom` tools under a shared name) into a flat
  * list of tools. Chat Completions has no namespace concept, so each leaf
@@ -63,14 +93,14 @@ export const NAMESPACE_SEPARATOR = configuredNamespaceSeparator || DEFAULT_NAMES
  * `_Z_` at every level, e.g. `outer_Z_nested_Z_deep_fn`) to avoid name
  * collisions between namespaces and to preserve enough information to
  * restore the original `name`/`namespace` split when converting a tool call
- * back to a Responses API `function_call` output item.
- *
- * `namespaceMap` accumulates `flatName -> namespacePath` (dot-joined, e.g.
- * `outer.nested`) for every renamed tool.
+ * back to a Responses API `function_call` output item. Names longer than
+ * `MAX_FUNCTION_NAME_LENGTH` are shortened; `namespaceMap` records the
+ * original `{ name, namespace }` under the final flat name either way.
  */
 function flattenNamespaces(
   tools: Array<Record<string, unknown>>,
-  namespaceMap: Map<string, string>,
+  namespaceMap: NamespaceMap,
+  counter: { value: number },
   prefix = ''
 ): Array<Record<string, unknown>> {
   const flat: Array<Record<string, unknown>> = [];
@@ -78,10 +108,11 @@ function flattenNamespaces(
     if (t.type === 'namespace' && Array.isArray(t.tools)) {
       const nsName = t.name as string;
       const nsPath = prefix ? `${prefix}.${nsName}` : nsName;
-      flat.push(...flattenNamespaces(t.tools as Array<Record<string, unknown>>, namespaceMap, nsPath));
+      flat.push(...flattenNamespaces(t.tools as Array<Record<string, unknown>>, namespaceMap, counter, nsPath));
     } else if (prefix && typeof t.name === 'string') {
-      const flatName = `${prefix.replace(/\./g, NAMESPACE_SEPARATOR)}${NAMESPACE_SEPARATOR}${t.name}`;
-      namespaceMap.set(flatName, prefix);
+      const fullName = `${prefix.replace(/\./g, NAMESPACE_SEPARATOR)}${NAMESPACE_SEPARATOR}${t.name}`;
+      const flatName = fullName.length > MAX_FUNCTION_NAME_LENGTH ? shortenFlatName(fullName, counter) : fullName;
+      namespaceMap.set(flatName, { name: t.name, namespace: prefix });
       flat.push({ ...t, name: flatName });
     } else {
       flat.push(t);
@@ -174,13 +205,13 @@ export function convertResponsesToChatCompletions(
   // supplied extra tools for this turn — see the `input` loop above). `namespace`
   // tools group `function`/`custom` tools under a shared name — flatten them into
   // the same flat list before conversion (Chat Completions has no namespace concept),
-  // renaming leaf tools to `<namespace>_<tool>` and recording the mapping so the
+  // renaming leaf tools to `<namespace>_Z_<tool>` and recording the mapping so the
   // response conversion can restore the original `name`/`namespace` split.
-  const namespaceMap = new Map<string, string>();
+  const namespaceMap: NamespaceMap = new Map();
   const allTools = flattenNamespaces([
     ...(Array.isArray(responsesRequest.tools) ? (responsesRequest.tools as Array<Record<string, unknown>>) : []),
     ...additionalTools,
-  ], namespaceMap);
+  ], namespaceMap, { value: 0 });
   if (allTools.length > 0) {
     // Responses API function tools use a flat format:
     //   { type: "function", name: "fn", description?: "...", parameters: {...} }
@@ -277,13 +308,13 @@ export function convertResponsesToChatCompletions(
 }
 
 /**
- * Reads back the `flatName -> namespacePath` map attached to a request
+ * Reads back the `flatName -> { name, namespace }` map attached to a request
  * returned by {@link convertResponsesToChatCompletions}, if any namespaced
  * tools were flattened. Used by response conversion to restore the original
  * `name`/`namespace` split on `function_call` output items.
  */
-export function getNamespaceMap(completionsRequest: OpenAIRequest): Map<string, string> | undefined {
-  return (completionsRequest as unknown as Record<string, unknown>)[NAMESPACE_MAP_KEY] as Map<string, string> | undefined;
+export function getNamespaceMap(completionsRequest: OpenAIRequest): NamespaceMap | undefined {
+  return (completionsRequest as unknown as Record<string, unknown>)[NAMESPACE_MAP_KEY] as NamespaceMap | undefined;
 }
 
 /**

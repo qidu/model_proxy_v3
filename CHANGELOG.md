@@ -5,6 +5,28 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): shorten flattened namespace tool names over the 64-char `function.name` limit
+
+Follow-up to the prefixed-name flattening entry below. Chat Completions (and
+Anthropic/Gemini) cap `function.name` at 64 chars in addition to the
+`[a-zA-Z0-9_-]` charset, so a `<namespace>_Z_<tool>` flattened name built from
+long namespace and tool names would be rejected by the upstream.
+
+- `flattenNamespaces` now shortens any flattened name longer than 64 chars to a
+  readable truncated head plus a per-request monotonic counter (e.g.
+  `<head>_1`), which keeps the name identifiable while guaranteeing distinct
+  long names never collide.
+- The namespace map is generalized from `Map<flatName, namespacePath>` to
+  `Map<flatName, { name, namespace? }>` (exported `NamespaceMap` /
+  `NamespaceMapEntry`), so the original bare `name` is recovered by a single
+  map lookup rather than by slicing the namespace prefix off the (possibly
+  shortened) flat name. Both reverse sites
+  (`convertCompletionsToResponses` and the `splitNamespace` helper in
+  `streamCompletionsAsResponses`) use the lookup.
+- `tests/unit/responses-completions-roundtrip.test.ts`: map-shape assertions
+  updated, plus a new test that an over-64 flattened name shortens to exactly
+  64 chars and round-trips to the original `name`/`namespace`.
+
 ### fix(responses): prefix flattened namespace tool names and restore the `name`/`namespace` split on `function_call` output items
 
 Follow-up to the namespace flattening in "fix(responses): flatten
