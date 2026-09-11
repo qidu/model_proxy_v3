@@ -235,6 +235,13 @@ export function convertInputItemsToMessages(items: Array<Record<string, unknown>
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
+    // Spec: `type` on an input item is optional and defaults to "message"
+    // when the item carries `role`/`content` (see EasyInputMessage/Message
+    // in the Responses API schema). Normalize here so downstream checks
+    // don't drop these items as unrecognized.
+    if (item.type === undefined && item.role !== undefined && item.content !== undefined) {
+      item.type = 'message';
+    }
 
     if (item.type === 'reasoning') {
       pendingReasoningContent = extractReasoningText(item) ?? pendingReasoningContent;

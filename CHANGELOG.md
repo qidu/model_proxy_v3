@@ -5,6 +5,22 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): default a missing input item `type` to `"message"` instead of dropping it
+
+Per the Responses API spec, `type` on an input item is optional and defaults
+to `"message"` when the item carries `role`/`content` (`EasyInputMessage` /
+`Message` in `docs/openai-response-methods-create.md`). The converter used to
+treat a typeless item as unrecognized — silently excluded from the assistant-
+turn merge and hit the `warnUnhandledItem` fallback in
+`convertInputItemToMessages`, dropping the message's content from the
+upstream conversation. `convertInputItemsToMessages` in
+`src/converters/responses-to-completions.ts` now normalizes `item.type` to
+`'message'` up front when it's `undefined` but `role`/`content` are present,
+before either the assistant-turn merge or per-item conversion branch on it.
+Affects all three conversion paths (`openai-completions`,
+`anthropic-messages`, `gemini`); passthrough to an `openai-responses`
+upstream is untouched since the body is forwarded as-is.
+
 ### test(agent-tools): quote a spliced tmp-path in the /tmp/ rm test; skip the signal-kill test on win32
 
 Two follow-on test fixes after switching the bash tool's shell to bare `'sh'`
