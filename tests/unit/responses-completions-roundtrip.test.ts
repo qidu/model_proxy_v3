@@ -311,11 +311,11 @@ describe('convertResponsesToChatCompletions', () => {
     );
 
     const names = out.tools!.map(t => (t as any).function.name).sort();
-    assert.deepEqual(names, ['outer_inner_fn', 'outer_nested_deep_fn']);
+    assert.deepEqual(names, ['outer_Z_inner_fn', 'outer_Z_nested_Z_deep_fn']);
 
     const namespaceMap = getNamespaceMap(out);
-    assert.equal(namespaceMap?.get('outer_inner_fn'), 'outer');
-    assert.equal(namespaceMap?.get('outer_nested_deep_fn'), 'outer.nested');
+    assert.equal(namespaceMap?.get('outer_Z_inner_fn'), 'outer');
+    assert.equal(namespaceMap?.get('outer_Z_nested_Z_deep_fn'), 'outer.nested');
   });
 
   it('restores the original name/namespace split on the function_call output item', () => {
@@ -339,7 +339,7 @@ describe('convertResponsesToChatCompletions', () => {
       id: 'chatcmpl-ns', object: 'chat.completion' as const, created: 1700000000, model: 'model',
       choices: [{
         index: 0,
-        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'crm_lookup', arguments: '{}' } }] },
+        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'crm_Z_lookup', arguments: '{}' } }] },
         finish_reason: 'tool_calls' as const,
       }],
     };
@@ -398,7 +398,7 @@ describe('convertResponsesToChatCompletions', () => {
     assert.equal(out.tools!.length, 1);
     const tool = out.tools![0] as any;
     assert.equal(tool.type, 'function');
-    assert.equal(tool.function.name, 'functions_exec');
+    assert.equal(tool.function.name, 'functions_Z_exec');
     assert.equal(tool.function.description, 'Run a command');
     assert.deepEqual(tool.function.parameters, {
       type: 'object',
@@ -406,8 +406,8 @@ describe('convertResponsesToChatCompletions', () => {
       required: ['input'],
     });
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /best-effort converting custom tool 'functions_exec'/);
-    assert.equal(getNamespaceMap(out)?.get('functions_exec'), 'functions');
+    assert.match(warnings[0], /best-effort converting custom tool 'functions_Z_exec'/);
+    assert.equal(getNamespaceMap(out)?.get('functions_Z_exec'), 'functions');
   });
 
   it('maps tool_choice { type: "function", name: "fn" } to nested format', () => {

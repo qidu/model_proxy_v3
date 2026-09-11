@@ -34,14 +34,36 @@ function warnUnhandledItem(type: string, warn?: ConversionWarnings): void {
 export const NAMESPACE_MAP_KEY = '__namespaceMap';
 
 /**
+ * Separator joining namespace-path levels and the leaf tool name in a
+ * flattened tool name (`<namespace>_Z_<tool>`, e.g. `outer_Z_nested_Z_deep_fn`).
+ * Overridable via the `NAMESPACE_SEPARATOR` env var (read once at module load,
+ * empty values fall back to the default). Must stay within the
+ * `[a-zA-Z0-9_-]` charset that Chat Completions allows for `function.name` —
+ * an out-of-charset value is rejected at startup rather than silently
+ * producing tool names the upstream refuses.
+ */
+const DEFAULT_NAMESPACE_SEPARATOR = '_Z_';
+const NAMESPACE_SEPARATOR_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+const configuredNamespaceSeparator = process.env.NAMESPACE_SEPARATOR;
+if (configuredNamespaceSeparator && !NAMESPACE_SEPARATOR_PATTERN.test(configuredNamespaceSeparator)) {
+  throw new Error(
+    `Invalid NAMESPACE_SEPARATOR ${JSON.stringify(configuredNamespaceSeparator)}: must match ` +
+    `${NAMESPACE_SEPARATOR_PATTERN} (Chat Completions restricts function.name to a-zA-Z0-9_-).`
+  );
+}
+
+export const NAMESPACE_SEPARATOR = configuredNamespaceSeparator || DEFAULT_NAMESPACE_SEPARATOR;
+
+/**
  * Recursively flattens `{ type: "namespace", name, tools: [...] }` entries
  * (which group `function`/`custom` tools under a shared name) into a flat
  * list of tools. Chat Completions has no namespace concept, so each leaf
- * tool is renamed to `<namespace>_<tool>` (nested namespaces join at every
- * level, e.g. `outer_nested_deep_fn`) to avoid name collisions between
- * namespaces and to preserve enough information to restore the original
- * `name`/`namespace` split when converting a tool call back to a Responses
- * API `function_call` output item.
+ * tool is renamed to `<namespace>_Z_<tool>` (nested namespaces join with
+ * `_Z_` at every level, e.g. `outer_Z_nested_Z_deep_fn`) to avoid name
+ * collisions between namespaces and to preserve enough information to
+ * restore the original `name`/`namespace` split when converting a tool call
+ * back to a Responses API `function_call` output item.
  *
  * `namespaceMap` accumulates `flatName -> namespacePath` (dot-joined, e.g.
  * `outer.nested`) for every renamed tool.
@@ -58,7 +80,7 @@ function flattenNamespaces(
       const nsPath = prefix ? `${prefix}.${nsName}` : nsName;
       flat.push(...flattenNamespaces(t.tools as Array<Record<string, unknown>>, namespaceMap, nsPath));
     } else if (prefix && typeof t.name === 'string') {
-      const flatName = `${prefix.replace(/\./g, '_')}_${t.name}`;
+      const flatName = `${prefix.replace(/\./g, NAMESPACE_SEPARATOR)}${NAMESPACE_SEPARATOR}${t.name}`;
       namespaceMap.set(flatName, prefix);
       flat.push({ ...t, name: flatName });
     } else {

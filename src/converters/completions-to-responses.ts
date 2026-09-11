@@ -3,6 +3,7 @@
  */
 
 import { OpenAIResponse } from '../types/openai.js';
+import { NAMESPACE_SEPARATOR } from './responses-to-completions.js';
 
 /**
  * OpenAI Responses API Response format
@@ -168,7 +169,9 @@ export function convertCompletionsToResponses(
           id: toolCall.id || `tool_${Date.now()}`,
           type: 'function_call',
           status: 'completed',
-          name: namespace ? flatName.slice(namespace.replace(/\./g, '_').length + 1) : flatName,
+          name: namespace
+            ? flatName.slice(namespace.replace(/\./g, NAMESPACE_SEPARATOR).length + NAMESPACE_SEPARATOR.length)
+            : flatName,
           arguments: toolCall.function?.arguments || '',
           call_id: toolCall.id,
           ...(namespace ? { namespace } : {}),

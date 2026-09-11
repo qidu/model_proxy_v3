@@ -18,9 +18,16 @@ even though the Responses API spec gives `function_call` a separate optional
 `namespace: string` field alongside `name` (`docs/openai-response-final.md`).
 
 - **Flatten with prefixed names**: `flattenNamespaces` now renames each leaf
-  tool to `<namespace>_<tool>`, nesting joined with `_` at every level
-  (e.g. `outer_nested_deep_fn`), fixing collisions and preserving enough
-  information to reverse the mapping. It builds a
+  tool to `<namespace>_Z_<tool>`, nesting joined with `_Z_` at every level
+  (e.g. `outer_Z_nested_Z_deep_fn`), fixing collisions and preserving enough
+  information to reverse the mapping. The separator is a shared
+  `NAMESPACE_SEPARATOR` const, default `_Z_` and overridable via the
+  `NAMESPACE_SEPARATOR` env var (read once at module load), rather than a
+  bare `_` so the namespace/tool boundary stays visually distinct from single
+  underscores inside namespace names (e.g. `mcp__cua_repl`). The value must
+  match `/^[a-zA-Z0-9_-]+$/` (the `function.name` charset) — an out-of-charset
+  value throws at startup instead of silently producing tool names the
+  upstream rejects. It builds a
   `Map<flatName, namespacePath>` (path joined with `.`, e.g. `outer.nested`)
   as a side output.
 - **Thread the map to the response side**: the map is attached to the returned
