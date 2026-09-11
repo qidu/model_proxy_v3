@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../../src/converters/completions-to-responses.js';
-import { convertResponsesToChatCompletions, convertInputItemsToMessages } from '../../src/converters/responses-to-completions.js';
+import { convertResponsesToChatCompletions, convertInputItemsToMessages, getNamespaceMap } from '../../src/converters/responses-to-completions.js';
 import { completionsToClaudeBody } from '../../src/handlers/openai.js';
 import type { OpenAIResponse } from '../../src/types/openai.js';
 
@@ -280,7 +280,7 @@ describe('convertResponsesToChatCompletions', () => {
     assert.equal(out.messages.length, 1);
   });
 
-  it('flattens namespace-wrapped tools (recursively) from additional_tools into the flat tools array', () => {
+  it('flattens namespace-wrapped tools (recursively), prefixing names with the namespace path', () => {
     const out = convertResponsesToChatCompletions(
       {
         input: [
@@ -311,7 +311,59 @@ describe('convertResponsesToChatCompletions', () => {
     );
 
     const names = out.tools!.map(t => (t as any).function.name).sort();
-    assert.deepEqual(names, ['deep_fn', 'inner_fn']);
+    assert.deepEqual(names, ['outer_inner_fn', 'outer_nested_deep_fn']);
+
+    const namespaceMap = getNamespaceMap(out);
+    assert.equal(namespaceMap?.get('outer_inner_fn'), 'outer');
+    assert.equal(namespaceMap?.get('outer_nested_deep_fn'), 'outer.nested');
+  });
+
+  it('restores the original name/namespace split on the function_call output item', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        tools: [
+          {
+            type: 'namespace',
+            name: 'crm',
+            description: '',
+            tools: [{ type: 'function', name: 'lookup', parameters: { type: 'object' } }],
+          },
+        ],
+        input: [{ type: 'message', role: 'user', content: 'hi' }],
+      },
+      'model',
+    );
+    const namespaceMap = getNamespaceMap(out);
+
+    const completion = {
+      id: 'chatcmpl-ns', object: 'chat.completion' as const, created: 1700000000, model: 'model',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'crm_lookup', arguments: '{}' } }] },
+        finish_reason: 'tool_calls' as const,
+      }],
+    };
+
+    const responsesResponse = convertCompletionsToResponses(completion, 'model', namespaceMap);
+    const fnCall = responsesResponse.output.find(o => o.type === 'function_call')!;
+    assert.equal(fnCall.name, 'lookup');
+    assert.equal((fnCall as any).namespace, 'crm');
+  });
+
+  it('leaves non-namespaced tool call names unaffected when namespaceMap is empty/omitted', () => {
+    const completion = {
+      id: 'chatcmpl-plain', object: 'chat.completion' as const, created: 1700000000, model: 'model',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'plain_fn', arguments: '{}' } }] },
+        finish_reason: 'tool_calls' as const,
+      }],
+    };
+
+    const responsesResponse = convertCompletionsToResponses(completion, 'model');
+    const fnCall = responsesResponse.output.find(o => o.type === 'function_call')!;
+    assert.equal(fnCall.name, 'plain_fn');
+    assert.equal((fnCall as any).namespace, undefined);
   });
 
   it('best-effort converts a custom tool to a function tool and warns', () => {
@@ -346,7 +398,7 @@ describe('convertResponsesToChatCompletions', () => {
     assert.equal(out.tools!.length, 1);
     const tool = out.tools![0] as any;
     assert.equal(tool.type, 'function');
-    assert.equal(tool.function.name, 'exec');
+    assert.equal(tool.function.name, 'functions_exec');
     assert.equal(tool.function.description, 'Run a command');
     assert.deepEqual(tool.function.parameters, {
       type: 'object',
@@ -354,7 +406,8 @@ describe('convertResponsesToChatCompletions', () => {
       required: ['input'],
     });
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /best-effort converting custom tool 'exec'/);
+    assert.match(warnings[0], /best-effort converting custom tool 'functions_exec'/);
+    assert.equal(getNamespaceMap(out)?.get('functions_exec'), 'functions');
   });
 
   it('maps tool_choice { type: "function", name: "fn" } to nested format', () => {

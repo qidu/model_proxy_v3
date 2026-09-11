@@ -26,15 +26,41 @@ function warnUnhandledItem(type: string, warn?: ConversionWarnings): void {
 }
 
 /**
- * Recursively flattens `{ type: "namespace", tools: [...] }` entries (which group
- * `function`/`custom` tools under a shared name) into a flat list of tools. Chat
- * Completions has no namespace concept, so namespace grouping is discarded.
+ * Key used to stash the namespace map on the returned `OpenAIRequest` as a
+ * non-enumerable property (invisible to JSON.stringify/hooks/existing tests
+ * that assert on the request shape, but readable by handlers that need it to
+ * reverse the flattening when converting the response back).
  */
-function flattenNamespaces(tools: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+export const NAMESPACE_MAP_KEY = '__namespaceMap';
+
+/**
+ * Recursively flattens `{ type: "namespace", name, tools: [...] }` entries
+ * (which group `function`/`custom` tools under a shared name) into a flat
+ * list of tools. Chat Completions has no namespace concept, so each leaf
+ * tool is renamed to `<namespace>_<tool>` (nested namespaces join at every
+ * level, e.g. `outer_nested_deep_fn`) to avoid name collisions between
+ * namespaces and to preserve enough information to restore the original
+ * `name`/`namespace` split when converting a tool call back to a Responses
+ * API `function_call` output item.
+ *
+ * `namespaceMap` accumulates `flatName -> namespacePath` (dot-joined, e.g.
+ * `outer.nested`) for every renamed tool.
+ */
+function flattenNamespaces(
+  tools: Array<Record<string, unknown>>,
+  namespaceMap: Map<string, string>,
+  prefix = ''
+): Array<Record<string, unknown>> {
   const flat: Array<Record<string, unknown>> = [];
   for (const t of tools) {
     if (t.type === 'namespace' && Array.isArray(t.tools)) {
-      flat.push(...flattenNamespaces(t.tools as Array<Record<string, unknown>>));
+      const nsName = t.name as string;
+      const nsPath = prefix ? `${prefix}.${nsName}` : nsName;
+      flat.push(...flattenNamespaces(t.tools as Array<Record<string, unknown>>, namespaceMap, nsPath));
+    } else if (prefix && typeof t.name === 'string') {
+      const flatName = `${prefix.replace(/\./g, '_')}_${t.name}`;
+      namespaceMap.set(flatName, prefix);
+      flat.push({ ...t, name: flatName });
     } else {
       flat.push(t);
     }
@@ -125,11 +151,14 @@ export function convertResponsesToChatCompletions(
   // Combine top-level `tools` with any `additional_tools` input items (developer-
   // supplied extra tools for this turn — see the `input` loop above). `namespace`
   // tools group `function`/`custom` tools under a shared name — flatten them into
-  // the same flat list before conversion (Chat Completions has no namespace concept).
+  // the same flat list before conversion (Chat Completions has no namespace concept),
+  // renaming leaf tools to `<namespace>_<tool>` and recording the mapping so the
+  // response conversion can restore the original `name`/`namespace` split.
+  const namespaceMap = new Map<string, string>();
   const allTools = flattenNamespaces([
     ...(Array.isArray(responsesRequest.tools) ? (responsesRequest.tools as Array<Record<string, unknown>>) : []),
     ...additionalTools,
-  ]);
+  ], namespaceMap);
   if (allTools.length > 0) {
     // Responses API function tools use a flat format:
     //   { type: "function", name: "fn", description?: "...", parameters: {...} }
@@ -213,7 +242,26 @@ export function convertResponsesToChatCompletions(
     completionsRequest.prompt_cache_key = responsesRequest.prompt_cache_key as string;
   }
 
+  if (namespaceMap.size > 0) {
+    // Non-enumerable: invisible to JSON.stringify (upstream body), before_upstream
+    // hooks, and existing tests that assert on the request's own fields.
+    Object.defineProperty(completionsRequest, NAMESPACE_MAP_KEY, {
+      value: namespaceMap,
+      enumerable: false,
+    });
+  }
+
   return completionsRequest;
+}
+
+/**
+ * Reads back the `flatName -> namespacePath` map attached to a request
+ * returned by {@link convertResponsesToChatCompletions}, if any namespaced
+ * tools were flattened. Used by response conversion to restore the original
+ * `name`/`namespace` split on `function_call` output items.
+ */
+export function getNamespaceMap(completionsRequest: OpenAIRequest): Map<string, string> | undefined {
+  return (completionsRequest as unknown as Record<string, unknown>)[NAMESPACE_MAP_KEY] as Map<string, string> | undefined;
 }
 
 /**

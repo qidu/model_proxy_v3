@@ -5,6 +5,49 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): prefix flattened namespace tool names and restore the `name`/`namespace` split on `function_call` output items
+
+Follow-up to the namespace flattening in "fix(responses): flatten
+`namespace`-wrapped tools..." below. That entry discarded the namespace name
+entirely, which caused two problems: (1) two namespaces containing a tool with
+the same bare name flattened to duplicate keys in the Chat Completions
+`tools[]` array, and (2) when the upstream called a flattened tool, the
+resulting `function_call` output item carried only the bare `name` with no
+`namespace`, so the client couldn't tell which namespace produced the call —
+even though the Responses API spec gives `function_call` a separate optional
+`namespace: string` field alongside `name` (`docs/openai-response-final.md`).
+
+- **Flatten with prefixed names**: `flattenNamespaces` now renames each leaf
+  tool to `<namespace>_<tool>`, nesting joined with `_` at every level
+  (e.g. `outer_nested_deep_fn`), fixing collisions and preserving enough
+  information to reverse the mapping. It builds a
+  `Map<flatName, namespacePath>` (path joined with `.`, e.g. `outer.nested`)
+  as a side output.
+- **Thread the map to the response side**: the map is attached to the returned
+  `OpenAIRequest` as a non-enumerable `__namespaceMap` property (via
+  `Object.defineProperty`) so the return type stays `OpenAIRequest` — existing
+  call sites, `JSON.stringify` round-trips, and deep-equality assertions are
+  unaffected. `getNamespaceMap(request)` reads it back.
+  `convertCompletionsToResponses` / `convertCompletionsToCompactedResponse` /
+  `streamCompletionsAsResponses` accept the map as an optional param; when a
+  tool call's `name` is a key in the map, the emitted `function_call` item gets
+  the bare tool `name` and the original `namespace` path. Unmapped (plain
+  top-level) tools are emitted unchanged — fully backward-compatible.
+
+- `src/converters/responses-to-completions.ts`: prefixed-name flattening,
+  `NAMESPACE_MAP_KEY` / `getNamespaceMap` export.
+- `src/converters/completions-to-responses.ts`: optional `namespaceMap` param,
+  `namespace?: string` on the output item type, split restore in the
+  `function_call` build.
+- `src/handlers/responses.ts`: thread the map through `handleAsCompletions`
+  (stream + non-stream) and `handleResponsesCompactRequest`; `splitNamespace`
+  helper in `streamCompletionsAsResponses` applied at the
+  `output_item.added` / `output_item.done` / `response.completed` emission
+  points.
+- `tests/unit/responses-completions-roundtrip.test.ts`: prefixed-name +
+  `namespaceMap` assertions, a namespaced round-trip test, a
+  non-namespaced-passthrough test.
+
 ### fix(responses): default a missing input item `type` to `"message"` instead of dropping it
 
 Per the Responses API spec, `type` on an input item is optional and defaults

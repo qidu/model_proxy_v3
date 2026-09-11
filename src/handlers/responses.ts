@@ -13,7 +13,7 @@ import { addForwardedHeaders, normalizeOpenAIAuthHeaders } from '../utils/routin
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
-import { convertResponsesToChatCompletions } from '../converters/responses-to-completions.js';
+import { convertResponsesToChatCompletions, getNamespaceMap } from '../converters/responses-to-completions.js';
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../converters/completions-to-responses.js';
 import { getConversation, saveConversation, normalizeInputToItems, getConversationThreadItems, appendConversationThreadItems } from '../utils/conversation-store.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
@@ -732,6 +732,7 @@ async function handleAsCompletions(
 
   // Convert Responses API request to Chat Completions format
   const completionsRequest = convertResponsesToChatCompletions(effectiveBody, model, { logger, requestId });
+  const namespaceMap = getNamespaceMap(completionsRequest);
 
   // Inject stored reasoning_content onto any assistant messages that have tool_calls
   // whose IDs were recorded from a prior thinking-mode response (DeepSeek requires
@@ -813,7 +814,7 @@ async function handleAsCompletions(
           logger.debug(requestId, `[conversation] saved responseId=${responseId} (${mergedInput.length} input + ${outputItems.length} output items)`);
         }
       : undefined;
-    return streamCompletionsAsResponses(response, model, requestId, logger, onComplete, conversationId);
+    return streamCompletionsAsResponses(response, model, requestId, logger, onComplete, conversationId, namespaceMap);
   }
 
   // Convert Chat Completions response back to Responses API format
@@ -821,7 +822,7 @@ async function handleAsCompletions(
   logger.debug(requestId, `Upstream completions response: ${responseText.substring(0, 1000)}`);
   logPipelineStage(logger, requestId, 'upstream-response', targetUrl, responseText);
   const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
-  const responsesResponse = convertCompletionsToResponses(completionsResponse, model);
+  const responsesResponse = convertCompletionsToResponses(completionsResponse, model, namespaceMap);
   if (conversationId) {
     (responsesResponse as unknown as Record<string, unknown>).conversation = conversationId;
   }
@@ -862,8 +863,16 @@ function streamCompletionsAsResponses(
   requestId: string,
   logger?: Logger,
   onComplete?: (responseId: string, outputItems: unknown[], completedResponse?: Record<string, unknown>) => void,
-  conversationId?: string
+  conversationId?: string,
+  namespaceMap?: Map<string, string>
 ): Response {
+  // Given a possibly-flattened tool name, restores the original `name`/`namespace`
+  // split recorded by convertResponsesToChatCompletions, if it was a namespaced tool.
+  const splitNamespace = (flatName: string): { name: string; namespace?: string } => {
+    const namespace = namespaceMap?.get(flatName);
+    if (!namespace) return { name: flatName };
+    return { name: flatName.slice(namespace.replace(/\./g, '_').length + 1), namespace };
+  };
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
   const itemId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
   const created_at = Math.floor(Date.now() / 1000);
@@ -1040,6 +1049,7 @@ function streamCompletionsAsResponses(
                 const outputIndex = nextOutputIndex++;
                 toolCallOutputIndex.set(idx, outputIndex);
                 // Emit output_item.added for this function_call
+                const { name: addedName, namespace: addedNamespace } = splitNamespace(tc.function?.name ?? '');
                 await writer.write(encoder.encode(sseEvent('response.output_item.added', {
                   type: 'response.output_item.added',
                   sequence_number: nextSeq(),
@@ -1048,9 +1058,10 @@ function streamCompletionsAsResponses(
                     id: tcId,
                     type: 'function_call',
                     status: 'in_progress',
-                    name: tc.function?.name ?? '',
+                    name: addedName,
                     arguments: '',
                     call_id: tcId,
+                    ...(addedNamespace ? { namespace: addedNamespace } : {}),
                   },
                 })));
                 // If the first chunk already carries argument data, emit it as a delta now
@@ -1126,7 +1137,7 @@ function streamCompletionsAsResponses(
       }
 
       // --- close each tool call item ---
-      const completedToolCalls: Array<{ id: string; type: string; status: string; name: string; arguments: string; call_id: string }> = [];
+      const completedToolCalls: Array<{ id: string; type: string; status: string; name: string; arguments: string; call_id: string; namespace?: string }> = [];
       for (const [idx, accum] of toolCalls) {
         const outputIndex = toolCallOutputIndex.get(idx)!;
         await writer.write(encoder.encode(sseEvent('response.function_call_arguments.done', {
@@ -1136,6 +1147,7 @@ function streamCompletionsAsResponses(
           output_index: outputIndex,
           arguments: accum.arguments,
         })));
+        const { name: doneName, namespace: doneNamespace } = splitNamespace(accum.name);
         await writer.write(encoder.encode(sseEvent('response.output_item.done', {
           type: 'response.output_item.done',
           sequence_number: nextSeq(),
@@ -1144,12 +1156,17 @@ function streamCompletionsAsResponses(
             id: accum.id,
             type: 'function_call',
             status: 'completed',
-            name: accum.name,
+            name: doneName,
             arguments: accum.arguments,
             call_id: accum.id,
+            ...(doneNamespace ? { namespace: doneNamespace } : {}),
           },
         })));
-        completedToolCalls.push({ id: accum.id, type: 'function_call', status: 'completed', name: accum.name, arguments: accum.arguments, call_id: accum.id });
+        completedToolCalls.push({
+          id: accum.id, type: 'function_call', status: 'completed', name: doneName,
+          arguments: accum.arguments, call_id: accum.id,
+          ...(doneNamespace ? { namespace: doneNamespace } : {}),
+        });
       }
 
       // Build output array for response.completed
@@ -1408,7 +1425,9 @@ export async function handleResponsesCompactRequest(
 
   if (upstreamMode === 'openai-completions') {
     // Convert to chat completions, call upstream, wrap as CompactedResponse
-    let completionsRequest: Record<string, unknown> = convertResponsesToChatCompletions(requestBody, model, { logger: activeLogger, requestId }) as unknown as Record<string, unknown>;
+    const convertedRequest = convertResponsesToChatCompletions(requestBody, model, { logger: activeLogger, requestId });
+    const namespaceMap = getNamespaceMap(convertedRequest);
+    let completionsRequest: Record<string, unknown> = convertedRequest as unknown as Record<string, unknown>;
 
     activeLogger.debug(requestId, `Compact -> completions: ${JSON.stringify(completionsRequest).substring(0, 500)}`);
 
@@ -1453,7 +1472,7 @@ export async function handleResponsesCompactRequest(
 
     const responseText = await compactCompletionsResponse.text();
     const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
-    const compactedResponse = convertCompletionsToCompactedResponse(completionsResponse, model);
+    const compactedResponse = convertCompletionsToCompactedResponse(completionsResponse, model, namespaceMap);
 
     const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
     logPipelineHeaders(activeLogger, requestId, 'outbound', '/v1/responses/compact', outHeaders);
