@@ -67,23 +67,27 @@ On `200`, the proxy reads:
 - **JSON body** (optional) — the **dynamic routing override**, a one-time alias
   config entry. See the table in [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service).
 
-**Dynamic routing override precedence.** When the auth response body carries
-any of `target` / `mode` (`upstream_mode`) / `base` (`base_url`) / `key`
-(`api_key`) / `transforms`, the proxy treats them as the resolved route for
-**this request only**:
+**Dynamic routing override precedence.** When the auth response body carries a
+`targets` array — each entry a target descriptor (`target` / `mode`
+(`upstream_mode`) / `base` (`base_url`) / `key` (`api_key`) / `transforms` /
+`timeout`) — the proxy treats them as the resolved route for **this request
+only**, in array order:
 
 1. The override fields are merged on top of the normal inheritance chain
    (per-entry → section → `[default_upstream]`). Auth-provided fields win over
    config-file fields for the same request.
-2. If the override supplies a `target`, the upstream sees that model id and the
+2. If an entry supplies a `target`, the upstream sees that model id and the
    proxy skips `[models.*]` / `[composite]` / `[schedule]` resolution entirely.
-3. If the override supplies `transforms`, those `[transforms.*]` sets are
+3. If an entry supplies `transforms`, those `[transforms.*]` sets are
    applied at the same five lifecycle hooks as config-attached sets.
-4. If the body is empty / not JSON / not a `200`, normal config resolution
+4. If an entry supplies `timeout` (ms), it overrides `UPSTREAM_BODY_TIMEOUT_MS`
+   as that target's upstream first-byte timeout; on expiry the proxy aborts the
+   attempt and fails over to the next entry in the array.
+5. If the body is empty / not JSON / not a `200`, normal config resolution
    proceeds unchanged.
 
 The override is **never cached** and **never persisted** to `proxy_config.toml`
-— it is a single-use, per-request alias.
+— it is a single-use, per-request alias list.
 
 ## Stats service — `[remote.recording] record_server`
 

@@ -58,19 +58,30 @@ sequenceDiagram
 ```
 
 **Auth dynamic-routing override (response body).** The auth service MAY respond
-with a JSON body that acts as a **one-time alias config entry** — the same shape
-as a `[models.*]` inline table. When present, the proxy uses it directly for
-this single request and skips resolving the model from `[models.*]` / `[composite]`
-/ `[schedule]` in the config file. All fields are optional; omitted fields fall
-back to the normal inheritance chain (`[default_upstream]` → section → entry):
+with a JSON body carrying `targets` — an ordered list of **one-time alias config
+entries** (the same shape as a `[models.*]` inline table). When present, the proxy
+uses them directly for this single request, trying them in order on failure, and
+skips resolving the model from `[models.*]` / `[composite]` / `[schedule]` in the
+config file. All fields are optional; omitted fields fall back to the normal
+inheritance chain (`[default_upstream]` → section → entry):
 
-| Body field | Type | Meaning |
+```json
+{ "targets": [
+    { "target": "claude-opus-4-6", "mode": "anthropic-messages",
+      "base": "https://api.anthropic.com", "key": "sk-…", "timeout": 30000 },
+    { "target": "gpt-5", "mode": "openai-completions",
+      "base": "https://api.openai.com/v1", "timeout": 10000 }
+] }
+```
+
+| Target field | Type | Meaning |
 |---|---|---|
 | `target` | string | Real upstream model id to send (like an alias `target`). |
 | `mode` / `upstream_mode` | string | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. |
 | `base` / `base_url` | string | Upstream base URL. |
 | `key` / `api_key` | string *(optional)* | Upstream API key for this request only. When omitted, the proxy uses the caller's key (subject to `auth_passthrough_with`) or the config-inherited key. |
 | `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached beyond what config resolution already yields. |
+| `timeout` | number *(optional)* | Upstream first-byte timeout for **this target**, in milliseconds. Overrides `UPSTREAM_BODY_TIMEOUT_MS`. If the target does not respond before it elapses, the proxy aborts it and fails over to the next entry in `targets`. |
 
 > The override is **per-request and ephemeral** — it is never cached, never
 > written to config, and does not persist across requests. If the auth response
