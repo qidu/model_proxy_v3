@@ -24,6 +24,62 @@ in the README.
   body (e.g. dynamic routes), `auth_with_body` has no body to send and degrades
   to a bodyless call.
 
+**Ordering vs. model resolution.** Under every configuration the auth call
+precedes route resolution — `getModelRouteConfig()`
+(`src/utils/config-loader.ts:1037`) never runs before `doAuthRequest()`
+(`src/index.ts:973`, `fetch` at `src/index.ts:999`). Only the position within
+the request shifts:
+
+| Flags | Call chain |
+|---|---|
+| default (both `false`) | `loadProxyConfig` (`index.ts:748`) → header presence check (`index.ts:948`) → **`doAuthRequest()` (`index.ts:1038`)** → body parse (`index.ts:1198`) → `modelName = body.model` (`index.ts:1248`) → **`getModelRouteConfig()` (`index.ts:1285`)** |
+| `auth_with_model` and/or `auth_with_body` | body parse (`index.ts:1198`) → `modelName = body.model` (`index.ts:1248`) → `resolveScheduleTarget()` (`index.ts:1264`) → **`doAuthRequest()` (`index.ts:1275`)** → **`getModelRouteConfig()` (`index.ts:1285`)** |
+
+`doAuthRequest` has three mutually exclusive call sites: the early one above,
+the deferred body path (`index.ts:1274`), and a deferred fixed-routing fallback
+for endpoints with no parsed body (`index.ts:1670`).
+
+**`x-resource-for` carries the client's model id, not the target.** By design,
+remote auth authorizes on the model id **as it appeared in the user's original
+request** — the alias, never the resolved upstream `target`. This keeps
+authorization independent of routing config, so retargeting an alias or adding
+a wildcard never silently changes who is authorized. `x-resource-for` is set at
+`src/index.ts:986`.
+
+The one exception is a **schedule alias**, which is resolved one hop before auth
+(`resolveScheduleTarget`, `src/index.ts:1264`, ahead of the deferred auth call
+at `:1275`): the sidecar then sees the target that alias selects for the current
+time-of-day, not the name the client sent. For every other alias kind —
+exact-match, wildcard, catch-all, composite/fusion — the client's literal string
+is forwarded unchanged, including model ids that match nothing in config. A
+sidecar matching `x-resource-for` against a known-model list therefore needs an
+explicit policy for unrecognized ids, and must tolerate the header being absent
+entirely (the two bodyless call sites, `index.ts:1038` and `:1671`, never send
+it, and it is omitted whenever no model id could be extracted).
+
+The resolved target is never sent to the auth service. It reaches the backend
+only afterwards, as the stats record's `model` field.
+
+**Two independent credential systems.** The remote auth call is a *global
+inbound gate*: it validates the **client's** headers against `auth_server`, and
+is not per-provider, so it carries no ordering dependency on resolution.
+Upstream/per-provider credentials are selected separately and necessarily
+*after* resolution — `transformAuthHeadersForUpstream()` (`src/index.ts:1335`),
+then the route's own key via `formatApiKeyForUpstream(modelRoute.apiKey, …)`
+(`src/index.ts:1340`, guarded at `:1339`), which takes effect when
+`auth_passthrough_with = 'config_key'` or the route's section is `free`. That selection is a local
+config lookup with **no network call**. So `auth_with_model` exists only so the
+auth sidecar can see which model is requested (quota/entitlement decisions and
+the dynamic routing override) — not because the proxy needs the resolution
+result in order to authenticate.
+
+**No auth-result caching.** `doAuthRequest` fires on every non-exempt request;
+there is no memoization, so the ordering above is the effective ordering every
+time. There is no OAuth or token-refresh path anywhere — `src/utils/key-store.ts`
+holds static config values. The one outbound call that *can* precede auth is a
+config fetch: on a cold `cachedConfig` (`config-loader.ts:2438`),
+`loadProxyConfig` may hit Apollo (`config-loader.ts:2476`) or Consul first.
+
 **Request** (proxy → auth service):
 
 | Aspect | Value |
