@@ -99,7 +99,7 @@ const BASE_TOML = `
 [dashboard]
 api_key = "dash"
 
-[remote.authentication]
+[remote]
 auth_server = "${AUTH_URL}"
 
 [models.claude]
@@ -113,7 +113,7 @@ const AUTH_WITH_MODEL_TOML = `
 [dashboard]
 api_key = "dash"
 
-[remote.authentication]
+[remote]
 auth_server = "${AUTH_URL}"
 auth_with_model = true
 

@@ -438,10 +438,10 @@ async function testUpsertModelTarget() {
 
 /**
  * TC720: Upsert Model Target — Invalid Mode Rejected
- * upsertModelTarget validates mode against the closed TransformSchema set
+ * upsertModelTarget validates mode against the closed upstream-mode set
  * (openai-completions / anthropic-messages / openai-responses /
- * gemini-generatecontent) and throws for anything else — the handler
- * surfaces that as a 400 with an error message.
+ * gemini-generatecontent / gemini-interactions) and throws for anything else —
+ * the handler surfaces that as a 400 with an error message.
  */
 async function testUpsertModelTargetInvalidMode() {
   const response = await sendRequest({

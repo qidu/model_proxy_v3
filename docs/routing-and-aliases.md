@@ -76,7 +76,7 @@ inheritance chain — anything left empty falls back to the level above:
 > at the API version or models collection (for example `/v1beta` or `/v1beta/models`);
 > the proxy appends the model endpoint without duplicating the version path.
 
-**Who wins — caller's key vs. configured `api_key`** — controlled by `[remote.authentication] auth_passthrough_with`:
+**Who wins — caller's key vs. configured `api_key`** — controlled by `[remote] auth_passthrough_with`:
 
 `auth_passthrough_with = "user_key"` *(default)*
 

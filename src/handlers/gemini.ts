@@ -107,7 +107,7 @@ export async function handleGeminiRequest(
     } else if (path.includes(':countTokens')) {
         activeLogger.debug(requestId, 'Routing to Gemini countTokens handler');
         return handleGeminiCountTokensRequest(
-            request, targetUrl, authHeaders, requestId, modelId, env, logger
+            request, targetUrl, authHeaders, requestId, modelId, env, logger, route
         );
     } else {
         activeLogger.debug(requestId, 'Routing to Gemini generateContent handler');
@@ -128,7 +128,8 @@ async function handleGeminiCountTokensRequest(
     requestId: string,
     modelId?: string,
     env?: Env,
-    logger?: Logger
+    logger?: Logger,
+    route?: ModelRouteConfig
 ): Promise<Response> {
     const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
     activeLogger.debug(requestId, `Gemini countTokens request to: ${targetUrl}`);
@@ -144,7 +145,7 @@ async function handleGeminiCountTokensRequest(
         method: 'POST',
         headers: geminiHeaders,
         body: request.body,
-        signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
@@ -282,7 +283,7 @@ async function handleGeminiInteractionsRequest(
         method: 'POST',
         headers: geminiHeaders,
         body: JSON.stringify(upstreamBodyGemini),
-        signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -463,7 +464,7 @@ async function handleGeminiGenerateContentRequest(
             method: 'POST',
             headers: geminiHeaders,
             body: JSON.stringify(upstreamBodyGeminiGen),
-            signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+            signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
         });
 
         if (route) {

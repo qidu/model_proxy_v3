@@ -1,7 +1,8 @@
 # Minimal proxy_config.toml — walkthrough in docs/configuration-guide.md.
 
 # Remote auth sidecar — validates proxy endpoint auth headers.
-# [remote.authentication]
+# (auth_* / record_* / dispatch_* keys all live in one flat [remote] table.)
+# [remote]
 # auth_server = "https://auth.example.com/validate"
 # auth_with_model = false          # when true, defers auth until after body parsing
                                    # and forwards requested model id as x-resource-for
@@ -11,7 +12,7 @@
 
 # Remote stats sidecar — POSTs per-request usage records to an HTTP collector.
 # Includes request_id, endpoint, raw user_key, model, response_status, and token counters.
-# [remote.recording]
+# Add to the same [remote] table above:
 # record_server = "http://127.0.0.1:8080/model-usage"
 # record_response_body = false     # when true, each record also includes the constructed response body
 

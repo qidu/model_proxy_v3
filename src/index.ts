@@ -37,6 +37,7 @@ import {
   handleDashboardUpsertScheduleTarget,
 } from './handlers/dashboard.js';
 import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget } from './utils/config-loader.js';
+import { parseAuthTargets, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
 import { detectCoordinatorStage } from './utils/coordinator.js';
 import {
   extractToolNamesFromBody,
@@ -962,10 +963,15 @@ export default {
       // When auth_with_model is true, defer the auth call until after body parsing
       // so the requested model id can be forwarded as x-resource-for.
       // Skipped for /v1/models (exempt from auth entirely).
-      const authUrl = isModelsListPath ? '' : (proxyConfig.remote?.authentication?.auth_server?.trim() ?? '');
-      const authWithModel = proxyConfig.remote?.authentication?.auth_with_model === true;
-      const authWithBody = proxyConfig.remote?.authentication?.auth_with_body === true;
+      const authUrl = isModelsListPath ? '' : (proxyConfig.remote?.auth_server?.trim() ?? '');
+      const authWithModel = proxyConfig.remote?.auth_with_model === true;
+      const authWithBody = proxyConfig.remote?.auth_with_body === true;
       let modelUsageOneTimeAuthCode: string | undefined;
+      // Auth-response dynamic-routing override: when the auth server returns
+      // HTTP 200 with a `targets[]` array, these become a failover ladder for
+      // this request (see docs/auth-stats-protocol.md). Empty ⇒ normal config
+      // resolution. Populated in doAuthRequest once the body is read.
+      let authTargets: RemoteTargetDescriptor[] = [];
       // Client-IP forwarding headers for the auth_server / record_server sidecars.
       // Computed early so it is in scope for doAuthRequest (which may run now
       // when auth_with_model = false) and for the later stats record calls.
@@ -1029,6 +1035,27 @@ export default {
             : `Remote auth server rejected the request (HTTP ${authStatus}). This is a failure from the configured remote auth_server.`;
           return createErrorResponse(new Error(detail), requestId, 401);
         }
+
+        // Auth-response dynamic-routing override: parse an optional `targets[]`
+        // failover ladder. A missing/empty/malformed body yields [] ⇒ normal
+        // config resolution. Invalid entries are dropped (loudly) and the
+        // ladder continues with the rest.
+        const rawTargets = parseAuthTargets(authRespBodyText);
+        if (rawTargets.length > 0) {
+          const { valid, dropped } = validateDescriptorEntries(rawTargets, {
+            allowedHostsEnv: getAllowedHostsFromConfig(proxyConfig).join(','),
+          });
+          for (const d of dropped) {
+            logger.error(requestId, `Auth targets entry dropped: ${d.reason} (entry=${JSON.stringify(d.entry)})`);
+          }
+          const maxTargets = proxyConfig.remote?.max_targets ?? DEFAULT_MAX_TARGETS;
+          authTargets = dedupeAndCap(valid, maxTargets);
+          if (authTargets.length === 0) {
+            logger.error(requestId, `Auth server returned ${rawTargets.length} target(s) but all were invalid; falling back to normal config resolution.`);
+          } else {
+            logger.info(requestId, `Auth targets override accepted: ${authTargets.length} rung(s) (from ${rawTargets.length}, ${dropped.length} dropped).`);
+          }
+        }
         return null;
       };
 
@@ -1055,7 +1082,7 @@ export default {
         }
       }
 
-      const useConfigKey = proxyConfig.remote?.authentication?.auth_passthrough_with === 'config_key';
+      const useConfigKey = proxyConfig.remote?.auth_passthrough_with === 'config_key';
 
       // Global token limit check: only applies to model API requests, not dashboard/health
       const globalTokenLimitRaw = proxyConfig.general?.global_token_limit;
@@ -1127,6 +1154,14 @@ export default {
       // runAttempt so its request_ingress/response_egress transforms fire (this path
       // bypasses compositeAttempts/buildRouteAttempt which set route otherwise).
       let outerRoute: ModelRouteConfig | undefined;
+      // Remote target-retry ladder state. `routeBody` holds the parsed request
+      // body (same object mutated by privacy/kompress/erase below) so the ladder
+      // can rebuild a fresh Request per rung at dispatch — the body-parse `try`
+      // below closes before dispatch, so `body` itself is not in scope there.
+      // `useAuthLadder` is set when the auth server returned a `targets[]`
+      // override that owns routing for this request (see docs/auth-stats-protocol.md).
+      let routeBody: Record<string, unknown> | undefined;
+      let useAuthLadder = false;
       let isGeminiBypass = false;
       const userAgentPrefix = extractUserAgentPrefix(request.headers.get('user-agent'));
       // Structured agent identity — filled in once the request body is parsed
@@ -1182,8 +1217,8 @@ export default {
       // Extract authentication headers early
       const authHeaders = extractAuthHeaders(request);
       const endpointUserKey = getRawEndpointUserKey(authHeaders);
-      const modelUsageRecordUrl = proxyConfig.remote?.recording?.record_server?.trim();
-      const modelUsageRecordBody = proxyConfig.remote?.recording?.record_response_body === true;
+      const modelUsageRecordUrl = proxyConfig.remote?.record_server?.trim();
+      const modelUsageRecordBody = proxyConfig.remote?.record_response_body === true;
       let modelAuthHeaders = authHeaders;
 
       // For endpoints that need model-specific routing, extract model from request body
@@ -1197,6 +1232,10 @@ export default {
         try {
           let bodyText = await request.text();
           const body = JSON.parse(bodyText);
+          // Keep the parsed body visible at dispatch (the ladder rebuilds a
+          // fresh Request per rung from it). Same object reference — the
+          // in-place privacy/kompress/erase mutations below stay reflected.
+          routeBody = body;
 
           // Extract tool stats from the already-parsed body — avoids a second
           // clone()+parse that would otherwise happen before the routing block.
@@ -1276,10 +1315,14 @@ export default {
             if (authError) return authError;
           }
 
-          // Passthrough for /v1/chat/completions: use fixed routing but extract model name for stats.
-          // When passthrough is NOT enabled, skip routing vars entirely — the outer "else" block
-          // (fixed routing) calls parseFixedRoute() which throws the block error.
-          if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
+          // Remote target-retry ladder: when the auth server returned a `targets[]`
+          // override, it owns routing for this request. Skip all config-based
+          // resolution here — the ladder builds each rung from a self-contained
+          // descriptor at dispatch.
+          useAuthLadder = authTargets.length > 0 && !!routeBody && typeof routeBody === 'object';
+          if (useAuthLadder) {
+            // no-op: per-rung descriptor routing runs at dispatch (before composite dispatch)
+          } else if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
             // Prefer per-model route (e.g. gpt-5.5 in [models.free]) over the global default,
             // so the correct base_url, api_key, and upstream_mode are used.
             const modelRoute = modelName ? getModelRouteConfig(modelName, proxyConfig) : undefined;
@@ -1871,6 +1914,24 @@ export default {
             candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
             candidateUpstreamMode = 'openai-completions';
           }
+        } else if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
+          // Mirrors the passthrough routing block's mode→URL mapping. The
+          // chat-completions handler forwards non-streaming bodies; Gemini
+          // streaming for this path lands in Phase 3.
+          candidateHandlerType = 'chat-completions';
+          if (route.upstreamMode === 'openai-responses') {
+            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
+            candidateUpstreamMode = 'openai-responses';
+          } else if (route.upstreamMode === 'anthropic-messages') {
+            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
+            candidateUpstreamMode = 'anthropic-messages';
+          } else if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
+            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
+            candidateUpstreamMode = route.upstreamMode;
+          } else {
+            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
+            candidateUpstreamMode = 'openai-completions';
+          }
         }
 
         return {
@@ -2238,7 +2299,7 @@ export default {
             break;
 
           case 'token-counting':
-            response = await handleTokenCountingRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, env, logger);
+            response = await handleTokenCountingRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, env, logger, attemptRoute);
             break;
 
           case 'messages':
@@ -2452,6 +2513,93 @@ export default {
 
         return response;
       };
+
+      /** Parse a `Retry-After` header (delta-seconds or HTTP-date) into ms, or undefined. */
+      const parseRetryAfterMs = (response: Response | undefined): number | undefined => {
+        const raw = response?.headers.get('retry-after');
+        if (!raw) return undefined;
+        const seconds = Number(raw);
+        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+        const dateMs = Date.parse(raw);
+        return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : undefined;
+      };
+
+      // ---- Remote target-retry failover ladder (auth `targets[]` override) ----
+      // Each rung is a self-contained descriptor, so no config resolution is
+      // involved. Axis 1 advances to the next rung on a retryable outcome
+      // (429 / 5xx); axis 2 re-hits the SAME rung on an explicit `retry_on`
+      // status. An exhausted ladder surfaces the last failure in its original
+      // form — a returned Response (chat-completions/embeddings handlers have
+      // nothing to throw) is returned verbatim; a thrown error is rethrown so
+      // the outer catch applies the usual error path. See
+      // docs/plan-remote-target-retry-dispatch.md.
+      const runTargetLadder = async (
+        entries: RemoteTargetDescriptor[],
+        bodyObj: Record<string, unknown>,
+      ): Promise<Response> => {
+        const maxTargetRetries = proxyConfig.remote?.max_target_retries ?? DEFAULT_MAX_TARGET_RETRIES;
+        // Auth-response one-time code is the base each rung's own otac overrides.
+        const baseOtac = modelUsageOneTimeAuthCode;
+        let lastOutcome: AttemptOutcome | undefined;
+
+        for (let i = 0; i < entries.length; i++) {
+          const entry = entries[i];
+          const route = descriptorToRoute(entry, proxyConfig);
+          modelUsageOneTimeAuthCode = entry.otac ?? baseOtac;
+          let attempt = buildRouteAttempt(entry.target, route, bodyObj);
+          let outcome: AttemptOutcome | undefined;
+
+          // Axis 2: same-target retry (retry_on).
+          for (let n = 0; n <= maxTargetRetries; n++) {
+            if (attempt.modelId) failedModelId = attempt.modelId;
+            try {
+              outcome = outcomeFromResponse(await runAttempt(attempt));
+            } catch (error) {
+              outcome = outcomeFromError(error);
+              // runAttempt's stats block only fires for returned Responses;
+              // record the thrown case here so a dead rung is still counted
+              // (mirrors the composite loop's catch).
+              if (attempt.modelId) {
+                recordModelFailedRequest(attempt.modelId);
+                modelFailureRecorded = true;
+              }
+            }
+            logger.debug(requestId, `Target ladder: ${entry.target}@${entry.base} attempt ${n + 1}/${maxTargetRetries + 1} -> ${outcome.status}`);
+
+            if (outcome.ok) return outcome.response as Response;
+
+            if (n >= maxTargetRetries || !entry.retry_on?.includes(outcome.status)) break;
+
+            const retryAfterMs = parseRetryAfterMs(outcome.response);
+            const backoffMs = Math.min(250 * 2 ** n, 2000);
+            const waitMs = retryAfterMs !== undefined ? Math.min(retryAfterMs, 2000) : backoffMs;
+            if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+            attempt = buildRouteAttempt(entry.target, route, bodyObj); // Request bodies are single-use
+          }
+
+          lastOutcome = outcome;
+          // Axis 1: advance to the next rung only on a retryable status.
+          if (!outcome || !isRetryableOutcome(outcome)) break;
+          if (i < entries.length - 1) {
+            logger.warn(requestId, `Target ladder: ${entry.target}@${entry.base} returned ${outcome.status}; trying next target ${entries[i + 1].target}`);
+          }
+        }
+
+        if (lastOutcome?.response) return lastOutcome.response;
+        throw lastOutcome?.error ?? new ClaudeProxyError('All auth targets failed', 502, 'upstream_error');
+      };
+
+      // ---- Remote target-retry ladder dispatch ----
+      // The override owns routing for this request: no composite attempts were
+      // built (the routing block short-circuited), so the ladder runs here and
+      // applies the post-response pipeline itself — same three steps the two
+      // existing call sites apply, or override requests would silently lose
+      // PII restoration / CORS / timing.
+      if (useAuthLadder) {
+        const ladderResponse = await runTargetLadder(authTargets, routeBody as Record<string, unknown>);
+        recordRequestTiming(path, Date.now() - requestStartTime);
+        return applyCorsHeaders(await restorePrivacyResponse(ladderResponse, piiMapping, requestId, logger), request, env);
+      }
 
       // ---- Fusion dispatch ----
       const _fusionPlan = (request as any)._fusionPlan as FusionPlan | undefined;

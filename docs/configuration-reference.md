@@ -23,21 +23,42 @@ environment.
 | `default_api_key` | `"sk-..."` | Global configured-key fallback. In `user_key` mode (default): wins only for `[models.FREE]`, acts as a fallback for other sections when the caller sends no key. In `config_key` mode: used for all models that have no per-entry or section `api_key`. Typically left unset in production. |
 | `upstream_mode` | `"openai-completions"` | Default protocol for models not claimed by any `[models.*]` section. |
 
-## `[remote.authentication]` config fields
+## `[remote]` config fields
+
+A single flat table; keys are prefixed by role — `auth_*` (pre-route gate), `record_*`
+(post-response collector), `dispatch_*` (on-failure retry, reserved). The former nested
+`[remote.authentication]` / `[remote.recording]` tables are **removed**: they are no longer
+parsed, and a startup warning is logged when one is still present.
+
+**Auth**
 
 | Field | Example | Purpose |
 |---|---|---|
-| `auth_server` | `"https://auth.example.com/validate"` | If set, every inbound request's proxy auth headers (`Authorization`, `x-api-key`, `x-goog-api-key`) plus `User-Agent` are validated by a `GET` to this URL before routing. HTTP 200 = pass; 4xx/5xx = 401 to client; network error = 503. **Exempt paths:** `/health`, `/`, `/dashboard`, and `/v1/models` (model listing is unauthenticated so SDKs can enumerate without a credential). |
+| `auth_server` | `"https://auth.example.com/validate"` | If set, every inbound request's proxy auth headers (`Authorization`, `x-api-key`, `x-goog-api-key`) plus `User-Agent` are validated by a `GET` to this URL before routing. HTTP 200 = pass; 4xx/5xx = 401 to client; network error = 503. **Exempt paths:** `/health`, `/`, `/dashboard`, and `/v1/models` (model listing is unauthenticated so SDKs can enumerate without a credential). A `200` body may carry a `targets[]` failover ladder — see [Auth & Stats Service Protocol](./auth-stats-protocol.md). |
 | `auth_with_model` | `false` | When `true`, the `auth_server` call is deferred until after the request body is parsed so the requested model id can be forwarded as `x-resource-for` header. Allows the auth server to make per-model decisions. Default: `false` (auth runs before body parsing). |
 | `auth_with_body` | `false` | When `true`, the `auth_server` call is deferred until after body parsing and the entire parsed request body is forwarded to the auth service as the `POST` body (raw JSON). Either `auth_with_model` or `auth_with_body` triggers the deferred path. See [Auth & Stats Service Protocol](./auth-stats-protocol.md). |
 | `auth_passthrough_with` | `"user_key"` | Standalone upstream-auth setting, separate from `auth_server` / `auth_with_model`. Controls which key is passed to the upstream provider: `"user_key"` (default) forwards the caller's key; `"config_key"` uses the configured `api_key`. |
+| `max_targets` | `4` | Upper bound on the auth `targets[]` failover ladder — caps upstream **attempts**, not just array length. Entries beyond the cap (after dedupe) are dropped. |
+| `max_target_retries` | `1` | Upper bound on axis-2 same-target re-hits per descriptor (`retry_on`). `0` disables axis 2. Backoff `250ms × 2^n`, capped `2s`, honoring `Retry-After`. |
 
-## `[remote.recording]` config fields
+**Recording**
 
 | Field | Example | Purpose |
 |---|---|---|
 | `record_server` | `"http://127.0.0.1:8080/model-usage"` | Optional HTTP collector. When set, the proxy POSTs per-request usage records with `request_id`, `endpoint`, raw `user_key`, `model`, `response_status`, and token counters (`input_tokens`, `cached_tokens`, `cache_written_tokens`, `output_tokens`, `total_tokens`). |
 | `record_response_body` | `false` | When `true`, each usage record also includes the constructed `response_body` (parsed JSON for non-streaming responses; accumulated raw SSE text for streaming; the upstream error body for non-2xx). Sent raw, not base64. See [Auth & Stats Service Protocol](./auth-stats-protocol.md). |
+
+**Dispatch (reserved — not yet implemented)**
+
+These keys are parsed and accepted so a config carrying them does not error, but the
+on-failure dispatch path is **not implemented** — they currently have no effect.
+
+| Field | Example | Purpose |
+|---|---|---|
+| `dispatch_server` | `"http://127.0.0.1:8788/dispatch"` | Reserved: sidecar consulted on upstream failure. |
+| `max_dispatches` | `2` | Reserved: loop guard per attempt. |
+| `dispatch_timeout_ms` | `2000` | Reserved: bound on the oracle call so a hung sidecar can't stall. |
+| `buffer_non_sse` | `false` | Reserved: buffer non-SSE bodies so mid-body failures retry. |
 
 ## `[transforms.*]` and `[transform_defaults]` config fields
 

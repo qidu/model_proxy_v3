@@ -32,8 +32,8 @@ usage stats and some configs modification.
 
 ### Proxy ↔ remote auth & stats service
 
-The two optional remote sidecars (`[remote.authentication] auth_server` and
-`[remote.recording] record_server`) can be the **same** service or two separate ones.
+The two optional remote sidecars (`[remote] auth_server` and
+`[remote] record_server`) can be the **same** service or two separate ones.
 `auth_server` gates admission; `record_server` collects per-request usage after the
 response. When they are the same service, the proxy can authenticate and
 report stats against one backend.
@@ -42,52 +42,84 @@ report stats against one backend.
 sequenceDiagram
     participant C as Client
     participant P as Model Proxy
-    participant A as Auth Service<br/>([remote.authentication] auth_server)
-    participant S as Stats Service<br/>([remote.recording] record_server)
+    participant A as Auth Service<br/>([remote] auth_server)
+    participant S as Stats Service<br/>([remote] record_server)
     participant U as Upstream Provider
 
     C->>P: POST /v1/messages<br/>(Authorization / x-api-key)
     Note over P: auth_with_model/auth_with_body = false → auth now (GET)<br/>either = true → defer until body parsed
     P->>A: auth_server<br/>GET (default) or POST (auth_with_body: whole request body)<br/>forward: Authorization, x-api-key, x-goog-api-key,<br/>user-agent, request_id, endpoint,<br/>[x-resource-for], [x-forwarded-for, x-real-ip]
-    A-->>P: 200 OK<br/>header: one_time_auth_code / OTAC (optional)<br/>body: dynamic routing override (optional)
-    Note over P: if body carries target/mode/base/key/transforms<br/>→ use as one-time dynamic route,<br/>skip config-file model resolution
+    A-->>P: 200 OK<br/>header: one_time_auth_code / OTAC (optional)<br/>body: targets[] failover ladder (optional)
+    Note over P: if body carries targets[]<br/>→ walk rungs in order, fail over on retryable error,<br/>skip config-file model resolution
     P->>U: forwarded request (native or converted)
     U-->>P: response (streaming or JSON)
     P-->>C: response (converted back to client schema)
     P-)S: POST record_server<br/>{request_id, endpoint, user_key, model, response_status, token counters,<br/>[response_body if record_response_body=true]}<br/>header: one_time_auth_code, x-forwarded-for, [x-real-ip]
 ```
 
-**Auth dynamic-routing override (response body).** The auth service MAY respond
-with a JSON body carrying `targets` — an ordered list of **one-time alias config
-entries** (the same shape as a `[models.*]` inline table). When present, the proxy
-uses them directly for this single request, trying them in order on failure, and
-skips resolving the model from `[models.*]` / `[composite]` / `[schedule]` in the
-config file. All fields are optional; omitted fields fall back to the normal
-inheritance chain (`[default_upstream]` → section → entry):
+**Auth `targets[]` failover ladder (response body).** The auth service MAY respond
+with a JSON body carrying `targets` — an ordered list of **self-contained target
+descriptors**. When present, the proxy uses them directly for this single request,
+starting on `targets[0]` and advancing to the next rung on a retryable upstream
+failure, and skips resolving the model from `[models.*]` / `[composite]` /
+`[schedule]` in the config file:
 
 ```json
 { "targets": [
     { "target": "claude-opus-4-6", "mode": "anthropic-messages",
       "base": "https://api.anthropic.com", "key": "sk-…", "timeout": 30000 },
     { "target": "gpt-5", "mode": "openai-completions",
-      "base": "https://api.openai.com/v1", "timeout": 10000 }
+      "base": "https://api.openai.com/v1", "timeout": 10000, "retry_on": [503] }
 ] }
 ```
 
 | Target field | Type | Meaning |
 |---|---|---|
-| `target` | string | Real upstream model id to send (like an alias `target`). |
-| `mode` / `upstream_mode` | string | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. |
-| `base` / `base_url` | string | Upstream base URL. |
-| `key` / `api_key` | string *(optional)* | Upstream API key for this request only. When omitted, the proxy uses the caller's key (subject to `auth_passthrough_with`) or the config-inherited key. |
-| `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached beyond what config resolution already yields. |
-| `timeout` | number *(optional)* | Upstream first-byte timeout for **this target**, in milliseconds. Overrides `UPSTREAM_BODY_TIMEOUT_MS`. If the target does not respond before it elapses, the proxy aborts it and fails over to the next entry in `targets`. |
+| `target` | string **required** | Real upstream model id to send (like an alias `target`). |
+| `base` / `base_url` | string **required** | Upstream base URL. |
+| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[default_upstream].upstream_mode`, else `openai-completions`. |
+| `key` / `api_key` | string *(optional)* | Upstream API key for this rung only. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (subject to `auth_passthrough_with`). |
+| `otac` | string *(optional)* | Per-rung value replacing the `one_time_auth_code` header for the upstream call and the stats record. Overrides the auth response's OTAC header for this rung. |
+| `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached. |
+| `timeout` | number *(optional)* | **Whole-request** upstream abort deadline for **this rung**, in milliseconds. Overrides `UPSTREAM_BODY_TIMEOUT_MS`; on expiry the proxy aborts the attempt and fails over to the next entry. |
+| `retry_on` | number[] *(optional)* | Upstream statuses that re-hit **this same rung** before the ladder advances (axis 2). Bounded by `[remote] max_target_retries` (default `1`; `0` disables). |
 
-> The override is **per-request and ephemeral** — it is never cached, never
-> written to config, and does not persist across requests. If the auth response
-> body is empty or not JSON, the proxy falls back to normal config resolution.
-> Requires `auth_with_model = true` so the auth call runs after body parsing
-> (the proxy needs the requested model id and the override before routing).
+**Descriptors are self-contained — `target` and `base` are required.** A
+descriptor is not merged onto `[default_upstream]` / section / entry; the only
+inherited field is `mode`. A missing `target`/`base` would fall back to
+`http://localhost` with no key, so entries that omit them are rejected (dropped
+with an error) rather than silently mis-routed.
+
+> **Notice — a rung's `key` replaces the caller's credential.** When a descriptor
+> carries a non-empty `key`, the proxy sends **that** key upstream and does **not**
+> forward the caller's. The rung's key overwrites the mode's auth header
+> (`Authorization` for `openai-completions`, `x-api-key` for `anthropic-messages`,
+> `x-goog-api-key` for the Gemini modes) rather than being added alongside it.
+> This applies without `auth_passthrough_with = "config_key"` — that setting
+> governs config-resolved routes, not ladder rungs, so an auth service can pin
+> credentials per rung regardless of the client's passthrough setting. It is
+> **per-rung, not per-ladder**: an entry with no `key` still forwards the caller's
+> credential, so one ladder may mix server-pinned and caller-supplied keys. A
+> rung's `otac` likewise overrides the `one_time_auth_code` header for that rung
+> only.
+
+**Failover (axis 1).** The ladder advances on HTTP `429`, any `5xx`, a transport
+failure (→ `502`), or an abort/timeout (→ `504`). A deterministic `4xx`
+(`400`/`401`/`422`/…) is terminal — the ladder stops and the client sees that
+rung's status. Total attempts are bounded by `[remote] max_targets` (default `4`).
+
+**Bounds and validation.** Entries are validated, deduplicated
+(`target@base@key`), then capped at `max_targets`; an invalid entry is dropped
+with an error and the ladder continues — even when it is `targets[0]`. If every
+entry is invalid, the body is empty/not JSON, or the auth call is not a `200`,
+the proxy falls back to normal config resolution.
+
+> The ladder is **per-request and ephemeral** — never cached, never written to
+> config, and does not persist across requests. It requires a **parsed JSON
+> request body** (the proxy re-serializes it for each rung), so it applies to
+> body-carrying endpoints. The auth call may run early or deferred —
+> `auth_with_model` / `auth_with_body` are not required; the `targets[]` override
+> is captured on either path.
 
 See [Auth & Stats Service Protocol](#auth--stats-service-protocol) below for the
 full wire-level contract.
@@ -445,12 +477,12 @@ fail to read the response body.
 ## Auth & Stats Service Protocol
 
 The proxy talks to two optional remote services over plain HTTP: an auth service
-(`[remote.authentication] auth_server`) that gates admission before routing, and a stats
-service (`[remote.recording] record_server`) that collects per-request usage records after
+(`[remote] auth_server`) that gates admission before routing, and a stats
+service (`[remote] record_server`) that collects per-request usage records after
 the response. The exact wire-level contract — request/response shapes, forwarded headers,
 the `one_time_auth_code` (OTAC) linkage, `auth_with_model` / `auth_with_body` timing, the
-dynamic routing override, and how to combine both services in one backend — is documented
-in [`docs/auth-stats-protocol.md`](./docs/auth-stats-protocol.md).
+auth `targets[]` failover ladder, and how to combine both services in one backend — is
+documented in [`docs/auth-stats-protocol.md`](./docs/auth-stats-protocol.md).
 
 ## Configuration Reference
 
@@ -458,9 +490,8 @@ Most users only need `proxy_config.toml`; optional environment variables tune be
 The full field-by-field reference lives in
 [`docs/configuration-reference.md`](./docs/configuration-reference.md):
 
-- **TOML sections** — `[general]`, `[default_upstream]`, `[remote.authentication]`,
-  `[remote.recording]`, `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`,
-  `[dashboard]`.
+- **TOML sections** — `[general]`, `[default_upstream]`, `[remote]`,
+  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[dashboard]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
   config `api_key` into the OS keychain (accounts `<target_model_id>/<base_url>` under
   the `model_proxy_v3` service) and rewrites the config file to `STORE_KEY_IN_SYSTEM`

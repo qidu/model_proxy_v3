@@ -52,6 +52,7 @@ import {
   getPrivacyKeysDetected,
 } from '../utils/dashboard-stats.js';
 import { formatApiKeyForUpstream } from '../utils/routing.js';
+import { UPSTREAM_MODES } from '../utils/upstream-modes.js';
 import { getModelQuota, formatQuotaLeft, getUpstreamRateLimitLeft, getUpstreamRateLimitLeftForUrl, type QuotaResult } from '../utils/provider-quota.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -1373,7 +1374,7 @@ export function handleDashboardPage(env: Env): Response {
         if (!stepsEl || !titleEl || !bodyEl || !statusEl || !cancelBtn || !backBtn || !submitBtn || !closeXBtn) return;
 
         const TOTAL_STEPS = 6;
-        const MODES = ['openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
+        const MODES = ${JSON.stringify(UPSTREAM_MODES)};
         const state = { step: 1, aliasKey: '', target: '', apiKey: '', baseUrl: '', mode: MODES[0], category: '' };
 
         function setStatus(msg, kind) {
@@ -2140,7 +2141,7 @@ export function handleDashboardPage(env: Env): Response {
 
       function upstreamModeSelect(categoryName, currentMode) {
         const disabledAttr = isReadOnly ? ' disabled' : '';
-        const options = ['anthropic-messages', 'openai-completions', 'openai-responses', 'gemini-generatecontent', 'gemini-interactions'];
+        const options = ${JSON.stringify(UPSTREAM_MODES)};
         const optionHtml = options.map((mode) => {
           const selected = mode === currentMode ? ' selected' : '';
           return '<option value="' + escapeHtml(mode) + '"' + selected + '>' + escapeHtml(mode) + '</option>';
@@ -2158,7 +2159,7 @@ export function handleDashboardPage(env: Env): Response {
       // drift from the category-level list.
       function perModelModeSelect(categoryName, modelKey, currentMode) {
         const disabledAttr = isReadOnly ? ' disabled' : '';
-        const options = ['', 'anthropic-messages', 'openai-completions', 'openai-responses', 'gemini-generatecontent', 'gemini-interactions'];
+        const options = ['', ...${JSON.stringify(UPSTREAM_MODES)}];
         const optionHtml = options.map((mode) => {
           const selected = mode === currentMode ? ' selected' : '';
           const label = mode === '' ? '(inherit)' : mode;

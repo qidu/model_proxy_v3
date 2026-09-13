@@ -36,4 +36,5 @@ export const suites = [
   '16_security/reasoning_effort_conversion.test.js',
   '16_security/openai_responses_routing.test.js',
   '16_security/dev_pass_through_responses.test.js',
+  '16_security/target_retry_ladder.test.js',
 ];

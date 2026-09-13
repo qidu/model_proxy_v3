@@ -565,7 +565,7 @@ async function handleAsAnthropicMessages(
     method: 'POST',
     headers: anthropicFetchHeaders,
     body: JSON.stringify(claudeBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
@@ -781,7 +781,7 @@ async function handleAsCompletions(
     method: 'POST',
     headers: completionsFetchHeaders,
     body: JSON.stringify(upstreamBodyResponses),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1324,7 +1324,7 @@ export async function handleResponsesInputTokensRequest(
       method: 'POST',
       headers: countFetchHeaders,
       body: JSON.stringify(countRequest),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -1373,7 +1373,7 @@ export async function handleResponsesInputTokensRequest(
     method: 'POST',
     headers: passthroughInputTokensHeaders,
     body: JSON.stringify(passthroughBodyInputTokens),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1449,7 +1449,7 @@ export async function handleResponsesCompactRequest(
       method: 'POST',
       headers: compactCompletionsHeaders,
       body: JSON.stringify(completionsRequest),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -1498,7 +1498,7 @@ export async function handleResponsesCompactRequest(
     method: 'POST',
     headers: compactPassthroughHeaders,
     body: JSON.stringify(passthroughBodyCompact),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1559,7 +1559,7 @@ async function handleAsPassthrough(
     method: 'POST',
     headers: passthroughFetchHeaders,
     body: JSON.stringify(upstreamBodyPassthrough),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {

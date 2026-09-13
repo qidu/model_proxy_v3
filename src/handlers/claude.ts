@@ -128,7 +128,7 @@ export async function handleClaudeRequest(
         method: 'POST',
         headers: upstreamHeaders,
         body: JSON.stringify(upstreamBody),
-        signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     // after_upstream: apply response transforms before !ok check (fires on both success and error).

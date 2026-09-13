@@ -557,19 +557,19 @@ base_url = "https://api.example.com"
 
 async function testModelUsageRoundTrip() {
   const cfg = parse(`
-[remote.recording]
+[remote]
 record_server = "http://127.0.0.1:8080/model-usage"
 `);
   assert(
-    cfg.remote?.recording?.record_server === 'http://127.0.0.1:8080/model-usage',
-    `record_server should parse, got "${cfg.remote?.recording?.record_server}"`
+    cfg.remote?.record_server === 'http://127.0.0.1:8080/model-usage',
+    `record_server should parse, got "${cfg.remote?.record_server}"`
   );
 
   const serialized = serializeProxyConfigToml(cfg);
   const reparsed = parse(serialized);
   assert(
-    reparsed.remote?.recording?.record_server === 'http://127.0.0.1:8080/model-usage',
-    `record_server should survive round-trip, got "${reparsed.remote?.recording?.record_server}"`
+    reparsed.remote?.record_server === 'http://127.0.0.1:8080/model-usage',
+    `record_server should survive round-trip, got "${reparsed.remote?.record_server}"`
   );
 }
 
@@ -595,7 +595,7 @@ const tests = [
   { name: 'TC1515: array value with trailing inline comment', fn: testInlineCommentOnArray },
   { name: 'TC1516: comment containing quote char does not corrupt string value', fn: testInlineCommentWithQuoteChar },
   { name: 'TC1517: full [privacy_filter] block with inline comments on every line', fn: testPrivacyFilterBlockWithComments },
-  { name: 'TC1518: [remote.recording] record_server round-trip', fn: testModelUsageRoundTrip },
+  { name: 'TC1518: [remote] record_server round-trip', fn: testModelUsageRoundTrip },
   { name: 'TC1519: 6-element entry max_tokens reaches getModelRouteConfig()', fn: testSixElementMaxTokensReachesRoute },
 ];
 

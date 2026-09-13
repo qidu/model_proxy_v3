@@ -15,6 +15,7 @@ import type { ConsulKvEntry } from './consul-loader.js';
 import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
 import { createLogger } from './logger.js';
 import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
+import { UPSTREAM_MODES } from './upstream-modes.js';
 
 // Check if we're running in Node.js environment
 const isNodeEnvironment = (typeof process !== 'undefined' && process.versions?.node) ||
@@ -31,16 +32,21 @@ export interface ProxyConfig {
     store_key_in_system?: boolean;
   };
   remote?: {
-    authentication?: {
-      auth_server?: string;
-      auth_with_model?: boolean;
-      auth_with_body?: boolean;
-      auth_passthrough_with?: 'user_key' | 'config_key';
-    };
-    recording?: {
-      record_server?: string;
-      record_response_body?: boolean;
-    };
+    // auth role — pre-route gate, fail-CLOSED
+    auth_server?: string;
+    auth_with_model?: boolean;
+    auth_with_body?: boolean;
+    auth_passthrough_with?: 'user_key' | 'config_key';
+    max_targets?: number;
+    max_target_retries?: number;
+    // recording role — post-response, fire-and-forget
+    record_server?: string;
+    record_response_body?: boolean;
+    // dispatch role — on-failure retry, fail-OPEN
+    dispatch_server?: string;
+    max_dispatches?: number;
+    dispatch_timeout_ms?: number;
+    buffer_non_sse?: boolean;
   };
   default_upstream?: {
     upstream_mode?: string;
@@ -512,6 +518,8 @@ export interface ModelRouteConfig {
   section?: string;
   transforms: TransformSet[];  // resolved & merged: mode-defaults → sector-defaults → entry
   maxTokens?: number;  // per-entry default max_tokens; falls back to DEFAULT_MAX_TOKENS when unset
+  /** Per-route abort deadline (ms). Overrides the env UPSTREAM_BODY_TIMEOUT_MS default. */
+  timeout?: number;
 }
 
 export interface CompositeRouteSelection {
@@ -538,7 +546,7 @@ interface CompositeResolvedTarget {
  * Order (design doc §3b / open-question #8): mode-defaults → sector-defaults → entry transforms.
  * Each level's names are looked up from proxyConfig.transforms.
  */
-function resolveTransforms(
+export function resolveTransforms(
   upstreamMode: string,
   categoryTransforms: string | undefined,
   entryTransforms: string | undefined,
@@ -2259,15 +2267,9 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
     lines.push('');
   }
 
-  if (config.remote?.authentication) {
-    lines.push('[remote.authentication]');
-    lines.push(...serializeTomlSection(config.remote.authentication as Record<string, unknown>));
-    lines.push('');
-  }
-
-  if (config.remote?.recording) {
-    lines.push('[remote.recording]');
-    lines.push(...serializeTomlSection(config.remote.recording as Record<string, unknown>));
+  if (config.remote) {
+    lines.push('[remote]');
+    lines.push(...serializeTomlSection(config.remote as Record<string, unknown>));
     lines.push('');
   }
 
@@ -2692,14 +2694,15 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'dashboard';
         currentCategory = null;
         config.dashboard = {};
-      } else if (parts[0] === 'remote' && (parts[1] === 'authentication' || parts[1] === 'recording')) {
-        currentSection = 'remote';
-        currentCategory = parts[1];
-        if (!config.remote) config.remote = {};
-        if (currentCategory === 'authentication') {
-          config.remote.authentication = {};
+      } else if (parts[0] === 'remote') {
+        if (parts[1] === 'authentication' || parts[1] === 'recording') {
+          console.warn(`[config] [remote.${parts[1]}] is removed — use the flat [remote] table with prefixed keys (auth_* / record_* / dispatch_*) instead. Keys under this section are IGNORED.`);
+          currentSection = 'remote_deprecated';
+          currentCategory = null;
         } else {
-          config.remote.recording = {};
+          currentSection = 'remote';
+          currentCategory = null;
+          if (!config.remote) config.remote = {};
         }
       } else if (parts[0] === 'privacy_filter') {
         currentSection = 'privacy_filter';
@@ -2745,17 +2748,17 @@ export function parseSimpleToml(content: string): ProxyConfig {
         } else if (cleanKey === 'week_start_day') {
           (config.general as any)[cleanKey] = value === 'sunday' ? 'sunday' : 'monday';
         }
-      } else if (currentSection === 'remote' && currentCategory === 'authentication' && config.remote?.authentication) {
-        if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with') {
-          (config.remote.authentication as any)[cleanKey] = value;
-        } else if (cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body') {
-          (config.remote.authentication as any)[cleanKey] = value === 'true';
-        }
-      } else if (currentSection === 'remote' && currentCategory === 'recording' && config.remote?.recording) {
-        if (cleanKey === 'record_server') {
-          config.remote.recording.record_server = value;
-        } else if (cleanKey === 'record_response_body') {
-          config.remote.recording.record_response_body = value === 'true';
+      } else if (currentSection === 'remote' && config.remote) {
+        if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with'
+          || cleanKey === 'record_server' || cleanKey === 'dispatch_server') {
+          (config.remote as any)[cleanKey] = value;
+        } else if (cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body'
+          || cleanKey === 'record_response_body' || cleanKey === 'buffer_non_sse') {
+          (config.remote as any)[cleanKey] = value === 'true';
+        } else if (cleanKey === 'max_targets' || cleanKey === 'max_target_retries'
+          || cleanKey === 'max_dispatches' || cleanKey === 'dispatch_timeout_ms') {
+          const n = Number(value);
+          if (Number.isFinite(n) && n >= 0) (config.remote as any)[cleanKey] = n;
         }
       } else if (currentSection === 'default_upstream' && config.default_upstream) {
         (config.default_upstream as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, value);
@@ -3056,17 +3059,16 @@ export function parseSimpleToml(content: string): ProxyConfig {
         } else if (cleanKey === 'image_encode' && typeof cleanValueAny === 'string') {
           config.fetch.image_encode = cleanValueAny;
         }
-      } else if (currentSection === 'remote' && currentCategory === 'recording' && config.remote?.recording) {
-        if (cleanKey === 'record_server' && typeof cleanValueAny === 'string') {
-          config.remote.recording.record_server = cleanValueAny;
-        } else if (cleanKey === 'record_response_body' && typeof cleanValueAny === 'boolean') {
-          config.remote.recording.record_response_body = cleanValueAny;
-        }
-      } else if (currentSection === 'remote' && currentCategory === 'authentication' && config.remote?.authentication) {
-        if ((cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body') && typeof cleanValueAny === 'boolean') {
-          (config.remote.authentication as any)[cleanKey] = cleanValueAny;
-        } else if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with') {
-          (config.remote.authentication as any)[cleanKey] = cleanValueAny;
+      } else if (currentSection === 'remote' && config.remote) {
+        if ((cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with'
+          || cleanKey === 'record_server' || cleanKey === 'dispatch_server') && typeof cleanValueAny === 'string') {
+          (config.remote as any)[cleanKey] = cleanValueAny;
+        } else if ((cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body'
+          || cleanKey === 'record_response_body' || cleanKey === 'buffer_non_sse') && typeof cleanValueAny === 'boolean') {
+          (config.remote as any)[cleanKey] = cleanValueAny;
+        } else if ((cleanKey === 'max_targets' || cleanKey === 'max_target_retries'
+          || cleanKey === 'max_dispatches' || cleanKey === 'dispatch_timeout_ms') && typeof cleanValueAny === 'number') {
+          if (cleanValueAny >= 0) (config.remote as any)[cleanKey] = cleanValueAny;
         }
       }
       continue;
@@ -3210,6 +3212,7 @@ export interface DashboardConfigPayload {
   global_token_limit?: string;
   remote_auth_active: boolean;
   remote_recording_active: boolean;
+  remote_dispatch_active: boolean;
   privacy_filter_active: boolean;
   /** True when every configured api_key in the local file is a STORE_KEY_IN_SYSTEM sentinel. */
   api_keys_in_system_store?: boolean;
@@ -3385,8 +3388,9 @@ export function toDashboardConfigPayload(config: ProxyConfig): DashboardConfigPa
     config_warnings: (config as unknown as { _validationWarnings?: ConfigValidationError[] })._validationWarnings ?? [],
     global_token_limit: config.general?.global_token_limit,
     api_keys_in_system_store: !!(config as ProxyConfig & { _api_keys_in_system_store?: boolean })._api_keys_in_system_store,
-    remote_auth_active: !!config.remote?.authentication?.auth_server,
-    remote_recording_active: !!config.remote?.recording?.record_server,
+    remote_auth_active: !!config.remote?.auth_server,
+    remote_recording_active: !!config.remote?.record_server,
+    remote_dispatch_active: !!config.remote?.dispatch_server,
     privacy_filter_active: !!config.privacy_filter?.filter_mode,
   };
 }
@@ -4048,8 +4052,6 @@ export function removeCompositeTarget(baseConfig: ProxyConfig, alias: string, ta
   return nextConfig;
 }
 
-const MODEL_TARGET_UPSTREAM_MODES: TransformSchema[] = ['openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent'];
-
 export interface ModelTargetPatch {
   target: string;
   base_url: string;
@@ -4076,8 +4078,8 @@ export function upsertModelTarget(
   if (!target) {
     throw new Error('Target model id is required');
   }
-  if (!MODEL_TARGET_UPSTREAM_MODES.includes(patch.mode as TransformSchema)) {
-    throw new Error(`Invalid upstream mode: ${patch.mode} — must be one of ${MODEL_TARGET_UPSTREAM_MODES.join(', ')}`);
+  if (!(UPSTREAM_MODES as readonly string[]).includes(patch.mode)) {
+    throw new Error(`Invalid upstream mode: ${patch.mode} — must be one of ${UPSTREAM_MODES.join(', ')}`);
   }
 
   const nextModels: Record<string, ModelCategoryConfig | ModelArrayConfig> = { ...(baseConfig.models || {}) };

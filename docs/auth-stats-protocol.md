@@ -6,7 +6,7 @@ a compatible auth/stats backend in any language. For the high-level overview and
 sequence diagram, see [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service)
 in the README.
 
-## Auth service — `[remote.authentication] auth_server`
+## Auth service — `[remote] auth_server`
 
 **When**: before routing (every non-exempt model-API request). Exempt paths:
 `/health`, `/`, `/dashboard`, `/v1/models`.
@@ -15,8 +15,10 @@ in the README.
 - `auth_with_model = false` (default) → auth runs **before** the request body is
   parsed.
 - `auth_with_model = true` → auth runs **after** body parsing, so the requested
-  model id is known and forwarded as `x-resource-for`. Required for the dynamic
-  routing override (the proxy needs the override before resolving the route).
+  model id is known and forwarded as `x-resource-for`. Deferring lets the auth
+  server key its decision to the requested model; it is **not** required for the
+  `targets[]` routing override, which is accepted whether auth runs early or
+  deferred.
 - `auth_with_body = true` → auth also runs **after** body parsing, and the entire
   parsed request body is forwarded to the auth service as the `POST` body (raw
   JSON, not base64). Either `auth_with_model` or `auth_with_body` defers auth
@@ -64,32 +66,72 @@ On `200`, the proxy reads:
 
 - **Header `one_time_auth_code`** (OTAC, optional) — stored and re-sent as the
   `one_time_auth_code` header on the later stats `POST record_server` call (see below).
-- **JSON body** (optional) — the **dynamic routing override**, a one-time alias
-  config entry. See the table in [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service).
+  A ladder descriptor's own `otac` field takes precedence over this header **for
+  that rung**: the rung sends its `otac` upstream and records that value, while
+  entries without an `otac` fall back to this response-header value.
+- **JSON body** (optional) — the **auth `targets[]` failover ladder**. See the
+  table in [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service).
 
-**Dynamic routing override precedence.** When the auth response body carries a
-`targets` array — each entry a target descriptor (`target` / `mode`
-(`upstream_mode`) / `base` (`base_url`) / `key` (`api_key`) / `transforms` /
-`timeout`) — the proxy treats them as the resolved route for **this request
-only**, in array order:
+**Auth `targets[]` failover ladder.** When the auth response body carries a
+`targets` array, the proxy treats each entry as a **self-contained target
+descriptor** and resolves the route for **this request only**, in array order.
+The first entry is the initial rung; on a retryable upstream failure the proxy
+advances to the next entry (see *Two orthogonal retry axes* below). Descriptors
+carry no config inheritance:
 
-1. The override fields are merged on top of the normal inheritance chain
-   (per-entry → section → `[default_upstream]`). Auth-provided fields win over
-   config-file fields for the same request.
-2. If an entry supplies a `target`, the upstream sees that model id and the
-   proxy skips `[models.*]` / `[composite]` / `[schedule]` resolution entirely.
-3. If an entry supplies `transforms`, those `[transforms.*]` sets are
-   applied at the same five lifecycle hooks as config-attached sets.
-4. If an entry supplies `timeout` (ms), it overrides `UPSTREAM_BODY_TIMEOUT_MS`
-   as that target's upstream first-byte timeout; on expiry the proxy aborts the
-   attempt and fails over to the next entry in the array.
-5. If the body is empty / not JSON / not a `200`, normal config resolution
-   proceeds unchanged.
+| Field | Required | Meaning |
+|---|---|---|
+| `target` | **yes** | Upstream model id sent as `model` (the alias key is ignored). |
+| `base` | **yes** | Upstream base URL — the descriptor's `base_url`. |
+| `mode` | no | Upstream mode. Defaults to `[default_upstream].upstream_mode`, else `openai-completions`. |
+| `key` | no | Upstream API key. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (passthrough). |
+| `otac` | no | Per-rung replacement for the `one_time_auth_code` header sent upstream and on the stats record. |
+| `transforms` | no | `[transforms.*]` set names applied at the same five lifecycle hooks as config-attached sets. Resolved with no section layer. |
+| `timeout` | no | **Whole-request** upstream abort deadline (ms). Overrides `UPSTREAM_BODY_TIMEOUT_MS` for this rung. |
+| `retry_on` | no | Per-rung retry axis (see below): re-hit this same rung before advancing. |
+
+**Why `target` and `base` are required.** A descriptor is self-sufficient. The
+config-resolution fallback for a missing target/base is `http://localhost` with
+no key — silently routing auth-directed traffic to a local address with no
+credential. Only `mode` has a safe default; the rest must be supplied or the
+entry is rejected.
+
+> **Notice — a rung's `key` replaces the caller's credential.** A descriptor
+> carrying a non-empty `key` sends **that** key upstream; the caller's credential
+> is not forwarded. The rung's key overwrites the mode's auth header
+> (`Authorization` for `openai-completions`, `x-api-key` for `anthropic-messages`,
+> `x-goog-api-key` for the Gemini modes) instead of being sent alongside it, and
+> no `auth_passthrough_with = "config_key"` opt-in is required. The rule is
+> **per-rung, not per-ladder** — an entry without a `key` still forwards the
+> caller's credential, so one ladder may mix server-pinned and caller-supplied
+> keys. A rung's `otac` overrides the response-header `one_time_auth_code` for
+> that rung only (see above).
+
+**Two orthogonal retry axes.**
+
+1. **Axis 1 — advance the ladder.** On any *retryable* upstream outcome the
+   proxy moves to the next entry. The set is fixed: HTTP `429`, any `5xx`,
+   transport failure (→ `502`), and abort/timeout (→ `504`). A *deterministic*
+   `4xx` (e.g. `400`/`401`/`422`) is terminal — the ladder stops and the client
+   sees that rung's status. The number of upstream attempts is bounded by
+   `[remote] max_targets` (default `4`).
+2. **Axis 2 — re-hit the same rung.** A descriptor's `retry_on` array lists the
+   upstream statuses that should re-hit **that same target** before the ladder
+   advances. Bounded by `[remote] max_target_retries` (default `1`; `0`
+   disables). Backoff is `250ms × 2^n`, capped at `2s`, honoring `Retry-After`.
+
+**Bounds and validation.** Entries are validated, deduplicated (key
+`target@base@key`), then capped at `max_targets`; the cap bounds *attempts*, not
+just array length. An invalid entry is dropped with an `ERROR` log and the
+ladder continues — including when the invalid entry is `targets[0]`. If every
+entry is invalid, or the body is empty / not JSON / not a `200`, normal config
+resolution proceeds unchanged.
 
 The override is **never cached** and **never persisted** to `proxy_config.toml`
-— it is a single-use, per-request alias list.
+— it is a single-use, per-request alias list. Each rung contributes at most one
+usage record to the stats service.
 
-## Stats service — `[remote.recording] record_server`
+## Stats service — `[remote] record_server`
 
 **When**: after the upstream response is received, once token usage is known.
 For streaming (`text/event-stream`) responses, usage is extracted from the SSE
@@ -98,7 +140,7 @@ responses, it is POSTed immediately after parsing. The POST is fire-and-forget
 (non-blocking); failures are logged at `WARN` and do not affect the client
 response.
 
-**When (with `record_response_body`)**: `[remote.recording] record_response_body = true` (default `false`)
+**When (with `record_response_body`)**: `[remote] record_response_body = true` (default `false`)
 adds the **entire constructed response body** to each usage record. For JSON
 responses this is the parsed response object; for streaming (`text/event-stream`)
 responses this is the accumulated raw SSE text (all events concatenated,

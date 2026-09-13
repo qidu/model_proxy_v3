@@ -331,7 +331,7 @@ export async function handleMessagesRequest(
         method: 'POST',
         headers: responsesFetchHeaders1,
         body: JSON.stringify(responsesBody),
-        signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
       });
 
       if (route) {
@@ -422,7 +422,7 @@ export async function handleMessagesRequest(
       method: 'POST',
       headers: openaiFetchHeaders,
       body: JSON.stringify(upstreamBodyOpenai),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -610,7 +610,7 @@ export async function handleMessagesRequest(
       method: 'POST',
       headers: responsesFetchHeaders2,
       body: JSON.stringify(responsesBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -721,7 +721,7 @@ export async function handleMessagesRequest(
     method: 'POST',
     headers: claudeFetchHeaders,
     body: JSON.stringify(upstreamBodyClaude),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {

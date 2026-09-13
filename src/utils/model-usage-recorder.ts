@@ -11,7 +11,7 @@ export interface ModelUsageRecordPayload {
    * HTTP status of the upstream response. 0 means no response was obtained.
    * Non-2xx statuses are recorded with all token counters at 0 (the upstream
    * typically returns an error body rather than usage), plus the error body
-   * in `response_body` when `[remote.recording] record_response_body = true`.
+   * in `response_body` when `[remote] record_response_body = true`.
    */
   response_status: number;
   input_tokens: number;
@@ -20,7 +20,7 @@ export interface ModelUsageRecordPayload {
   output_tokens: number;
   total_tokens: number;
   /**
-   * Only present when `[remote.recording] record_response_body = true`. For JSON responses
+   * Only present when `[remote] record_response_body = true`. For JSON responses
    * this is the parsed response body object; for streaming (text/event-stream)
    * responses this is the accumulated raw SSE text (all events concatenated).
    * For non-2xx responses it carries the upstream's constructed error body.

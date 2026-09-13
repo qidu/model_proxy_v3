@@ -811,6 +811,7 @@ async function forwardCompletionsAsAnthropicMessages(
   logger: Logger,
   originalRequest: Request,
   env?: Env,
+  route?: ModelRouteConfig,
 ): Promise<Response> {
   const claudeBody = await completionsToClaudeBody(openaiRequest, model);
 
@@ -849,7 +850,7 @@ async function forwardCompletionsAsAnthropicMessages(
     method: 'POST',
     headers: anthropicFetchHeaders,
     body: JSON.stringify(claudeBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
@@ -996,7 +997,7 @@ async function forwardCompletionsAsOpenAIResponses(
     method: 'POST',
     headers: responsesFetchHeaders,
     body: JSON.stringify(responsesBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1223,7 +1224,7 @@ export async function handleOpenAIRequest(
     if (upstreamMode === 'anthropic-messages') {
       return forwardCompletionsAsAnthropicMessages(
         openaiRequest, targetUrl, authHeaders, requestId,
-        openaiRequest.model as string, activeLogger, request, env,
+        openaiRequest.model as string, activeLogger, request, env, route,
       );
     }
     if (upstreamMode === 'openai-responses') {
@@ -1296,7 +1297,7 @@ export async function handleOpenAIRequest(
             method: 'POST',
             headers: openaiFetchHeaders,
             body: JSON.stringify(upstreamBody),
-            signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+            signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
         });
 
         if (route) {

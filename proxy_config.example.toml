@@ -8,7 +8,8 @@
 # If omitted or empty, dashboard APIs remain loopback-only.
 api_key = "test"
 
-[remote.authentication]
+[remote]
+# --- auth role: pre-route gate (fail-CLOSED) ---
 # Optional: remote auth sidecar. Proxy forwards client auth headers (Authorization,
 # x-api-key, x-goog-api-key) plus User-Agent to this URL (GET, follows 301/302).
 # HTTP 200 = success; any 4xx/5xx = 401 to the client; network error = 503.
@@ -26,7 +27,7 @@ api_key = "test"
 # (not the auth sidecar). "user_key" (default): forward client's key; "config_key": use configured api_key.
 # auth_passthrough_with = "user_key"
 
-[remote.recording]
+# --- recording role: post-response (fire-and-forget) ---
 # Optional: POST per-request model usage records to an HTTP collector.
 # Payload includes request_id, endpoint, raw user_key, model, response_status,
 # and token usage counters: input/cached/cache_written/output/total.
@@ -38,7 +39,7 @@ api_key = "test"
 # record_response_body = false
 
 [general]
-# auth_passthrough_with is now under [remote.authentication] (see above).
+# auth_passthrough_with is now under [remote] (see above).
 budget_to_effort_low = 32768
 budget_to_effort_medium = 65536
 budget_to_effort_high = 128000

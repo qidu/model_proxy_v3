@@ -5,6 +5,81 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(dashboard): single shared `UPSTREAM_MODES` list (adds `gemini-interactions`)
+
+`gemini-interactions` was already a valid `upstream_mode` at runtime (the
+failover ladder accepted it) but two authoring lists omitted it, so the dashboard
+model-target wizard could not offer it and `upsertModelTarget` rejected it as an
+invalid mode. The upstream-mode list was also duplicated across several modules
+that had drifted out of sync.
+
+- New `src/utils/upstream-modes.ts` exports the single `UPSTREAM_MODES` constant
+  (and `UpstreamMode` type) — the authoritative order is `openai-completions`
+  first, which is also the wizard's default new-target mode.
+- `src/utils/config-loader.ts`: the local `MODEL_TARGET_UPSTREAM_MODES` const is
+  removed; `upsertModelTarget` validates against `UPSTREAM_MODES`. (Its old type
+  was `TransformSchema[]` — the wrong type: this is an upstream-mode whitelist,
+  not a transform-set schema, and `gemini-interactions` has no `SCHEMA_PATHS`
+  entry.)
+- `src/utils/target-retry.ts`: the local `KNOWN_MODES`/`KnownMode` are removed in
+  favour of `UPSTREAM_MODES`.
+- `src/handlers/dashboard.ts`: the wizard's `MODES`, the category-level
+  `upstreamModeSelect`, and the per-model `perModelModeSelect` now interpolate
+  `UPSTREAM_MODES` via `JSON.stringify`, so the embedded client script cannot
+  drift from the server list again.
+- `upsertModelTarget` unit test and the TC720 comment updated to the five-mode set.
+
+### feat(remote): flat `[remote]` config table + auth `targets[]` failover ladder
+
+The `[remote]` config is now a **single flat table** (breaking — see below), and
+the auth service's `200` response body may carry a `targets[]` **failover
+ladder** that the proxy walks before falling back to config-file model
+resolution.
+
+**Breaking config rename.** The nested `[remote.authentication]` and
+`[remote.recording]` subsections are **removed**; their fields move to the flat
+`[remote]` table under role-prefixed keys (`auth_*`, `record_*`). There is no
+dual-parse — a config still using a nested subsection triggers a `console.warn`
+naming the flat replacement, and its fields are no longer read.
+
+```toml
+[remote]
+auth_server           = "https://auth.example.com/validate"
+auth_with_model       = false
+auth_with_body        = false
+auth_passthrough_with = "user_key"
+max_targets           = 4        # cap on the targets[] ladder attempts
+max_target_retries    = 1        # per-descriptor retry_on re-hits (0 disables)
+record_server         = "http://127.0.0.1:8080/model-usage"
+record_response_body  = false
+```
+
+- **auth `targets[]` failover ladder**: when the auth `200` body carries a
+  `targets` array, each entry is a **self-contained descriptor** (`target` +
+  `base` required; `mode` / `key` / `otac` / `transforms` / `timeout` /
+  `retry_on` optional) and the proxy owns routing for that request — skipping
+  `[models.*]` / `[composite]` / `[schedule]` resolution.
+- **A rung's `key` replaces the caller's credential**: a non-empty descriptor
+  `key` is sent upstream in place of the caller's key (it overwrites the mode's
+  auth header, not adds to it) and needs no `auth_passthrough_with = "config_key"`
+  opt-in; an entry without a `key` still forwards the caller's credential, so a
+  ladder may mix server-pinned and caller-supplied keys. Documented as a Notice
+  in `README.md` and `docs/auth-stats-protocol.md`.
+- **Two retry axes**: axis 1 advances the ladder on `429` / any `5xx` / transport
+  (→`502`) / abort-timeout (→`504`), bounded by `max_targets`; a deterministic
+  `4xx` is terminal. Axis 2 re-hits the same rung per a descriptor's `retry_on`,
+  bounded by `max_target_retries`. An invalid entry is dropped (logged) and the
+  ladder continues — including when it is `targets[0]`; if all entries are
+  invalid (or the body is empty / not-JSON / not-`200`), normal config
+  resolution runs.
+- **dispatch keys reserved**: `dispatch_server`, `max_dispatches`,
+  `dispatch_timeout_ms`, `buffer_non_sse` are parsed but **not yet implemented**
+  (the on-failure dispatch path is deferred).
+- New `src/utils/target-retry.ts` (descriptor parsing / validation / capping)
+  with unit tests; `tests/integration/16_security/target_retry_ladder.test.js`
+  covers failover, terminal-4xx, same-target `retry_on`, and the composite
+  short-circuit.
+
 ### fix(responses): shorten flattened namespace tool names over the 64-char `function.name` limit
 
 Follow-up to the prefixed-name flattening entry below. Chat Completions (and

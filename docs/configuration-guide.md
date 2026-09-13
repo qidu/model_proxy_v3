@@ -25,18 +25,19 @@ A minimal `proxy_config.toml` looks like this (shipped as
 [`proxy_config.minimal.toml`](../proxy_config.minimal.toml)):
 
 ```toml
-# Remote auth sidecar — validates proxy endpoint auth headers.
-# [remote.authentication]
+# Remote sidecars — one flat [remote] table (keys prefixed by role).
+# [remote]
+# --- auth role: validates proxy endpoint auth headers before routing ---
 # auth_server = "https://auth.example.com/validate"
 # auth_with_model = false          # when true, defers auth until after body parsing
                                    # and forwards requested model id as x-resource-for
 # auth_with_body = false           # when true, POSTs the parsed request body to auth_server
 # auth_passthrough_with = "user_key"   # controls which key is passed upstream:
                                        # "user_key" (default) or "config_key"
-
-# Remote stats sidecar — POSTs per-request usage records to an HTTP collector.
+# max_targets = 4                  # cap on the auth targets[] failover ladder attempts
+# max_target_retries = 1           # per-descriptor retry_on re-hits (0 disables)
+# --- recording role: POSTs per-request usage records to an HTTP collector ---
 # Includes request_id, endpoint, raw user_key, model, response_status, and token counters.
-# [remote.recording]
 # record_server = "http://127.0.0.1:8080/model-usage"
 # record_response_body = false     # when true, each record also includes the constructed response body
 

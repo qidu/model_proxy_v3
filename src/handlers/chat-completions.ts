@@ -101,7 +101,7 @@ export async function handleChatCompletionsPassthrough(
       method: 'POST',
       headers: anthropicFetchHeaders,
       body: JSON.stringify(claudeBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
     });
 
     if (route) {
@@ -249,7 +249,7 @@ export async function handleChatCompletionsPassthrough(
       method: 'POST',
       headers: responsesFetchHeaders,
       body: JSON.stringify(responsesBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
     });
 
     if (route) {
@@ -343,7 +343,7 @@ export async function handleChatCompletionsPassthrough(
       method: 'POST',
       headers: geminiFetchHeaders,
       body: JSON.stringify(geminiBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
     });
 
     if (route) {
@@ -466,7 +466,7 @@ export async function handleChatCompletionsPassthrough(
     method: 'POST',
     headers: defaultFetchHeaders,
     body: JSON.stringify(parsedBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
   });
 
   if (route) {
