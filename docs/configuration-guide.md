@@ -29,6 +29,8 @@ A minimal `proxy_config.toml` looks like this (shipped as
 # [remote]
 # --- auth role: validates proxy endpoint auth headers before routing ---
 # auth_server = "https://auth.example.com/validate"
+                                   # a 200 body MUST carry `version` (missing -> 401);
+                                   # it MAY also carry a `targets[]` failover ladder
 # auth_with_model = false          # when true, defers auth until after body parsing
                                    # and forwards requested model id as x-resource-for
 # auth_with_body = false           # when true, POSTs the parsed request body to auth_server

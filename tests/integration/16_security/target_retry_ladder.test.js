@@ -31,6 +31,8 @@
  * - TC4011: a rung's own `retry` overrides `[remote] max_target_retries` for
  *           that rung only (`retry: 2` → the rung is re-hit twice before the
  *           ladder advances, vs. the default 1).
+ * - TC4012: an auth `200` body without the required `version` field is rejected
+ *           (401) before any rung is fetched — the ladder is never trusted.
  *
  * Reference: docs/plan-remote-target-retry-dispatch.md (Testing).
  */
@@ -166,8 +168,12 @@ function descriptor(target, key, extra = {}) {
  * factory returning a Response; the auth GET is answered from `authTargets`.
  * An unexpected model yields a distinctive 200 body (rather than throwing) so
  * a wrongly-taken code path is observable in the recorded calls.
+ *
+ * `opts.includeVersion = false` drops the required `version` field from the auth
+ * 200 body (to exercise the contract-rejection path); `opts.authStatus`
+ * overrides the auth response status.
  */
-async function withStub(authTargets, rungResponders, fn) {
+async function withStub(authTargets, rungResponders, fn, { authStatus = 200, includeVersion = true } = {}) {
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
@@ -181,7 +187,10 @@ async function withStub(authTargets, rungResponders, fn) {
     calls.push(call);
 
     if (call.url.endsWith('/auth')) {
-      return jsonResponse({ targets: authTargets }, 200);
+      return jsonResponse(
+        includeVersion ? { version: 'v1', targets: authTargets } : { targets: authTargets },
+        authStatus,
+      );
     }
     const model = call.body && call.body.model;
     const responder = rungResponders[model];
@@ -564,6 +573,29 @@ async function testNonConfigHostRungAccepted() {
   );
 }
 
+// The auth `200` body MUST advertise the wire-contract `version` field. A body
+// without it is a contract violation: the proxy rejects the request (401) before
+// parsing any `targets[]`, rather than silently trusting the ladder.
+async function testMissingProtocolVersionRejected() {
+  resetEffectiveCompositeSharesForTest();
+  const configPath = writeConfig(LADDER_CONFIG);
+  clearProxyConfigCache();
+
+  const targets = [descriptor('model-a', 'sk-desc-a')];
+  await withStub(
+    targets,
+    { 'model-a': () => jsonResponse(claudeJson('from-a'), 200) },
+    async (calls) => {
+      const response = await proxyFetch(makeRequest('claude-x'), { PROXY_CONFIG_PATH: configPath });
+
+      assert(response.status === 401, `an auth 200 missing "version" must be rejected with 401, got ${response.status}`);
+      const upstreams = upstreamCalls(calls);
+      assert(upstreams.length === 0, `no rung may be fetched when the auth contract is violated, got ${upstreams.length}`);
+    },
+    { includeVersion: false },
+  );
+}
+
 if (require.main === module) {
   loadModule().then(() => runTestSuite('Remote Target-Retry Ladder', [
     { name: 'TC4001: auth targets A(503) fails over to B, descriptor base+key used', fn: testFailoverRescuesOnNextTarget },
@@ -577,6 +609,7 @@ if (require.main === module) {
     { name: 'TC4009: a retry_on miss advances immediately (rung fetched once)', fn: testRetryOnMissAdvancesImmediately },
     { name: 'TC4010: a rung on a non-config, non-loopback host is accepted', fn: testNonConfigHostRungAccepted },
     { name: 'TC4011: a rung\u2019s own retry overrides [remote] max_target_retries', fn: testPerRungRetryOverride },
+    { name: 'TC4012: an auth 200 body missing the required version is rejected (401)', fn: testMissingProtocolVersionRejected },
   ])).then(cleanupConfigFiles).catch((error) => {
     cleanupConfigFiles();
     console.error(error);

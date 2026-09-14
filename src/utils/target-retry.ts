@@ -91,6 +91,32 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 /**
+ * Whether an auth `200` body advertises the required `version` field. The
+ * version is a hard contract requirement (docs/auth-stats-protocol.md): a body
+ * without a non-empty string `version` is rejected by the caller (401) before
+ * any `targets[]` are parsed, so a legacy body-less auth service fails loudly
+ * instead of being silently trusted. Only the `{ version, targets }` object form
+ * qualifies — a bare array carries no version.
+ */
+export function hasRequiredProtocolVersion(rawBody: string | undefined | null): boolean {
+  if (!rawBody) return false;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    return false;
+  }
+
+  return (
+    parsed !== null &&
+    typeof parsed === 'object' &&
+    !Array.isArray(parsed) &&
+    isNonEmptyString((parsed as { version?: unknown }).version)
+  );
+}
+
+/**
  * Validate raw `targets[]` entries into descriptors. Each entry failing a
  * check is dropped with a reason (the caller logs it) and the ladder continues
  * with the rest — including when the offending entry is `targets[0]`.

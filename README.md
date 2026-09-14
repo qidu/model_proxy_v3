@@ -49,7 +49,7 @@ sequenceDiagram
     C->>P: POST /v1/messages<br/>(Authorization / x-api-key)
     Note over P: auth_with_model/auth_with_body = false → auth now (GET)<br/>either = true → defer until body parsed
     P->>A: auth_server<br/>GET (default) or POST (auth_with_body: whole request body)<br/>forward: Authorization, x-api-key, x-goog-api-key,<br/>user-agent, request_id, endpoint,<br/>[x-resource-for], [x-forwarded-for, x-real-ip]
-    A-->>P: 200 OK<br/>header: one_time_auth_code / OTAC (optional)<br/>body: targets[] failover ladder (optional)
+    A-->>P: 200 OK<br/>header: one_time_auth_code / OTAC (optional)<br/>body: {version (required), targets[] (optional)}
     Note over P: if body carries targets[]<br/>→ walk rungs in order, fail over on retryable error,<br/>skip config-file model resolution
     P->>U: forwarded request (native or converted)
     U-->>P: response (streaming or JSON)
@@ -57,15 +57,19 @@ sequenceDiagram
     P-)S: POST record_server<br/>{request_id, endpoint, user_key, model, response_status, token counters,<br/>[response_body if record_response_body=true]}<br/>header: one_time_auth_code, x-forwarded-for, [x-real-ip]
 ```
 
-**Auth `targets[]` failover ladder (response body).** The auth service MAY respond
-with a JSON body carrying `targets` — an ordered list of **self-contained target
-descriptors**. When present, the proxy uses them directly for this single request,
-starting on `targets[0]` and advancing to the next rung on a retryable upstream
-failure, and skips resolving the model from `[models.*]` / `[composite]` /
-`[schedule]` in the config file:
+**Auth `targets[]` failover ladder (response body).** The auth service's `200`
+body **MUST** carry `version` (a non-empty string — `"v1"` is the current era).
+A `200` whose body is missing `version`, or is not an object, is rejected with
+`401` before any routing — a service that does not speak the versioned contract
+is never silently trusted. It **MAY** additionally carry `targets` — an ordered
+list of **self-contained target descriptors**. When present, the proxy uses them
+directly for this single request, starting on `targets[0]` and advancing to the
+next rung on a retryable upstream failure, and skips resolving the model from
+`[models.*]` / `[composite]` / `[schedule]` in the config file:
 
 ```json
-{ "targets": [
+{ "version": "v1",
+  "targets": [
     { "target": "claude-opus-4-6", "mode": "anthropic-messages",
       "base": "https://api.anthropic.com", "key": "sk-…", "timeout": 30000 },
     { "target": "gpt-5", "mode": "openai-completions",
@@ -111,12 +115,13 @@ rung's status. Total attempts are bounded by `[remote] max_targets` (default `16
 
 **Bounds and validation.** Entries are validated, deduplicated
 (`target@base@key`), then capped at `max_targets`; an invalid entry is dropped
-with an error and the ladder continues — even when it is `targets[0]`. If every
-entry is invalid, the body is empty/not JSON, or the auth call is not a `200`,
-the proxy falls back to normal config resolution. A rung's `base` host is **not**
-checked against the config host allowlist — the auth server is a trusted routing
-authority, so a descriptor may target any well-formed host (only `base` URL
-syntax is validated).
+with an error and the ladder continues — even when it is `targets[0]`. If the
+`version`-carrying body has no `targets` (or every entry is invalid), the proxy
+falls back to normal config resolution; a missing `version`, a non-`200` auth
+call, or an unparseable body is a contract failure (see the response table
+above). A rung's `base` host is **not** checked against the config host
+allowlist — the auth server is a trusted routing authority, so a descriptor may
+target any well-formed host (only `base` URL syntax is validated).
 
 > The ladder is **per-request and ephemeral** — never cached, never written to
 > config, and does not persist across requests. It requires a **parsed JSON

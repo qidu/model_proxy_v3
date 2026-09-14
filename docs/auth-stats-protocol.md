@@ -64,13 +64,26 @@ parseable JSON so the sidecar can inspect fields directly.
 
 On `200`, the proxy reads:
 
+- **Body field `version`** (**required**) — a non-empty string advertising which
+  era of this wire contract the auth service speaks (the bundled mock sidecar
+  sends `"v1"`). The proxy **requires** it: a `200` whose body is missing
+  `version`, is not a JSON object, or carries a blank/non-string value is
+  rejected with `401` before any routing, so a service that predates the
+  versioned contract fails loudly instead of being silently trusted. The check is
+  a *presence* check — any non-empty string passes (`"v1"` is the current era).
 - **Header `one_time_auth_code`** (OTAC, optional) — stored and re-sent as the
   `one_time_auth_code` header on the later stats `POST record_server` call (see below).
   A ladder descriptor's own `otac` field takes precedence over this header **for
   that rung**: the rung sends its `otac` upstream and records that value, while
   entries without an `otac` fall back to this response-header value.
-- **JSON body** (optional) — the **auth `targets[]` failover ladder**. See the
-  table in [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service).
+- **JSON body field `targets[]`** (optional) — the **auth `targets[]` failover
+  ladder**. See the table in
+  [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service).
+
+The response table above is therefore refined on `200`: a valid `version`-bearing
+body passes and proceeds to routing. A `200` body without a valid `version` is
+treated as a contract failure and returns `401` to the client (same as any `4xx`
+/ `5xx` auth response) — it does **not** fall back to config resolution.
 
 **Auth `targets[]` failover ladder.** When the auth response body carries a
 `targets` array, the proxy treats each entry as a **self-contained target
@@ -125,9 +138,12 @@ entry is rejected.
 **Bounds and validation.** Entries are validated, deduplicated (key
 `target@base@key`), then capped at `max_targets`; the cap bounds *attempts*, not
 just array length. An invalid entry is dropped with an `ERROR` log and the
-ladder continues — including when the invalid entry is `targets[0]`. If every
-entry is invalid, or the body is empty / not JSON / not a `200`, normal config
-resolution proceeds unchanged.
+ladder continues — including when the invalid entry is `targets[0]`. If the
+`version`-bearing body has no `targets` (or every entry is invalid), normal
+config resolution proceeds unchanged. A missing `version`, a body that is not a
+JSON object, or a non-`200` auth call is a contract failure and returns `401`
+(see the auth *Response* section) — it does **not** fall back to config
+resolution.
 
 The override is **never cached** and **never persisted** to `proxy_config.toml`
 — it is a single-use, per-request alias list. Each rung contributes at most one
@@ -194,7 +210,11 @@ Body (`ModelUsageRecordPayload`):
 | `response_body` | object \| string | **Only when `record_response_body = true`.** Parsed JSON object for non-streaming responses; accumulated raw SSE text for streaming responses. Absent otherwise. |
 
 **Response**: the proxy only checks `response.ok`; a non-2xx is logged at
-`WARN` with the status code. There is no retry.
+`WARN` with the status code. There is no retry. The stats POST is
+fire-and-forget — its response never gates the client — so, unlike the auth
+path, a `version` body field here is **not** enforced. The bundled sidecar still
+sends `{ "version": "v1", "ok": true }` on `200` for symmetry, but the proxy
+ignores it.
 
 ## Combining auth and stats in one service
 

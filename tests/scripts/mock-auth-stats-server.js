@@ -6,21 +6,24 @@
  * configured with a `[remote]` auth_server / record_server can be driven
  * end-to-end without a real backend.
  *
- *   /validate     (GET or POST)  → validates the CLIENT's original key (the
+ *   /v1/validate  (GET or POST)     → validates the CLIENT's original key (the
  *                                 one the proxy forwards under
  *                                 `auth_passthrough_with = "user_key"`) against
  *                                 the MOCK_USER_KEYS allowlist. A key matching
  *                                 none → 401. On success: 200 +
  *                                 `one_time_auth_code` header + a
  *                                 `{ targets: [...] }` failover ladder (see
- *                                 DEFAULT_TARGETS). The request body's `model`
+ *                                 mock_targets.json). The request body's `model`
  *                                 then selects the ladder: rungs whose `alias`
  *                                 equals it win, else no targets are returned.
  *                                 (or MOCK_AUTH_STATUS to force a rejection).
- *   /model-usage  (POST)         → logs the ModelUsageRecordPayload, 200.
+ *   /v1/model-usage (POST)          → logs the ModelUsageRecordPayload, 200.
+ *
+ * Both 200 responses carry a `version` field (PROTOCOL_VERSION) advertising the
+ * wire-contract era.
  *
  * Everything the proxy sends (forwarded headers, usage record) is printed to
- * stdout so you can eyeball the exact on-the-wire shape. The /validate request
+ * stdout so you can eyeball the exact on-the-wire shape. The /v1/validate request
  * body and the record's `response_body` are hidden — only their type/length is
  * shown.
  *
@@ -30,10 +33,10 @@
  * Env:
  *   MOCK_HOST          bind host          (default 127.0.0.1)
  *   MOCK_PORT          bind port          (default 8989)
- *   MOCK_AUTH_STATUS   status for /validate (default 200; e.g. 401 to test the
+ *   MOCK_AUTH_STATUS   status for /v1/validate (default 200; e.g. 401 to test the
  *                      proxy's rejection path)
- *   MOCK_TARGETS_JSON  JSON array overriding the default ladder
- *   MOCK_USER_KEYS     comma-separated client-key allowlist /validate accepts
+ *   MOCK_TARGETS_JSON  inline JSON array overriding mock_targets.json
+ *   MOCK_USER_KEYS     comma-separated client-key allowlist /v1/validate accepts
  *                      (default "*" — any key). A key matching none → 401.
  *
  * NOTE on rung hosts: a ladder entry's `base` host is NOT validated against the
@@ -45,12 +48,17 @@
 
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 const HOST = process.env.MOCK_HOST || '127.0.0.1';
 const PORT = Number(process.env.MOCK_PORT || 8989);
 const AUTH_STATUS = Number(process.env.MOCK_AUTH_STATUS || 200);
 
-// Allowlist of client keys /validate accepts. The proxy forwards the CLIENT's
+// Wire-contract version advertised on every 200 response (both roles), so a
+// caller can tell which era of the auth/stats contract the sidecar speaks.
+const PROTOCOL_VERSION = 'v1';
+
+// Allowlist of client keys /v1/validate accepts. The proxy forwards the CLIENT's
 // original key (auth_passthrough_with = "user_key"), so this is the credential a
 // real auth backend would check against its key store. A presented key matching
 // none → 401. Override with e.g. MOCK_USER_KEYS="sk-test,sk-other".
@@ -62,22 +70,42 @@ const USER_KEYS = (process.env.MOCK_USER_KEYS || '*')
 // "*" means allow-all: accept any presented key without consulting the list.
 const ALLOW_ALL_KEYS = USER_KEYS.includes('*');
 
-// Failover ladder returned by /validate. Each rung carries an `alias`: the
-// model name a client requests to be routed to that rung. When the request
-// body's `model` equals an alias, only that alias's rungs are served; with no
-// match (or no model in the request) no rungs are served. The proxy tries
-// rung 0 first and advances down the list on a retryable upstream failure. This
-// is a standalone test server — no key store is involved — so the keys below
-// are sent upstream verbatim and must be real upstream keys. Override the whole
-// list with MOCK_TARGETS_JSON to serve different rungs.
-const DEFAULT_TARGETS = [
-  { alias: 'code-small', target: 'nvidia/nemotron-3.5-lightning:free', base: 'https://openrouter.ai/api/v1', mode: 'openai-completions', key: 'sk-or-v1-0b3d', timeout: 5000, retry: 1 },
-  { alias: 'code-small', target: 'nvidia/nemotron-3-ultra-550b-a55b:free', base: 'https://openrouter.ai/api/v1', mode: 'openai-completions', key: 'sk-or-v1-0b3d', timeout: 5000, retry: 1 },
-  { alias: 'code-small', target: 'deepseek/deepseek-v4.1-flash', base: 'https://api.qnaigc.com', mode: 'openai-completions', key: 'sk-172d89', transforms: 'code_small_compat', timeout: 20000, retry: 1 },
-  { alias: 'code-small', target: 'qwen3.8-max', base: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', mode: 'openai-completions', key: 'sk-sp-H.DEXPIY', transforms: 'code_small_compat', timeout: 20000, retry: 1 },
-];
+// Failover ladder served by /v1/validate, loaded from mock_targets.json (next to
+// this script). Each rung carries an `alias`: the model name a client requests to
+// be routed to that rung. When the request body's `model` equals an alias, only
+// that alias's rungs are served; with no match (or no model in the request) no
+// rungs are served. The proxy tries rung 0 first and advances down the list on a
+// retryable upstream failure. This is a standalone test server — no key store is
+// involved — so a rung's `key`, if present, is sent upstream verbatim and must be
+// a real upstream key (omit `key` to forward the caller's credential instead).
+//
+// mock_targets.json example — an array of rungs; only target/base are required:
+//   [
+//     {
+//       "alias": "code-small",            // client model name that selects this rung
+//       "target": "vendor/model-id",      // upstream model id sent as `model`
+//       "base": "https://host/api/v1",    // upstream base URL
+//       "mode": "openai-completions",     // upstream mode (default openai-completions)
+//       "key": "sk-...",                  // upstream key; omit to forward the caller's
+//       "otac": "otac_...",               // per-rung one_time_auth_code override
+//       "transforms": "set_a,set_b",      // [transforms.*] sets applied to the rung
+//       "timeout": 20000,                 // whole-request abort deadline (ms)
+//       "retry_on": [429, 503],           // statuses that re-hit this SAME rung
+//       "retry": 2                        // max same-rung retries (overrides [remote] max_target_retries)
+//     }
+//   ]
+const TARGETS_FILE = new URL('./mock_targets.json', import.meta.url);
 
-let targets = DEFAULT_TARGETS;
+let targets;
+try {
+  targets = JSON.parse(readFileSync(TARGETS_FILE, 'utf8'));
+} catch (err) {
+  console.error(`[mock] cannot load ${TARGETS_FILE.pathname}: ${err.message}`);
+  process.exit(1);
+}
+
+// MOCK_TARGETS_JSON (an inline JSON array) overrides the file — handy for one-off
+// ladders without editing mock_targets.json.
 if (process.env.MOCK_TARGETS_JSON) {
   try {
     targets = JSON.parse(process.env.MOCK_TARGETS_JSON);
@@ -173,7 +201,7 @@ async function handleValidate(req, res) {
   const rawBody = req.method === 'POST' ? await readBody(req) : '';
   const parsedBody = parseJson(rawBody);
 
-  console.log(`\n[${ts()}] ── /validate  ${req.method} ─────────────────────────────`);
+  console.log(`\n[${ts()}] ── /v1/validate  ${req.method} ─────────────────────────────`);
   console.log('  forwarded headers:');
   logForwardedHeaders(req);
   if (parsedBody !== undefined) {
@@ -205,14 +233,14 @@ async function handleValidate(req, res) {
   for (const [i, rung] of rungs.entries()) {
     console.log(`      rung[${i}] target=${rung.target} base=${rung.base} mode=${rung.mode ?? '(default)'} key=${rung.key ? maskKey(rung.key) : '(passthrough)'} timeout=${rung.timeout ?? '(default)'} retry=${rung.retry ?? '(config default)'}`);
   }
-  sendJson(res, 200, { targets: rungs }, { one_time_auth_code: otac });
+  sendJson(res, 200, { version: PROTOCOL_VERSION, targets: rungs }, { one_time_auth_code: otac });
 }
 
 async function handleModelUsage(req, res) {
   const rawBody = await readBody(req);
   const payload = parseJson(rawBody);
 
-  console.log(`\n[${ts()}] ── /model-usage  ${req.method} ───────────────────────────`);
+  console.log(`\n[${ts()}] ── /v1/model-usage  ${req.method} ───────────────────────────`);
   console.log(`  one_time_auth_code: ${req.headers['one_time_auth_code'] || '(none)'}`);
   if (req.headers['x-forwarded-for']) console.log(`  x-forwarded-for: ${req.headers['x-forwarded-for']}`);
   if (req.headers['x-real-ip']) console.log(`  x-real-ip: ${req.headers['x-real-ip']}`);
@@ -230,24 +258,24 @@ async function handleModelUsage(req, res) {
     }
   }
 
-  sendJson(res, 200, { ok: true });
+  sendJson(res, 200, { version: PROTOCOL_VERSION, ok: true });
 }
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || HOST}`);
   const route = url.pathname;
 
-  if (route === '/validate') {
+  if (route === '/v1/validate') {
     handleValidate(req, res).catch(err => {
-      console.error(`[mock] /validate error: ${err.stack || err}`);
+      console.error(`[mock] /v1/validate error: ${err.stack || err}`);
       sendJson(res, 500, { error: { message: String(err) } });
     });
     return;
   }
 
-  if (route === '/model-usage') {
+  if (route === '/v1/model-usage') {
     handleModelUsage(req, res).catch(err => {
-      console.error(`[mock] /model-usage error: ${err.stack || err}`);
+      console.error(`[mock] /v1/model-usage error: ${err.stack || err}`);
       sendJson(res, 500, { error: { message: String(err) } });
     });
     return;
@@ -260,8 +288,8 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   console.log('════════════════════════════════════════════════════════════');
   console.log(`mock auth + stats sidecar listening on http://${HOST}:${PORT}`);
-  console.log('  POST/GET /validate     client-key check → 200 + OTAC + targets[]');
-  console.log('  POST     /model-usage  usage record → 200');
+  console.log('  POST/GET /v1/validate     client-key check → 200 + OTAC + targets[]');
+  console.log('  POST     /v1/model-usage  usage record → 200');
   console.log(`  MOCK_AUTH_STATUS=${AUTH_STATUS}  targets=${targets.length}`);
   console.log(`  accepted client keys: ${ALLOW_ALL_KEYS ? '(any — "*")' : (USER_KEYS.join(', ') || '(none — all 401)')}`);
   console.log('────────────────────────────────────────────────────────────');
@@ -269,11 +297,11 @@ server.listen(PORT, HOST, () => {
   console.log('http on the same port):');
   console.log('');
   console.log('  [remote]');
-  console.log(`  auth_server = "http://${HOST}:${PORT}/validate"`);
+  console.log(`  auth_server = "http://${HOST}:${PORT}/v1/validate"`);
   console.log('  auth_with_body = true');
   console.log('  auth_passthrough_with = "user_key"');
   console.log('  auth_with_model = true');
-  console.log(`  record_server = "http://${HOST}:${PORT}/model-usage"`);
+  console.log(`  record_server = "http://${HOST}:${PORT}/v1/model-usage"`);
   console.log('  record_response_body = true');
   console.log('');
   console.log(`Send the client key as x-api-key (or Authorization: Bearer) — it is`);
@@ -281,7 +309,8 @@ server.listen(PORT, HOST, () => {
     ? 'accepted without an allowlist check (MOCK_USER_KEYS="*").'
     : `checked against MOCK_USER_KEYS=${process.env.MOCK_USER_KEYS || '*'}.`);
   console.log('Ladder rung hosts are not allowlist-checked — any well-formed base');
-  console.log('URL is accepted. Override the ladder with MOCK_TARGETS_JSON.');
+  console.log('URL is accepted. Edit tests/scripts/mock_targets.json to change the');
+  console.log('ladder (MOCK_TARGETS_JSON overrides it inline).');
   console.log('════════════════════════════════════════════════════════════');
 
   for (const rung of targets) {

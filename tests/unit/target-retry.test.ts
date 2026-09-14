@@ -9,6 +9,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseAuthTargets,
+  hasRequiredProtocolVersion,
   validateDescriptorEntries,
   dedupeAndCap,
   descriptorToRoute,
@@ -54,6 +55,38 @@ describe('parseAuthTargets', () => {
   it('filters out non-object entries (null, primitives, nested arrays)', () => {
     const out = parseAuthTargets('[null, 1, "x", [1], {"target":"m","base":"http://localhost"}]');
     assert.deepEqual(out, [{ target: 'm', base: 'http://localhost' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hasRequiredProtocolVersion
+// ---------------------------------------------------------------------------
+
+describe('hasRequiredProtocolVersion', () => {
+  it('accepts an object body carrying a non-empty string version', () => {
+    assert.equal(hasRequiredProtocolVersion('{"version":"v1","targets":[]}'), true);
+    assert.equal(hasRequiredProtocolVersion('{"version":"v1"}'), true);
+    // Any non-empty era string passes the presence check (v1 is the current era).
+    assert.equal(hasRequiredProtocolVersion('{"version":"v2"}'), true);
+  });
+
+  it('rejects an absent / blank / non-string version', () => {
+    assert.equal(hasRequiredProtocolVersion('{"targets":[]}'), false);
+    assert.equal(hasRequiredProtocolVersion('{"version":""}'), false);
+    assert.equal(hasRequiredProtocolVersion('{"version":"   "}'), false);
+    assert.equal(hasRequiredProtocolVersion('{"version":1}'), false);
+    assert.equal(hasRequiredProtocolVersion('{"version":null}'), false);
+    assert.equal(hasRequiredProtocolVersion('{"version":["v1"]}'), false);
+  });
+
+  it('rejects undefined / empty / malformed / non-object bodies', () => {
+    assert.equal(hasRequiredProtocolVersion(undefined), false);
+    assert.equal(hasRequiredProtocolVersion(null), false);
+    assert.equal(hasRequiredProtocolVersion(''), false);
+    assert.equal(hasRequiredProtocolVersion('not json {'), false);
+    // A bare array (the old extractor-tolerant form) carries no version.
+    assert.equal(hasRequiredProtocolVersion('[{"version":"v1"}]'), false);
+    assert.equal(hasRequiredProtocolVersion('"v1"'), false);
   });
 });
 

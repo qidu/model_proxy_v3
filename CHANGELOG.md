@@ -5,6 +5,30 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(remote): require `version` on the auth `200` response
+
+The auth service's `200` body **must** now carry a non-empty string `version`
+(the bundled sidecar sends `"v1"`). A `200` whose body is missing `version`, is
+not a JSON object, or carries a blank/non-string value is rejected with `401`
+before any routing — a service that does not speak the versioned contract fails
+loudly instead of being silently trusted (previously the field was advisory and
+ignored). The check is a *presence* check; `"v1"` is the current contract era.
+The stats `POST` is fire-and-forget and its response never gates the client, so
+its `version` field remains unenforced. New helper
+`hasRequiredProtocolVersion` in `src/utils/target-retry.ts`; the gate lives in
+`src/index.ts` (401 on failure).
+
+### test(mock): `/v1/` route prefix, `version` field, ladder externalized to mock_targets.json
+
+`tests/scripts/mock-auth-stats-server.js` now serves `/v1/validate` and
+`/v1/model-usage` (was `/validate` / `/model-usage`), and both `200` responses
+carry a `version` body field (`PROTOCOL_VERSION = "v1"`) advertising the
+wire-contract era. The auth ladder moved out of the source into
+`tests/scripts/mock_targets.json`, which the server reads at startup (fails loud
+if missing or invalid); `MOCK_TARGETS_JSON` still overrides it inline. The
+`version` field is required by the proxy (see the entry above); see
+[docs/auth-stats-protocol.md](docs/auth-stats-protocol.md).
+
 ### change(remote): raise the default `[remote] max_targets` ladder cap from 4 to 16
 
 The auth `targets[]` failover ladder's default attempt bound is now `16` (was

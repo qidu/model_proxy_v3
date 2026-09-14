@@ -37,7 +37,7 @@ import {
   handleDashboardUpsertScheduleTarget,
 } from './handlers/dashboard.js';
 import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget } from './utils/config-loader.js';
-import { parseAuthTargets, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
+import { parseAuthTargets, hasRequiredProtocolVersion, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
 import { detectCoordinatorStage } from './utils/coordinator.js';
 import {
   extractToolNamesFromBody,
@@ -1036,10 +1036,23 @@ export default {
           return createErrorResponse(new Error(detail), requestId, 401);
         }
 
-        // Auth-response dynamic-routing override: parse an optional `targets[]`
-        // failover ladder. A missing/empty/malformed body yields [] ⇒ normal
-        // config resolution. Invalid entries are dropped (loudly) and the
-        // ladder continues with the rest.
+        // Contract gate: a 200 response MUST advertise the wire-contract
+        // `version` field. A missing/blank/non-string version means the auth
+        // service does not speak the versioned contract we trust for routing, so
+        // reject (401) before parsing any `targets[]` (never silently fall back).
+        if (!hasRequiredProtocolVersion(authRespBodyText)) {
+          logger.warn(requestId, `Remote auth server (${authUrl}) returned 200 without a valid "version" field for ${path}; rejecting.`);
+          return createErrorResponse(
+            new Error('Remote auth server response is missing the required "version" field. This is a failure from the configured remote auth_server.'),
+            requestId,
+            401,
+          );
+        }
+
+        // Auth-response dynamic-routing override: parse the `targets[]` failover
+        // ladder. An absent/empty/malformed `targets` yields [] ⇒ normal config
+        // resolution. Invalid entries are dropped (loudly) and the ladder
+        // continues with the rest.
         const rawTargets = parseAuthTargets(authRespBodyText);
         if (rawTargets.length > 0) {
           const { valid, dropped } = validateDescriptorEntries(rawTargets);
