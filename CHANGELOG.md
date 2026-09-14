@@ -5,6 +5,45 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### test(mock): auth sidecar validates the client key, then selects rungs by alias
+
+`tests/scripts/mock-auth-stats-server.js` `/validate` now models the real auth
+contract end-to-end:
+
+- It reads the CLIENT's original key (the one the proxy forwards under
+  `auth_passthrough_with = "user_key"`) from `x-api-key`, then a Bearer
+  `Authorization`, then `x-goog-api-key`, and checks it against a
+  `MOCK_USER_KEYS` allowlist (comma-separated, default `sk-test`). A key
+  matching none — or none presented — is rejected with `401`.
+- On a valid key it returns the configured ladder filtered by alias: only rungs
+  whose `alias` equals the request body's `model` are served; no match (or no
+  model) yields `{ targets: [] }`, so the proxy falls back to normal config
+  resolution.
+
+### fix(remote): drop host allowlist for auth-ladder rungs; replace `section:'free'` hack
+
+The auth `targets[]` failover ladder no longer validates a rung's `base` host
+against the config host allowlist. The auth server is a trusted routing
+authority and a descriptor is self-contained, so its destination need not appear
+as a configured model `base_url`; previously such rungs were silently dropped
+(`base host '…' is not allowed`). Only the `base` URL **syntax** is still checked.
+
+- `src/utils/target-retry.ts` — `validateEntry` drops the `isHostAllowed` check
+  (keeps `new URL` well-formedness). The unused `DescriptorValidationOptions`
+  interface (and its `allowedHostsEnv` / `defaultMode` fields), the
+  `validateDescriptorEntries` `opts` parameter, and the now-unused
+  `isHostAllowed` import are removed. Call site `src/index.ts` updated to
+  `validateDescriptorEntries(rawTargets)`.
+- `descriptorToRoute` no longer sets `section: 'free'` to force a rung's key
+  upstream. It sets a new `ModelRouteConfig.explicitApiKey` flag instead, and
+  `buildRouteAttempt` (`src/index.ts`) applies the key when
+  `route.explicitApiKey` is set — removing the abuse of the unrelated
+  `[models.free]` section semantics.
+- `README.md` and the `tests/scripts/mock-auth-stats-server.js` docblock/banner
+  updated to state rung hosts are not allowlist-checked. Tests updated: unit
+  allowlist tests now assert any well-formed host is accepted; new integration
+  case **TC4010** covers a non-config, non-loopback rung host.
+
 ### fix(dashboard): single shared `UPSTREAM_MODES` list (adds `gemini-interactions`)
 
 `gemini-interactions` was already a valid `upstream_mode` at runtime (the

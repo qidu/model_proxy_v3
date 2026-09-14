@@ -1042,9 +1042,7 @@ export default {
         // ladder continues with the rest.
         const rawTargets = parseAuthTargets(authRespBodyText);
         if (rawTargets.length > 0) {
-          const { valid, dropped } = validateDescriptorEntries(rawTargets, {
-            allowedHostsEnv: getAllowedHostsFromConfig(proxyConfig).join(','),
-          });
+          const { valid, dropped } = validateDescriptorEntries(rawTargets);
           for (const d of dropped) {
             logger.error(requestId, `Auth targets entry dropped: ${d.reason} (entry=${JSON.stringify(d.entry)})`);
           }
@@ -1780,7 +1778,7 @@ export default {
         });
 
         let candidateAuthHeaders = transformAuthHeadersForUpstream(candidateRequest, route.upstreamMode, path, requestId, env as Record<string, unknown>);
-        if (route.apiKey && (route.section === 'free' || route.section === 'FREE' || useConfigKey)) {
+        if (route.apiKey && (route.section === 'free' || route.section === 'FREE' || route.explicitApiKey || useConfigKey)) {
           if (route.upstreamMode === 'openai-completions') {
             if (route.modelAlias) {
               candidateAuthHeaders = { ...candidateAuthHeaders, ...formatApiKeyForUpstream(route.apiKey, route.upstreamMode) };

@@ -112,7 +112,10 @@ rung's status. Total attempts are bounded by `[remote] max_targets` (default `4`
 (`target@base@key`), then capped at `max_targets`; an invalid entry is dropped
 with an error and the ladder continues — even when it is `targets[0]`. If every
 entry is invalid, the body is empty/not JSON, or the auth call is not a `200`,
-the proxy falls back to normal config resolution.
+the proxy falls back to normal config resolution. A rung's `base` host is **not**
+checked against the config host allowlist — the auth server is a trusted routing
+authority, so a descriptor may target any well-formed host (only `base` URL
+syntax is validated).
 
 > The ladder is **per-request and ephemeral** — never cached, never written to
 > config, and does not persist across requests. It requires a **parsed JSON

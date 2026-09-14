@@ -119,35 +119,20 @@ describe('validateDescriptorEntries', () => {
     assert.match(dropped[0].reason, /not a valid URL/);
   });
 
-  it('drops a disallowed host under the default allowlist', () => {
-    const { valid, dropped } = validateDescriptorEntries([{ target: 'm', base: 'https://api.example.com' }]);
-    assert.equal(valid.length, 0);
-    assert.match(dropped[0].reason, /not allowed/);
-  });
-
-  it('allows a host present in allowedHostsEnv', () => {
-    const { valid, dropped } = validateDescriptorEntries(
-      [{ target: 'm', base: 'https://api.example.com' }],
-      { allowedHostsEnv: 'api.example.com,localhost' },
-    );
-    assert.equal(dropped.length, 0);
-    assert.equal(valid.length, 1);
-  });
-
-  it('allows loopback by default', () => {
-    const { valid } = validateDescriptorEntries([{ target: 'm', base: 'http://127.0.0.1' }]);
-    assert.equal(valid.length, 1);
-  });
-
-  it('matches host:port verbatim — a port must appear in the allowlist', () => {
-    const noPort = validateDescriptorEntries([{ target: 'm', base: 'http://localhost:8080' }]);
-    assert.equal(noPort.valid.length, 0, 'default allowlist has no port, so host:port is rejected');
-
-    const withPort = validateDescriptorEntries(
-      [{ target: 'm', base: 'http://localhost:8080' }],
-      { allowedHostsEnv: 'localhost:8080' },
-    );
-    assert.equal(withPort.valid.length, 1);
+  it('accepts any well-formed host — the config allowlist does not gate rungs', () => {
+    // A self-contained descriptor's destination need not appear as a configured
+    // model base_url; the auth server is a trusted routing authority.
+    for (const base of [
+      'https://api.example.com',
+      'https://api.example.com/v1',
+      'http://localhost:8080',
+      'http://127.0.0.1',
+      'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+    ]) {
+      const { valid, dropped } = validateDescriptorEntries([{ target: 'm', base }]);
+      assert.equal(dropped.length, 0, `${base} should not be dropped`);
+      assert.equal(valid.length, 1, `${base} should be accepted`);
+    }
   });
 
   it('drops an unknown mode but accepts every UPSTREAM_MODE', () => {
@@ -257,11 +242,12 @@ describe('descriptorToRoute', () => {
     assert.equal(route.upstreamMode, 'gemini-generatecontent');
   });
 
-  it('marks section "free" only when a key is present', () => {
+  it('sets explicitApiKey only when a key is present (not via section)', () => {
     const withKey = descriptorToRoute({ target: 'm', base: 'https://api.up', key: 'sk-x' }, cfg());
     const noKey = descriptorToRoute({ target: 'm', base: 'https://api.up' }, cfg());
-    assert.equal(withKey.section, 'free');
-    assert.equal(noKey.section, undefined);
+    assert.equal(withKey.explicitApiKey, true);
+    assert.equal(noKey.explicitApiKey, false);
+    assert.equal(withKey.section, undefined, 'section is no longer abused by descriptors');
   });
 
   it('prefers descriptor.mode over default_upstream, falling back to openai-completions', () => {

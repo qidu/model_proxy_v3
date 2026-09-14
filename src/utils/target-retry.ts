@@ -13,7 +13,6 @@
 
 import type { ProxyConfig, ModelRouteConfig } from './config-loader.js';
 import { resolveTransforms } from './config-loader.js';
-import { isHostAllowed } from './routing.js';
 import { ClaudeProxyError, classifyTransportError } from './errors.js';
 import { UPSTREAM_MODES } from './upstream-modes.js';
 
@@ -59,17 +58,6 @@ export interface ValidatedTargets {
   dropped: DroppedEntry[];
 }
 
-export interface DescriptorValidationOptions {
-  /**
-   * Comma-joined host allowlist in the form `isHostAllowed` expects
-   * (see `getAllowedHostsFromConfig`). When omitted, `isHostAllowed` falls
-   * back to its loopback defaults.
-   */
-  allowedHostsEnv?: string;
-  /** `[default_upstream].upstream_mode`, used to validate a missing `mode`. Unused for now. */
-  defaultMode?: string;
-}
-
 /**
  * Extract the `targets` array from an auth `200` body. Accepts either
  * `{ "targets": [...] }` or a bare array. Returns only object entries; a
@@ -104,16 +92,17 @@ function isNonEmptyString(value: unknown): value is string {
  * Validate raw `targets[]` entries into descriptors. Each entry failing a
  * check is dropped with a reason (the caller logs it) and the ladder continues
  * with the rest — including when the offending entry is `targets[0]`.
+ *
+ * A rung's `base` host is NOT checked against the config allowlist: the auth
+ * server is a trusted routing authority, and a self-contained descriptor's
+ * destination host need not appear as a configured model base_url.
  */
-export function validateDescriptorEntries(
-  raw: RawTargetEntry[],
-  opts: DescriptorValidationOptions = {},
-): ValidatedTargets {
+export function validateDescriptorEntries(raw: RawTargetEntry[]): ValidatedTargets {
   const valid: RemoteTargetDescriptor[] = [];
   const dropped: DroppedEntry[] = [];
 
   for (const entry of raw) {
-    const reason = validateEntry(entry, opts);
+    const reason = validateEntry(entry);
     if (reason) {
       dropped.push({ entry, reason });
       continue;
@@ -137,18 +126,16 @@ export function validateDescriptorEntries(
 }
 
 /** Returns a human-readable reason when `entry` is invalid, else `undefined`. */
-function validateEntry(entry: RawTargetEntry, opts: DescriptorValidationOptions): string | undefined {
+function validateEntry(entry: RawTargetEntry): string | undefined {
   if (!isNonEmptyString(entry.target)) return 'target must be a non-empty string';
 
   if (!isNonEmptyString(entry.base)) return 'base must be a non-empty string (required; no inherit-from-config)';
 
-  let host: string;
   try {
-    host = new URL(entry.base).host;
+    new URL(entry.base);
   } catch {
     return `base is not a valid URL: ${entry.base}`;
   }
-  if (!isHostAllowed(host, opts.allowedHostsEnv)) return `base host '${host}' is not allowed`;
 
   if (entry.mode !== undefined && entry.mode !== null) {
     if (typeof entry.mode !== 'string' || !(UPSTREAM_MODES as readonly string[]).includes(entry.mode)) {
@@ -208,10 +195,10 @@ export function dedupeAndCap(
  * resolution, no inheritance chain. `target` becomes `modelAlias` so
  * `buildRouteAttempt` sends it as the upstream model id.
  *
- * When a `key` is present, `section` is set to `'free'` so the existing
- * free-section rule in `buildRouteAttempt` applies it even when the client did
- * not opt into `auth_passthrough_with = "config_key"` — that is the returned
- * key overriding the passthrough chain. `section` is otherwise unused.
+ * When a `key` is present, `explicitApiKey` is set so `buildRouteAttempt`
+ * applies it unconditionally — that is the returned key overriding the caller's
+ * credential even when the client did not opt into
+ * `auth_passthrough_with = "config_key"`.
  */
 export function descriptorToRoute(descriptor: RemoteTargetDescriptor, proxyConfig: ProxyConfig): ModelRouteConfig {
   const mode = descriptor.mode || proxyConfig.default_upstream?.upstream_mode || 'openai-completions';
@@ -220,7 +207,7 @@ export function descriptorToRoute(descriptor: RemoteTargetDescriptor, proxyConfi
     apiKey: descriptor.key,
     upstreamMode: mode,
     modelAlias: descriptor.target,
-    section: descriptor.key ? 'free' : undefined,
+    explicitApiKey: !!descriptor.key,
     transforms: resolveTransforms(mode, undefined, descriptor.transforms, proxyConfig),
     timeout: descriptor.timeout,
   };

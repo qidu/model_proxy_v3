@@ -516,6 +516,12 @@ export interface ModelRouteConfig {
   upstreamMode: string;
   modelAlias?: string;
   section?: string;
+  /**
+   * Set by auth-ladder descriptors whose `key` must be applied upstream
+   * verbatim, bypassing the client passthrough / `config_key` opt-in chain.
+   * Absent for config-derived routes (which use `section === 'free'` instead).
+   */
+  explicitApiKey?: boolean;
   transforms: TransformSet[];  // resolved & merged: mode-defaults → sector-defaults → entry
   maxTokens?: number;  // per-entry default max_tokens; falls back to DEFAULT_MAX_TOKENS when unset
   /** Per-route abort deadline (ms). Overrides the env UPSTREAM_BODY_TIMEOUT_MS default. */

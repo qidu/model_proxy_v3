@@ -26,6 +26,8 @@
  * - TC4008: an auth array longer than `[remote] max_targets` is truncated.
  * - TC4009: axis-2 miss — a status absent from `retry_on` advances the ladder
  *           immediately (the rung is fetched exactly once).
+ * - TC4010: a rung whose host is absent from the config (and is not loopback)
+ *           is accepted — the config allowlist does not gate descriptor hosts.
  *
  * Reference: docs/plan-remote-target-retry-dispatch.md (Testing).
  */
@@ -496,6 +498,37 @@ async function testRetryOnMissAdvancesImmediately() {
   );
 }
 
+// A rung whose host appears NOWHERE in the config (and is not loopback) is
+// accepted: the auth server is a trusted routing authority, so the config host
+// allowlist does not gate descriptor destinations.
+async function testNonConfigHostRungAccepted() {
+  resetEffectiveCompositeSharesForTest();
+  const configPath = writeConfig(LADDER_CONFIG);
+  clearProxyConfigCache();
+
+  const targets = [descriptor('model-a', 'sk-desc-a', { base: 'https://api.example.com' })];
+  await withStub(
+    targets,
+    {
+      'model-a': () => jsonResponse(claudeJson('from-a'), 200),
+    },
+    async (calls) => {
+      const response = await proxyFetch(makeRequest('claude-x'), { PROXY_CONFIG_PATH: configPath });
+
+      assert(response.status === 200, `a non-config rung host must be accepted, got ${response.status}`);
+      const body = await response.json();
+      assert(body.content && body.content[0] && body.content[0].text === 'from-a', `client should see rung A's body, got ${JSON.stringify(body)}`);
+
+      const upstreams = upstreamCalls(calls);
+      assert(upstreams.length === 1, `expected exactly 1 upstream call, got ${upstreams.length}`);
+      assert(
+        upstreams[0].url === 'https://api.example.com/v1/messages',
+        `rung must be fetched at the descriptor's own host, got ${upstreams[0].url}`,
+      );
+    },
+  );
+}
+
 if (require.main === module) {
   loadModule().then(() => runTestSuite('Remote Target-Retry Ladder', [
     { name: 'TC4001: auth targets A(503) fails over to B, descriptor base+key used', fn: testFailoverRescuesOnNextTarget },
@@ -507,6 +540,7 @@ if (require.main === module) {
     { name: 'TC4007: the same body is reused across a 3-rung ladder (per-rung model id)', fn: testBodyReuseAcrossRungs },
     { name: 'TC4008: an array longer than max_targets is truncated, not walked', fn: testLadderTruncatedAtMaxTargets },
     { name: 'TC4009: a retry_on miss advances immediately (rung fetched once)', fn: testRetryOnMissAdvancesImmediately },
+    { name: 'TC4010: a rung on a non-config, non-loopback host is accepted', fn: testNonConfigHostRungAccepted },
   ])).then(cleanupConfigFiles).catch((error) => {
     cleanupConfigFiles();
     console.error(error);
