@@ -73,6 +73,7 @@ describe('validateDescriptorEntries', () => {
         transforms: 't1,t2',
         timeout: 1500,
         retry_on: [429, 503],
+        retry: 2,
       },
     ]);
     assert.equal(dropped.length, 0);
@@ -86,6 +87,7 @@ describe('validateDescriptorEntries', () => {
       transforms: 't1,t2',
       timeout: 1500,
       retry_on: [429, 503],
+      retry: 2,
     });
   });
 
@@ -174,6 +176,18 @@ describe('validateDescriptorEntries', () => {
       assert.equal(valid.length, 0, `retry_on ${JSON.stringify(retry_on)} should be dropped`);
       assert.match(dropped[0].reason, /retry_on/);
     }
+  });
+
+  it('drops a retry that is not a non-negative integer, keeps 0', () => {
+    for (const retry of [-1, 1.5, NaN, Infinity, '1', true]) {
+      const { valid, dropped } = validateDescriptorEntries([{ target: 'm', base: 'http://localhost', retry }]);
+      assert.equal(valid.length, 0, `retry ${JSON.stringify(retry)} should be dropped`);
+      assert.match(dropped[0].reason, /retry/);
+    }
+
+    const zero = validateDescriptorEntries([{ target: 'm', base: 'http://localhost', retry: 0 }]);
+    assert.equal(zero.dropped.length, 0);
+    assert.equal(zero.valid[0].retry, 0);
   });
 
   it('drops only the offending entry and keeps valid ones (order preserved)', () => {

@@ -71,10 +71,10 @@ const ALLOW_ALL_KEYS = USER_KEYS.includes('*');
 // are sent upstream verbatim and must be real upstream keys. Override the whole
 // list with MOCK_TARGETS_JSON to serve different rungs.
 const DEFAULT_TARGETS = [
-  { alias: 'code-small', target: 'deepseek/deepseek-v4.1-flash', base: 'https://api.qnaigc.com', mode: 'openai-completions', key: 'sk-a88f7199c894a700f1a228c672d4c2d26dd439e211c69b76324066771efba493', transforms: 'code_small_compat' },
-  { alias: 'code-small', target: 'qwen3.8-max', base: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', mode: 'openai-completions', key: 'sk-sp-H.DEXPIY.TGiF.MEUCIFg5sCBUqKCCtuAu37jsIdLvf_mdItuXqjG1BIiuzyOcAiEAuVohkTaPKg9sggC1dDcmePHMXi-c1wcekmc7OXI5tM0', transforms: 'code_small_compat' },
-//  { alias: 'code-small', target: 'nvidia/nemotron-3.5-lightning:free', base: 'https://openrouter.ai/api/v1', mode: 'openai-completions', key: 'sk-2' },
-//  { alias: 'code-small', target: 'nvidia/nemotron-3-ultra-550b-a55b:free', base: 'https://openrouter.ai/api/v1', mode: 'openai-completions', key: 'sk-3' },
+  { alias: 'code-small', target: 'nvidia/nemotron-3.5-lightning:free', base: 'https://openrouter.ai/api/v1', mode: 'openai-completions', key: 'sk-or-v1-0b3d', timeout: 5000, retry: 1 },
+  { alias: 'code-small', target: 'nvidia/nemotron-3-ultra-550b-a55b:free', base: 'https://openrouter.ai/api/v1', mode: 'openai-completions', key: 'sk-or-v1-0b3d', timeout: 5000, retry: 1 },
+  { alias: 'code-small', target: 'deepseek/deepseek-v4.1-flash', base: 'https://api.qnaigc.com', mode: 'openai-completions', key: 'sk-172d89', transforms: 'code_small_compat', timeout: 20000, retry: 1 },
+  { alias: 'code-small', target: 'qwen3.8-max', base: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', mode: 'openai-completions', key: 'sk-sp-H.DEXPIY', transforms: 'code_small_compat', timeout: 20000, retry: 1 },
 ];
 
 let targets = DEFAULT_TARGETS;
@@ -203,7 +203,7 @@ async function handleValidate(req, res) {
   const otac = `otac_${randomUUID()}`;
   console.log(`  → 200, key '${maskKey(clientKey)}' accepted, one_time_auth_code=${otac}, targets=${rungs.length} rung(s) [${note}]`);
   for (const [i, rung] of rungs.entries()) {
-    console.log(`      rung[${i}] target=${rung.target} base=${rung.base} mode=${rung.mode ?? '(default)'} key=${rung.key ? maskKey(rung.key) : '(passthrough)'}`);
+    console.log(`      rung[${i}] target=${rung.target} base=${rung.base} mode=${rung.mode ?? '(default)'} key=${rung.key ? maskKey(rung.key) : '(passthrough)'} timeout=${rung.timeout ?? '(default)'} retry=${rung.retry ?? '(config default)'}`);
   }
   sendJson(res, 200, { targets: rungs }, { one_time_auth_code: otac });
 }
@@ -286,7 +286,7 @@ server.listen(PORT, HOST, () => {
 
   for (const rung of targets) {
     const keyDisplay = rung.key ? maskKey(rung.key) : '(passthrough)';
-    console.log(`  rung: alias=${rung.alias ?? '(none)'} target=${rung.target} base=${rung.base} mode=${rung.mode ?? '(default)'} key=${keyDisplay}`);
+    console.log(`  rung: alias=${rung.alias ?? '(none)'} target=${rung.target} base=${rung.base} mode=${rung.mode ?? '(default)'} key=${keyDisplay} timeout=${rung.timeout ?? '(default)'} retry=${rung.retry ?? '(config default)'}`);
   }
 });
 

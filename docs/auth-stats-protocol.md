@@ -89,6 +89,7 @@ carry no config inheritance:
 | `transforms` | no | `[transforms.*]` set names applied at the same five lifecycle hooks as config-attached sets. Resolved with no section layer. |
 | `timeout` | no | **Whole-request** upstream abort deadline (ms). Overrides `UPSTREAM_BODY_TIMEOUT_MS` for this rung. |
 | `retry_on` | no | Per-rung retry axis (see below): re-hit this same rung before advancing. |
+| `retry` | no | Max same-rung retries for **this rung** only, overriding `[remote] max_target_retries`; `retry_on` still gates the statuses, `0` disables. |
 
 **Why `target` and `base` are required.** A descriptor is self-sufficient. The
 config-resolution fallback for a missing target/base is `http://localhost` with
@@ -114,11 +115,12 @@ entry is rejected.
    transport failure (→ `502`), and abort/timeout (→ `504`). A *deterministic*
    `4xx` (e.g. `400`/`401`/`422`) is terminal — the ladder stops and the client
    sees that rung's status. The number of upstream attempts is bounded by
-   `[remote] max_targets` (default `4`).
+   `[remote] max_targets` (default `16`).
 2. **Axis 2 — re-hit the same rung.** A descriptor's `retry_on` array lists the
    upstream statuses that should re-hit **that same target** before the ladder
-   advances. Bounded by `[remote] max_target_retries` (default `1`; `0`
-   disables). Backoff is `250ms × 2^n`, capped at `2s`, honoring `Retry-After`.
+   advances. The retry count is `[remote] max_target_retries` (default `1`; `0`
+   disables) unless the rung's own `retry` overrides it for that rung only.
+   Backoff is `250ms × 2^n`, capped at `2s`, honoring `Retry-After`.
 
 **Bounds and validation.** Entries are validated, deduplicated (key
 `target@base@key`), then capped at `max_targets`; the cap bounds *attempts*, not

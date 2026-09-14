@@ -17,7 +17,7 @@ import { ClaudeProxyError, classifyTransportError } from './errors.js';
 import { UPSTREAM_MODES } from './upstream-modes.js';
 
 /** Cap on the remote-supplied `targets[]` ladder length when `[remote] max_targets` is unset. */
-export const DEFAULT_MAX_TARGETS = 4;
+export const DEFAULT_MAX_TARGETS = 16;
 /** Same-target (axis 2) retries per entry when `[remote] max_target_retries` is unset. 0 disables. */
 export const DEFAULT_MAX_TARGET_RETRIES = 1;
 
@@ -43,6 +43,8 @@ export interface RemoteTargetDescriptor {
   timeout?: number;
   /** Axis 2 only: statuses worth re-hitting THIS target on. */
   retry_on?: number[];
+  /** Axis 2 only: max same-rung retries for THIS rung; overrides `[remote] max_target_retries`. */
+  retry?: number;
 }
 
 /** A raw, unvalidated `targets[]` element. */
@@ -118,6 +120,7 @@ export function validateDescriptorEntries(raw: RawTargetEntry[]): ValidatedTarge
     if (typeof entry.transforms === 'string' && entry.transforms.trim()) descriptor.transforms = entry.transforms;
     if (typeof entry.timeout === 'number') descriptor.timeout = entry.timeout;
     if (Array.isArray(entry.retry_on)) descriptor.retry_on = entry.retry_on as number[];
+    if (typeof entry.retry === 'number') descriptor.retry = entry.retry;
 
     valid.push(descriptor);
   }
@@ -160,6 +163,17 @@ function validateEntry(entry: RawTargetEntry): string | undefined {
     const r = entry.retry_on;
     if (!Array.isArray(r) || !r.every(n => typeof n === 'number' && Number.isFinite(n) && Number.isInteger(n))) {
       return 'retry_on must be an array of finite integers';
+    }
+  }
+
+  if (entry.retry !== undefined && entry.retry !== null) {
+    if (
+      typeof entry.retry !== 'number' ||
+      !Number.isFinite(entry.retry) ||
+      !Number.isInteger(entry.retry) ||
+      entry.retry < 0
+    ) {
+      return 'retry must be a non-negative integer';
     }
   }
 

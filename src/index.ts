@@ -2535,13 +2535,14 @@ export default {
         entries: RemoteTargetDescriptor[],
         bodyObj: Record<string, unknown>,
       ): Promise<Response> => {
-        const maxTargetRetries = proxyConfig.remote?.max_target_retries ?? DEFAULT_MAX_TARGET_RETRIES;
         // Auth-response one-time code is the base each rung's own otac overrides.
         const baseOtac = modelUsageOneTimeAuthCode;
         let lastOutcome: AttemptOutcome | undefined;
 
         for (let i = 0; i < entries.length; i++) {
           const entry = entries[i];
+          // A rung's own `retry` overrides the `[remote]` default for this rung only.
+          const maxTargetRetries = entry.retry ?? proxyConfig.remote?.max_target_retries ?? DEFAULT_MAX_TARGET_RETRIES;
           const route = descriptorToRoute(entry, proxyConfig);
           modelUsageOneTimeAuthCode = entry.otac ?? baseOtac;
           let attempt = buildRouteAttempt(entry.target, route, bodyObj);

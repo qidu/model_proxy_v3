@@ -38,8 +38,8 @@ parsed, and a startup warning is logged when one is still present.
 | `auth_with_model` | `false` | When `true`, the `auth_server` call is deferred until after the request body is parsed so the requested model id can be forwarded as `x-resource-for` header. Allows the auth server to make per-model decisions. Default: `false` (auth runs before body parsing). |
 | `auth_with_body` | `false` | When `true`, the `auth_server` call is deferred until after body parsing and the entire parsed request body is forwarded to the auth service as the `POST` body (raw JSON). Either `auth_with_model` or `auth_with_body` triggers the deferred path. See [Auth & Stats Service Protocol](./auth-stats-protocol.md). |
 | `auth_passthrough_with` | `"user_key"` | Standalone upstream-auth setting, separate from `auth_server` / `auth_with_model`. Controls which key is passed to the upstream provider: `"user_key"` (default) forwards the caller's key; `"config_key"` uses the configured `api_key`. |
-| `max_targets` | `4` | Upper bound on the auth `targets[]` failover ladder — caps upstream **attempts**, not just array length. Entries beyond the cap (after dedupe) are dropped. |
-| `max_target_retries` | `1` | Upper bound on axis-2 same-target re-hits per descriptor (`retry_on`). `0` disables axis 2. Backoff `250ms × 2^n`, capped `2s`, honoring `Retry-After`. |
+| `max_targets` | `16` | Upper bound on the auth `targets[]` failover ladder — caps upstream **attempts**, not just array length. Entries beyond the cap (after dedupe) are dropped. |
+| `max_target_retries` | `1` | Default upper bound on axis-2 same-target re-hits per descriptor (`retry_on`); a rung's own `retry` field overrides it for that rung only. `0` disables axis 2. Backoff `250ms × 2^n`, capped `2s`, honoring `Retry-After`. |
 
 **Recording**
 

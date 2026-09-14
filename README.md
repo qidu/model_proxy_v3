@@ -69,7 +69,7 @@ failure, and skips resolving the model from `[models.*]` / `[composite]` /
     { "target": "claude-opus-4-6", "mode": "anthropic-messages",
       "base": "https://api.anthropic.com", "key": "sk-…", "timeout": 30000 },
     { "target": "gpt-5", "mode": "openai-completions",
-      "base": "https://api.openai.com/v1", "timeout": 10000, "retry_on": [503] }
+      "base": "https://api.openai.com/v1", "timeout": 10000, "retry_on": [503], "retry": 2 }
 ] }
 ```
 
@@ -82,7 +82,8 @@ failure, and skips resolving the model from `[models.*]` / `[composite]` /
 | `otac` | string *(optional)* | Per-rung value replacing the `one_time_auth_code` header for the upstream call and the stats record. Overrides the auth response's OTAC header for this rung. |
 | `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached. |
 | `timeout` | number *(optional)* | **Whole-request** upstream abort deadline for **this rung**, in milliseconds. Overrides `UPSTREAM_BODY_TIMEOUT_MS`; on expiry the proxy aborts the attempt and fails over to the next entry. |
-| `retry_on` | number[] *(optional)* | Upstream statuses that re-hit **this same rung** before the ladder advances (axis 2). Bounded by `[remote] max_target_retries` (default `1`; `0` disables). |
+| `retry_on` | number[] *(optional)* | Upstream statuses that re-hit **this same rung** before the ladder advances (axis 2). Bounded by `[remote] max_target_retries` (default `1`; `0` disables) unless this rung sets `retry`. |
+| `retry` | number *(optional)* | Max same-rung retries for **this rung** only, overriding `[remote] max_target_retries` (axis 2). `retry_on` still gates which statuses trigger it; `0` disables same-rung retry for the rung. |
 
 **Descriptors are self-contained — `target` and `base` are required.** A
 descriptor is not merged onto `[default_upstream]` / section / entry; the only
@@ -106,7 +107,7 @@ with an error) rather than silently mis-routed.
 **Failover (axis 1).** The ladder advances on HTTP `429`, any `5xx`, a transport
 failure (→ `502`), or an abort/timeout (→ `504`). A deterministic `4xx`
 (`400`/`401`/`422`/…) is terminal — the ladder stops and the client sees that
-rung's status. Total attempts are bounded by `[remote] max_targets` (default `4`).
+rung's status. Total attempts are bounded by `[remote] max_targets` (default `16`).
 
 **Bounds and validation.** Entries are validated, deduplicated
 (`target@base@key`), then capped at `max_targets`; an invalid entry is dropped

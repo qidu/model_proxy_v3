@@ -34,8 +34,9 @@ A minimal `proxy_config.toml` looks like this (shipped as
 # auth_with_body = false           # when true, POSTs the parsed request body to auth_server
 # auth_passthrough_with = "user_key"   # controls which key is passed upstream:
                                        # "user_key" (default) or "config_key"
-# max_targets = 4                  # cap on the auth targets[] failover ladder attempts
-# max_target_retries = 1           # per-descriptor retry_on re-hits (0 disables)
+# max_targets = 16                 # cap on the auth targets[] failover ladder attempts
+# max_target_retries = 1           # per-descriptor retry_on re-hits (0 disables);
+                                   # a rung's own `retry` field overrides this for that rung
 # --- recording role: POSTs per-request usage records to an HTTP collector ---
 # Includes request_id, endpoint, raw user_key, model, response_status, and token counters.
 # record_server = "http://127.0.0.1:8080/model-usage"

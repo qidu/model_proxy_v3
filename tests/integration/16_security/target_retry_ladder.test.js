@@ -28,6 +28,9 @@
  *           immediately (the rung is fetched exactly once).
  * - TC4010: a rung whose host is absent from the config (and is not loopback)
  *           is accepted — the config allowlist does not gate descriptor hosts.
+ * - TC4011: a rung's own `retry` overrides `[remote] max_target_retries` for
+ *           that rung only (`retry: 2` → the rung is re-hit twice before the
+ *           ladder advances, vs. the default 1).
  *
  * Reference: docs/plan-remote-target-retry-dispatch.md (Testing).
  */
@@ -273,6 +276,38 @@ async function testRetryOnRehitsSameTarget() {
       assert(
         upstreams[0].body.model === 'model-a' && upstreams[1].body.model === 'model-a' && upstreams[2].body.model === 'model-b',
         `expected [model-a, model-a, model-b], got ${JSON.stringify(upstreams.map(c => c.body.model))}`,
+      );
+    },
+  );
+}
+
+// A rung's own `retry` overrides `[remote] max_target_retries` for that rung
+// only. With the default (1) rung A would be fetched twice; `retry: 2` makes it
+// three attempts before the ladder advances.
+async function testPerRungRetryOverride() {
+  resetEffectiveCompositeSharesForTest();
+  const configPath = writeConfig(LADDER_CONFIG);
+  clearProxyConfigCache();
+
+  const targets = [
+    descriptor('model-a', 'sk-desc-a', { retry: 2, retry_on: [503] }),
+    descriptor('model-b', 'sk-desc-b'),
+  ];
+  await withStub(
+    targets,
+    {
+      'model-a': () => jsonResponse({ error: { message: 'boom' } }, 503),
+      'model-b': () => jsonResponse(claudeJson('from-b'), 200),
+    },
+    async (calls) => {
+      const response = await proxyFetch(makeRequest('claude-x'), { PROXY_CONFIG_PATH: configPath });
+
+      assert(response.status === 200, `client should see rung B's 200, got ${response.status}`);
+      const upstreams = upstreamCalls(calls);
+      assert(upstreams.length === 4, `retry:2 must fetch A 3 times then B (4 calls), got ${upstreams.length}`);
+      assert(
+        upstreams.map(c => c.body.model).join(',') === 'model-a,model-a,model-a,model-b',
+        `expected [model-a, model-a, model-a, model-b], got ${JSON.stringify(upstreams.map(c => c.body.model))}`,
       );
     },
   );
@@ -541,6 +576,7 @@ if (require.main === module) {
     { name: 'TC4008: an array longer than max_targets is truncated, not walked', fn: testLadderTruncatedAtMaxTargets },
     { name: 'TC4009: a retry_on miss advances immediately (rung fetched once)', fn: testRetryOnMissAdvancesImmediately },
     { name: 'TC4010: a rung on a non-config, non-loopback host is accepted', fn: testNonConfigHostRungAccepted },
+    { name: 'TC4011: a rung\u2019s own retry overrides [remote] max_target_retries', fn: testPerRungRetryOverride },
   ])).then(cleanupConfigFiles).catch((error) => {
     cleanupConfigFiles();
     console.error(error);

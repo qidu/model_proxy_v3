@@ -5,6 +5,22 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### change(remote): raise the default `[remote] max_targets` ladder cap from 4 to 16
+
+The auth `targets[]` failover ladder's default attempt bound is now `16` (was
+`4`). The knob itself is unchanged — an explicit `[remote] max_targets` still
+overrides the default, and entries are still deduped then truncated to the cap.
+
+### feat(remote): per-rung `retry` override on the auth `targets[]` ladder
+
+An auth `targets[]` descriptor may now carry a `retry` (non-negative integer)
+field that overrides `[remote] max_target_retries` for that rung only, falling
+back to the config default when absent — so one ladder may mix a rung that
+retries twice with rungs that retry once (or not at all, `retry: 0`). `retry_on`
+still gates which statuses trigger a same-rung retry; `retry` only sets the
+count. The per-rung `timeout` field is unchanged (milliseconds). The mock auth
+sidecar's default ladder now emits `timeout: 10000, retry: 1`.
+
 ### test(mock): auth sidecar validates the client key, then selects rungs by alias
 
 `tests/scripts/mock-auth-stats-server.js` `/validate` now models the real auth
