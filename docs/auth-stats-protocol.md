@@ -80,6 +80,36 @@ On `200`, the proxy reads:
   ladder**. See the table in
   [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service).
 
+Example `200` body (auth service → proxy) — `version` is required, `targets[]`
+is optional:
+
+```json
+{
+  "version": "v1",
+  "targets": [
+    {
+      "target": "deepseek/deepseek-v4.1-flash",
+      "base": "https://api.example.com",
+      "mode": "openai-completions",
+      "key": "sk-upstream-key",
+      "transforms": "code_small_compat",
+      "timeout": 20000,
+      "retry": 1,
+      "retry_on": [429, 500, 502, 503, 504]
+    },
+    {
+      "target": "nvidia/nemotron-3.5-lightning:free",
+      "base": "https://openrouter.ai/api/v1",
+      "mode": "openai-completions"
+    }
+  ]
+}
+```
+
+The `one_time_auth_code` travel-header (above) is returned alongside this body.
+The first rung pins its own upstream `key`; the second omits `key`, so it
+forwards the caller's credential (passthrough).
+
 The response table above is therefore refined on `200`: a valid `version`-bearing
 body passes and proceeds to routing. A `200` body without a valid `version` is
 treated as a contract failure and returns `401` to the client (same as any `4xx`
@@ -199,6 +229,7 @@ Body (`ModelUsageRecordPayload`):
 | `request_id` | string | Same proxy-generated request id forwarded to auth. |
 | `timestamp` | string | ISO 8601 timestamp of the record. |
 | `endpoint` | string | Inbound request path (e.g. `/v1/messages`). |
+| `version` | string | Wire-contract era this record speaks. A fixed proxy constant (`"v1"`), sent on every record regardless of the auth response — the proxy does not echo the auth service's advertised `version`. |
 | `user_key` | string | Raw caller auth key (from `Authorization` / `x-api-key` / `x-goog-api-key`). |
 | `model` | string | **Resolved** upstream model id actually sent upstream (the `target`, not the alias key). |
 | `response_status` | number | Upstream HTTP status. `0` means no response was obtained. Non-2xx statuses are recorded with all token counters at `0`. |
@@ -211,10 +242,10 @@ Body (`ModelUsageRecordPayload`):
 
 **Response**: the proxy only checks `response.ok`; a non-2xx is logged at
 `WARN` with the status code. There is no retry. The stats POST is
-fire-and-forget — its response never gates the client — so, unlike the auth
-path, a `version` body field here is **not** enforced. The bundled sidecar still
-sends `{ "version": "v1", "ok": true }` on `200` for symmetry, but the proxy
-ignores it.
+fire-and-forget — its response never gates the client — so the response body is
+ignored entirely: unlike the auth `200` (which must carry `version`), the stats
+response carries no `version` and the proxy does not read its body. The bundled
+sidecar answers `{ "ok": true }`.
 
 ## Combining auth and stats in one service
 

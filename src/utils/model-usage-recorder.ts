@@ -1,10 +1,20 @@
 import type { Logger } from '../types/shared.js';
 import type { UsageStats } from './dashboard-stats.js';
 
+/**
+ * Wire-contract era this proxy speaks, sent as `version` on every usage record.
+ * The stats service does not validate it (the record POST is fire-and-forget),
+ * but the field lets the collector tell which era of this contract produced the
+ * record. See docs/auth-stats-protocol.md.
+ */
+export const PROTOCOL_VERSION = 'v1';
+
 export interface ModelUsageRecordPayload {
   request_id: string;
   timestamp: string;
   endpoint: string;
+  /** Wire-contract era (see `PROTOCOL_VERSION`). */
+  version: string;
   user_key: string;
   model: string;
   /**
@@ -45,6 +55,7 @@ export function buildModelUsageRecordPayload(
     request_id: requestId,
     timestamp: new Date().toISOString(),
     endpoint,
+    version: PROTOCOL_VERSION,
     user_key: userKey,
     model,
     response_status: responseStatus,

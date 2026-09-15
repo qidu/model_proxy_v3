@@ -7,7 +7,7 @@ import { extractTokenCounts } from '../../src/converters/openai-to-claude.js';
 import { countClaudeRequestTokens } from '../../src/utils/token-counting.js';
 import { handleMessagesRequest } from '../../src/handlers/messages.js';
 import { createUsageTrackingTransformStream, extractUsageFromResponsePayload } from '../../src/utils/dashboard-stats.js';
-import { buildModelUsageRecordPayload, recordModelUsageToRemote } from '../../src/utils/model-usage-recorder.js';
+import { buildModelUsageRecordPayload, recordModelUsageToRemote, PROTOCOL_VERSION } from '../../src/utils/model-usage-recorder.js';
 
 async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string> {
   const reader = stream.getReader();
@@ -144,6 +144,7 @@ describe('remote usage recording', () => {
 
     assert.equal(payload.request_id, 'req-1');
     assert.equal(payload.endpoint, '/v1/messages');
+    assert.equal(payload.version, PROTOCOL_VERSION);
     assert.equal(payload.user_key, 'sk-user');
     assert.equal(payload.model, 'claude-test');
     assert.equal(payload.input_tokens, 11);

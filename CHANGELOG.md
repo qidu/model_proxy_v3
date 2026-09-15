@@ -5,6 +5,24 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(remote): send `version` on the stats usage record
+
+The proxy now sends a `version` field on every `ModelUsageRecordPayload` POSTed
+to `[remote] record_server`. `src/utils/model-usage-recorder.ts` gains a
+`PROTOCOL_VERSION = 'v1'` constant, set as `version` in
+`buildModelUsageRecordPayload` — a fixed proxy constant, sent on every record
+regardless of the auth response (the proxy does not echo the auth service's
+advertised era). The stats service does not validate it: the POST is
+fire-and-forget and the proxy still reads only `response.ok`.
+
+The stats **response** body carries no `version`: only the auth `200` body
+advertises the contract era. `tests/scripts/mock-auth-stats-server.js` answers
+`/v1/model-usage` with `{ "ok": true }` (was `{ "version": "v1", "ok": true }`)
+and now logs the received `version` from each record; `PROTOCOL_VERSION` remains
+on the `/v1/validate` response. [docs/auth-stats-protocol.md](docs/auth-stats-protocol.md)
+documents the auth `200` example body (`version` + a two-rung `targets[]`
+ladder) and the `ModelUsageRecordPayload` `version` field.
+
 ### feat(remote): require `version` on the auth `200` response
 
 The auth service's `200` body **must** now carry a non-empty string `version`

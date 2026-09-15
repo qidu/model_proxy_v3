@@ -19,8 +19,9 @@
  *                                 (or MOCK_AUTH_STATUS to force a rejection).
  *   /v1/model-usage (POST)          → logs the ModelUsageRecordPayload, 200.
  *
- * Both 200 responses carry a `version` field (PROTOCOL_VERSION) advertising the
- * wire-contract era.
+ * The /v1/validate 200 response carries a `version` field (PROTOCOL_VERSION)
+ * advertising the wire-contract era. The /v1/model-usage 200 body does not: the
+ * proxy ignores the stats response body entirely.
  *
  * Everything the proxy sends (forwarded headers, usage record) is printed to
  * stdout so you can eyeball the exact on-the-wire shape. The /v1/validate request
@@ -54,7 +55,7 @@ const HOST = process.env.MOCK_HOST || '127.0.0.1';
 const PORT = Number(process.env.MOCK_PORT || 8989);
 const AUTH_STATUS = Number(process.env.MOCK_AUTH_STATUS || 200);
 
-// Wire-contract version advertised on every 200 response (both roles), so a
+// Wire-contract version advertised on the /v1/validate 200 response, so a
 // caller can tell which era of the auth/stats contract the sidecar speaks.
 const PROTOCOL_VERSION = 'v1';
 
@@ -249,6 +250,7 @@ async function handleModelUsage(req, res) {
     console.log(`  body (non-JSON): ${rawBody.slice(0, 400)}`);
   } else {
     const { response_body, ...rest } = payload;
+    console.log(`  version: ${payload.version ?? '(none)'}`);
     console.log(`  record: ${JSON.stringify(rest)}`);
     if (response_body !== undefined) {
       const size = typeof response_body === 'string'
@@ -258,7 +260,7 @@ async function handleModelUsage(req, res) {
     }
   }
 
-  sendJson(res, 200, { version: PROTOCOL_VERSION, ok: true });
+  sendJson(res, 200, { ok: true });
 }
 
 const server = http.createServer((req, res) => {
