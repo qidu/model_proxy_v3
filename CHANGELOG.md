@@ -5,6 +5,61 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(build): the win32 single-executable build stores keys in its own file body
+
+`store_key_in_system = true` now works inside the **win32** SEA binary.
+`@github/keytar` needs too many dependencies on Windows (Visual Studio Build Tools
+with the C++ workload + Python 3, via node-gyp) to be worth carrying into
+a self-contained single-file distribution, so the win32 build substitutes an
+in-binary store there: `loadKeytar`'s failure falls through to
+`tryBodyKeyStore()` (`src/utils/body-key-store.ts`), which returns a
+`KeytarLike` (`src/utils/key-store.ts:37-42`, unchanged) whose backing store is
+the executable's own file body (`process.execPath`): each `setPassword` appends
+one `{service, account, password}` record at EOF via `src/utils/body-record.ts`,
+and reads walk the record chain backwards, newest-per-account winning. macOS and
+Linux are unchanged — they keep the OS keychain via `@github/keytar` — and
+Docker, Workers, and macOS/Linux SEA binaries keep the fatal `KeyStoreError`.
+The record format (`$ReCorDeR` tail, CRC32, backwards-linked list) is the one from
+`store-in-body`, ported path-parameterized; CRC32 is a local table
+implementation rather than `node:zlib`'s, which would add a `>=20.15` floor the
+Workers/`nodejs_compat` module graph should not inherit.
+
+The gate (`tryBodyKeyStore`) is deliberately narrow — `process.platform ===
+'win32'`, a real SEA binary (`node:sea` `isSea()`, imported through a
+non-literal specifier like the existing `KEYTAR_MODULE` so no bundler resolves
+it statically), and an `execPath` basename that is not `node`/`node.exe`. Any
+gate failing returns `null` and the caller keeps its existing fatal error, so
+the body store can never be pointed at a plain Node install.
+
+Appending to a **running** `.exe` is not the reference's single rename: a
+Windows image cannot be renamed-over by name while mapped. So `appendRecord`
+tries the cheap path first — open `self` `'r+'` and append at EOF with no copy
+of the ~110 MB binary — and only if Windows denies that open falls back to
+copy → append → `rename(self → self.<uniq>.old)` → `rename(tmp → self)`, with
+the leftover `.old` swept on the next start and a restore-from-`.old` if the
+swap half-completes. The `.old` name is unique per append because a fixed name
+is un-renamable-over (the first `.old` is the still-mapped original).
+
+**Security: the records are plaintext inside the `.exe`.** That is not secrecy
+— anyone who can read the binary can read the keys — the gain is a
+self-contained single-file distribution whose keys travel with the binary
+instead of sitting in `proxy_config.toml`. It is a downgrade from an OS
+keychain, needs a writable directory beside the executable, and is wiped by a
+rebuild (a fresh blob is injected into a fresh copy of `node`). Documented in
+[README.md](./README.md) and
+[docs/configuration-reference.md](./docs/configuration-reference.md); the
+`scripts/build-sea.js` banner and `EXTERNALS` comment now say win32 is
+supported rather than fatal.
+
+New tests: `tests/unit/body-record.test.ts` (round-trip, oldest→newest order,
+link chain, CRC-corruption stopping the walk, non-linking to a foreign tail,
+the swap flow end-to-end, stale-swap sweep) and
+`tests/unit/body-key-store.test.ts` (set/get, miss → `null`,
+last-write-wins, `findCredentials` latest-per-account service-filtered,
+malformed record throwing loud, and the non-win32 gate returning `null`). The
+Windows *semantics* — which tier engages, and a read-only directory failing
+loud — still need a real Windows host; that is called out in the plan.
+
 ### feat(remote): send `version` on the stats usage record
 
 The proxy now sends a `version` field on every `ModelUsageRecordPayload` POSTed

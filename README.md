@@ -533,18 +533,41 @@ The full field-by-field reference lives in
   "Always Allow". This fallback call is bounded to 60s — if it doesn't respond
   in time (e.g. a stuck/dismissed dialog), it fails loud with a clear timeout
   error instead of hanging the process indefinitely.
+- **`store_key_in_system` in the win32 single-executable build** — `@github/keytar`
+  needs too many dependencies on Windows (Visual Studio Build Tools with the "Desktop
+  development with C++" workload + Python 3, via node-gyp — see the toolchain table
+  below), so on **Windows only** the executable substitutes an in-binary store and
+  keeps the keys **in its own file body**
+  (`process.execPath`, using the record format from `store-in-body`): `setPassword`
+  appends a JSON record at EOF and lookups walk the record chain backwards. No OS
+  keychain is involved, and the `proxy_config.toml` behaviour is unchanged (keys are
+  still rewritten to sentinels and resolved on later loads). Three consequences:
+  **the keys are plaintext inside the `.exe`** — that is portability, not secrecy;
+  **appending rewrites the executable**, so its directory must be writable (an
+  in-place append at EOF is tried first; otherwise the whole file is copied and
+  swapped, and either way the directory must permit writes) and a full append is
+  O(file size); and **rebuilding wipes the stored keys**, since a fresh blob is
+  injected into a fresh copy of `node`. The fallback engages only for a real SEA
+  binary whose `process.execPath` basename is not `node`/`node.exe`, so it can never
+  target a Node install. macOS and Linux keep the OS keychain via `@github/keytar`;
+  the Docker image and macOS/Linux SEA binaries keep the fatal `KeyStoreError`.
 - **System & toolchain requirements for `store_key_in_system = true`** — the feature
-  needs an OS keychain backend at run time. The `@github/keytar` native addon normally
-  installs as a prebuilt NAPI binary (ABI 3 — works on any modern Node), so no build
-  toolchain is required; a native toolchain (Python 3 + a C++ compiler, via node-gyp)
-  is needed only when the prebuilt download fails (e.g. no network access to GitHub
-  releases) and npm falls back to compiling the addon from source:
+  needs an OS keychain backend at run time. On macOS/Linux the `@github/keytar` native
+  addon installs as a prebuilt NAPI binary (ABI 3 — works on any modern Node), so no
+  build toolchain is required; a native toolchain (Python 3 + a C++ compiler, via
+  node-gyp) is needed only when the prebuilt download fails (e.g. no network access to
+  GitHub releases) and npm falls back to compiling the addon from source. On Windows
+  the addon needs that toolchain in the normal case — Visual Studio Build Tools with
+  the "Desktop development with C++" workload + Python 3 — which is why the win32
+  **single-executable build** skips keytar entirely and stores the keys in the
+  executable's own file body instead (see the bullet above):
 
-  | Platform | Runtime requirement (OS keychain) | Source-build fallback (node-gyp) |
+  | Platform | Runtime requirement (OS keychain) | Node build toolchain (node-gyp) |
   |---|---|---|
-  | macOS | Keychain Services (built in) | Xcode Command Line Tools (`xcode-select --install`) + Python 3 |
-  | Linux | a Secret Service provider — `gnome-keyring` (or KWallet) daemon running, with `libsecret-1` | `build-essential` (gcc/g++/make) + Python 3 + `libsecret-1-dev` headers |
-  | Windows | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 |
+  | macOS | Keychain Services (built in) | Xcode Command Line Tools (`xcode-select --install`) + Python 3 — only for the source-build fallback |
+  | Linux | a Secret Service provider — `gnome-keyring` (or KWallet) daemon running, with `libsecret-1` | `build-essential` (gcc/g++/make) + Python 3 + `libsecret-1-dev` headers — only for the source-build fallback |
+  | Windows — `node dist/server.js` | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 |
+  | Windows — single-executable build | **not used** — no OS keychain, keys go in the executable's own file body (see the bullet above) | **not needed** — keytar is not installed |
 
   Headless Linux servers need a keyring daemon unlocked in the session (e.g.
   `gnome-keyring-daemon --start --components=secrets` with `DBus` session) or keychain

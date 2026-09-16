@@ -15,8 +15,20 @@
  * This is a local/dev-host feature: the keytar native addon requires an OS
  * keychain (no Docker/distroless, no Cloudflare Workers). When the feature is
  * enabled but the keychain itself is unavailable, the error is fatal — no
- * silent fallback (it would affect every key). An individual sentinel that
- * has no matching keychain entry is NOT fatal: that one slot is cleared to
+ * silent fallback (it would affect every key).
+ *
+ * Exception — the win32 single-executable build: `@github/keytar` needs too
+ * many dependencies on Windows (Visual Studio Build Tools with the C++ workload
+ * + Python 3, via node-gyp) to be worth carrying into a self-contained
+ * single-file distribution, so that build stores the keys in the executable's
+ * own file body instead (body-key-store.ts, addressed by `process.execPath`).
+ * That store is PLAINTEXT inside the exe — a deliberate portability-for-secrecy
+ * trade, only used where an OS keychain is not practical. macOS and Linux keep
+ * the OS keychain via `@github/keytar`; Docker, Cloudflare Workers and
+ * macOS/Linux SEA binaries keep the fatal error above.
+ *
+ * An individual sentinel that has no matching keychain entry is NOT fatal:
+ * that one slot is cleared to
  * `''` (== "not configured", so the normal api_key fallback chain applies) and
  * reported, so the rest of the config still loads and the proxy still starts.
  *
@@ -28,6 +40,7 @@
  */
 
 import { copyFileSync, readFileSync, writeFileSync } from 'fs';
+import { tryBodyKeyStore } from './body-key-store.js';
 import type { ModelCategoryConfig, ProxyConfig } from './config-loader.js';
 
 export const KEY_STORE_SERVICE = 'model_proxy_v3';
@@ -151,9 +164,18 @@ async function loadKeytar(opts: { keytarImpl?: KeytarLike }): Promise<KeytarLike
     const mod = await import(KEYTAR_MODULE);
     return ((mod as { default?: KeytarLike }).default ?? mod) as KeytarLike;
   } catch (err) {
+    // win32 SEA fallback: keytar needs too many dependencies on Windows (VS
+    // Build Tools + Python 3, via node-gyp), so the win32 single-executable
+    // build stores the keys in the executable's own file body instead (see
+    // body-key-store.ts). Null on every other platform, and on any binary that
+    // is not a real SEA whose execPath basename is not node/node.exe — so a
+    // plain Node install is never a target.
+    const body = await tryBodyKeyStore();
+    if (body) return body;
     throw new KeyStoreError(
       `store_key_in_system = true but the system keychain is unavailable: ${(err as Error).message}` +
-      ` (requires the @github/keytar native addon and an OS keychain — not available in Docker/Workers)`,
+      ` (requires the @github/keytar native addon and an OS keychain — not available in Docker/Workers;` +
+      ` on win32, a single-executable build substitutes an in-binary body store automatically)`,
     );
   }
 }

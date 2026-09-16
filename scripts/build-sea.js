@@ -78,12 +78,18 @@ const BUILD = path.join(ROOT, '.sea-build');
  * not a warning. Marking them external turns each into a plain runtime
  * `require()` that throws where the source already handles a throw.
  *
- * @github/keytar — a native .node addon. SEA embeds a single JS blob and has
- *   no mechanism for shipping native addons, so this can never be bundled.
- *   src/utils/key-store.ts:145-156 already loads it through a non-literal
- *   specifier and converts absence into a KeyStoreError, and Dockerfile:20
- *   already installs with --omit=optional. So in the binary, as in Docker,
- *   `store_key_in_system = true` fails loud with an actionable message.
+ * @github/keytar — a native .node addon, so SEA (one embedded JS blob, no
+ *   mechanism for shipping native addons) could never carry it. src/utils/
+ *   key-store.ts already loads it through a non-literal specifier and converts
+ *   absence into a KeyStoreError, and Dockerfile:20 already installs with
+ *   --omit=optional. So in the binary, as in Docker, `store_key_in_system =
+ *   true` fails loud with an actionable message — EXCEPT on win32: keytar needs
+ *   too many dependencies there (Visual Studio Build Tools with the C++ workload
+ *   + Python 3, via node-gyp) to be worth carrying into a single-file
+ *   distribution, so loadKeytar falls back to src/utils/body-key-store.ts,
+ *   which stores the keys in the executable's own file body (plaintext; see
+ *   that file's header). macOS and Linux keep keytar and the OS keychain;
+ *   macOS/Linux SEA binaries keep the fatal KeyStoreError.
  *
  * chatjimmy — the sdk:// route's optional submodule
  *   (src/utils/sdk-handler.ts:62-75). It is loaded via a deliberately
@@ -323,9 +329,13 @@ function main() {
     '[build-sea] note: proxy_config.toml is still read from the working directory at\n' +
       '            runtime (PROXY_CONFIG_PATH, default ./proxy_config.toml) — it is not\n' +
       '            embedded in the binary.\n' +
-      '[build-sea] excluded from this binary: system keychain (@github/keytar, so\n' +
-      '            store_key_in_system is unsupported) and sdk:// routes (chatjimmy).\n' +
-      '            Both match the Docker image, and both fail loud if used.'
+      '[build-sea] excluded from this binary: system keychain (@github/keytar) and\n' +
+      '            sdk:// routes (chatjimmy). sdk:// always fails loud, as in the\n' +
+      '            Docker image. keytar needs too many dependencies on Windows, so the\n' +
+      '            win32 build substitutes an in-binary body store for\n' +
+      '            store_key_in_system (plaintext in the .exe, needs a writable\n' +
+      '            directory); macOS/Linux SEA binaries keep the fatal KeyStoreError,\n' +
+      '            and a `node dist/server.js` run on those platforms keeps keytar.'
   );
 }
 
