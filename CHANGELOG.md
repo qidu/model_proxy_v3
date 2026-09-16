@@ -5,6 +5,27 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(build): quote cmd.exe words so `build:native` runs on Windows
+
+`npm run build:native` failed on Windows before it reached SEA. `run()`
+(`scripts/build-sea.js`) uses `shell: true` on Windows because `npx` there is
+`npx.cmd`, and `execFileSync` with a shell joins the command and argv with plain
+spaces and escapes nothing — so cmd re-split every word on whitespace before the
+child saw it. The esbuild banner (`--banner:js=const __SEA_IMPORT_META_URL__ =
+...`) was the first casualty: esbuild received the fragments as extra positional
+inputs and rejected the build with "Must use outdir when there are multiple
+input files". The next step failed the same way with `process.execPath` —
+`C:\Program Files\nodejs\node.exe` — which cmd truncated to `C:\Program` ("is
+not recognized as an internal or external command").
+
+The fix adds `quoteForCmd`, applied to the command and every argument when a
+shell is used: words containing whitespace or a cmd control character
+(`&|<>^()`) are wrapped in double quotes, which cmd strips before exec while
+preserving the inner text (the banner's single quotes survive). Bare words are
+left untouched so POSIX argv is unchanged and a path ending in a backslash is
+not mis-parsed as an escaped quote. A word containing a literal double quote —
+which no argument here does — fails loud rather than mis-quote.
+
 ### feat(build): the win32 single-executable build stores keys in its own file body
 
 `store_key_in_system = true` now works inside the **win32** SEA binary.

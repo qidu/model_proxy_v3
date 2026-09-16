@@ -126,6 +126,40 @@ function outputName() {
 }
 
 /**
+ * Quotes one shell word (the command or one of its arguments) for cmd.exe.
+ *
+ * With shell:true, execFileSync joins the command and argv with plain spaces
+ * and does NOT escape anything itself, so cmd re-splits every word on
+ * whitespace before the child ever sees it. The esbuild banner
+ * ('--banner:js=const X = ...') is the first casualty: cmd hands esbuild the
+ * fragments as separate positional arguments, and esbuild reads the extra ones
+ * as additional entry points ("Must use outdir when there are multiple input
+ * files"). The command is just as exposed — process.execPath is
+ * 'C:\\Program Files\\nodejs\\node.exe', which cmd truncates to 'C:\\Program'
+ * ("is not recognized as an internal or external command") — and so is any
+ * path under a directory whose name contains a space.
+ *
+ * Wrapping such a word in double quotes keeps it whole: cmd strips the quotes
+ * and passes the inner text — including the single quotes the banner's
+ * `require('node:url')` needs — through untouched. Words with no
+ * shell-significant characters are left bare, which also keeps paths that end
+ * in a backslash safe (a quoted '...\' would let the child's argv parser read
+ * the closing quote as escaped and swallow it).
+ *
+ * A literal double quote cannot be represented inside a double-quoted word in
+ * a way that survives both cmd and the child's argv parsing, so rather than
+ * emit something subtly wrong we fail loud. No word in this script contains
+ * one.
+ */
+function quoteForCmd(word) {
+  if (!/[ \t&|<>^()]/.test(word)) return word;
+  if (word.includes('"')) {
+    throw new Error(`Cannot quote build word containing a double quote: ${word}`);
+  }
+  return `"${word}"`;
+}
+
+/**
  * shell:true on Windows because `npx` there is `npx.cmd`, a batch script.
  * execFileSync spawns the executable directly with no shell, and CreateProcess
  * cannot run a .cmd — so every npx step below dies with ENOENT without it.
@@ -133,15 +167,17 @@ function outputName() {
  * shell, as a fix for CVE-2024-27980.)
  *
  * The shell is confined to Windows: on POSIX it is unnecessary, and it would
- * put an extra layer of quoting between us and the argv we pass. Every
- * argument here is build-time constant or a path this script computed, so
- * there is no untrusted input to interpolate either way.
+ * put an extra layer of quoting between us and the argv we pass. On Windows it
+ * has exactly that cost, so the command and every argument are run through
+ * quoteForCmd. Every word here is build-time constant or a path this script
+ * computed, so there is no untrusted input to interpolate either way.
  */
 function run(cmd, args, opts = {}) {
-  execFileSync(cmd, args, {
+  const useShell = os.platform() === 'win32';
+  execFileSync(useShell ? quoteForCmd(cmd) : cmd, useShell ? args.map(quoteForCmd) : args, {
     stdio: 'inherit',
     cwd: ROOT,
-    shell: os.platform() === 'win32',
+    shell: useShell,
     ...opts,
   });
 }
