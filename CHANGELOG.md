@@ -5,6 +5,44 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(stats): native Anthropic responses were counted twice
+
+Token usage for `/v1/messages` against an `anthropic-messages` upstream was
+recorded twice, so the dashboard, the TUI, and `[remote].record_server` all saw
+2× the real token counts for that path.
+
+`src/handlers/claude.ts` recorded usage itself — it teed the SSE body and piped
+one branch through `createUsageTrackingTransformStream(accountingModel)`, and on
+the non-streaming branch it parsed a clone and called `recordModelUsage` /
+`recordUpstreamResponseToolNames` directly. But `src/index.ts` wraps *every* 2xx
+response after the handler returns: `text/event-stream` bodies get the same
+tracker, `application/json` bodies get `extractUsageFromResponsePayload` →
+`recordModelUsage`. `recordModelUsage` accumulates with no dedup, so both
+recorders fired for the same bytes and the same model id. The handler-local
+recorder predates the centralized block in `index.ts` and was left behind when
+it was added.
+
+`claude.ts` now returns the upstream body untouched and does no usage or tool
+recording — `index.ts` already covers it, and covers more: composite-alias
+windows, the remote `record_server` call, `record_response_body`, and tool names
+attributed to the calling agent (the handler-local copy dropped that
+attribution). The one behavior change: when `attemptModelId` is undefined the
+handler's `requestBody.model` fallback used to record local token stats, and that
+degenerate path now records none. `attemptModelId` is always set for
+`/v1/messages` in practice (`route.modelAlias || candidateName`).
+
+New suite `tests/integration/17_token_counting/` (TC4101–TC4105) guards this.
+Each case sums `total_tokens` across all rows of `GET
+/dashboard/api/stats/models` before and after one request and requires the delta
+to equal the usage the client was told about — exactly once, so a 2× delta
+fails. It covers non-streaming and streaming `/v1/messages`,
+`/v1/chat/completions` (including the force-injected
+`stream_options.include_usage` chunk), and Gemini `:streamGenerateContent?alt=sse`.
+Candidates are discovered from the live config per upstream mode, so the suite is
+not tied to particular model ids; unusable candidates print `(skipped: ...)`.
+Verified by restoring the old tee: TC4102 fails with `delta 50 != 25 (2x)`, and
+passes with the fix.
+
 ### feat(cli): `--export-openclaw-providers`
 
 The CLI gained `--export-openclaw-providers`, which prints the `models.providers`
