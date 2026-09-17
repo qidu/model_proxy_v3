@@ -8,6 +8,7 @@ import { createServer } from 'http';
 import type { Env } from './types/shared.js';
 import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit } from './utils/config-loader.js';
 import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled } from './utils/dashboard-stats.js';
+import { runCli } from './cli.js';
 
 const port = parseInt(process.env.PORT || '8788', 10);
 
@@ -60,6 +61,13 @@ const env: NodeEnv = {
   KOMPRESS_KEEP_RATIO: process.env.KOMPRESS_KEEP_RATIO,
   KOMPRESS_MIN_CHARS: process.env.KOMPRESS_MIN_CHARS,
 };
+
+// CLI subcommands exit before the server starts. No args (runCli returns null)
+// preserves the previous behavior of starting the HTTP server.
+const cliExitCode = runCli(process.argv.slice(2), env);
+if (cliExitCode !== null) {
+  process.exit(cliExitCode);
+}
 
 const server = createServer(async (req, res) => {
   try {

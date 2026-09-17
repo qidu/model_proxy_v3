@@ -486,9 +486,9 @@ class PromptOverlay implements Component, Focusable {
   }
 }
 
-/** Strip the Ç/ƒ/Ö marker suffix used for duplicate disambiguation. */
+/** Strip the ᙅ/Ƒ/Ö marker suffix used for duplicate disambiguation. */
 function stripModelMarker(value: string): string {
-  return / [ÇƒÖ]$/.test(value) ? value.replace(/ [ÇƒÖ]$/, '').trim() : value;
+  return / [ᙅƑÖ]$/.test(value) ? value.replace(/ [ᙅƑÖ]$/, '').trim() : value;
 }
 
 /** Per-row quota data for the 'Model Quota' picker, keyed by choice value. */
@@ -757,7 +757,7 @@ class CompositeAliasesOverlay implements Component, Focusable {
         ? ` ${dim(fmt(windowUsed))} ${dim('/')} ${dim('(')}${dim(fmt(aliasLimit.num) + '/' + windowDuration)}${dim(')')}${dim(bold('𝕋'))}`
         : '';
       const aliasMode = snap.config ? getCompositeAliasMode(alias, snap.config) : undefined;
-      const aliasTag = aliasMode === 'fusion' ? dim(' ƒ') : aliasMode === 'coordinator' ? dim(' Ö') : dim(' Ç');
+      const aliasTag = aliasMode === 'fusion' ? dim(' Ƒ') : aliasMode === 'coordinator' ? dim(' Ö') : dim(' ᙅ');
       const hasError = compositeErrors.some((e) => e.path === `composite.${alias}`);
       const errorMark = hasError ? red(' x') : '';
       // Record this alias's line index for selections array
@@ -1257,7 +1257,7 @@ class DashboardView implements Component {
       const shownModels = customModels.slice(0, maxCustomModelRows);
       const hiddenCount = customModels.length - shownModels.length;
       for (const row of shownModels) {
-        const tag = row.category === 'fusion' ? 'ƒ' : row.category === 'coordinator' ? 'Ö' : row.category === 'composite' ? 'Ç' : dim(titleCase(row.category));
+        const tag = row.category === 'fusion' ? 'Ƒ' : row.category === 'coordinator' ? 'Ö' : row.category === 'composite' ? 'ᙅ' : dim(titleCase(row.category));
         const extra = row.description ? ` ${dim(row.description)}` : '';
         const timing = modelTimingMap.get(row.routeModel ?? row.modelId);
         const timingStr = timing ? ` ${dim('[')}${dim(fmtSeconds(timing.min_time_ms))}${dim('/')}${dim(fmtSeconds(timing.avg_time_ms))}${dim('/')}${dim(fmtSeconds(timing.max_time_ms))}${dim('s]')}` : '';
@@ -1557,8 +1557,8 @@ class DashboardApp {
 
   openModePicker(alias: string, onPicked: (mode: 'composite' | 'fusion' | 'coordinator' | null) => void): void {
     const choices: SelectItem[] = [
-      { value: 'composite', label: 'composite  Ç', description: 'share / primary / fallback routing' },
-      { value: 'fusion', label: 'fusion  ƒ', description: 'panel / judge / synth with fusion_options' },
+      { value: 'composite', label: 'composite  ᙅ', description: 'share / primary / fallback routing' },
+      { value: 'fusion', label: 'fusion  Ƒ', description: 'panel / judge / synth with fusion_options' },
       { value: 'coordinator', label: 'coordinator  Ö', description: 'planner / executor stages with coord weight' },
     ];
     this.hideOverlay();
@@ -1843,7 +1843,7 @@ class DashboardApp {
 
   openHelpOverlay(): void {
     const items: SelectItem[] = [
-      { value: 'help\0c', label: `  ${bold('C(c)').padEnd(6)} ${dim('Manage composite')} ${bold('Ç')}${dim(' and fusion')} ${bold('ƒ')}${dim(' aliases')}` },
+      { value: 'help\0c', label: `  ${bold('C(c)').padEnd(6)} ${dim('Manage composite')} ${bold('ᙅ')}${dim(' and fusion')} ${bold('Ƒ')}${dim(' aliases')}` },
       { value: 'help\0s', label: `  ${bold('S(s)').padEnd(6)} ${dim('Manage schedule aliases')} ${bold('$')}` },
       { value: 'help\0t', label: `  ${bold('T(t)').padEnd(6)} ${dim('Test custom models')}` },
       { value: 'help\0q', label: `  ${bold('Q(q)').padEnd(6)} ${dim('Show model quota / usage left')}` },
@@ -1867,8 +1867,8 @@ class DashboardApp {
       { value: 'help\0sep2', label: dim('─'.repeat(50)) },
       { value: 'help\0hdr2', label: dim('Markers') },
       { value: 'help\0mk_limit', label: `  ${bold('𝕋')}${dim('     Token limit (global / alias)')}` },
-      { value: 'help\0mk_composite', label: `  ${bold('Ç')}${dim('     Composite alias')}` },
-      { value: 'help\0mk_fusion', label: `  ${bold('ƒ')}${dim('     Fusion alias')}` },
+      { value: 'help\0mk_composite', label: `  ${bold('ᙅ')}${dim('     Composite alias')}` },
+      { value: 'help\0mk_fusion', label: `  ${bold('Ƒ')}${dim('     Fusion alias')}` },
       { value: 'help\0mk_coordinator', label: `  ${bold('Ö')}${dim('     Coordinator alias')}` },
       { value: 'help\0mk_auth', label: `  ${bold('Ä')}${dim('     Remote authentication active (auth_server)')}` },
       { value: 'help\0mk_recording', label: `  ${bold('®')}${dim('     Remote recording active (record_server)')}` },
@@ -2438,7 +2438,7 @@ class DashboardApp {
   /**
    * Fetch quota data for every model in the picker (getModelQuota's 30s cache
    * keeps provider load bounded). Keyed by choice value — including the
-   * Ç/ƒ/Ö duplicate marker — so lookup from onSelectionChange is direct.
+   * ᙅ/Ƒ/Ö duplicate marker — so lookup from onSelectionChange is direct.
    */
   private async buildQuotaData(choices: { value: string }[]): Promise<Map<string, QuotaPickerEntry>> {
     const data = new Map<string, QuotaPickerEntry>();
@@ -2639,7 +2639,7 @@ class DashboardApp {
   }
 
   async runModelTest(modelId: string): Promise<void> {
-    const displayId = / [ÇƒÖ]$/.test(modelId) ? modelId.replace(/ [ÇƒÖ]$/, '').trim() : modelId;
+    const displayId = / [ᙅƑÖ]$/.test(modelId) ? modelId.replace(/ [ᙅƑÖ]$/, '').trim() : modelId;
     const snap = this.viewSnapshot();
     const cfg = snap ? resolveModelTestConfig(snap.config, displayId, snap.compositeResolved, this.proxyConfig) : undefined;
     const target = cfg?.directModel && cfg.directModel !== displayId ? `(${cfg.directModel})` : '';
@@ -2666,8 +2666,8 @@ class DashboardApp {
     usage: string;
     detail: string;
   } | null> {
-    // Strip Ç/ƒ/Ö marker suffix if present (used only for duplicate disambiguation in the picker)
-    const actualModelId = / [ÇƒÖ]$/.test(modelId) ? modelId.replace(/ [ÇƒÖ]$/, '').trim() : modelId;
+    // Strip ᙅ/Ƒ/Ö marker suffix if present (used only for duplicate disambiguation in the picker)
+    const actualModelId = / [ᙅƑÖ]$/.test(modelId) ? modelId.replace(/ [ᙅƑÖ]$/, '').trim() : modelId;
     const port = this.source.env.PORT || '8788';
     const endpoint = `http://127.0.0.1:${port}${TEST_ENDPOINT}`;
     const snapshot = this.viewSnapshot();
@@ -3577,14 +3577,14 @@ class DashboardApp {
       }
     }
 
-    // Add composite aliases — if same name as a model, add with a marker suffix (Ç/ƒ/Ö) to differentiate
+    // Add composite aliases — if same name as a model, add with a marker suffix (ᙅ/Ƒ/Ö) to differentiate
     if (snapshot.compositeResolved) {
       for (const alias of snapshot.compositeResolved) {
         if (alias.targets.length === 0) continue;
         const aliasMode = snapshot.config ? getCompositeAliasMode(alias.alias, snapshot.config) : undefined;
         const isFusion = aliasMode === 'fusion';
         const isCoordinator = aliasMode === 'coordinator';
-        const modeTag = isFusion ? 'ƒ' : isCoordinator ? 'Ö' : 'Ç';
+        const modeTag = isFusion ? 'Ƒ' : isCoordinator ? 'Ö' : 'ᙅ';
         const category = isCoordinator ? 'coordinator' : isFusion ? 'fusion' : 'composite';
         const isDuplicate = seenNames.has(alias.alias);
         const aliasConfig = snapshot.config.composite?.[alias.alias] as Record<string, unknown> | undefined;
@@ -3602,7 +3602,7 @@ class DashboardApp {
           : '';
         const description = `${avgPrefix}${targets}`;
         if (isDuplicate) {
-          // Same name already added as a model — add marker suffix (Ç/ƒ/Ö) to make value unique
+          // Same name already added as a model — add marker suffix (ᙅ/Ƒ/Ö) to make value unique
           choices.push({
             category,
             modelId: alias.alias,

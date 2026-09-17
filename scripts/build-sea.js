@@ -31,14 +31,21 @@
  *
  * BUILD NODE REQUIREMENTS: the Node running this script is the runtime that
  * ends up embedded in the output, so it should satisfy this package's
- * "engines" field. It must also be an official, self-contained build — step 3
- * copies this very binary and patches it, so a thin launcher linked against a
- * shared libnode cannot work. Homebrew ships node as a ~67KB stub +
- * libnode.dylib; the fuse lives in the dylib, so injection fails. An official
- * build (nodejs.org or nvm) is ~110MB. Check by size; neither
- * `node --experimental-sea-config /dev/null` nor
- * process.config.variables.node_use_node_snapshot distinguishes the two — the
- * former only validates config parsing and passes on the unusable stub.
+ * "engines" field. It must also be a Node that can host a SEA binary at all,
+ * which Homebrew's cannot. Two independent properties are required, and
+ * assertSeaCapableHost below checks both before the build starts:
+ *
+ *   - SEA compiled in (process.config.variables.single_executable_application).
+ *     The Homebrew bottle is built with it off, so `--experimental-sea-config`
+ *     exits 1 with "Single executable application is disabled." — but only
+ *     after the typecheck and the esbuild bundle have already run.
+ *   - A self-contained binary (node_shared false). Homebrew ships node as a
+ *     ~37KB launcher plus libnode.<N>.dylib, and step 3 copies and patches that
+ *     launcher; the fuse lives in the dylib, so injection cannot work.
+ *
+ * An official build (nodejs.org, nvm, actions/setup-node) satisfies both and is
+ * ~150MB. `npx --yes --package=node@26 node scripts/build-sea.js` gets one
+ * without changing the system Node.
  *
  * SENTINEL FUSE: --sentinel-fuse must be passed explicitly, read from the
  * binary at build time. See readSentinelFuse below for why assuming
@@ -183,6 +190,41 @@ function run(cmd, args, opts = {}) {
 }
 
 /**
+ * Fails fast when the Node running this script cannot host a SEA binary.
+ *
+ * Two independent properties are required and neither is guaranteed (see the
+ * BUILD NODE REQUIREMENTS note at the top of this file): SEA must be compiled
+ * in, and the binary must be self-contained. Both are reported together,
+ * before anything is built, because the alternative is finding out from
+ * `--experimental-sea-config` — which says "Single executable application is
+ * disabled." and nothing about why — minutes later, after the typecheck, the
+ * bundle, and the blob have all run.
+ */
+function assertSeaCapableHost() {
+  const vars = process.config.variables ?? {};
+  const problems = [];
+  if (vars.single_executable_application === false) {
+    problems.push('SEA support is compiled out of it (single_executable_application=false)');
+  }
+  if (vars.node_shared === true) {
+    problems.push(
+      'it is a shared-library build (node_shared=true), so its binary is a thin launcher ' +
+        'and the SEA fuse lives in libnode rather than in the file this script would patch'
+    );
+  }
+  if (problems.length === 0) return;
+
+  throw new Error(
+    `Cannot build a SEA binary with ${process.version} at ${process.execPath}:\n` +
+      problems.map((problem) => `  - ${problem}`).join('\n') +
+      '\n\nThe output embeds a copy of the build Node, so only an official, self-contained\n' +
+      'build (nodejs.org, nvm, actions/setup-node) can produce one. Without changing the\n' +
+      'system Node:\n' +
+      '  npx --yes --package=node@26 node scripts/build-sea.js'
+  );
+}
+
+/**
  * Reads the SEA sentinel fuse out of a Node binary.
  *
  * The fuse is the marker postject overwrites to record that a blob was
@@ -235,11 +277,16 @@ function readSentinelFuse(binaryPath) {
       'the build Node lacks SEA support, or is a thin launcher linked against a shared libnode\n' +
       '(Homebrew builds node as a ~67KB stub + libnode.dylib; the fuse lives in the dylib and\n' +
       'cannot be injected). Use an official self-contained Node (nodejs.org or nvm) instead —\n' +
-      'a real one is ~110MB.'
+      'a real one is ~150MB.'
   );
 }
 
 function main() {
+  // Everything below assumes an official, self-contained Node, and the two
+  // ways that assumption breaks both fail later with a message that does not
+  // name the real cause. Check first, before any work.
+  assertSeaCapableHost();
+
   // --- 0. Typecheck ------------------------------------------------------
   //
   // esbuild strips types without checking them, so without this a native build

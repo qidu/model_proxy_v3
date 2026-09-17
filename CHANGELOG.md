@@ -5,6 +5,74 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(build): `build:native` fails fast on a Node that cannot host SEA
+
+`npm run build:native` on Homebrew Node 26.4.0 died at the blob step with a bare
+`Error: Command failed: .../node --experimental-sea-config ...` wrapping "Single
+executable application is disabled." — after the typecheck and the esbuild
+bundle had already run, and without naming either of the two real causes. That
+bottle is built with SEA compiled out (`single_executable_application=false`)
+*and* is a shared-library build (`node_shared=true`: a ~37KB launcher plus
+`libnode.147.dylib`), so it can neither generate a blob nor have one injected
+into it — the fuse lives in the dylib, not in the launcher this script patches.
+
+`scripts/build-sea.js` now runs `assertSeaCapableHost()` before anything else,
+checking both flags and reporting every problem it finds plus the fix: build
+with an official, self-contained Node (nodejs.org, nvm, `actions/setup-node`),
+or, without touching the system Node, `npx --yes --package=node@26 node
+scripts/build-sea.js`. The header comment is corrected to match — it previously
+offered binary size as the test and claimed `--experimental-sea-config` "passes
+on the unusable stub", which stopped being true on Node 26.
+
+The native build was previously undocumented outside this changelog; README now
+has a **Deployment → Native single-file binary** section giving `npm run
+build:native` and the `npx` backup above.
+
+### feat(cli): config inspection subcommands on the server entrypoint
+
+`dist/server.js` now parses its own argv (`src/cli.ts`) before listening: with no
+arguments it starts the HTTP server exactly as before, and with `--list-models
+[--json]`, `--validate-config`, `--export-pi-models`, or `--help`/`-h` it runs that
+command and exits. This gives a way to check what a config file actually
+resolves to (targets, composite/schedule aliases, inherited `base_url`/`mode`)
+without booting the proxy or opening the dashboard, and to feed the configured
+aliases to a pi-agent-core session as `Model` objects.
+
+`--export-pi-models` emits the `~/.pi/agent/models.json` file shape — a single
+`providers` entry (`model-proxy-v3`) holding one pi-ai `Model` per target model
+and alias — so its output can be merged straight into that file. The provider's
+`apiKey` is the dummy `sk-hi`: the proxy's client auth is a presence check, and
+configured target `api_key` values are never emitted.
+
+It also carries the `defaultProvider`/`defaultModel` pair pi keeps in
+`~/.pi/agent/settings.json`, so one command covers both files. `--default-model
+<id>` picks the default (must be a configured model or alias — otherwise a usage
+error); when omitted it falls back to the first configured model.
+
+The commands read the local TOML only (`$PROXY_CONFIG_PATH`, default
+`./proxy_config.toml`) — Consul/Apollo remote sources are deliberately not
+consulted. `--list-models` reuses `toDashboardConfigPayload`, so `--json` is the
+same sanitized shape the dashboard serves with `api_key` values stripped; its
+table lists each composite/schedule alias target on its own line (long target
+lists were unreadable comma-joined into one cell), with a space before each
+target's attribute list (`grok46 (share=10)`), and prints no dash rule under
+the headers, keeping `MODE` as the last column of the target-models table;
+`--validate-config` reuses the parser's own validation (`parseSimpleToml` logs each
+finding and records the arrays) rather than running a second set of checks.
+
+To keep the CLI off the production dependency graph, the pi-ai `Model` builder
+moved to `src/utils/pi-model-catalog.ts` (dependency-free) — `pi-ai` is a
+devDependency not shipped in the image, so `agent-session.ts`'s `buildSelfModel`
+now delegates to it, and the shared provider id lives there too instead of being
+duplicated. The shared builder's default `input` is now `['text']` (previously
+`['text', 'image']`), so both the export and the agent session declare
+text-only input; its `reasoning` is now `true` (previously `false`), so pi
+treats the proxy's aliases as reasoning-capable in the exported models file and
+in agent sessions alike.
+
+Exit codes: `0` success / `1` command failed (unreadable or invalid config) /
+`2` usage error. Covered by `tests/unit/cli.test.ts`.
+
 ### fix(agent): pass a `Context` to `loadSkills()` after the pi-agent-core 0.85 bump
 
 `@earendil-works/pi-agent-core` moved from `^0.81.1` to `^0.85.1`, and in that

@@ -30,6 +30,7 @@ import { anthropicMessagesApi } from '@earendil-works/pi-ai/api/anthropic-messag
 import type { Env } from './types/shared.js';
 import type { ProxyConfig } from './utils/config-loader.js';
 import { getConfiguredModelIds } from './utils/config-loader.js';
+import { PROXY_PROVIDER_ID, buildProxyPiModel } from './utils/pi-model-catalog.js';
 import { createAgentTools } from './agent-tools.js';
 
 export interface AgentSessionSource {
@@ -73,7 +74,7 @@ function isTrajectoryLoggingEnabled(): boolean {
   return process.env.TRAJ === 'true' || process.env.TRAJ === '1';
 }
 
-const PROVIDER_ID = 'model-proxy-v3';
+const PROVIDER_ID = PROXY_PROVIDER_ID;
 const SYSTEM_PROMPT_FILENAMES = ['AGENTS.md', 'CLAUDE.md'];
 const DEFAULT_SYSTEM_PROMPT = 'You are a helpful coding assistant.';
 // Explicit end-the-session commands for the follow-up task prompt, alongside
@@ -657,18 +658,7 @@ export function diffWorkDirSnapshots(before: Map<string, number>, after: Map<str
 // ---------------------------------------------------------------------------
 
 function buildSelfModel(alias: string, port: number): Model<'anthropic-messages'> {
-  return {
-    id: alias,
-    name: alias,
-    api: 'anthropic-messages',
-    provider: PROVIDER_ID,
-    baseUrl: `http://127.0.0.1:${port}`,
-    reasoning: false,
-    input: ['text', 'image'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 200_000,
-    maxTokens: 8_192,
-  };
+  return buildProxyPiModel(alias, `http://127.0.0.1:${port}`);
 }
 
 /**

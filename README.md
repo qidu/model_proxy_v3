@@ -264,6 +264,37 @@ providers. The TUI key bindings, the
 `model_proxy_tokens.jsonl` usage-dump format, and the startup stats-restoration rules
 are documented in [`docs/live-stats.md`](./docs/live-stats.md).
 
+## CLI Commands
+
+The server binary doubles as a config inspection tool. With no arguments it starts
+the HTTP server as before; with one of the commands below it runs, prints, and exits.
+
+```bash
+npm run server -- --list-models          # human-readable table
+npm run server -- --list-models --json   # machine-readable (dashboard config shape)
+npm run server -- --validate-config      # check the config file
+npm run server -- --export-pi-models     # pi models file + default provider/model
+npm run server -- --export-pi-models --default-model smart-coder   # pick the default model
+npm run server -- --help                 # usage
+```
+
+(`npx model-proxy-v3 …` or `node dist/server.js …` once built.)
+
+| Command | Purpose |
+|---|---|
+| `--list-models [--json]` | List configured target models plus composite and schedule aliases. The default output is a grouped table — target models (`CATEGORY`/`ID`/`TARGET`/`BASE URL`/`MODE`, with category-level `base_url`/`upstream_mode` shown when an entry inherits them), composite aliases with their targets (one per line) and token limit, and schedule aliases with their timed windows (one per line). Headers are listed directly above the rows — no dash rule. `--json` emits the sanitized payload the dashboard config endpoint serves, with `api_key` values stripped. |
+| `--validate-config` | Parse and validate the config, printing the `[ERROR]`/`[WARN]` lines the parser finds plus a counts summary; exits `1` when there are errors. |
+| `--export-pi-models [--default-model <id>]` | Print what pi needs to route through this proxy: `defaultProvider`/`defaultModel` (for `~/.pi/agent/settings.json`) plus a `providers` block (for `~/.pi/agent/models.json`) — one provider (`model-proxy-v3`) holding a pi-ai `Model` object per configured target model and alias, each pointed at this proxy's own loopback origin (`http://127.0.0.1:$PORT`, default `8788`). `defaultModel` is the `--default-model` alias, or the first configured model when the flag is omitted; an unknown id is a usage error. `apiKey` is a dummy (`sk-hi`): the proxy's client auth is a presence check, and configured target `api_key` values are never emitted. |
+| `--help`, `-h` | Print usage. |
+
+Commands read the **local TOML file only** (`$PROXY_CONFIG_PATH`, default
+`./proxy_config.toml`); Consul/Apollo remote sources are not consulted.
+
+Exit codes: `0` success (for `--validate-config`: no errors), `1` command failed
+(unreadable config, or a config with errors), `2` usage error (unknown argument,
+more than one command, `--json` without `--list-models`, or `--default-model`
+without `--export-pi-models` / without a model id / naming an unknown one).
+
 ## API Endpoints
 
 | Endpoint | Purpose |
@@ -466,6 +497,25 @@ PORT=8788 model-proxy-v3                # default port is 8788
 > The server reads `proxy_config.toml` from the **current working directory**.
 > When running from elsewhere, point it at the config with
 > `PROXY_CONFIG_PATH=/path/to/proxy_config.toml npx model-proxy-v3`.
+
+### Native single-file binary
+
+```bash
+npm run build:native     # -> dist/model-proxy-v3-<platform>-<arch>
+```
+
+`scripts/build-sea.js` bundles the server into one Node SEA executable. The
+output *is* a copy of the Node that built it, so that Node must be an official,
+self-contained build (nodejs.org, nvm, `actions/setup-node`). Homebrew's is a
+thin launcher over a shared `libnode` with SEA compiled out and cannot host one;
+the script detects that up front and refuses rather than failing mid-build.
+
+If `npm run build:native` fails on that check, build with an official Node
+without touching the system install:
+
+```bash
+npx --yes --package=node@22 node scripts/build-sea.js
+```
 
 ### Node response compression headers
 
