@@ -18,7 +18,7 @@
  * DANGEROUS_COMMAND_PATTERNS and isPathAllowed for the accepted tradeoffs.
  */
 import type { AgentTool } from '@earendil-works/pi-agent-core';
-import { loadSkills, formatSkillInvocation } from '@earendil-works/pi-agent-core';
+import { BACKGROUND_CONTEXT, loadSkills, formatSkillInvocation } from '@earendil-works/pi-agent-core';
 import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';
 import { Type, type Static } from 'typebox';
 import { readFile, writeFile, mkdir } from 'fs/promises';
@@ -377,7 +377,7 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
         // registry: skillsDir: ".pi/skills" for the "pi" agent target, project-scoped).
         const skillsDir = resolve(workDir, '.pi/skills');
         const env = new NodeExecutionEnv({ cwd: workDir });
-        const { skills, diagnostics } = await loadSkills(env, skillsDir);
+        const { skills, diagnostics } = await loadSkills(env, skillsDir, BACKGROUND_CONTEXT);
         const added = skills.find((s) => s.name === params.skill);
         if (!added) {
           const diagText = diagnostics.map((d) => `${d.code}: ${d.message} (${d.path})`).join('; ');

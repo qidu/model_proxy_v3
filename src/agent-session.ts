@@ -23,7 +23,7 @@ import {
   type Component,
   type SelectItem,
 } from '@earendil-works/pi-tui';
-import { Agent, loadSkills, formatSkillInvocation, type Skill } from '@earendil-works/pi-agent-core';
+import { Agent, BACKGROUND_CONTEXT, loadSkills, formatSkillInvocation, type Skill } from '@earendil-works/pi-agent-core';
 import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';
 import { createModels, createProvider, type Model } from '@earendil-works/pi-ai';
 import { anthropicMessagesApi } from '@earendil-works/pi-ai/api/anthropic-messages.lazy';
@@ -431,7 +431,7 @@ export async function gatherSkillCandidates(
   } else {
     const env = new NodeExecutionEnv({ cwd: workDir });
     const projectSkillsDir = resolve(workDir, '.pi/skills');
-    const { skills, diagnostics } = await loadSkills(env, [projectSkillsDir, globalSkillsDir]);
+    const { skills, diagnostics } = await loadSkills(env, [projectSkillsDir, globalSkillsDir], BACKGROUND_CONTEXT);
     for (const diag of diagnostics) {
       console.log(dim(`[skills] ${diag.code}: ${diag.message} (${diag.path})`));
     }
@@ -472,7 +472,7 @@ export async function loadSelectedSkills(workDir: string, candidates: SkillCandi
       );
     });
     const skillsDir = resolve(workDir, '.pi/skills');
-    const { skills, diagnostics } = await loadSkills(env, skillsDir);
+    const { skills, diagnostics } = await loadSkills(env, skillsDir, BACKGROUND_CONTEXT);
     const installed = skills.find((s) => s.name === name);
     if (!installed) {
       const diagText = diagnostics.map((d) => `${d.code}: ${d.message} (${d.path})`).join('; ');
@@ -925,7 +925,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     });
     candidateRef.current = candidate;
 
-    console.log(dim(`[verify] checking proxy v3 with model `) + choice + dim(`, says: hi, which model and agent are right here?`));
+    console.log(dim(`[verify] checking proxy v3 and model `) + choice + dim(` with prompt "hi, which model and agent are right here?"`));
     let replyText = '';
     let sawError = false;
     const unsubscribe = candidate.subscribe((event) => {

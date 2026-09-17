@@ -5,6 +5,21 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(agent): pass a `Context` to `loadSkills()` after the pi-agent-core 0.85 bump
+
+`@earendil-works/pi-agent-core` moved from `^0.81.1` to `^0.85.1`, and in that
+range `loadSkills()` grew a third parameter: `loadSkills(env, dirs, context)`.
+The context is a `@earendil-works/chord` `Context`, threaded into every
+`ExecutionEnv` call the loader makes (`fileInfo`, `listDir`, `readTextFile`, …)
+so directory walks can be cancelled and attributed to a telemetry parent. The
+build failed with `TS2554: Expected 3 arguments, but got 2` at all three call
+sites.
+
+Each site now passes `BACKGROUND_CONTEXT` — the shared non-cancellable root
+context, which is what these loads are: they run outside any request/session
+scope (skill discovery at startup and the `add_skill` tool's post-install
+re-read), so there is no parent context to derive from and nothing to cancel.
+
 ### fix(build): quote cmd.exe words so `build:native` runs on Windows
 
 `npm run build:native` failed on Windows before it reached SEA. `run()`
