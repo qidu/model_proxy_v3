@@ -11,4 +11,5 @@ docs/test_keys.md
 .kiro
 tests/.fuse_*
 config-dumps/
+tests/scripts/mock_targets.json
 model_proxy_tokens.jsonl

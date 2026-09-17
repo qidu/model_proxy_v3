@@ -19,6 +19,8 @@ import {
   parseSimpleToml,
   toDashboardConfigPayload,
   type ConfigValidationError,
+  type OpenClawConfig,
+  type OpenClawProviderModelConfig,
   type ProxyConfig,
 } from './utils/config-loader.js';
 import { PROXY_PROVIDER_ID, buildProxyPiModel, proxyLoopbackBaseUrl } from './utils/pi-model-catalog.js';
@@ -28,10 +30,11 @@ const USAGE = `Usage: model-proxy-v3 [command]
 Run without a command to start the HTTP server.
 
 Commands:
-  --list-models        List configured target models and aliases
-  --export-pi-models   Print a ~/.pi/agent/models.json provider entry for this proxy
-  --validate-config    Validate the config file and report errors/warnings
-  --help, -h           Show this help
+  --list-models                List configured target models and aliases
+  --export-pi-models           Print a ~/.pi/agent/models.json provider entry for this proxy
+  --export-openclaw-providers  Print a ~/.openclaw/openclaw.json models.providers entry for this proxy
+  --validate-config            Validate the config file and report errors/warnings
+  --help, -h                   Show this help
 
 Options:
   --json               Machine-readable output for --list-models (dashboard config shape)
@@ -43,13 +46,15 @@ Config is read from the local TOML file at $PROXY_CONFIG_PATH (default ./proxy_c
 --export-pi-models prints defaultProvider/defaultModel (for ~/.pi/agent/settings.json)
 plus the providers block (for ~/.pi/agent/models.json).
 
+--export-openclaw-providers prints the models.providers block (for ~/.openclaw/openclaw.json).
+
 Exit codes:
   0  success (for --validate-config: no errors)
   1  command failed (unreadable config, or config with errors)
   2  usage error
 `;
 
-const COMMANDS = ['--list-models', '--export-pi-models', '--validate-config'] as const;
+const COMMANDS = ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--validate-config'] as const;
 type Command = (typeof COMMANDS)[number];
 
 /**
@@ -112,6 +117,8 @@ export function runCli(argv: string[], env: Env): number | null {
       return listModels(configPath, json);
     case '--export-pi-models':
       return exportPiModels(configPath, proxyLoopbackBaseUrl(env.PORT), defaultModel);
+    case '--export-openclaw-providers':
+      return exportOpenClawProviders(configPath, proxyLoopbackBaseUrl(env.PORT));
     case '--validate-config':
       return validateConfig(configPath);
   }
@@ -292,6 +299,56 @@ function exportPiModels(configPath: string, baseUrl: string, defaultModel: strin
     },
   };
   process.stdout.write(`${JSON.stringify(modelsFile, null, 2)}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --export-openclaw-providers
+// ---------------------------------------------------------------------------
+
+function exportOpenClawProviders(configPath: string, baseUrl: string): number {
+  const config = tryLoadConfig(configPath);
+  if (!config) return 1;
+
+  const ids = getConfiguredModelIds(config);
+  if (ids.length === 0) {
+    process.stderr.write('Cannot export OpenClaw providers: the config defines no models\n');
+    return 1;
+  }
+
+  // OpenClaw keys providers by id under `models.providers` (an object, not an
+  // array), so every alias goes into the single proxy provider entry.
+  // `apiKey` is the same dummy --export-pi-models writes: the proxy's client
+  // auth is a presence check, so nothing secret is written. The per-model
+  // fields mirror the provider block's api/baseUrl rather than repeating them.
+  const models: OpenClawProviderModelConfig[] = ids.map((id) => {
+    const model = buildProxyPiModel(id, baseUrl);
+    return {
+      id: model.id,
+      name: model.name,
+      reasoning: model.reasoning,
+      input: model.input,
+      cost: model.cost,
+      contextWindow: model.contextWindow,
+      maxTokens: model.maxTokens,
+    };
+  });
+
+  const openclaw: OpenClawConfig = {
+    models: {
+      mode: 'merge',
+      providers: {
+        [PROXY_PROVIDER_ID]: {
+          baseUrl,
+          apiKey: 'sk-hi',
+          auth: 'api-key',
+          api: 'anthropic-messages',
+          models,
+        },
+      },
+    },
+  };
+  process.stdout.write(`${JSON.stringify(openclaw, null, 2)}\n`);
   return 0;
 }
 

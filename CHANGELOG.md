@@ -5,6 +5,26 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(cli): `--export-openclaw-providers`
+
+The CLI gained `--export-openclaw-providers`, which prints the `models.providers`
+block for an OpenClaw config (`~/.openclaw/openclaw.json`) — a single provider
+(`model-proxy-v3`, the same id `--export-pi-models` uses) holding one entry per
+configured target model and alias, each pointed at this proxy's loopback origin.
+Like `--export-pi-models` it prints to stdout and writes nothing, so the output
+can be merged into an existing config by hand; `models.mode` is `merge`, so
+importing it does not drop OpenClaw's other providers. The provider declares
+`api: 'anthropic-messages'` and `auth: 'api-key'`, and its `apiKey` is the same
+dummy `sk-hi` — the proxy's client auth is a presence check, and configured
+target `api_key` values are never emitted. Model entries carry
+`id`/`name`/`reasoning`/`input`/`cost`/`contextWindow`/`maxTokens` from the
+shared `buildProxyPiModel`, inheriting `api` and `baseUrl` from the provider.
+
+The previously unreferenced `OpenClaw*` interfaces in `config-loader.ts` were
+also corrected to the real schema: `models.providers` is an object keyed by
+provider id (not an array), the api field is `api` (not `apiSchema`), and the
+provider block carries `auth`.
+
 ### fix(build): `build:native` fails fast on a Node that cannot host SEA
 
 `npm run build:native` on Homebrew Node 26.4.0 died at the blob step with a bare

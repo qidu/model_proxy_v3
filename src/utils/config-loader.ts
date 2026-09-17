@@ -4367,24 +4367,28 @@ export function loadProxyConfigFromPath(configPath: string): ProxyConfig {
 export interface OpenClawProviderModelConfig {
   id: string;
   name?: string;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   contextWindow?: number;
   maxTokens?: number;
-  reasoning?: boolean;
   [key: string]: unknown;
 }
 
 export interface OpenClawProviderConfig {
-  id: string;
   baseUrl?: string;
   apiKey?: string;
-  apiSchema?: 'anthropic-messages' | 'openai-completions';
+  auth?: string;
+  api?: 'anthropic-messages' | 'openai-completions';
   models?: OpenClawProviderModelConfig[];
   [key: string]: unknown;
 }
 
 export interface OpenClawConfig {
   models?: {
-    providers?: OpenClawProviderConfig[];
+    mode?: string;
+    /** Providers keyed by provider id (not an array). */
+    providers?: Record<string, OpenClawProviderConfig>;
     [key: string]: unknown;
   };
   agents?: {

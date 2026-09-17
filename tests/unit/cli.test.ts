@@ -48,16 +48,25 @@ empty = {target = ""}
 "self" = {"self" = {share = 1}}
 `;
 
+// Parses cleanly but configures no models — the export commands must fail loudly.
+const NO_MODELS_CONFIG = `
+[general]
+global_token_limit = "1B 1d"
+`;
+
 let tempDir: string;
 let goodPath: string;
 let badPath: string;
+let noModelsPath: string;
 
 before(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'mpv3-cli-test-'));
   goodPath = join(tempDir, 'good.toml');
   badPath = join(tempDir, 'bad.toml');
+  noModelsPath = join(tempDir, 'no-models.toml');
   writeFileSync(goodPath, GOOD_CONFIG);
   writeFileSync(badPath, BAD_CONFIG);
+  writeFileSync(noModelsPath, NO_MODELS_CONFIG);
 });
 
 after(() => {
@@ -99,11 +108,15 @@ describe('runCli argument handling', () => {
   it('--help exits 0 and documents every command', () => {
     const result = capture(['--help'], envFor(goodPath));
     assert.equal(result.code, 0);
-    for (const command of ['--list-models', '--export-pi-models', '--validate-config', '--default-model']) {
+    for (const command of ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--validate-config', '--default-model']) {
       assert.ok(result.out.includes(command), `help must mention ${command}`);
     }
     assert.ok(result.out.includes('~/.pi/agent/models.json'), 'help must point --export-pi-models at the pi models file');
     assert.ok(result.out.includes('~/.pi/agent/settings.json'), 'help must point the default* fields at the pi settings file');
+    assert.ok(
+      result.out.includes('~/.openclaw/openclaw.json'),
+      'help must point --export-openclaw-providers at the OpenClaw config file',
+    );
   });
 
   it('rejects an unknown argument with exit code 2', () => {
@@ -119,7 +132,11 @@ describe('runCli argument handling', () => {
   });
 
   it('rejects --json without --list-models', () => {
-    for (const argv of [['--validate-config', '--json'], ['--export-pi-models', '--json']]) {
+    for (const argv of [
+      ['--validate-config', '--json'],
+      ['--export-pi-models', '--json'],
+      ['--export-openclaw-providers', '--json'],
+    ]) {
       const result = capture(argv, envFor(goodPath));
       assert.equal(result.code, 2, `${argv.join(' ')} must be a usage error`);
       assert.match(result.err, /--json is only supported with --list-models/);
@@ -223,6 +240,68 @@ describe('--export-pi-models', () => {
     assert.equal(result.code, 2);
     assert.match(result.err, /--default-model "nope" is not a configured model or alias/);
     assert.match(result.err, /fable5/, 'the error must list ids that would have worked');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// --export-openclaw-providers
+// ---------------------------------------------------------------------------
+
+describe('--export-openclaw-providers', () => {
+  it('emits one proxy provider keyed by id with a model entry per target model and alias', () => {
+    const result = capture(['--export-openclaw-providers'], envFor(goodPath));
+    assert.equal(result.code, 0);
+
+    const config = JSON.parse(result.out) as {
+      models: {
+        mode: string;
+        providers: Record<
+          string,
+          { baseUrl: string; apiKey: string; auth: string; api: string; models: Array<Record<string, unknown>> }
+        >;
+      };
+    };
+    assert.equal(config.models.mode, 'merge');
+    assert.deepEqual(Object.keys(config.models.providers), [PROXY_PROVIDER_ID]);
+
+    const provider = config.models.providers[PROXY_PROVIDER_ID];
+    assert.equal(provider.baseUrl, 'http://127.0.0.1:8788');
+    assert.equal(provider.apiKey, 'sk-hi');
+    assert.equal(provider.auth, 'api-key');
+    assert.equal(provider.api, 'anthropic-messages');
+
+    // 3 target models (fable5, sonnet, ds-qn) + 1 composite + 1 schedule alias
+    assert.deepEqual(provider.models.map((m) => m.id), ['fable5', 'sonnet', 'ds-qn', 'smart', 'dddsg']);
+    assert.deepEqual(provider.models[0], {
+      id: 'fable5',
+      name: 'fable5',
+      reasoning: true,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200_000,
+      maxTokens: 8_192,
+    });
+  });
+
+  it('never leaks a configured api_key into the exported provider', () => {
+    const result = capture(['--export-openclaw-providers'], envFor(goodPath));
+    assert.equal(result.code, 0);
+    assert.ok(!result.out.includes('SECRET_KEY_VALUE'), 'target api_key must never be exported');
+  });
+
+  it('uses the PORT env for the provider baseUrl', () => {
+    const result = capture(['--export-openclaw-providers'], envFor(goodPath, { PORT: '9001' }));
+    const config = JSON.parse(result.out) as {
+      models: { providers: Record<string, { baseUrl: string }> };
+    };
+    assert.equal(config.models.providers[PROXY_PROVIDER_ID].baseUrl, 'http://127.0.0.1:9001');
+  });
+
+  it('fails loudly when the config defines no models', () => {
+    const result = capture(['--export-openclaw-providers'], envFor(noModelsPath));
+    assert.equal(result.code, 1);
+    assert.match(result.err, /the config defines no models/);
+    assert.equal(result.out, '');
   });
 });
 

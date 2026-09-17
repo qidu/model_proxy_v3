@@ -275,6 +275,7 @@ npm run server -- --list-models --json   # machine-readable (dashboard config sh
 npm run server -- --validate-config      # check the config file
 npm run server -- --export-pi-models     # pi models file + default provider/model
 npm run server -- --export-pi-models --default-model smart-coder   # pick the default model
+npm run server -- --export-openclaw-providers   # OpenClaw models.providers block
 npm run server -- --help                 # usage
 ```
 
@@ -285,6 +286,7 @@ npm run server -- --help                 # usage
 | `--list-models [--json]` | List configured target models plus composite and schedule aliases. The default output is a grouped table — target models (`CATEGORY`/`ID`/`TARGET`/`BASE URL`/`MODE`, with category-level `base_url`/`upstream_mode` shown when an entry inherits them), composite aliases with their targets (one per line) and token limit, and schedule aliases with their timed windows (one per line). Headers are listed directly above the rows — no dash rule. `--json` emits the sanitized payload the dashboard config endpoint serves, with `api_key` values stripped. |
 | `--validate-config` | Parse and validate the config, printing the `[ERROR]`/`[WARN]` lines the parser finds plus a counts summary; exits `1` when there are errors. |
 | `--export-pi-models [--default-model <id>]` | Print what pi needs to route through this proxy: `defaultProvider`/`defaultModel` (for `~/.pi/agent/settings.json`) plus a `providers` block (for `~/.pi/agent/models.json`) — one provider (`model-proxy-v3`) holding a pi-ai `Model` object per configured target model and alias, each pointed at this proxy's own loopback origin (`http://127.0.0.1:$PORT`, default `8788`). `defaultModel` is the `--default-model` alias, or the first configured model when the flag is omitted; an unknown id is a usage error. `apiKey` is a dummy (`sk-hi`): the proxy's client auth is a presence check, and configured target `api_key` values are never emitted. |
+| `--export-openclaw-providers` | Print the `models.providers` block for `~/.openclaw/openclaw.json` — a single provider (`model-proxy-v3`) holding one entry per configured target model and alias, each pointed at this proxy's own loopback origin (`http://127.0.0.1:$PORT`, default `8788`). The provider carries `api: 'anthropic-messages'`, `auth: 'api-key'`, and the dummy `apiKey` (`sk-hi`); the surrounding `models.mode` is `merge`, so the block can be merged into an existing OpenClaw config without dropping its other providers. Configured target `api_key` values are never emitted. |
 | `--help`, `-h` | Print usage. |
 
 Commands read the **local TOML file only** (`$PROXY_CONFIG_PATH`, default
