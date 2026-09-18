@@ -32,11 +32,12 @@
  * `''` (== "not configured", so the normal api_key fallback chain applies) and
  * reported, so the rest of the config still loads and the proxy still starts.
  *
- * Scope: ONLY configured api_key values of `[models.*]` targets (and
- * `[default_upstream].default_api_key`) in the local `proxy_config.toml` file.
- * Not applied to Consul/Apollo config-center sources; composite/schedule
- * aliases carry no api_key of their own; and caller/user keys from request
- * headers are never stored — an empty api_key (auth passthrough) is skipped.
+ * Scope: ONLY configured api_key values of `[models.*]` targets,
+ * `[default_upstream].default_api_key`, and `[passthrough]` target `key`s in the
+ * local `proxy_config.toml` file. Not applied to Consul/Apollo config-center
+ * sources; composite/schedule aliases carry no api_key of their own; and
+ * caller/user keys from request headers are never stored — an empty api_key
+ * (auth passthrough) is skipped.
  */
 
 import { copyFileSync, readFileSync, writeFileSync } from 'fs';
@@ -79,6 +80,7 @@ interface KeySlot {
  * - category-level `api_key` → account `<category>/<category base_url>`
  * - entry-level `api_key` (index 2) → account `<target>/<entry or category base_url>`
  * - `default_upstream.default_api_key` → account `default_upstream/<default_base_url>`
+ * - `[passthrough].<name>.key` → account `passthrough.<name>/<base>`
  */
 function collectKeySlots(config: ProxyConfig): KeySlot[] {
   const slots: KeySlot[] = [];
@@ -120,6 +122,19 @@ function collectKeySlots(config: ProxyConfig): KeySlot[] {
       account: keychainAccount('default_upstream', defaultUpstream.default_base_url ?? ''),
       get: () => holder.default_api_key,
       set: (v) => { holder.default_api_key = v; },
+    });
+  }
+
+  // Passthrough targets have no model id, so the account is namespaced by the
+  // `[passthrough]` target name instead.
+  for (const [name, target] of Object.entries(config.passthrough ?? {})) {
+    if (target.key === undefined) continue;
+    const holder = target as { key?: string };
+    slots.push({
+      location: `passthrough.${name}.key`,
+      account: keychainAccount(`passthrough.${name}`, target.base ?? ''),
+      get: () => holder.key,
+      set: (v) => { holder.key = v; },
     });
   }
 

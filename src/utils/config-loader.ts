@@ -110,6 +110,35 @@ export interface ProxyConfig {
     image_encode?: string;
     timeout_ms?: number;
   };
+  /**
+   * Passthrough targets for verbatim upstream forwarding.
+   * Key = target name, value = target config with base URL, mode, share, etc.
+   */
+  passthrough?: Record<string, PassthroughTargetConfig>;
+}
+
+/**
+ * Configuration for a single passthrough target, declared as an inline table
+ * under `[passthrough]`:
+ *
+ *   [passthrough]
+ *   openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
+ *
+ * Short names are canonical here (targets are terse); the long aliases
+ * `base_url`/`url`, `api_key`/`key` and `upstream_mode`/`mode` are accepted on
+ * parse. `[models.*]` sections use the long names instead.
+ */
+export interface PassthroughTargetConfig {
+  /** Base URL (bare origin + optional path prefix). Must NOT end with an endpoint path. */
+  base: string;
+  /** Upstream mode: one of 'openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent', 'gemini-interactions' */
+  mode: string;
+  /** Weight for weighted random selection (default: 1) */
+  share?: number;
+  /** Per-target timeout override in milliseconds */
+  timeout?: number;
+  /** Optional API key for config_key auth mode */
+  key?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1710,6 +1739,18 @@ function serializeScheduleConfig(config: ScheduleConfig): string {
   return `{${entries.join(', ')}}`;
 }
 
+/** Serialize a passthrough target as a TOML inline table (short field names). */
+function serializePassthroughTarget(target: PassthroughTargetConfig): string {
+  const fields: string[] = [
+    `base = ${JSON.stringify(target.base)}`,
+    `mode = ${JSON.stringify(target.mode)}`,
+  ];
+  if (target.key !== undefined) fields.push(`key = ${JSON.stringify(target.key)}`);
+  if (target.share !== undefined) fields.push(`share = ${target.share}`);
+  if (target.timeout !== undefined) fields.push(`timeout = ${target.timeout}`);
+  return `{${fields.join(', ')}}`;
+}
+
 /**
  * Config validation
  */
@@ -2125,6 +2166,48 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
   // the misconfiguration is visible in the dashboard status bar / TUI.
   validateBaseUrls(config, errors);
 
+  // Validate passthrough targets
+  if (config.passthrough) {
+    const validModes = new Set<string>(UPSTREAM_MODES);
+    for (const [name, target] of Object.entries(config.passthrough)) {
+      if (!target.base || typeof target.base !== 'string') {
+        errors.push({ path: `passthrough.${name}.base`, message: 'base is required and must be a string' });
+      } else {
+        try {
+          new URL(target.base);
+        } catch {
+          errors.push({ path: `passthrough.${name}.base`, message: 'base must be a valid URL' });
+        }
+        // Warn if base ends with a version segment or known endpoint path
+        const lowerBase = target.base.toLowerCase();
+        if (lowerBase.match(/\/v\d+[a-z]*\/?$/)) {
+          warnings.push({ path: `passthrough.${name}.base`, message: `base ends with a version segment (e.g. /v1, /v1beta); with plain join this will cause duplicate version in upstream URL` });
+        }
+        const knownEndpoints = ['/v1/messages', '/v1/chat/completions', '/v1/responses', '/v1/interactions', '/v1beta/models/', '/v1/models/'];
+        for (const ep of knownEndpoints) {
+          if (lowerBase.endsWith(ep) || lowerBase.includes(ep + '/')) {
+            warnings.push({ path: `passthrough.${name}.base`, message: `base appears to contain an endpoint path (${ep}); with plain join the client's version prefix will be appended, causing double path` });
+            break;
+          }
+        }
+      }
+      if (!target.mode || typeof target.mode !== 'string') {
+        errors.push({ path: `passthrough.${name}.mode`, message: 'mode is required and must be a string' });
+      } else if (!validModes.has(target.mode)) {
+        errors.push({ path: `passthrough.${name}.mode`, message: `mode must be one of: ${Array.from(validModes).join(', ')}` });
+      }
+      if (target.share !== undefined && (typeof target.share !== 'number' || target.share <= 0)) {
+        errors.push({ path: `passthrough.${name}.share`, message: 'share must be a positive number' });
+      }
+      if (target.timeout !== undefined && (typeof target.timeout !== 'number' || target.timeout <= 0)) {
+        errors.push({ path: `passthrough.${name}.timeout`, message: 'timeout must be a positive number (ms)' });
+      }
+      if (target.key !== undefined && typeof target.key !== 'string') {
+        errors.push({ path: `passthrough.${name}.key`, message: 'key must be a string' });
+      }
+    }
+  }
+
   return { errors, warnings, valid: errors.length === 0 };
 }
 
@@ -2171,6 +2254,14 @@ function validateBaseUrls(config: ProxyConfig, errors: ConfigValidationError[]):
         if (typeof value[1] === 'string') {
           check(value[1], `models.${categoryName}.${key}.base_url`);
         }
+      }
+    }
+  }
+
+  if (config.passthrough) {
+    for (const [name, target] of Object.entries(config.passthrough)) {
+      if (target.base) {
+        check(target.base, `passthrough.${name}.base`);
       }
     }
   }
@@ -2355,6 +2446,12 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
     lines.push('');
   }
 
+  if (config.passthrough) {
+    lines.push('[passthrough]');
+    lines.push(...Object.entries(config.passthrough).map(([name, target]) => `${tomlKey(name)} = ${serializePassthroughTarget(target)}`));
+    lines.push('');
+  }
+
   return lines.join('\n').replace(/\n$/, '');
 }
 
@@ -2424,6 +2521,15 @@ export function getAllowedHostsFromConfig(config: ProxyConfig): string[] {
         if (Array.isArray(value) && value.length >= 2 && typeof value[1] === 'string' && value[1]) {
           try { hosts.add(new URL(value[1]).host); } catch { /* ignore */ }
         }
+      }
+    }
+  }
+
+  // [passthrough] target base
+  if (config.passthrough) {
+    for (const target of Object.values(config.passthrough)) {
+      if (target.base) {
+        try { hosts.add(new URL(target.base).host); } catch { /* ignore */ }
       }
     }
   }
@@ -2634,6 +2740,10 @@ export function parseSimpleToml(content: string): ProxyConfig {
   const seenSections = new Set<string>();
   // Track seen keys per section+category, e.g. "models.gemini/api_key"
   const seenKeys = new Set<string>();
+  // Field-name errors detected while parsing (a short alias used where only the
+  // long name is accepted, e.g. `mode` in a [models.*] section). Merged into
+  // validateProxyConfig's result below so they reach the TUI/dashboard.
+  const sectionFieldErrors: ConfigValidationError[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
@@ -2727,6 +2837,13 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'transform_defaults';
         currentCategory = null;
         if (!config.transform_defaults) config.transform_defaults = {};
+      } else if (parts[0] === 'passthrough') {
+        currentSection = 'passthrough';
+        currentCategory = null;
+        if (!config.passthrough) config.passthrough = {};
+        if (parts[1]) {
+          console.warn(`[config] [passthrough.${parts[1]}] sections are not supported at line ${i + 1} — declare targets as inline tables under [passthrough]: ${parts[1]} = {base = "...", mode = "..."}`);
+        }
       }
       continue;
     }
@@ -2772,6 +2889,16 @@ export function parseSimpleToml(content: string): ProxyConfig {
         const category = config.models[currentCategory] as ModelCategoryConfig;
         if (cleanKey === 'upstream_mode' || cleanKey === 'base_url' || cleanKey === 'api_key') {
           category[cleanKey] = value;
+        } else if (cleanKey === 'mode' || cleanKey === 'url' || cleanKey === 'key') {
+          // A [models.*] section takes ONLY the long names; the short aliases
+          // belong to inline entries and [passthrough] targets. Silently
+          // dropping the key would lose base_url/mode/key with no message, so
+          // report it (surfaced in the TUI/dashboard status).
+          const longName = cleanKey === 'mode' ? 'upstream_mode' : cleanKey === 'url' ? 'base_url' : 'api_key';
+          sectionFieldErrors.push({
+            path: `models.${currentCategory}.${cleanKey}`,
+            message: `short field name is not accepted in a [models.*] section — use ${longName}`,
+          });
         }
       } else if (currentSection === 'composite' && config.composite) {
         config.composite[cleanKey] = parseCompositeModelConfig(value);
@@ -2849,6 +2976,54 @@ export function parseSimpleToml(content: string): ProxyConfig {
         }
         const category = config.models[currentCategory] as ModelCategoryConfig;
         category[cleanKey] = entry as [string, string, string, string, string];
+        continue;
+      }
+    }
+
+    // Handle passthrough inline-table entries:
+    //   openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
+    // Short names are canonical; the long aliases (base_url|url, api_key|key,
+    // upstream_mode|mode) are accepted for symmetry with [models.*] entries.
+    if (currentSection === 'passthrough' && config.passthrough) {
+      const ptTableMatch = trimmedNoComment.match(/^"?([^"=]+)"?\s*=\s*(\{[^{}]*\})$/);
+      if (ptTableMatch) {
+        const cleanKey = ptTableMatch[1].trim().replace(/^"|"$/g, '');
+        const seenKeyIdTable = `${currentSection}/${cleanKey}`;
+        if (seenKeys.has(seenKeyIdTable)) {
+          console.warn(`[config] duplicate key "${cleanKey}" in [passthrough] at line ${i + 1} — earlier value is overwritten`);
+        }
+        seenKeys.add(seenKeyIdTable);
+        const tableBody = ptTableMatch[2].slice(1, -1); // strip outer braces
+        const fields: Record<string, string> = {};
+        // Split on top-level commas only — must not split inside quoted values.
+        const fieldParts: string[] = [];
+        let buf = '';
+        let inQuote = false;
+        for (let ci = 0; ci < tableBody.length; ci++) {
+          const ch = tableBody[ci];
+          if (ch === '"') inQuote = !inQuote;
+          if (ch === ',' && !inQuote) {
+            fieldParts.push(buf);
+            buf = '';
+          } else {
+            buf += ch;
+          }
+        }
+        if (buf.trim()) fieldParts.push(buf);
+        for (const field of fieldParts) {
+          // Values are quoted strings, or bare numbers (share = 3, timeout = 600000).
+          const kv = field.trim().match(/^(\w+)\s*=\s*(?:"([^"]*)"|(\d+))$/);
+          if (kv) fields[kv[1]] = kv[2] !== undefined ? kv[2] : kv[3];
+        }
+        const target: PassthroughTargetConfig = {
+          base: fields['base'] ?? fields['base_url'] ?? fields['url'] ?? '',
+          mode: fields['mode'] ?? fields['upstream_mode'] ?? '',
+        };
+        const key = fields['key'] ?? fields['api_key'];
+        if (key !== undefined) target.key = key;
+        if (fields['share'] !== undefined) target.share = Number(fields['share']);
+        if (fields['timeout'] !== undefined) target.timeout = Number(fields['timeout']);
+        config.passthrough[cleanKey] = target;
         continue;
       }
     }
@@ -3083,6 +3258,7 @@ export function parseSimpleToml(content: string): ProxyConfig {
 
   // Validate config and log errors/warnings
   const validation = validateProxyConfig(config);
+  validation.errors.push(...sectionFieldErrors);
   for (const err of validation.errors) {
     const level = err.message.includes('Routing cycle detected') ? '[FATAL]' : '[ERROR]';
     console.error(`${level} ${err.path}: ${err.message}`);

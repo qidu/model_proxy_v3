@@ -125,6 +125,47 @@ describe('applySystemKeyStore', () => {
     for (const c of setCalls) assert.equal(c.service, KEY_STORE_SERVICE);
   });
 
+  it('stores a [passthrough] target key under a passthrough.<name> account', async () => {
+    const passthroughToml = `${SAMPLE_TOML}
+[passthrough]
+openai = {base = "https://api.openai.example", mode = "openai-completions", key = "sk-pt-333"}
+`;
+    const keytar = makeMockKeytar();
+    const { path } = writeTempConfig(passthroughToml);
+    const config = parseSimpleToml(passthroughToml);
+
+    await applySystemKeyStore(config, { configPath: path, keytarImpl: keytar });
+
+    const setCalls = keytar.calls.filter((c) => c.op === 'set');
+    assert.ok(
+      setCalls.some((c) => c.account === 'passthrough.openai/https://api.openai.example' && c.password === 'sk-pt-333'),
+      `expected the passthrough slot stored, got accounts ${JSON.stringify(setCalls.map((c) => c.account))}`,
+    );
+
+    const rewritten = readFileSync(path, 'utf-8');
+    assert.ok(!rewritten.includes('sk-pt-333'), 'plaintext passthrough key removed from file');
+    assert.ok(rewritten.includes(`key = "${STORE_KEY_IN_SYSTEM}"`));
+  });
+
+  it('resolves a passthrough sentinel in-memory from the keychain', async () => {
+    const passthroughToml = `${SAMPLE_TOML}
+[passthrough]
+openai = {base = "https://api.openai.example", mode = "openai-completions", key = "${STORE_KEY_IN_SYSTEM}"}
+`;
+    const keytar = makeMockKeytar(new Map([
+      [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
+      [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
+      [`${KEY_STORE_SERVICE}/default_upstream/https://api.default.dev`, 'sk-default-000'],
+      [`${KEY_STORE_SERVICE}/passthrough.openai/https://api.openai.example`, 'sk-pt-333'],
+    ]));
+    const config = parseSimpleToml(passthroughToml);
+
+    const { config: result, unresolved } = await applySystemKeyStore(config, { keytarImpl: keytar });
+
+    assert.equal(result.passthrough?.openai?.key, 'sk-pt-333');
+    assert.deepEqual(unresolved, []);
+  });
+
   it('rewrites the config file to sentinels, preserving comments, and writes .bak', async () => {
     const keytar = makeMockKeytar();
     const { path } = writeTempConfig(SAMPLE_TOML);

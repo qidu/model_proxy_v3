@@ -5,6 +5,75 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(passthrough): `/passthrough/v1/*` verbatim upstream forwarding
+
+New routing mode: a request to `/passthrough/<path>` is forwarded verbatim to a
+configured upstream, bypassing model routing, composite selection, schedule,
+transforms, privacy filtering, and kompress. The client's path and body are
+relayed unchanged; only the auth header is rewritten when the target declares
+`key`.
+
+Configured with inline tables under a single `[passthrough]` section (short
+field names are canonical; `base_url`/`url`, `api_key`/`key`, `upstream_mode`/
+`mode` are accepted as aliases):
+
+```toml
+[passthrough]
+openai = {base = "https://api.openai.com", mode = "openai-completions", share = 1}
+# key = "sk-..."   # optional; overrides the client key upstream
+```
+
+Behavior (see `docs/design_passthrough_mode.md`):
+
+- **Endpoint → mode** is a fixed map: `/v1/messages` and
+  `/v1/messages/count_tokens` → `anthropic-messages`; `/v1/chat/completions` →
+  `openai-completions`; `/v1/responses`, `/v1/responses/input_tokens`,
+  `/v1/responses/compact` → `openai-responses`; `/v1/interactions` →
+  `gemini-interactions`; `/v1beta/models/*` and `/v1/models/*` with a
+  `:generateContent`/`:streamGenerateContent`/`:countTokens` action →
+  `gemini-generatecontent`. An unmapped path is a 404.
+- **Candidates** are the targets whose `mode` matches, picked by weighted random
+  on `share` (default 1) — the weight only applies within a pool, so a `mode`
+  with a single target always uses it whatever its `share`. No candidates for
+  that mode is a 404.
+- **Schema gate**: a body that does not match the mode's required shape is a 400
+  (`messages[]` for the completions/messages modes, `input` for responses and
+  interactions, `contents[]` for generateContent).
+- **URL** is a plain join — `stripTrailingSlash(base) + '/' + path` — so a base
+  already ending in a path prefix (e.g. `https://gw.example.com/anthropic`)
+  composes as written and the client path is never rewritten.
+- **Retained**: the global client-key presence check, the `auth_server` gate,
+  logging, upstream status recording, per-target `timeout`, and usage recording
+  (streaming and non-streaming) keyed on the body's `model` (or `unknown` when
+  the body carries none). `[remote].record_server` receives the same payload as
+  the normal routes. `[general] global_token_limit` is also enforced — it runs
+  before dispatch, so a passthrough request is refused once the window limit is
+  reached.
+- **NOT applied — local token counting**: `LOCAL_TIKTOKEN` and the native
+  `count_tokens` handler do not run for passthrough requests.
+  `/passthrough/v1/messages/count_tokens` is forwarded verbatim to the upstream,
+  so the returned count is the upstream's, never a local tiktoken estimate.
+- **SSRF**: `[passthrough]` target `base` hosts are added to the shared
+  `getAllowedHostsFromConfig` allowlist, the same list `[models.*].base_url`
+  hosts feed — so they also become reachable through the existing
+  `/http/<host>/…` dynamic route (design doc §11.13).
+- **Key store**: `[passthrough]` target `key`s are covered by
+  `[general] store_key_in_system`, like `[models.*]` api_keys. Since a
+  passthrough target has no model id, its keychain account is
+  `passthrough.<name>/<base>`.
+
+Integration suite `tests/integration/18_passthrough/` (TC5101–TC5111) covers the
+mode mapping, usage-counted-once behavior, 404/400 gates, and the plain-join URL.
+
+### fix(config): short field names in a `[models.*]` section are now a reported error
+
+A `[models.<category>]` section takes only the long field names (`upstream_mode`,
+`base_url`, `api_key`); the short aliases (`mode`, `url`, `key`) belong to inline
+entries and `[passthrough]` targets. Writing a short alias at section level used to
+drop the key silently — the target lost its base_url/mode/key with no message. It is
+now reported as a config error (TUI/dashboard status and console), naming the long
+form to use. Inline entries keep accepting both forms.
+
 ### fix(stats): native Anthropic responses were counted twice
 
 Token usage for `/v1/messages` against an `anthropic-messages` upstream was

@@ -18,6 +18,7 @@ import { handleOpenAIRequest } from './handlers/openai.js';
 import { handleClaudeRequest } from './handlers/claude.js';
 import { handleEmbeddingsRequest } from './handlers/embeddings.js';
 import { handleChatCompletionsPassthrough } from './handlers/chat-completions.js';
+import { handlePassthroughRequest, PASSTHROUGH_PREFIX } from './handlers/passthrough.js';
 import {
   handleDashboardAgentStats,
   handleDashboardAddScheduleAlias,
@@ -128,7 +129,7 @@ export function resetEffectiveCompositeSharesForTest(): void {
   compositeEffectiveShares.clear();
 }
 
-function selectWeightedCompositeCandidate<T>(candidates: T[], getWeight: (candidate: T) => number): T | undefined {
+export function selectWeightedCompositeCandidate<T>(candidates: T[], getWeight: (candidate: T) => number): T | undefined {
   const totalWeight = candidates.reduce((sum, candidate) => sum + Math.max(0, getWeight(candidate)), 0);
   if (totalWeight <= 0) return candidates[0];
 
@@ -1220,13 +1221,46 @@ export default {
       const privacyActive = !!privacyConfig;
       let piiMapping: PiiMapping = {};
 
+      // Extract authentication headers early (needed for passthrough)
+      const authHeaders = extractAuthHeaders(request);
+
       // Kompress: lossy, one-directional compression of outbound request text.
       // No response-side handling needed.
       const kompressConfig = getKompressConfig(env);
       const kompressActive = !!kompressConfig && shouldCompressPath(kompressConfig, path);
 
-      // Extract authentication headers early
-      const authHeaders = extractAuthHeaders(request);
+      // Passthrough mode: /passthrough/v1/... -> verbatim upstream
+      if (path.startsWith(`${PASSTHROUGH_PREFIX}/`)) {
+        // The early gate above already ran unless auth is deferred
+        // (auth_with_model / auth_with_body). Those modes need the parsed body,
+        // and passthrough returns before the normal post-parse auth call — so
+        // run the deferred gate here, reusing the same doAuthRequest closure.
+        const passthroughBodyText = await request.text();
+        if (authUrl && (authWithModel || authWithBody)) {
+          let passthroughModel: string | undefined;
+          try {
+            const parsed = JSON.parse(passthroughBodyText);
+            if (parsed && typeof parsed.model === 'string') passthroughModel = parsed.model;
+          } catch {
+            // Invalid JSON is rejected by the handler with a 400.
+          }
+          const authError = await doAuthRequest(passthroughModel, passthroughBodyText);
+          if (authError) return authError;
+        }
+        return await handlePassthroughRequest(
+          request,
+          path,
+          passthroughBodyText,
+          proxyConfig,
+          env,
+          logger,
+          requestId,
+          authHeaders,
+          getRawEndpointUserKey(authHeaders),
+          modelUsageOneTimeAuthCode,
+          sidecarForwardedHeaders,
+        );
+      }
       const endpointUserKey = getRawEndpointUserKey(authHeaders);
       const modelUsageRecordUrl = proxyConfig.remote?.record_server?.trim();
       const modelUsageRecordBody = proxyConfig.remote?.record_response_body === true;

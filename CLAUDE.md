@@ -19,7 +19,7 @@ When the codebase has two contradictory patterns, call it out ("Module A uses X,
 Never re-suggest a fix that has been rejected. After ~3 failed attempts at the same problem, stop, present current state, and ask.
 
 ## 7. Meaningful Tests
-Tests must verify meaningful properties (values, structure, side effects, error types) — not merely "returns something" or "doesn't throw". Flag it explicitly when tests are too weak.
+Tests must verify meaningful properties (values, structure, side effects, error types) — not merely "returns something" or "doesn't throw". Flag it explicitly when tests are too weak. when testing, DO NOT `pkill`, use `pgrep`,`lsof` to find right process, then use `kill`. 
 
 ## 8. Fail Loud
 Errors must be thrown, returned, or reported — never swallowed or hidden behind default values. When batch jobs or loops skip records, report skip counts and reasons in the output. If you cannot confirm 100% success, say so — silent "default success" is forbidden.

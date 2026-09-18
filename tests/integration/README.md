@@ -106,6 +106,7 @@ Environment variables honored by the runner:
 | `15_config_parse/` | Config parse / serialize / route-resolution unit tests (no proxy required) |
 | `16_security/` | Security-specific tests: SSRF guard, privacy filter, kompress, conversation store, free-tier fan-out bound, prototype-pollution denylist, schedule routing, /v1/chat/completions passthrough validation, reasoning_effort conversion |
 | `17_token_counting/` | Token-usage accounting: client-reported usage vs. dashboard per-model stats agree exactly (regression guard for double-counted streams) |
+| `18_passthrough/` | Passthrough mode: /passthrough/v1/* verbatim forwarding with mode mapping, usage recording, auth gating, plain-join URL construction |
 | `utils/` | Shared test helpers |
 
 ## Test Files
@@ -192,6 +193,10 @@ Environment variables honored by the runner:
 ### 17_token_counting
 
 - `token_counting.test.js` — Live token-accounting tests. Each test takes the sum of `total_tokens` across all rows of `GET /dashboard/api/stats/models` before and after one request, and asserts the delta equals the usage the client was told about — exactly once, so a 2× delta fails. TC4101 non-streaming `/v1/messages`, TC4102 streaming `/v1/messages` against an `anthropic-messages` model (the regression guard for the duplicate recorder that lived in `src/handlers/claude.ts`), TC4103/TC4104 streaming and non-streaming `/v1/chat/completions` (covers the force-injected `stream_options.include_usage` final chunk), TC4105 `:streamGenerateContent?alt=sse` (the `usageMetadata` frame shape). Models are discovered from the live config by upstream mode; a test whose model or endpoint is unavailable prints `(skipped: ...)`.
+
+### 18_passthrough
+
+- `passthrough.test.js` — Live passthrough mode tests. Verifies `/passthrough/v1/*` endpoints forward requests verbatim to configured upstreams. TC5101 non-streaming `/passthrough/v1/messages`, TC5102 streaming `/passthrough/v1/messages`, TC5103 streaming `/passthrough/v1/chat/completions`, TC5104 `/passthrough/v1/responses`, TC5105 `/passthrough/v1beta/models/x:streamGenerateContent`, TC5106 unknown endpoint → 404, TC5107 schema gate failure → 400, TC5108 weighted selection config, TC5109 auth server gating, TC5110 record server recording, TC5111 plain-join URL construction (no double version segment). Requires `[passthrough]` section in test config.
 
 ## Prerequisites
 

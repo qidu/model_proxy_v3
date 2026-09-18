@@ -38,4 +38,5 @@ export const suites = [
   '16_security/dev_pass_through_responses.test.js',
   '16_security/target_retry_ladder.test.js',
   '17_token_counting/token_counting.test.js',
+  '18_passthrough/passthrough.test.js',
 ];

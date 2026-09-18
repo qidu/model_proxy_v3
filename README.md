@@ -316,6 +316,7 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /health` (also `GET /`) | Health check. Probes the resolved default-category / `[default_upstream]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
 | `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api-endpoints.md#dynamic-routing). |
+| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
 
 A Gemini `/v1/models/{model}:...` variant exists for each `/v1beta/models/{model}:...`
 endpoint. `:countTokens` is supported too: native Gemini routes forward to Gemini
@@ -552,7 +553,8 @@ The full field-by-field reference lives in
 [`docs/configuration-reference.md`](./docs/configuration-reference.md):
 
 - **TOML sections** — `[general]`, `[default_upstream]`, `[remote]`,
-  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[dashboard]`.
+  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[dashboard]`,
+  `[passthrough]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
   config `api_key` into the OS keychain (accounts `<target_model_id>/<base_url>` under
   the `model_proxy_v3` service) and rewrites the config file to `STORE_KEY_IN_SYSTEM`
@@ -563,7 +565,8 @@ The full field-by-field reference lives in
   fatal: that slot is cleared (treated as unconfigured, so the normal api_key fallback
   applies) and reported as a config error in the TUI/dashboard/console, letting the rest
   of the models load and the proxy start. Scope:
-  configured api_keys of `[models.*]` targets (and `default_upstream.default_api_key`)
+  configured api_keys of `[models.*]` targets, `default_upstream.default_api_key`,
+  and `[passthrough]` target `key`s
   in the local `proxy_config.toml` only — ignored for Consul/Apollo sources, N/A for
   composite aliases, and caller/user keys from request headers are never stored.
   Local/dev-host feature only — fails loud when no OS keychain is available (Docker,

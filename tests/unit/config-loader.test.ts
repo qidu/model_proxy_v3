@@ -469,6 +469,47 @@ describe('parseSimpleToml', () => {
     assert.ok(Array.isArray(cfg._validationErrors));
   });
 
+  it('accepts the long field names in a [models.*] section', () => {
+    const cfg = parseSimpleToml(`
+      [models.x]
+      upstream_mode = "openai-completions"
+      base_url = "https://a.dev"
+      api_key = "sk-a"
+    `) as any;
+    assert.equal(cfg.models.x.upstream_mode, 'openai-completions');
+    assert.equal(cfg.models.x.base_url, 'https://a.dev');
+    assert.equal(cfg.models.x.api_key, 'sk-a');
+    assert.deepEqual(cfg._validationErrors, []);
+  });
+
+  it('reports an error (not a silent drop) for short field names in a [models.*] section', () => {
+    const cfg = parseSimpleToml(`
+      [models.x]
+      mode = "openai-completions"
+      url = "https://a.dev"
+      key = "sk-a"
+    `) as any;
+    assert.deepEqual(cfg.models.x, {}, 'short-name keys are not applied to the section');
+    assert.deepEqual(
+      cfg._validationErrors.map((e: { path: string; message: string }) => `${e.path}: ${e.message}`),
+      [
+        'models.x.mode: short field name is not accepted in a [models.*] section — use upstream_mode',
+        'models.x.url: short field name is not accepted in a [models.*] section — use base_url',
+        'models.x.key: short field name is not accepted in a [models.*] section — use api_key',
+      ],
+    );
+  });
+
+  it('still accepts short aliases inside a [models.*] inline entry', () => {
+    const cfg = parseSimpleToml(`
+      [models.x]
+      upstream_mode = "anthropic-messages"
+      "m1" = {target = "t1", url = "https://b.dev", key = "sk-b", mode = "openai-completions"}
+    `) as any;
+    assert.deepEqual(cfg.models.x.m1, ['t1', 'https://b.dev', 'sk-b', 'openai-completions']);
+    assert.deepEqual(cfg._validationErrors, []);
+  });
+
   it('returns empty config for empty input (with validation metadata attached)', () => {
     const cfg = parseSimpleToml('') as any;
     assert.equal(cfg.general, undefined);

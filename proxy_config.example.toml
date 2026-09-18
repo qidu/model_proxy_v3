@@ -560,3 +560,32 @@ openai-responses   = ["max_tokens_rename"]
 # image_encode = "localhost:34567"   # shorthand; "http://localhost:34567" also accepted
 # timeout_ms = 40000                 # per-call timeout
 
+# ---------------------------------------------------------------------------
+# Passthrough mode — verbatim forwarding of /passthrough/v1/* to configured upstreams.
+# ---------------------------------------------------------------------------
+#
+# The `/passthrough` prefix is stripped and the remaining path is mapped to an
+# upstream mode (see docs/design_passthrough_mode.md §3.1). The upstream URL is
+# built by PLAIN JOIN: `stripTrailingSlash(base) + '/' + upstreamPath` (query
+# appended). `buildUpstreamUrl`'s full-endpoint short-circuit and version-dedupe
+# are NOT used — the client's path is preserved verbatim.
+#
+# Each inline table under `[passthrough]` defines one target, keyed by an
+# arbitrary name. Multiple entries with the same `mode` form a weighted pool
+# (by `share`, default 1) — `share` only matters inside such a pool, so a mode
+# with a single target always uses it whatever its `share` says. The auth key
+# used defaults to the caller's inbound key; set `key` to override with a config
+# key. The `auth_server` gate (§8) applies as a pure allow/deny check.
+#
+# Short field names are canonical here; the long aliases (base_url/url,
+# api_key/key, upstream_mode/mode) are also accepted.
+#
+# [passthrough]
+# # Weighted pool: both targets serve openai-completions, split 20:30 (40% / 60%).
+# openai1 = {base = "https://api.openai-a.com", mode = "openai-completions", share = 20}
+# openai2 = {base = "https://api.openai-b.com", mode = "openai-completions", share = 30}
+# # key = "sk-..."     # optional: overrides caller's key when set
+# # timeout = 30000    # optional: per-target timeout in ms
+# anthropic = {base = "https://api.anthropic.com", mode = "anthropic-messages"}
+# gemini = {base = "https://generativelanguage.googleapis.com", mode = "gemini-generatecontent"}
+

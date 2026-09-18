@@ -13,7 +13,7 @@ export type UsageStats = {
   total_tokens?: number;
 };
 
-type ModelStatsEntry = {
+export type ModelStatsEntry = {
   model: string;
   requests: number;
   failed_requests: number;
