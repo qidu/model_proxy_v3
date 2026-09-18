@@ -183,9 +183,13 @@ The target's `key` is formatted for the mode via the existing
 `anthropic-messages`, `x-goog-api-key` for the two Gemini modes,
 `Authorization: Bearer` otherwise.
 
-When `key` is empty, the caller's inbound auth headers are forwarded verbatim
-(`extractAuthHeaders`) — the proxy holds no credential for that target and
-passes the caller's through.
+When `key` is empty, the proxy holds no credential for that target and passes the
+caller's through. `extractAuthHeaders` is mode-agnostic (it folds `x-api-key` into
+`Authorization: Bearer`), so the recovered caller key is re-formatted for the mode
+with the same `formatApiKeyForUpstream` — an `anthropic-messages` upstream gets
+`x-api-key: <caller key>`, not a Bearer token it would ignore. In both cases the
+other credential headers are dropped, so only one credential ever reaches the
+upstream; non-credential headers (e.g. `anthropic-beta`) are kept.
 
 ## 8. Remote pipeline (`[remote]`)
 
@@ -325,7 +329,7 @@ design — they would rewrite the body, which contradicts the verbatim contract.
 
 ## 11. Resolved decisions
 
-1. Empty `key` → forward the caller's key verbatim (§7).
+1. Empty `key` → forward the caller's key, re-formatted for the mode (§7).
 2. Any `/passthrough/*` is routed; a path with no mode mapping → 404 (§3.1).
 3. Random selection is weighted by the per-entry `share` field, default `1` (§5).
 4. A per-entry `timeout` override is supported, falling back to the env default (§6).

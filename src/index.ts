@@ -1247,7 +1247,7 @@ export default {
           const authError = await doAuthRequest(passthroughModel, passthroughBodyText);
           if (authError) return authError;
         }
-        return await handlePassthroughRequest(
+        const passthroughResponse = await handlePassthroughRequest(
           request,
           path,
           passthroughBodyText,
@@ -1260,6 +1260,12 @@ export default {
           modelUsageOneTimeAuthCode,
           sidecarForwardedHeaders,
         );
+        // Same timing convention as the normal routes: recorded once the
+        // response is available (time-to-first-byte for SSE), keyed on the
+        // request path so /passthrough/v1/* shows real min/avg/max in the TUI
+        // and dashboard endpoint tables.
+        recordRequestTiming(path, Date.now() - requestStartTime);
+        return passthroughResponse;
       }
       const endpointUserKey = getRawEndpointUserKey(authHeaders);
       const modelUsageRecordUrl = proxyConfig.remote?.record_server?.trim();

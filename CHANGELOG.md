@@ -48,11 +48,26 @@ Behavior (see `docs/design_passthrough_mode.md`):
   the body carries none). `[remote].record_server` receives the same payload as
   the normal routes. `[general] global_token_limit` is also enforced — it runs
   before dispatch, so a passthrough request is refused once the window limit is
-  reached.
+  reached. Endpoint stats include `/passthrough/v1/*` in both the request-count
+  and the timing tables (min/avg/max), recorded on the request path like the
+  normal routes — time-to-first-byte for SSE.
+- **Credential**: `target.key` wins when set, otherwise the caller's key is used.
+  Either way the credential is re-emitted in the header the mode actually reads —
+  `x-api-key` (`anthropic-messages`), `x-goog-api-key` (Gemini), or
+  `Authorization: Bearer` (OpenAI) — and the other credential headers are dropped,
+  so an upstream never receives two credentials and an `anthropic-messages`
+  upstream gets `x-api-key` rather than a Bearer token it would ignore.
+  Non-credential headers (e.g. `anthropic-beta`) are forwarded unchanged.
 - **NOT applied — local token counting**: `LOCAL_TIKTOKEN` and the native
   `count_tokens` handler do not run for passthrough requests.
   `/passthrough/v1/messages/count_tokens` is forwarded verbatim to the upstream,
   so the returned count is the upstream's, never a local tiktoken estimate.
+- **Streaming usage caveat**: the request body is forwarded byte-for-byte, so the
+  proxy never injects `stream_options.include_usage`. For an `openai-completions`
+  SSE stream whose request omits it, the upstream usually drops the final usage
+  chunk and no tokens are counted — a warning is logged per such request.
+  `anthropic-messages` / `openai-responses` / Gemini streams carry usage natively
+  and are unaffected.
 - **SSRF**: `[passthrough]` target `base` hosts are added to the shared
   `getAllowedHostsFromConfig` allowlist, the same list `[models.*].base_url`
   hosts feed — so they also become reachable through the existing

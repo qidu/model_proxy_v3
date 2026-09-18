@@ -86,6 +86,20 @@ function buildPlainJoinUrl(base: string, upstreamPath: string, queryString: stri
   return queryString ? `${joined}${queryString}` : joined;
 }
 
+/**
+ * Recover the raw caller credential from `extractAuthHeaders` output.
+ * `extractAuthHeaders` is mode-agnostic: it folds `x-api-key` into
+ * `Authorization: Bearer ...` and preserves `x-goog-api-key` as-is. Prefer the
+ * explicit Gemini key when present, otherwise unwrap the Bearer token.
+ */
+function extractCallerKey(authHeaders: Record<string, string>): string | undefined {
+  const goog = authHeaders['x-goog-api-key'];
+  if (goog) return goog.startsWith('Bearer ') ? goog.slice(7) : goog;
+  const auth = authHeaders['Authorization'];
+  if (auth) return auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+  return undefined;
+}
+
 export async function handlePassthroughRequest(
   request: Request,
   path: string,
@@ -176,17 +190,26 @@ export async function handlePassthroughRequest(
   const upstreamUrl = buildPlainJoinUrl(target.base, upstreamPath, queryString);
   logger.info(requestId, `Passthrough: ${path} -> ${upstreamUrl} (target: ${targetName}, mode: ${mode})`);
 
-  // Auth headers: default to client key, override with target.key if set
+  // Auth headers: the configured `target.key` when set, otherwise the caller's
+  // credential. `extractAuthHeaders` is mode-agnostic — it folds the caller's
+  // credential into `Authorization` (and preserves `x-goog-api-key`) — while
+  // `formatApiKeyForUpstream` writes the header the mode actually uses
+  // (`x-api-key` / `x-goog-api-key` / `Authorization`). Re-emit the credential in
+  // the mode-appropriate header and drop the originals, so an anthropic-messages
+  // upstream gets `x-api-key` (not a Bearer token it ignores) and no mode ever
+  // sends BOTH credentials. Non-credential headers (e.g. `anthropic-beta`) are kept.
+  const upstreamCredential = target.key ?? extractCallerKey(authHeaders);
   let upstreamAuthHeaders = { ...authHeaders };
-  if (target.key) {
-    upstreamAuthHeaders = { ...upstreamAuthHeaders, ...formatApiKeyForUpstream(target.key, mode) };
+  delete upstreamAuthHeaders['Authorization'];
+  delete upstreamAuthHeaders['x-goog-api-key'];
+  if (upstreamCredential) {
+    upstreamAuthHeaders = { ...upstreamAuthHeaders, ...formatApiKeyForUpstream(upstreamCredential, mode) };
   }
 
   // The auth_server gate has already run in index.ts before dispatch (either the
   // early gate, or the deferred post-parse gate for auth_with_model/body).
 
   // Forward request to upstream
-  const isStreaming = body.stream === true;
   const upstreamHeaders = { 'Content-Type': 'application/json', ...addForwardedHeaders(upstreamAuthHeaders, request) };
   logPipelineHeaders(logger, requestId, 'upstream-request', upstreamUrl, upstreamHeaders);
   logPipelineStage(logger, requestId, 'upstream-request', upstreamUrl, bodyText);
@@ -237,6 +260,17 @@ export async function handlePassthroughRequest(
 
   if (isEventStream && response.body) {
     logger.debug(requestId, `[Passthrough] ${upstreamUrl}: <streaming SSE, relaying with usage tracking>`);
+
+    // The request body is forwarded verbatim, so the proxy never injects
+    // `stream_options.include_usage`. For an openai-completions upstream the
+    // final usage chunk is emitted only when the client asked for it — warn so
+    // a silently uncounted stream is not mistaken for a working one.
+    const streamOptions = body.stream_options as Record<string, unknown> | undefined;
+    const includeUsageRequested =
+      typeof streamOptions === 'object' && streamOptions !== null && streamOptions.include_usage === true;
+    if (mode === 'openai-completions' && !includeUsageRequested) {
+      logger.warn(requestId, `Passthrough: streaming openai-completions request without stream_options.include_usage — the upstream will omit the usage chunk, so token usage will NOT be counted. Send stream_options = {include_usage = true} to enable it.`);
+    }
 
     // Track usage via the central transform stream
     const usageTrackingStream = createUsageTrackingTransformStream(
