@@ -877,6 +877,17 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   });
   models.setProvider(provider);
 
+  // The verification round-trip only needs to prove the loopback call reaches
+  // upstream and comes back non-empty — it is not a task. The candidate Agent
+  // carries the full system prompt and tool set, so an open-ended question
+  // ("which model are you?") gets treated as real work and the model starts
+  // exploring the working directory instead of answering, which is slow and
+  // tells us nothing the picker didn't already. One terse tool-free line
+  // keeps the round-trip short; the model's identity is already printed by
+  // the picker line above. Shared by the display line and the call below so
+  // the two can't drift.
+  const VERIFY_PROMPT = 'Reply "ok". Do not use tools.';
+
   let selectedAlias: string | null = null;
   let agent: Agent | null = null;
 
@@ -915,7 +926,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     });
     candidateRef.current = candidate;
 
-    console.log(dim(`[verify] checking proxy v3 and model `) + choice + dim(` with prompt "hi, which model and agent are right here?"`));
+    console.log(dim(`[verify] checking proxy v3 and model `) + choice + dim(` with prompt "${VERIFY_PROMPT}"`));
     let replyText = '';
     let sawError = false;
     const unsubscribe = candidate.subscribe((event) => {
@@ -931,7 +942,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       }
     });
     try {
-      await candidate.prompt('hi, which model and agent are right here?');
+      await candidate.prompt(VERIFY_PROMPT);
     } catch (err) {
       sawError = true;
       console.error(`[verify] verifying failed: ${(err as Error).message}`);
@@ -1025,9 +1036,17 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // the same row in between, so our next print is the only thing visible
   // on it. A final `\n` is emitted once the run settles (see end of task
   // loop) so the next prompt starts on its own row, not stranded on this
-  // one. No-op when stdout isn't a TTY (e.g. piped to a file) — the
+  // one. Progress chatter rather than agent output, so it goes to stderr,
+  // where the proxy's own per-request lines land too — stdout carries only the
+  // agent's reply (see the console redirect in src/server.ts). Falls back to a
+  // plain console.log line when stderr isn't a TTY (e.g. piped to a file) — the
   // carriage return would just corrupt the log.
   const isTty = Boolean(process.stdout.isTTY);
+  // The process-log line below is written to stderr, so both its in-place
+  // rendering and the ticker that animates its dots are gated on stderr's
+  // TTY-ness — not stdout's. Gating the ticker on stdout would emit a plain
+  // progress line every 400ms into a piped stderr log.
+  const isStderrTty = Boolean(process.stderr.isTTY);
   // Ticks 0..2 every 400ms while the agent is running, so the trailing
   // dots on the process-log line animate `.` -> `..` -> `...` -> `.`
   // and visibly indicate progress during the whole turn (including
@@ -1047,7 +1066,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     progressTick = 0;
   };
   const startProgressInterval = () => {
-    if (progressInterval !== null || !isTty) return;
+    if (progressInterval !== null || !isStderrTty) return;
     progressInterval = setInterval(() => {
       progressTick = (progressTick + 1) % 3;
       printProcessLog();
@@ -1069,8 +1088,8 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // reason between the agent's text deltas.
     const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
     const line = dim(`[${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results] ${skillsList}|${toolsList} ${dots}`);
-    if (isTty) {
-      process.stdout.write(`\r\x1b[K${line}`);
+    if (isStderrTty) {
+      process.stderr.write(`\r\x1b[K${line}`);
     } else {
       console.log(line);
     }

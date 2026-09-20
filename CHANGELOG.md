@@ -5,6 +5,43 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(server): route proxy diagnostics to stderr
+
+`src/server.ts` now redirects `console.log`/`info`/`debug` to stderr at startup,
+so stdout carries only machine-readable output — CLI subcommand payloads
+(`src/cli.ts` writes those with `process.stdout.write`) and, in `--rpc` mode, the
+NDJSON JSON-RPC control channel (see `docs/design_tauri_tray.md`).
+
+Previously every proxy log level, including `warn` and `error`, went to stdout
+via `console.log` in `src/utils/logger.ts`; a single log line on stdout would
+have been parsed as a corrupt JSON-RPC frame. Redirecting the methods in one
+place covers the direct `console.log/info/debug` call sites in
+`src/utils/key-store.ts` and `src/utils/privacy-filter.ts` as well, and any
+`console.log` added later. `console.error`/`warn` already wrote to stderr.
+
+`AGENT=true` is covered too, but its task output is unaffected: the streamed
+reply deltas and the pi-tui prompts are written with `process.stdout.write`, so
+they stay on stdout, while its status/progress lines (the in-place
+`printProcessLog` line in `src/agent-session.ts` now writes to stderr) land with
+the proxy's logs. Docker is unaffected (`Dockerfile` has no redirection; both
+streams go to the container log), as are TUI mode (which overrides these methods
+again) and the Cloudflare Workers target (no stdout/stderr split — the logger is
+unchanged).
+
+### fix(agent): shorten the model-picker verification prompt
+
+The `AGENT=true` model picker verifies a chosen model with a loopback
+`/v1/messages` call before starting the session. It asked
+`"hi, which model and agent are right here?"`, but the candidate Agent is built
+with the full system prompt and tool set, so the model read that as a real task
+and started exploring the working directory instead of answering — slow, and
+redundant since the picker line already names the model.
+
+The prompt is now `Reply "ok". Do not use tools.` (`VERIFY_PROMPT` in
+`src/agent-session.ts`, shared by the display line and the call so the two can't
+drift). The gate is unchanged: a reply is still required and an error still
+sends you back to the picker.
+
 ### feat(passthrough): `/passthrough/v1/*` verbatim upstream forwarding
 
 New routing mode: a request to `/passthrough/<path>` is forwarded verbatim to a

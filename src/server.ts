@@ -62,6 +62,21 @@ const env: NodeEnv = {
   KOMPRESS_MIN_CHARS: process.env.KOMPRESS_MIN_CHARS,
 };
 
+// Diagnostics go to stderr so stdout carries only machine-readable output: the
+// CLI subcommand payloads (src/cli.ts) and, in --rpc mode, the NDJSON JSON-RPC
+// control channel (docs/design_tauri_tray.md). Proxy logging funnels through
+// console.log (src/utils/logger.ts), with a few direct console.log/info/debug
+// call sites besides, so redirect the methods once here rather than at each
+// site — this covers console.log calls added later too. console.error/warn
+// already write to stderr. AGENT=true's interactive session is unaffected in
+// substance: its task output (streamed reply deltas, pi-tui prompts) is written
+// with process.stdout.write and stays on stdout, while its status/progress
+// lines go through console.log and land here on stderr alongside the proxy's
+// own logs. TUI=true overrides these methods again below.
+console.log = console.error;
+console.info = console.error;
+console.debug = console.error;
+
 // CLI subcommands exit before the server starts. No args (runCli returns null)
 // preserves the previous behavior of starting the HTTP server.
 const cliExitCode = runCli(process.argv.slice(2), env);
