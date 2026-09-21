@@ -5,6 +5,31 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(rpc): add `--rpc` JSON-RPC 2.0 control channel on stdio
+
+`--rpc` starts a newline-delimited JSON-RPC 2.0 server on stdio alongside the
+HTTP server, so an external supervisor (the Tauri tray in
+`docs/design_tauri_tray.md`) can start, inspect and control the proxy over the
+same pipe that carries its process handle — no port to discover and no key to
+pass. It is a *mode*, not a CLI command: `src/server.ts` strips it from argv
+before `runCli()`, and it is mutually exclusive with `AGENT`/`TUI` (all three
+own stdout), failing loud with exit 2 rather than picking a winner.
+
+`src/rpc.ts` is lazily imported from inside the `server.listen` callback, so the
+HTTP socket is already bound before the first request is read — a reply to
+`status.get` proves the port is live, and no readiness probe is needed. Stdin
+EOF calls the existing `shutdown()`, so the proxy cannot outlive the core that
+spawned it (an orphan would hold port 8788).
+
+Every method dispatches to a function the proxy already exposes
+(`src/handlers/dashboard.ts` and the config loader); the RPC layer adds no new
+state. Notifications are **poll-derived** (1 s, emit-on-change) rather than
+instrumented into the request path, which is why `src/index.ts` and
+`src/utils/dashboard-stats.ts` are untouched: `stats.tick` reads
+`getActiveRequestCount()`/`getTokensInWindow()`, and `config.changed` polls the
+config file's mtime. The method and notification tables, error codes and
+lifecycle are specified in `docs/design_tauri_tray.md` §3.
+
 ### fix(server): route proxy diagnostics to stderr
 
 `src/server.ts` now redirects `console.log`/`info`/`debug` to stderr at startup,

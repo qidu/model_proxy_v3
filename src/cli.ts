@@ -36,6 +36,11 @@ Commands:
   --validate-config            Validate the config file and report errors/warnings
   --help, -h                   Show this help
 
+Modes:
+  --rpc                        Serve the JSON-RPC 2.0 control channel on stdio
+                               (newline-delimited JSON) alongside the HTTP server.
+                               Mutually exclusive with the AGENT and TUI modes.
+
 Options:
   --json               Machine-readable output for --list-models (dashboard config shape)
   --default-model <id> Model named as defaultModel in --export-pi-models (must be a

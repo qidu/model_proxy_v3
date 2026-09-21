@@ -77,11 +77,24 @@ console.log = console.error;
 console.info = console.error;
 console.debug = console.error;
 
+// `--rpc` is a *mode*, not a runCli() command: runCli() rejects unknown args and
+// exits after every command, so strip it before the scan. A real command beside
+// it (`--rpc --list-models`) still runs and exits as usual.
+const argv = process.argv.slice(2);
+const rpcEnabled = argv.includes('--rpc');
+
 // CLI subcommands exit before the server starts. No args (runCli returns null)
 // preserves the previous behavior of starting the HTTP server.
-const cliExitCode = runCli(process.argv.slice(2), env);
+const cliExitCode = runCli(argv.filter((arg) => arg !== '--rpc'), env);
 if (cliExitCode !== null) {
   process.exit(cliExitCode);
+}
+
+// --rpc, TUI and AGENT all want stdout (RPC frames vs. TUI rendering vs. agent
+// output), so combining them is a startup error rather than a silent winner.
+if (rpcEnabled && (env.AGENT === 'true' || env.AGENT === '1' || process.env.TUI === 'true' || process.env.TUI === '1')) {
+  console.error('[FATAL] --rpc cannot be combined with AGENT or TUI: all three own stdout.');
+  process.exit(2);
 }
 
 const server = createServer(async (req, res) => {
@@ -176,6 +189,7 @@ const server = createServer(async (req, res) => {
 });
 
 let stopTui: (() => void) | undefined;
+let stopRpc: (() => void) | undefined;
 let agentSessionPromise: Promise<void> | undefined;
 
 server.listen(port, '0.0.0.0', async () => {
@@ -272,6 +286,23 @@ server.listen(port, '0.0.0.0', async () => {
     loadProxyConfig(env).catch((err) => {
       console.error('Failed to load config at startup:', (err as Error).message);
     });
+
+    if (rpcEnabled) {
+      // Lazy import: pi-tui/pi-agent-core are devDependencies, but rpc.ts is
+      // bundled into the SEA blob like tui.js/agent-session.js. Starting here,
+      // inside the listen callback, means the port is bound before the first
+      // request is read — a reply to status.get proves the socket is live.
+      const { startRpc } = await import('./rpc.js');
+      stopRpc = startRpc({
+        env,
+        loadConfig: async (forceReload?: boolean) => {
+          if (forceReload) clearProxyConfigCache();
+          return loadProxyConfig(env);
+        },
+        port,
+        shutdown,
+      });
+    }
   }
 });
 
@@ -284,6 +315,7 @@ function shutdown(): void {
   }
   shuttingDown = true;
   stopTui?.();
+  stopRpc?.();
   server.close(() => process.exit(0));
   server.closeAllConnections();
 }
