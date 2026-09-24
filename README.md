@@ -518,6 +518,10 @@ npm run build:native     # -> dist/model-proxy-v3-<host-triple>
 The output is named `<name>-<host target triple>` (e.g.
 `model-proxy-v3-x86_64-apple-darwin`), the same name the Tauri tray's
 `externalBin` stages the sidecar under, so it can be copied across unchanged.
+A ready-to-use system tray for this proxy lives in
+`git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
+its sidecar and supervises it over the `--rpc` JSON-RPC control channel
+(design: [`docs/design_tauri_tray.md`](./docs/design_tauri_tray.md)).
 
 `scripts/build-sea.js` bundles the server into one Node SEA executable. The
 output *is* a copy of the Node that built it, so that Node must be an official,

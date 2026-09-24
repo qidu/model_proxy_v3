@@ -5,6 +5,19 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### build(sea): name `build:native` output with the host target triple
+
+`outputName()` in `scripts/build-sea.js` now emits
+`model-proxy-v3-<host target triple>` — `-x86_64-apple-darwin`,
+`-aarch64-apple-darwin`, `-x86_64-unknown-linux-gnu`,
+`-aarch64-unknown-linux-gnu`, `-x86_64-pc-windows-msvc.exe`,
+`-aarch64-pc-windows-msvc.exe` — instead of the platform-tagged `-macos-<arch>`
+/ `-linux-<arch>` / `-win.exe` names. That is the shape Tauri's `externalBin`
+expects on disk (it appends `-<triple>`, plus `.exe` on Windows, to the untagged
+entry), so the tray's `stage-sidecar.sh` copies the SEA across with no rename.
+Windows ARM is now named `aarch64-pc-windows-msvc` rather than being left
+arch-agnostic as `-win.exe`.
+
 ### feat(config): resolve the default config path in the working directory or the home directory
 
 When `PROXY_CONFIG_PATH` is unset, the default is no longer the bare relative
