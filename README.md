@@ -737,14 +737,14 @@ models you trust. See `src/agent-tools.ts` for the exact checks.
 ### Models Involved
 1. `DeepSeek-R1`, `V3.2`, `V4-Flash`, `V4-Pro`, `V4.1-Flash`
 2. `Minimax-M2.6`, `M2.7-highspeed`, `M3`
-4. `Kimi-K2.6`, `K2.7-Code`, `K3`
-5. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`, `GPT-5.6`
-6. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
-7. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`
-8. `Nemotron-3-Super-120b`, `gpt-oss-120b`, `Nemotron-3-ultra-550b-a55b`
-9. `GLM-5.2`, `GLM-5.3`
-10. `Qwen3.8-Max`
-11. `Grok-4.6`
+3. `Kimi-K2.6`, `K2.7-Code`, `K3`
+4. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`, `GPT-5.6`
+5. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
+6. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`
+7. `Nemotron-3-Super-120b`, `gpt-oss-120b`, `Nemotron-3-ultra-550b-a55b`
+8. `GLM-5.2`, `GLM-5.3`
+9. `Qwen3.8-Max`
+10. `Grok-4.6`
 
 ### Tools Involved
 1. `Claude-Code`
