@@ -230,7 +230,7 @@ Body (`ModelUsageRecordPayload`):
 | `timestamp` | string | ISO 8601 timestamp of the record. |
 | `endpoint` | string | Inbound request path (e.g. `/v1/messages`). |
 | `version` | string | Wire-contract era this record speaks. A fixed proxy constant (`"v1"`), sent on every record regardless of the auth response — the proxy does not echo the auth service's advertised `version`. |
-| `user_key` | string | Raw caller auth key (from `Authorization` / `x-api-key` / `x-goog-api-key`). |
+| `user_key` | string | Truncated caller auth key — first 16 characters followed by `****` (from `Authorization` / `x-api-key` / `x-goog-api-key`). The full key is never sent to the recording server. |
 | `model` | string | **Resolved** upstream model id actually sent upstream (the `target`, not the alias key). |
 | `response_status` | number | Upstream HTTP status. `0` means no response was obtained. Non-2xx statuses are recorded with all token counters at `0`. |
 | `input_tokens` | number | Input tokens reported by the upstream (or local tiktoken estimate when `LOCAL_TIKTOKEN=true`). For non-2xx, `0`. |
