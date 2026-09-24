@@ -313,7 +313,7 @@ active.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PROXY_CONFIG_PATH` | `./proxy_config.toml` | Path to the local TOML config file |
+| `PROXY_CONFIG_PATH` | `./proxy_config.toml` if it exists, else `~/.config/model-proxy-v3/proxy_config.toml` (returned even when absent, with its directory created) | Path to the local TOML config file |
 | `PROXY_CONFIG_CONSUL` | unset | Consul meta URL (e.g. `http://127.0.0.1:8500`); reads KV under the `model-proxy-v3/` prefix recursively. Host must be loopback or private/LAN (SSRF guard). Read-only dashboard. |
 | `PROXY_CONFIG_APOLLO` | unset | Path to an [Apollo](https://www.apolloconfig.com/) connection file (see below). The named Apollo namespace holds the full `proxy_config.toml` content as a plain-text value. Read-only dashboard. Node-only. |
 

@@ -7,13 +7,16 @@
  * validateProxyConfig, validateTransformSet, getModelNamesInConfig,
  * findAliasNameConflicts, stripConflictingAliases,
  * findSelfReferencingCompositeTargets, getConfiguredModelIds,
- * getAllowedHostsFromConfig.
+ * getAllowedHostsFromConfig, resolveDefaultProxyConfigPath.
  *
  * Run with: npx tsx --test tests/unit/config-loader.test.ts
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 import {
   parseHumanTokenLimit,
@@ -39,6 +42,8 @@ import {
   applyDashboardConfigUpdate,
   toDashboardConfigPayload,
   upsertModelTarget,
+  resolveDefaultProxyConfigPath,
+  HOME_PROXY_CONFIG_PATH,
   type ProxyConfig,
   type TransformSet,
 } from '../../src/utils/config-loader.js';
@@ -1949,5 +1954,55 @@ describe('upsertModelTarget', () => {
     const reparsed = parseSimpleToml(toml);
     const entry = (reparsed.models!.free as Record<string, unknown>)['brand-new'] as string[];
     assert.deepEqual(entry, ['brand-new-target', 'https://brand-new.example', 'brand-new-key', 'openai-responses']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveDefaultProxyConfigPath
+// ---------------------------------------------------------------------------
+
+describe('resolveDefaultProxyConfigPath', () => {
+  it('prefers ./proxy_config.toml in the working directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mpv3-cfgpath-'));
+    writeFileSync(join(dir, 'proxy_config.toml'), '');
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(dir);
+      assert.equal(
+        resolveDefaultProxyConfigPath(),
+        './proxy_config.toml',
+        'a repo checkout must keep resolving the working-directory config',
+      );
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the home path, creating its directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mpv3-cfgpath-'));
+    const homeConfigDir = dirname(HOME_PROXY_CONFIG_PATH);
+    const homeConfigRoot = dirname(homeConfigDir);
+    const homeConfigDirExisted = existsSync(homeConfigDir);
+    const homeConfigRootExisted = existsSync(homeConfigRoot);
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(dir);
+      assert.equal(
+        resolveDefaultProxyConfigPath(),
+        HOME_PROXY_CONFIG_PATH,
+        'with no working-directory config the home path is the default',
+      );
+      assert.ok(
+        existsSync(homeConfigDir),
+        'the home config directory must be created when it is the fallback',
+      );
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(dir, { recursive: true, force: true });
+      // Undo only what this test created; never touch a pre-existing config dir.
+      if (!homeConfigDirExisted) rmSync(homeConfigDir, { recursive: true, force: true });
+      if (!homeConfigRootExisted) rmSync(homeConfigRoot, { recursive: true, force: true });
+    }
   });
 });

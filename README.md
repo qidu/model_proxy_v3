@@ -237,8 +237,10 @@ curl http://localhost:8788/v1/messages \
   }'
 ```
 
-The proxy reads `proxy_config.toml` from the working directory by default. Point it
-elsewhere with `PROXY_CONFIG_PATH=./other.toml npm run server`. Change the port with
+The proxy reads `proxy_config.toml` from the working directory by default; when
+that is absent it falls back to `~/.config/model-proxy-v3/proxy_config.toml`.
+Point it elsewhere with
+`PROXY_CONFIG_PATH=./other.toml npm run server`. Change the port with
 `PORT=7777`.
 
 ### 4. Watch live stats (optional)
@@ -289,8 +291,13 @@ npm run server -- --help                 # usage
 | `--export-openclaw-providers` | Print the `models.providers` block for `~/.openclaw/openclaw.json` — a single provider (`model-proxy-v3`) holding one entry per configured target model and alias, each pointed at this proxy's own loopback origin (`http://127.0.0.1:$PORT`, default `8788`). The provider carries `api: 'anthropic-messages'`, `auth: 'api-key'`, and the dummy `apiKey` (`sk-hi`); the surrounding `models.mode` is `merge`, so the block can be merged into an existing OpenClaw config without dropping its other providers. Configured target `api_key` values are never emitted. |
 | `--help`, `-h` | Print usage. |
 
-Commands read the **local TOML file only** (`$PROXY_CONFIG_PATH`, default
-`./proxy_config.toml`); Consul/Apollo remote sources are not consulted.
+Commands read the **local TOML file only** (`$PROXY_CONFIG_PATH`); Consul/Apollo
+remote sources are not consulted. When `PROXY_CONFIG_PATH` is unset, the config
+path defaults to `./proxy_config.toml` if it exists, else
+`~/.config/model-proxy-v3/proxy_config.toml`. When neither exists the home path
+is returned anyway and its directory (`~/.config/model-proxy-v3`) is created, so
+a GUI-launched binary whose working directory is not the repo still finds its
+config in the home directory.
 
 Exit codes: `0` success (for `--validate-config`: no errors), `1` command failed
 (unreadable config, or a config with errors), `2` usage error (unknown argument,
@@ -497,15 +504,20 @@ npx model-proxy-v3                      # or: npm i -g model-proxy-v3 && model-p
 PORT=8788 model-proxy-v3                # default port is 8788
 ```
 
-> The server reads `proxy_config.toml` from the **current working directory**.
-> When running from elsewhere, point it at the config with
+> The server reads `proxy_config.toml` from the **current working directory**;
+> when that is absent it falls back to `~/.config/model-proxy-v3/proxy_config.toml`.
+> Point it elsewhere with
 > `PROXY_CONFIG_PATH=/path/to/proxy_config.toml npx model-proxy-v3`.
 
 ### Native single-file binary
 
 ```bash
-npm run build:native     # -> dist/model-proxy-v3-<platform>-<arch>
+npm run build:native     # -> dist/model-proxy-v3-<host-triple>
 ```
+
+The output is named `<name>-<host target triple>` (e.g.
+`model-proxy-v3-x86_64-apple-darwin`), the same name the Tauri tray's
+`externalBin` stages the sidecar under, so it can be copied across unchanged.
 
 `scripts/build-sea.js` bundles the server into one Node SEA executable. The
 output *is* a copy of the Node that built it, so that Node must be an official,

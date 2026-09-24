@@ -118,17 +118,29 @@ const BUILD = path.join(ROOT, '.sea-build');
  */
 const EXTERNALS = ['@github/keytar', '../../submodules/chatjimmy/dist/index.js'];
 
-/** Platform-tagged output name, so CI can collect one artifact per runner. */
+/**
+ * Output name in Rust target-triple form (`<name>-<host-tuple>`), the shape the
+ * Tauri tray's `externalBin` stages the sidecar under, so it can be copied
+ * across with no rename. One artifact per runner.
+ */
 function outputName() {
   const platform = os.platform();
   const arch = os.arch();
   if (platform === 'darwin') {
-    return arch === 'arm64' ? 'model-proxy-v3-macos-arm64' : 'model-proxy-v3-macos-x64';
+    return arch === 'arm64'
+      ? 'model-proxy-v3-aarch64-apple-darwin'
+      : 'model-proxy-v3-x86_64-apple-darwin';
   }
   if (platform === 'linux') {
-    return arch === 'arm64' ? 'model-proxy-v3-linux-arm64' : 'model-proxy-v3-linux-x64';
+    return arch === 'arm64'
+      ? 'model-proxy-v3-aarch64-unknown-linux-gnu'
+      : 'model-proxy-v3-x86_64-unknown-linux-gnu';
   }
-  if (platform === 'win32') return 'model-proxy-v3-win.exe';
+  if (platform === 'win32') {
+    return arch === 'arm64'
+      ? 'model-proxy-v3-aarch64-pc-windows-msvc.exe'
+      : 'model-proxy-v3-x86_64-pc-windows-msvc.exe';
+  }
   throw new Error(`Unsupported platform: ${platform}`);
 }
 
@@ -409,8 +421,9 @@ function main() {
 
   console.error(`[build-sea] built ${outPath}`);
   console.error(
-    '[build-sea] note: proxy_config.toml is still read from the working directory at\n' +
-      '            runtime (PROXY_CONFIG_PATH, default ./proxy_config.toml) — it is not\n' +
+    '[build-sea] note: proxy_config.toml is still read at runtime (PROXY_CONFIG_PATH;\n' +
+      '            when unset: ./proxy_config.toml, then\n' +
+      '            ~/.config/model-proxy-v3/proxy_config.toml) — it is not\n' +
       '            embedded in the binary.\n' +
       '[build-sea] excluded from this binary: system keychain (@github/keytar) and\n' +
       '            sdk:// routes (chatjimmy). sdk:// always fails loud, as in the\n' +

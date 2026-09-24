@@ -4589,6 +4589,30 @@ export function resolveOpenClawConfigPath(configPath?: string | null): string {
   return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_OPENCLAW_CONFIG_PATH;
 }
 
+const CWD_PROXY_CONFIG_PATH = './proxy_config.toml';
+export const HOME_PROXY_CONFIG_PATH = join(homedir(), '.config', 'model-proxy-v3', 'proxy_config.toml');
+
+/**
+ * Resolve the proxy config path when PROXY_CONFIG_PATH is unset: the working
+ * directory (a repo checkout in dev, where the historical './proxy_config.toml'
+ * default still applies), else ~/.config/model-proxy-v3/proxy_config.toml —
+ * returned even when it does not exist, with its directory created, so a
+ * missing config fails with a path the user (or the tray) can drop a file into
+ * rather than a bare relative name.
+ *
+ * Deliberately not derived from the executable's directory: under
+ * `node dist/server.js` that is the Node install, and the tray passes
+ * PROXY_CONFIG_PATH explicitly rather than relying on a path next to the SEA
+ * binary.
+ */
+export function resolveDefaultProxyConfigPath(): string {
+  if (existsSync(CWD_PROXY_CONFIG_PATH)) {
+    return CWD_PROXY_CONFIG_PATH;
+  }
+  mkdirSync(dirname(HOME_PROXY_CONFIG_PATH), { recursive: true });
+  return HOME_PROXY_CONFIG_PATH;
+}
+
 export function loadOpenClawConfigFromPath(configPath = DEFAULT_OPENCLAW_CONFIG_PATH): OpenClawConfig {
   try {
     const content = readFileSync(configPath, 'utf-8');

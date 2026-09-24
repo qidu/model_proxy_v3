@@ -765,7 +765,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // there is done. Early-return paths (no model picked, cancelled
   // prompt, missing API key) skip the restore on purpose — the process
   // is still the proxy server and there is nothing to hand back.
-  const agentTitle = 'Agent launched in model proxy v3';
+  const agentTitle = 'Agent π in proxy v3';
   const isStdoutTty = Boolean(process.stdout.isTTY);
   if (isStdoutTty) {
     process.stdout.write(`\x1b]0;${agentTitle}\x07`);
@@ -780,7 +780,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // path-confinement/denylist checks in agent-tools.ts apply, and those are
   // raw string/regex matching, not enforced by the OS. Printed unconditionally
   // at session start so this is visible before any prompt (Rule 8: fail loud).
-  console.log('[WARNING] No OS-level sandbox — bash/write_file run with this user\'s full privileges,')
+  console.log('[WARN] No OS-level sandbox — bash/write_file run with this user\'s full privileges,')
   console.log(dim('confined only by this session\'s own path/command checks (see README "Tool safety limits").'));
 
   const dirInputRaw = await promptText('\nWorking directory (default: current dir):', process.cwd());
@@ -794,7 +794,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     console.log(dim(fallbackNotice));
   }
   const baseSystemPrompt = await loadSystemPrompt(workDir);
-  console.log(dim('[check] global/project skills...'));
+  console.log(dim('[proxy] checking global/project skills...'));
   const skillCandidates = await gatherSkillCandidates(workDir);
   let startupSkills = '';
   let skillsUsed = 0;
@@ -819,10 +819,10 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // npx has to resolve the "skills" package even when it's installed locally,
   // which can take a few seconds with no output of its own — print a notice
   // first so this doesn't look like a silent hang (Rule 8).
-  console.log(dim('[check] "skills" CLI...'));
+  console.log(dim('[proxy] checking "skills" CLI...'));
   const skillsCliAvailable = await probeSkillsCli(workDir);
   if (!skillsCliAvailable) {
-    console.log(dim('[INFO] "skills" CLI not found (npx skills --version failed) — find_skill/add_skill tools disabled for this session.'));
+    console.log(dim('[WARN] "skills" CLI not found (npx skills --version failed) — find_skill/add_skill tools disabled for this session.'));
     console.log(dim('       To enable them: run `npm install skills`, then verify with `npx skills find <query>`.'));
   }
 
@@ -926,7 +926,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     });
     candidateRef.current = candidate;
 
-    console.log(dim(`[verify] checking proxy v3 and model `) + choice + dim(` with prompt "${VERIFY_PROMPT}"`));
+    console.log(dim(`[proxy] checking proxy v3 and model `) + choice + dim(` with prompt "${VERIFY_PROMPT}"`));
     let replyText = '';
     let sawError = false;
     const unsubscribe = candidate.subscribe((event) => {
@@ -937,7 +937,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         const last = candidate.state.messages[candidate.state.messages.length - 1] as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
         if (last?.role === 'assistant' && last.stopReason === 'error') {
           sawError = true;
-          console.error(`[verify] verifying failed: ${last.errorMessage ?? 'unknown error'}`);
+          console.error(`[proxy] verifying failed: ${last.errorMessage ?? 'unknown error'}`);
         }
       }
     });
@@ -945,18 +945,18 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       await candidate.prompt(VERIFY_PROMPT);
     } catch (err) {
       sawError = true;
-      console.error(`[verify] verifying failed: ${(err as Error).message}`);
+      console.error(`[proxy] verifying failed: ${(err as Error).message}`);
     } finally {
       unsubscribe();
     }
 
     if (sawError || !replyText.trim()) {
-      if (!sawError) console.error('[verify] verifying failed: model returned an empty reply.');
+      if (!sawError) console.error('[proxy] verifying failed: model returned an empty reply.');
       console.log(dim('Pick a different model.'));
       continue;
     }
 
-    console.log(dim(`[reply] ${replyText.trim()}`));
+    console.log(dim(`[proxy] replied ${replyText.trim()}`));
     selectedAlias = choice;
     agent = candidate;
   }
@@ -967,7 +967,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   let budget: Budget | null = null;
   while (!budget) {
     const raw = await promptText(
-      '\n[budget] Set task budget (e.g. 1000000 or 1m for tokens, e.g. 40 for turns), /quit or /exit to end.\nOr leave blank as DEFAULT budget (5m tokens && 100 turns):',
+      '\n[π budget] Set task budget (e.g. 1000000 or 1m for tokens, e.g. 40 for turns), /quit or /exit to end.\nOr leave blank as DEFAULT budget (5m tokens && 100 turns):',
       BUDGET_PROMPT_DEFAULT,
     );
     if (raw === null || QUIT_COMMANDS.has(raw.trim().toLowerCase())) {
@@ -985,10 +985,10 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     }
     budget = parseBudget(raw);
     if (!budget) {
-      console.error(`[budget] Could not parse "${raw}" — enter a bare integer for turns (e.g. 20) or a k/m-suffixed value for tokens (e.g. 50k), or leave blank for the default.`);
+      console.error(`[π budget] Could not parse "${raw}" — enter a bare integer for turns (e.g. 20) or a k/m-suffixed value for tokens (e.g. 50k), or leave blank for the default.`);
     }
   }
-  console.log(dim(`[Budget: ${formatBudget(budget)}]`));
+  console.log(dim(`[budget: ${formatBudget(budget)}]`));
 
   // Proxy-request logging (e.g. "/v1/messages for ... to ..." and the
   // per-request upstream summary line, both logged at info) is very noisy
@@ -1087,7 +1087,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // show a stable suffix so the line doesn't keep flickering for no
     // reason between the agent's text deltas.
     const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
-    const line = dim(`[${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results] ${skillsList}|${toolsList} ${dots}`);
+    const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList}|${toolsList} ${dots}`);
     if (isStderrTty) {
       process.stderr.write(`\r\x1b[K${line}`);
     } else {
@@ -1156,7 +1156,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // them?") — it's appended to the same transcript via prompt(), not a fresh
     // conversation, so the agent picks up right where it left off. Blank input
     // or /q, /quit, /exit end the session early, without waiting for budget.
-    let task = await promptText('\n[task] What do you want the agent to do?');
+    let task = await promptText('\n[π task] What do you want the agent to do?');
     while (task !== null && !QUIT_COMMANDS.has(task.trim().toLowerCase()) && task.trim() && !budgetHit) {
       committedForTurn = false;
       printProcessLog();
@@ -1167,7 +1167,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           await runningAgent.continue();
         }
       } catch (err) {
-        console.error(`\n[agent] Agent run failed: ${(err as Error).message}`);
+        console.error(`\n[π agent] run failed: ${(err as Error).message}`);
       }
 
       // Commit the in-place process-log line so the post-run summary and the
@@ -1186,7 +1186,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
             modified.length > 0 ? `modified: ${modified.join(', ')}` : null,
           ].filter(Boolean).join(' | ');
       console.log(dim(
-        `\n[${budgetHit ? 'Budget reached' : 'Task done'} (${tokensUsed} tokens, ${turnsUsed} turns used, budget limit: ${formatBudget(budget)})]\n` +
+        `\n[π ${budgetHit ? 'Budget reached' : 'task done'} (${tokensUsed} tokens, ${turnsUsed} turns used, budget limit: ${formatBudget(budget)})]\n` +
         `${changeSummary}\n`,
       ));
 
@@ -1195,12 +1195,12 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         // explicit acknowledgment before exiting so this reads as a deliberate
         // stop, not a hang (Rule 8: fail loud, don't just trail off).
         commitProcessLog();
-        await promptText('\nBudget reached — press enter or type /q to exit:');
+        await promptText('\n[π budget] reached — press enter or type /q to exit:');
         restoreTerminalTitle();
         break;
       }
       commitProcessLog();
-      task = await promptText('\nNext task' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+      task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
     }
     // Sign off on a user-initiated exit (blank input, /q, /quit, /exit, or a
     // cancelled prompt). Not printed when the budget stopped the run — that
@@ -1208,7 +1208,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // the session ended on its own terms rather than because the user asked.
     if (!budgetHit) {
       commitProcessLog();
-      console.log(dim('bye!'));
+      console.log(dim('π: bye!'));
       restoreTerminalTitle();
     }
   } finally {

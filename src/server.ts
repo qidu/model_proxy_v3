@@ -6,7 +6,7 @@
 
 import { createServer } from 'http';
 import type { Env } from './types/shared.js';
-import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit } from './utils/config-loader.js';
+import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit, resolveDefaultProxyConfigPath } from './utils/config-loader.js';
 import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled } from './utils/dashboard-stats.js';
 import { runCli } from './cli.js';
 
@@ -42,7 +42,7 @@ const env: NodeEnv = {
   MESSAGES_UPSTREAM_MODE: (process.env.MESSAGES_UPSTREAM_MODE as 'native' | 'openai-completions') || 'openai-completions',
   INTERACTIONS_UPSTREAM_MODE: (process.env.INTERACTIONS_UPSTREAM_MODE as 'native' | 'openai-completions') || 'native',
   GENERATE_CONTENT_UPSTREAM_MODE: (process.env.GENERATE_CONTENT_UPSTREAM_MODE as 'native' | 'openai-completions') || 'native',
-  PROXY_CONFIG_PATH: process.env.PROXY_CONFIG_PATH || (process.env.TEST_CONFIG ? `./${process.env.TEST_CONFIG}proxy_config.toml` : './proxy_config.toml'),
+  PROXY_CONFIG_PATH: process.env.PROXY_CONFIG_PATH || (process.env.TEST_CONFIG ? `./${process.env.TEST_CONFIG}proxy_config.toml` : resolveDefaultProxyConfigPath()),
   PROXY_CONFIG_CONSUL: process.env.PROXY_CONFIG_CONSUL,
   PROXY_CONFIG_APOLLO: process.env.PROXY_CONFIG_APOLLO,
   PORT: process.env.PORT || '8788',

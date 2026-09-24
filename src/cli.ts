@@ -7,7 +7,8 @@
  * starts as before.
  *
  * Config is read from the local TOML file only ($PROXY_CONFIG_PATH, default
- * ./proxy_config.toml) — Consul/Apollo remote sources are not consulted here.
+ * resolved by resolveDefaultProxyConfigPath()) — Consul/Apollo remote sources
+ * are not consulted here.
  */
 
 import { readFileSync } from 'fs';
@@ -17,6 +18,7 @@ import {
   getModelNamesInConfig,
   loadProxyConfigFromPath,
   parseSimpleToml,
+  resolveDefaultProxyConfigPath,
   toDashboardConfigPayload,
   type ConfigValidationError,
   type OpenClawConfig,
@@ -46,7 +48,9 @@ Options:
   --default-model <id> Model named as defaultModel in --export-pi-models (must be a
                        configured model or alias; defaults to the first one)
 
-Config is read from the local TOML file at $PROXY_CONFIG_PATH (default ./proxy_config.toml).
+Config is read from the local TOML file at $PROXY_CONFIG_PATH. When unset, the
+default is ./proxy_config.toml if it exists, else
+~/.config/model-proxy-v3/proxy_config.toml.
 
 --export-pi-models prints defaultProvider/defaultModel (for ~/.pi/agent/settings.json)
 plus the providers block (for ~/.pi/agent/models.json).
@@ -115,7 +119,7 @@ export function runCli(argv: string[], env: Env): number | null {
     return usageError(`--default-model is only supported with --export-pi-models`);
   }
 
-  const configPath = env.PROXY_CONFIG_PATH || './proxy_config.toml';
+  const configPath = env.PROXY_CONFIG_PATH || resolveDefaultProxyConfigPath();
 
   switch (command) {
     case '--list-models':

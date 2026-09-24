@@ -5,6 +5,22 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(config): resolve the default config path in the working directory or the home directory
+
+When `PROXY_CONFIG_PATH` is unset, the default is no longer the bare relative
+`./proxy_config.toml`. `resolveDefaultProxyConfigPath()`
+(`src/utils/config-loader.ts`) now returns `./proxy_config.toml` when it exists
+(the repo checkout in dev), else `~/.config/model-proxy-v3/proxy_config.toml`,
+creating the home directory (`~/.config/model-proxy-v3`) so there is somewhere to
+drop a config. Used by both `src/server.ts` and `src/cli.ts`; the RPC and
+dashboard paths read `env.PROXY_CONFIG_PATH`, so they inherit it.
+
+This is what lets the Tauri tray spawn the SEA sidecar with no environment
+(`docs/design_tauri_tray.md` §7): a GUI app's working directory is not the repo,
+so the old relative default read the wrong file or none. A config dropped in
+`~/.config/model-proxy-v3/` is now found. The `TEST_CONFIG` override in
+`src/server.ts` keeps precedence over this default.
+
 ### feat(rpc): add `--rpc` JSON-RPC 2.0 control channel on stdio
 
 `--rpc` starts a newline-delimited JSON-RPC 2.0 server on stdio alongside the

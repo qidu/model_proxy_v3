@@ -132,6 +132,13 @@ requires instrumenting the hot path, which is explicitly declined) and `log`
 (stderr already carries logs — see the transport paragraph above; emitting them
 on stdout would duplicate and risk interleaving with frames).
 
+That last point is about the *proxy* not emitting a `log` RPC notification, and
+it stands: the child still logs to stderr only. But a GUI launch has no terminal
+to read that stderr, so the **tray** mirrors each stderr line — and its own
+spawn-failure and exit diagnostics — to its window as a local Tauri event,
+`proxy://log` (`{line}`). This is a core→webview event, not part of the RPC
+surface, and the child is untouched by it.
+
 **Errors.** The five reserved codes are used exactly as specified; proxy-specific failures use the implementation-defined server range.
 
 | Code | Message | Used for |
@@ -248,9 +255,9 @@ The app is tray-first: it starts with no window, and the proxy lives as long as 
 | Export Provider Config ▸ | runs `--export-pi-models` or `--export-openclaw-providers` and shows the block in the window |
 | Quit | sends `shutdown`, then exits the app |
 
-**Icon state carries the status:** green running, grey stopped, amber when the last `config.reload` reported an error. A tray icon is the only status surface visible when the window is hidden, so the three states must be distinguishable at icon size.
+**Icon state carries the status:** green running, grey stopped, amber when the last `config.reload` reported an error or when the child exited unexpectedly. A requested Stop is grey, not amber: the tray records that it asked for the shutdown, and treats any other exit with a non-zero code (or a signal) as a failure. A tray icon is the only status surface visible when the window is hidden, so the three states must be distinguishable at icon size.
 
-**Window behaviour.** The window is the app's **own status/export surface** — tray state, live counters, the resolved config path, the last export block — and it is not the dashboard. Open Dashboard hands `/dashboard` to the system browser instead, so the window still says something when the child is down; a webview pointed at a server the app itself stopped is a blank page. Left click opens the window; the menu is bound to right click (`show_menu_on_left_click(false)`). Closing the window hides it — only Quit stops the proxy.
+**Window behaviour.** The window is the app's **own status/export surface** — tray state, live counters, the resolved config path, the last export block, and a live **LOG** section carrying the child's stderr (the `proxy://log` event above; the UI caps the buffer) — and it is not the dashboard. Open Dashboard hands `/dashboard` to the system browser instead, so the window still says something when the child is down; a webview pointed at a server the app itself stopped is a blank page. Left click opens the window; the menu is bound to right click (`show_menu_on_left_click(false)`). Closing the window hides it — only Quit stops the proxy.
 
 **Platform note.** Tray mouse events (`Click`, `DoubleClick`, `Enter`, `Move`, `Leave`) are not emitted on Linux; the menu still works there, so nothing may depend on hover or click handlers.
 
@@ -258,8 +265,8 @@ The app is tray-first: it starts with no window, and the proxy lives as long as 
 
 The tray ships the proxy, so the build order is fixed: build the SEA binary first, then the Tauri bundle.
 
-1. `npm run build:native` → `dist/model-proxy-v3-macos-arm64` (or `-linux-x64`, `-win.exe`).
-2. Copy it into `src-tauri/binaries/` with the target-triple suffix `externalBin` requires.
+1. `npm run build:native` → `dist/model-proxy-v3-<host-triple>`, e.g. `model-proxy-v3-aarch64-apple-darwin`.
+2. Copy it into `src-tauri/binaries/` under the same name — `build-sea.js` already names it with the target triple `externalBin` requires.
 3. `tauri build` → an app bundle with the proxy inside.
 
 **No cross-compilation at either layer.** `scripts/build-sea.js` embeds a copy of the Node that ran it, so the binary is bound to that platform and architecture, and the Tauri bundle is per-platform too. CI must run the whole chain on each target runner — the same shape the repo already needs for native releases.
@@ -270,6 +277,8 @@ The tray ships the proxy, so the build order is fixed: build the SEA binary firs
 
 **Windows caveat.** The build excludes `@github/keytar`, so `store_key_in_system = true` falls back to the in-binary body store, which keeps keys in plaintext inside the executable and needs a writable directory. That is a real difference from the macOS and Linux builds and belongs in the UI or the README.
 
+**Windows inbound rule.** A tray-launched proxy is reachable from other hosts only if Windows Defender allows inbound traffic to it, so a start ensures an inbound allow rule for the bundled `model-proxy-v3.exe` (`src-tauri/src/firewall.rs`, the `windows_firewall` crate; program-scoped, so any port and protocol). Adding a rule needs Administrator and the tray is not elevated, so this is best-effort: the outcome is mirrored to the window's LOG (the `proxy://log` event above) and the proxy starts regardless.
+
 ## 7. Open questions and risks
 
 | Question | Why it matters | Leaning |
@@ -278,7 +287,7 @@ The tray ships the proxy, so the build order is fixed: build the SEA binary firs
 | ~~How is RPC mode selected — `--rpc` flag or `PROXY_RPC=1`?~~ | **Resolved: `--rpc` flag.** Handled in `server.ts` before `runCli()` (which rejects unknown args, `cli.ts:93-96`, and exits after every command, `server.ts:82-85`). Mutually exclusive with `TUI`/`AGENT`; fails loud rather than picking a winner. | `--rpc` |
 | Do logs move to stderr only in RPC mode, or always? | Always is simpler and matches container practice; RPC-only leaves today's console output untouched | Always — done; `AGENT=true`'s own reply output stays on stdout |
 | ~~Port 8788 already in use — adopt the running proxy or fail?~~ | **Resolved: fail loud** is the only option this transport allows — a process you did not spawn cannot be adopted over stdio. Adopting would require the rejected HTTP control path. | Fail loud |
-| Absolute `PROXY_CONFIG_PATH` on GUI launch | A GUI app's working directory is not the repo, so the relative default reads the wrong file or none | Pass explicitly |
+| ~~Absolute `PROXY_CONFIG_PATH` on GUI launch~~ | **Resolved: the binary resolves its own default.** A GUI app's working directory is not the repo, so the old relative default read the wrong file or none. `resolveDefaultProxyConfigPath()` (`config-loader.ts`) now tries the working directory, then `~/.config/model-proxy-v3/proxy_config.toml` (created when absent) — so the tray can spawn the sidecar with no env at all, and a dropped-in config in the home directory just works. | No `PROXY_CONFIG_PATH` needed |
 | Single instance | Two tray icons would fight over the same port | `tauri-plugin-single-instance` |
 | Windows key storage | The body store keeps keys in plaintext inside the executable | Accept, but surface it |
 
