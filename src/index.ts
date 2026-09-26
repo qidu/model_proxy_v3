@@ -6,6 +6,8 @@
  */
 
 import { Env } from './types/shared.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
 import { createErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { createLogger, type Logger } from './utils/logger.js';
@@ -2300,7 +2302,7 @@ export default {
             const clonedBody = attemptRequest.clone();
             const bodyText = await clonedBody.text();
             const { writeFileSync } = await import('fs');
-            writeFileSync('/tmp/test_model.log',
+            writeFileSync(join(tmpdir(), 'test_model.log'),
               `[${new Date().toISOString()}] proxy routing\n` +
               `path: ${path}\n` +
               `targetUrl: ${attemptTargetUrl}\n` +
@@ -2313,7 +2315,7 @@ export default {
           } catch (_e) {
             try {
               const { writeFileSync } = await import('fs');
-              writeFileSync('/tmp/test_model.log', `[${new Date().toISOString()}] proxy routing - failed to log request body: ${(_e as Error).message}\n`);
+              writeFileSync(join(tmpdir(), 'test_model.log'), `[${new Date().toISOString()}] proxy routing - failed to log request body: ${(_e as Error).message}\n`);
             } catch {}
           }
         }

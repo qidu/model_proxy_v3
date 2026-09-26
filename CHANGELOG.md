@@ -5,6 +5,26 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(cross-platform): replace hardcoded `/tmp` paths with `tmpdir()` and normalize `resolve()` to `join()`
+
+Seven debug log sites across `src/handlers/dashboard.ts`, `src/handlers/messages.ts`,
+`src/index.ts`, and `src/tui.ts` wrote to the literal string `/tmp/test_model.log`,
+which fails silently on Windows (no such directory). All now use
+`join(tmpdir(), 'test_model.log')` so the OS temp directory is resolved correctly
+on macOS (`/var/folders/.../T`), Linux (`/tmp`), and Windows (`%TEMP%`).
+
+Three error messages in `src/agent-tools.ts` reported blocking paths outside the
+literal string `/tmp/`, but the actual allowed temp root is `TMP_ROOT_RAW` (from
+`os.tmpdir()`). Messages now interpolate `${TMP_ROOT_RAW}` so the reported path
+matches the enforcement logic on every platform.
+
+Five path-construction sites in `src/agent-session.ts` used `resolve()` with
+embedded forward slashes (`'.pi/agent/skills'`, `'.agents/.skill-lock.json'`,
+`'.pi/skills'`) where `join()` is the correct API for joining path segments.
+Changed to `join()` for consistency with the rest of the codebase and to avoid
+the (harmless but misleading) appearance of POSIX-only paths in Windows builds.
+One `resolve()` at line 338 was kept for path normalization of user input.
+
 ### build(sea): name `build:native` output with the host target triple
 
 `outputName()` in `scripts/build-sea.js` now emits

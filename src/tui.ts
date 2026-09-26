@@ -41,6 +41,8 @@ import { formatApiKeyForUpstream } from './utils/routing.js';
 import { KEY_STORE_SERVICE, listSystemKeychainAccounts } from './utils/key-store.js';
 import { getModelRouteConfig } from './utils/config-loader.js';
 import { getModelQuota, formatQuota, formatQuotaLeft, getUpstreamRateLimitLeft, getUpstreamRateLimitLeftForUrl, type QuotaResult } from './utils/provider-quota.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const TEST_ENDPOINT = '/v1/messages';
 const TEST_TOOL_NAME = 'test_tool';
@@ -2716,7 +2718,7 @@ class DashboardApp {
     if (process.env.LOG_LEVEL === 'debug') {
       try {
         const fs = await import('fs');
-        fs.writeFileSync('/tmp/test_model.log',
+        fs.writeFileSync(join(tmpdir(), 'test_model.log'),
           `[${new Date().toISOString()}] test model request (tui)\n` +
           `target: ${endpoint}\n` +
           `upstreamMode: ${upstreamMode}\n` +
@@ -2743,7 +2745,7 @@ class DashboardApp {
         try {
           const fs = await import('fs');
           const responseText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody, null, 2);
-          fs.appendFileSync('/tmp/test_model.log',
+          fs.appendFileSync(join(tmpdir(), 'test_model.log'),
             `response status: ${response.status}\n` +
             `response body:\n${responseText}\n` +
             `---\n`,

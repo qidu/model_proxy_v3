@@ -5,6 +5,8 @@
  */
 
 import { Env } from '../types/shared.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { Logger, createLogger, logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
@@ -441,7 +443,7 @@ export async function handleMessagesRequest(
           const respClone = response.clone();
           const respBody = await respClone.text();
           const { appendFileSync } = await import('fs');
-          appendFileSync('/tmp/test_model.log',
+          appendFileSync(join(tmpdir(), 'test_model.log'),
             `[${new Date().toISOString()}] upstream response (openai-passthrough)\n` +
             `upstream url: ${targetUrl}\n` +
             `upstream status: ${response.status}\n` +
@@ -739,7 +741,7 @@ export async function handleMessagesRequest(
         const respClone = response.clone();
         const respBody = await respClone.text();
         const { appendFileSync } = await import('fs');
-        appendFileSync('/tmp/test_model.log',
+        appendFileSync(join(tmpdir(), 'test_model.log'),
           `[${new Date().toISOString()}] upstream response (claude->openai)\n` +
           `upstream url: ${targetUrl}\n` +
           `upstream status: ${response.status}\n` +

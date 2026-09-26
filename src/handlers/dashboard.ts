@@ -1,4 +1,6 @@
 import { Env } from '../types/shared.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   ProxyConfig,
   CompositeTargetPatch,
@@ -3599,7 +3601,7 @@ export async function handleDashboardTestModel(
     if (env.LOG_LEVEL === 'debug') {
       try {
         const fs = await import('fs');
-        fs.writeFileSync('/tmp/test_model.log',
+        fs.writeFileSync(join(tmpdir(), 'test_model.log'),
           `[${new Date().toISOString()}] test model request\n` +
           `target: ${endpoint}\n` +
           `upstreamMode: ${upstreamMode}\n` +
@@ -3625,7 +3627,7 @@ export async function handleDashboardTestModel(
       try {
         const fs = await import('fs');
         const responseText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody, null, 2);
-        fs.appendFileSync('/tmp/test_model.log',
+        fs.appendFileSync(join(tmpdir(), 'test_model.log'),
           `response status: ${testResponse.status}\n` +
           `response body:\n${responseText}\n` +
           `---\n`,

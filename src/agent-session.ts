@@ -84,7 +84,7 @@ const QUIT_COMMANDS = new Set(['/q', '/quit', '/exit']);
 // dist/cli.mjs): the "pi" agent target's global skills dir is ~/.pi/agent/skills,
 // distinct from project-scoped ".pi/skills" (used by add_skill, agent-tools.ts) and
 // distinct from other agents' global dirs (~/.claude/skills etc. are not pi-scoped).
-const GLOBAL_SKILLS_DIR = resolve(homedir(), '.pi/agent/skills');
+const GLOBAL_SKILLS_DIR = join(homedir(), '.pi/agent/skills');
 
 // ---------------------------------------------------------------------------
 // Minimal standalone pi-tui screens (picker + text prompt). The full
@@ -323,7 +323,7 @@ async function resolveWorkDir(input: string): Promise<{ dir: string; fallbackNot
   if (await isWritable(requested)) {
     return { dir: requested, fallbackNotice: null };
   }
-  const fallback = resolve(tmpdir(), `task-${randomUUID().slice(0, 8)}`);
+  const fallback = join(tmpdir(), `task-${randomUUID().slice(0, 8)}`);
   await mkdir(fallback, { recursive: true });
   return {
     dir: fallback,
@@ -334,7 +334,7 @@ async function resolveWorkDir(input: string): Promise<{ dir: string; fallbackNot
 async function loadSystemPrompt(workDir: string): Promise<string> {
   for (const filename of SYSTEM_PROMPT_FILENAMES) {
     try {
-      const content = await readFile(resolve(workDir, filename), 'utf-8');
+      const content = await readFile(join(workDir, filename), 'utf-8');
       if (content.trim()) return content;
     } catch {
       // not found / unreadable — try next filename
@@ -349,7 +349,7 @@ async function loadSystemPrompt(workDir: string): Promise<string> {
 // '.agents', '.skill-lock.json')). Reading it directly avoids depending on
 // `npx skills list -g`'s human-oriented (non-JSON, ANSI-colored) output as a
 // parse target.
-const SKILL_LOCK_PATH = resolve(homedir(), '.agents/.skill-lock.json');
+const SKILL_LOCK_PATH = join(homedir(), '.agents/.skill-lock.json');
 
 interface SkillLockEntry {
   source: string;
@@ -431,7 +431,7 @@ export async function gatherSkillCandidates(
     console.log(dim('[skills] pi-scoped skill loading disabled on win32 (upstream pi-agent-core bug: relativeEnvPath mishandles backslash paths) — see agent-session.ts gatherSkillCandidates.'));
   } else {
     const env = new NodeExecutionEnv({ cwd: workDir });
-    const projectSkillsDir = resolve(workDir, '.pi/skills');
+    const projectSkillsDir = join(workDir, '.pi/skills');
     const { skills, diagnostics } = await loadSkills(env, [projectSkillsDir, globalSkillsDir], BACKGROUND_CONTEXT);
     for (const diag of diagnostics) {
       console.log(dim(`[skills] ${diag.code}: ${diag.message} (${diag.path})`));
@@ -472,7 +472,7 @@ export async function loadSelectedSkills(workDir: string, candidates: SkillCandi
         (error) => (error ? rejectPromise(error) : resolvePromise()),
       );
     });
-    const skillsDir = resolve(workDir, '.pi/skills');
+    const skillsDir = join(workDir, '.pi/skills');
     const { skills, diagnostics } = await loadSkills(env, skillsDir, BACKGROUND_CONTEXT);
     const installed = skills.find((s) => s.name === name);
     if (!installed) {

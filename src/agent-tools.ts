@@ -171,7 +171,7 @@ function findPathEscapingRmMv(command: string, workDir: string): string | null {
     for (const target of args) {
       const resolved = resolveInWorkDir(workDir, target);
       if (!isPathAllowed(workDir, resolved)) {
-        return `${verb} targeting a path outside the working directory and outside /tmp/ (${target})`;
+        return `${verb} targeting a path outside the working directory and outside ${TMP_ROOT_RAW} (${target})`;
       }
     }
   }
@@ -225,7 +225,7 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
       // this session's model provider is the proxy itself, whatever it reads is
       // sent upstream as conversation context.
       if (!isPathAllowed(workDir, fullPath)) {
-        throw new Error(`Blocked: read_file path is outside the working directory and outside /tmp/ (${fullPath}).`);
+        throw new Error(`Blocked: read_file path is outside the working directory and outside ${TMP_ROOT_RAW} (${fullPath}).`);
       }
       const content = await readFile(fullPath, 'utf-8');
       return {
@@ -243,7 +243,7 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
     execute: async (_toolCallId: string, params: Static<typeof writeFileParams>) => {
       const fullPath = resolveInWorkDir(workDir, params.path);
       if (!isPathAllowed(workDir, fullPath)) {
-        throw new Error(`Blocked: write_file path is outside the working directory and outside /tmp/ (${fullPath}).`);
+        throw new Error(`Blocked: write_file path is outside the working directory and outside ${TMP_ROOT_RAW} (${fullPath}).`);
       }
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, params.content, 'utf-8');
