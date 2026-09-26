@@ -213,9 +213,9 @@ wildcards) and the behavioral notes on extended thinking (inline `#` comment sup
 third-party `anthropic-messages` endpoints, synthetic thinking signatures,
 `budget_tokens` vs `max_tokens`, the `kimi-k2.7-code` `thinking_budget` collision,
 tag-based and `reasoning_content` extraction) live in
-[`docs/configuration-guide.md`](./docs/configuration-guide.md).
+[`docs/getting-started/configuration-guide.md`](./docs/getting-started/configuration-guide.md).
 
-See [`proxy_config.example.toml`](./proxy_config.example.toml) for a fully commented config
+See [`proxy_config.example.toml`](./docs/getting-started/proxy_config.example.toml) for a fully commented config
 covering every section and option.
 
 ### 3. Run
@@ -264,7 +264,7 @@ composite-aliases panel each target model shows its usage left after the timing 
 e.g. `[0.11/2.12/63.93s] (58% left)` or `(6930/12000, 42% left)` for count-based
 providers. The TUI key bindings, the
 `model_proxy_tokens.jsonl` usage-dump format, and the startup stats-restoration rules
-are documented in [`docs/live-stats.md`](./docs/live-stats.md).
+are documented in [`docs/guides/live-stats.md`](./docs/guides/live-stats.md).
 
 ## CLI Commands
 
@@ -322,8 +322,8 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /config-reload` | Reload config from `PROXY_CONFIG_CONSUL` or `PROXY_CONFIG_APOLLO`. Only meaningful when a remote config source is set; returns `400`/`500` otherwise. Clears the config cache and re-fetches. |
 | `GET /health` (also `GET /`) | Health check. Probes the resolved default-category / `[default_upstream]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
-| `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api-endpoints.md#dynamic-routing). |
-| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
+| `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
+| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
 
 A Gemini `/v1/models/{model}:...` variant exists for each `/v1beta/models/{model}:...`
 endpoint. `:countTokens` is supported too: native Gemini routes forward to Gemini
@@ -340,7 +340,7 @@ The mode is selected by the route's `defaultMode` / model config:
 |---|---|---|---|---|---|
 | `POST /v1/messages` | **Native passthrough** to `/v1/messages`; request stays Claude Messages format end-to-end. | **Direct transform**: Claude Messages → Chat Completions → Claude Messages. If input is already OpenAI-shaped, it can pass through. | **Indirect transform via `openai-completions`**: Claude Messages → Chat Completions → Responses `input` → Claude Messages. Basic tools and streaming are supported; `max_tokens` is rewritten to `max_output_tokens`. | **Direct transform**: Claude Messages → Gemini generateContent → Claude Messages. | **Direct transform**: Claude Messages → Gemini Interactions/generateContent-compatible upstream → Claude Messages. |
 | `POST /v1/responses` | **Direct transform**: Responses `input`/`instructions` → Claude Messages → Responses. Text and tool-use are supported for non-streaming and streaming. | **Direct transform**: Responses → Chat Completions → Responses. For `api.qnaigc.com`, keeps legacy `max_tokens`; otherwise uses `max_completion_tokens`. | **Native passthrough** to `/v1/responses`. | **Direct transform via Claude Messages**: Responses → Claude Messages → Gemini generateContent → Claude Messages → Responses. | **Direct transform via Claude Messages**: Responses → Claude Messages → Gemini Interactions/generateContent → Claude Messages → Responses. |
-| `POST /v1/chat/completions` | **Convert passthrough**: Chat Completions body is converted to Claude Messages format and forwarded to `/v1/messages`; response (streaming and non-streaming) is converted back to OpenAI completions format. Tool schema types are lowercased; `content: ""` on assistant messages with `tool_calls` is normalized to `null`; consecutive tool messages are grouped into one user turn. | **Native passthrough**. Uses the resolved per-model route; composite aliases and `target`-mapped model ids are resolved and the `model` field in the forwarded body is rewritten to the target model id. | **Transform passthrough**: Chat Completions body is converted to Responses `input` and forwarded to `/v1/responses` using the resolved per-model route. | **Transform passthrough**: Chat Completions body (including `image_url` blocks) is converted to Gemini `generateContent` body (`inline_data` for data-URI images; http(s) image URLs are fetched server-side with an SSRF guard) and forwarded to `:generateContent` / `:streamGenerateContent?alt=sse`. Text deltas and `finishReason` round-trip; tool-call/thinking response parts and any model-generated image output are dropped (response schemas for Claude Messages and OpenAI Completions do not carry image output — see [image I/O notes](./docs/api-endpoints.md#image-inputoutput-across-format-boundaries)). | Same as `gemini-generatecontent`; not separately wired today. |
+| `POST /v1/chat/completions` | **Convert passthrough**: Chat Completions body is converted to Claude Messages format and forwarded to `/v1/messages`; response (streaming and non-streaming) is converted back to OpenAI completions format. Tool schema types are lowercased; `content: ""` on assistant messages with `tool_calls` is normalized to `null`; consecutive tool messages are grouped into one user turn. | **Native passthrough**. Uses the resolved per-model route; composite aliases and `target`-mapped model ids are resolved and the `model` field in the forwarded body is rewritten to the target model id. | **Transform passthrough**: Chat Completions body is converted to Responses `input` and forwarded to `/v1/responses` using the resolved per-model route. | **Transform passthrough**: Chat Completions body (including `image_url` blocks) is converted to Gemini `generateContent` body (`inline_data` for data-URI images; http(s) image URLs are fetched server-side with an SSRF guard) and forwarded to `:generateContent` / `:streamGenerateContent?alt=sse`. Text deltas and `finishReason` round-trip; tool-call/thinking response parts and any model-generated image output are dropped (response schemas for Claude Messages and OpenAI Completions do not carry image output — see [image I/O notes](./docs/api/api-endpoints.md#image-inputoutput-across-format-boundaries)). | Same as `gemini-generatecontent`; not separately wired today. |
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | **Indirect transform via `openai-completions`**: generateContent → Chat Completions → Claude Messages → generateContent. Forwards upstream to `/v1/messages`; text, tool calls, and streaming text deltas return as Gemini `candidates[].content.parts`; tool calls become `functionCall` parts. | **Direct transform**: generateContent → Chat Completions → generateContent. Forwards upstream to `/v1/chat/completions`. | **Indirect transform via `openai-completions`**: generateContent → Chat Completions → Responses `input` → generateContent. Forwards upstream to `/v1/responses`; `system`/`developer` messages become Responses `instructions`; content-part arrays are normalized to text. | **Native passthrough** to `:generateContent` / `:streamGenerateContent` using the configured Gemini API version. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint using Interactions-compatible mode. |
 | `POST /v1/interactions` | **Indirect transform via `openai-completions`**: Interactions → Chat Completions → Claude Messages → Interactions. Forwards upstream to `/v1/messages`; text, tool calls, and streaming text deltas return in Interactions shape. | **Direct transform**: Interactions → Chat Completions → Interactions. Forwards upstream to `/v1/chat/completions`. | **Indirect transform via `openai-completions`**: Interactions → Chat Completions → Responses `input` → Interactions. Forwards upstream to `/v1/responses`; `system`/`developer` messages become Responses `instructions`; content-part arrays are normalized to text. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint using Interactions-compatible mode. |
 | `GET /v1/models` | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. |
@@ -351,7 +351,7 @@ Notes:
 - **Direct transform** means the proxy converts directly between the client endpoint format and the selected upstream family, then converts the response directly back to the client endpoint shape.
 - **Direct transform via Claude Messages** means Responses uses Claude Messages as its internal bridge before calling Gemini; it does not go through `openai-completions`.
 - **Indirect transform via `openai-completions`** means the request body is routed through OpenAI Chat Completions as an intermediate shape before reaching the target upstream family. This covers two cases: (a) Gemini endpoint input becomes Chat Completions, then becomes Claude Messages or OpenAI Responses; (b) `/v1/messages` routed to an `openai-responses` upstream becomes Chat Completions, then Responses `input`. This reuses the Chat Completions middle mode for code reuse while preserving the original client endpoint response shape.
-- Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/routing-review.md) for tradeoffs and recommendations.
+- Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/architecture/routing-review.md) for tradeoffs and recommendations.
 
 
 ### Token usage statistics columns
@@ -376,7 +376,7 @@ Notes:
 
 ### Endpoint details
 
-Additional endpoint behavior is documented in [`docs/api-endpoints.md`](./docs/api-endpoints.md):
+Additional endpoint behavior is documented in [`docs/api/api-endpoints.md`](./docs/api/api-endpoints.md):
 
 - **Dynamic routing** — per-request upstream override routes `/{protocol}/{host}/...` with an SSRF allowlist (`ALLOWED_HOSTS`).
 - **Image input/output across format boundaries** — wire shapes, source-shape handling, who fetches HTTP image URLs, and the model-generated-image limits.
@@ -397,7 +397,7 @@ Incoming model names resolve through three stacked logic levels (see the
   the proxy never sets, modifies, or caps it. **Some upstreams require `max_tokens`**
   (e.g. DeepSeek's Anthropic-compatible API rejects requests without it) — configure
   `max_tokens` on those target entries, since the proxy no longer injects a default.
-  See [`docs/configuration-reference.md`](./docs/configuration-reference.md).
+  See [`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md).
   `[models.FREE]` and `[models.EMBEDDING]` are exact-only;
   in `[models.FREE]` the configured key always wins, elsewhere the caller's key wins
   by default (`auth_passthrough_with`).
@@ -420,12 +420,12 @@ Incoming model names resolve through three stacked logic levels (see the
 > upstream model returns, not the alias they requested. To echo the requested
 > alias back instead, attach the `restore_client_model_alias` transform
 > built-in to the route — see
-> [`docs/transforms-reference.md`](./docs/transforms-reference.md#restore_client_model_alias--echo-the-requested-alias-back-to-the-client).
+> [`docs/reference/transforms-reference.md`](./docs/reference/transforms-reference.md#restore_client_model_alias--echo-the-requested-alias-back-to-the-client).
 
 The full reference — category lookup priority tables, `base_url`/`api_key` override and
 "who wins" rules, every composite/fusion/coordinator/schedule option, the token-limit
 windowing engine, and worked examples — lives in
-[`docs/routing-and-aliases.md`](./docs/routing-and-aliases.md).
+[`docs/reference/routing-and-aliases.md`](./docs/reference/routing-and-aliases.md).
 
 ## Routing Hierarchy (Logic Levels)
 
@@ -455,7 +455,7 @@ level below* gets to serve this request:
 
 
 Level-by-level details and worked request-resolution examples are in
-[`docs/routing-and-aliases.md`](./docs/routing-and-aliases.md#routing-hierarchy-logic-levels--details).
+[`docs/reference/routing-and-aliases.md`](./docs/reference/routing-and-aliases.md#routing-hierarchy-logic-levels--details).
 
 ## Deployment
 
@@ -470,7 +470,7 @@ docker run --network host -p 8788:8788 -v $(pwd)/proxy_config.toml:/app/proxy_co
 ```
 
 For higher throughput, run several containers behind an nginx reverse proxy that load-balances across them.
-Refer to docs/nginx_conf/ for nginx configuration examples.
+Refer to docs/reference/nginx_conf/ for nginx configuration examples.
 
 ### npm
 
@@ -521,7 +521,7 @@ The output is named `<name>-<host target triple>` (e.g.
 A ready-to-use system tray for this proxy lives in
 `git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
 its sidecar and supervises it over the `--rpc` JSON-RPC control channel
-(design: [`docs/design_tauri_tray.md`](./docs/design_tauri_tray.md)).
+(design: [`docs/architecture/design_tauri_tray.md`](./docs/architecture/design_tauri_tray.md)).
 
 `scripts/build-sea.js` bundles the server into one Node SEA executable. The
 output *is* a copy of the Node that built it, so that Node must be an official,
@@ -560,13 +560,13 @@ service (`[remote] record_server`) that collects per-request usage records after
 the response. The exact wire-level contract — request/response shapes, forwarded headers,
 the `one_time_auth_code` (OTAC) linkage, `auth_with_model` / `auth_with_body` timing, the
 auth `targets[]` failover ladder, and how to combine both services in one backend — is
-documented in [`docs/auth-stats-protocol.md`](./docs/auth-stats-protocol.md).
+documented in [`docs/reference/auth-stats-protocol.md`](./docs/reference/auth-stats-protocol.md).
 
 ## Configuration Reference
 
 Most users only need `proxy_config.toml`; optional environment variables tune behavior.
 The full field-by-field reference lives in
-[`docs/configuration-reference.md`](./docs/configuration-reference.md):
+[`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md):
 
 - **TOML sections** — `[general]`, `[default_upstream]`, `[remote]`,
   `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[dashboard]`,
@@ -650,14 +650,14 @@ The full field-by-field reference lives in
   (`PROXY_CONFIG_PATH` / `PROXY_CONFIG_CONSUL` / `PROXY_CONFIG_APOLLO`), token counting &
   upstream, and the privacy-filter / compression / image-encode sidecars.
 
-Also see [`proxy_config.example.toml`](./proxy_config.example.toml) and
-[`docs/README_DETAILS.md`](./docs/README_DETAILS.md).
+Also see [`proxy_config.example.toml`](./docs/getting-started/proxy_config.example.toml) and
+[`docs/getting-started/README_DETAILS.md`](./docs/getting-started/README_DETAILS.md).
 
 **Config field aliases** — The proxy accepts both canonical and short field names
 in different config contexts (e.g., `base_url`/`base`, `upstream_mode`/`mode`,
 `api_key`/`key`). The rules differ between `[models.*]` inline tables,
 section-level defaults, and `[passthrough]` entries. See
-[**Config field aliases**](./docs/configuration-reference.md#config-field-aliases)
+[**Config field aliases**](./docs/reference/configuration-reference.md#config-field-aliases)
 in the configuration reference for the full mapping tables.
 
 ## Testing
@@ -682,18 +682,18 @@ PROXY_URL=http://localhost:8788 API_KEY=sk-test node tests/run-integration-tests
 
 The [`docs/`](./docs/) folder has deep-dives on specific topics:
 
-- **Routing & aliases** — `docs/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `proxy_config.example.toml`, `docs/routing_refactor.md`, `docs/routing_config_revision.md`
-- **API endpoint details** — `docs/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
-- **Configuration guide** — `docs/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
-- **Configuration reference** — `docs/configuration-reference.md` (all TOML sections + environment variables)
-- **Auth & stats protocol** — `docs/auth-stats-protocol.md` (wire-level contract for the remote auth/stats sidecars)
-- **Config loading** — `docs/config_loader.md`
-- **Live stats** — `docs/live-stats.md` (TUI/web dashboard, JSONL usage-dump format, startup stats restoration)
-- **Thinking / reasoning** — `docs/claude-extended-thinking.md`, `docs/claude-adaptive-thinking.md`
-- **API formats** — `docs/claude-api-reference.md`, `docs/gemini-api-reference.md`, `docs/openai-api-reference.md`
-- **Fusion & composite design** — `docs/design_fusion_composite_alias.md`
-- **Request/response transform hooks** — `docs/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transform_defaults]` config) — plus `docs/design_request_transform_hooks.md` (original design) and `docs/implementation_of_request_transform_hooks.md` (implementation log)
-- **Agent harness integrations** — [`docs/agents/`](./docs/agents/) (per-agent guides; e.g. [using this proxy as an LLM provider for deepseek-harness](./docs/agents/proxy-as-provider-for-deepseek-harness.md))
+- **Routing & aliases** — `docs/reference/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `proxy_config.example.toml`, `docs/architecture/routing_refactor.md`, `docs/architecture/routing_config_revision.md`
+- **API endpoint details** — `docs/api/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
+- **Configuration guide** — `docs/getting-started/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
+- **Configuration reference** — `docs/reference/configuration-reference.md` (all TOML sections + environment variables)
+- **Auth & stats protocol** — `docs/reference/auth-stats-protocol.md` (wire-level contract for the remote auth/stats sidecars)
+- **Config loading** — `docs/reference/config_loader.md`
+- **Live stats** — `docs/guides/live-stats.md` (TUI/web dashboard, JSONL usage-dump format, startup stats restoration)
+- **Thinking / reasoning** — `docs/guides/claude-extended-thinking.md`, `docs/guides/claude-adaptive-thinking.md`
+- **API formats** — `docs/api/claude-api-reference.md`, `docs/api/gemini-api-reference.md`, `docs/api/openai-api-reference.md`
+- **Fusion & composite design** — `docs/architecture/design_fusion_composite_alias.md`
+- **Request/response transform hooks** — `docs/reference/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transform_defaults]` config) — plus `docs/architecture/design_request_transform_hooks.md` (original design) and `docs/contributing/implementation_of_request_transform_hooks.md` (implementation log)
+- **Agent harness integrations** — [`docs/guides/agents/`](./docs/guides/agents/) (per-agent guides; e.g. [using this proxy as an LLM provider for deepseek-harness](./docs/guides/agents/proxy-as-provider-for-deepseek-harness.md))
 
 ## Interactive agent session (optional)
 

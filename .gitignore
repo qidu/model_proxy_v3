@@ -4,7 +4,7 @@ node_modules/
 dist/
 .sea-build/
 tests/__pycache__/
-docs/test_keys.md
+docs/getting-started/test_keys.md
 ./package-lock.json
 .git_audit_before_commiting
 .env
