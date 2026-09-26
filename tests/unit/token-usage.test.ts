@@ -145,7 +145,7 @@ describe('remote usage recording', () => {
     assert.equal(payload.request_id, 'req-1');
     assert.equal(payload.endpoint, '/v1/messages');
     assert.equal(payload.version, PROTOCOL_VERSION);
-    assert.equal(payload.user_key, 'sk-user');
+    assert.equal(payload.user_key, 'sk-user****');
     assert.equal(payload.model, 'claude-test');
     assert.equal(payload.input_tokens, 11);
     assert.equal(payload.cached_tokens, 3);
@@ -177,7 +177,7 @@ describe('remote usage recording', () => {
       assert.equal(calls.length, 1);
       assert.equal(calls[0].url, 'http://collector.test/usage');
       assert.equal(calls[0].headers.one_time_auth_code, 'one-time-token');
-      assert.equal(calls[0].body.user_key, 'sk-user');
+      assert.equal(calls[0].body.user_key, 'sk-user****');
       assert.equal(calls[0].body.total_tokens, 9);
     } finally {
       globalThis.fetch = originalFetch;

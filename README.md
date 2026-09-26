@@ -518,6 +518,10 @@ npm run build:native     # -> dist/model-proxy-v3-<host-triple>
 The output is named `<name>-<host target triple>` (e.g.
 `model-proxy-v3-x86_64-apple-darwin`), the same name the Tauri tray's
 `externalBin` stages the sidecar under, so it can be copied across unchanged.
+A ready-to-use system tray for this proxy lives in
+`git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
+its sidecar and supervises it over the `--rpc` JSON-RPC control channel
+(design: [`docs/design_tauri_tray.md`](./docs/design_tauri_tray.md)).
 
 `scripts/build-sea.js` bundles the server into one Node SEA executable. The
 output *is* a copy of the Node that built it, so that Node must be an official,
@@ -738,20 +742,22 @@ models you trust. See `src/agent-tools.ts` for the exact checks.
 
 ## Models and Tools
 ### Models Involved
-1. `DeepSeek-R1`, `V3.2`, `V4-Flash`, `V4-Pro`
+1. `DeepSeek-R1`, `V3.2`, `V4-Flash`, `V4-Pro`, `V4.1-Flash`
 2. `Minimax-M2.6`, `M2.7-highspeed`, `M3`
-4. `Kimi-K2.6`, `K2.7-Code`
-5. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`
-6. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
-7. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`
-8. `Nemotron-3-Super-120b`, `gpt-oss-120b`
-9. `GLM-5.2`, `GLM-5.3`
+3. `Kimi-K2.6`, `K2.7-Code`, `K3`
+4. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`, `GPT-5.6`
+5. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
+6. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`
+7. `Nemotron-3-Super-120b`, `gpt-oss-120b`, `Nemotron-3-ultra-550b-a55b`
+8. `GLM-5.2`, `GLM-5.3`
+9. `Qwen3.8-Max`
+10. `Grok-4.6`
 
 ### Tools Involved
-1. `Claude Code`
+1. `Claude-Code`
 2. `Kiro`
 3. `Gemini-Cli`
-4. `Pi`
+4. `Pi-Coding-Agent`
 5. `Codex`
 6. `opencode`
 7. `model_proxy_v3` (For over 90% of its lifecycle, it functions as a local LLM gateway and continuously improves itself with CC and models.)

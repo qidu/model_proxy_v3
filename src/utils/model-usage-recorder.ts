@@ -56,7 +56,7 @@ export function buildModelUsageRecordPayload(
     timestamp: new Date().toISOString(),
     endpoint,
     version: PROTOCOL_VERSION,
-    user_key: userKey,
+    user_key: userKey.slice(0, 16) + '****',
     model,
     response_status: responseStatus,
     input_tokens: toSafeNumber(usage.input_tokens),
