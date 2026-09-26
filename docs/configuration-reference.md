@@ -286,6 +286,89 @@ The `base` host is added to the shared SSRF allowlist alongside
 `[models.*].base_url` hosts, so it is also reachable through the
 `/http/<host>/…` dynamic route.
 
+## Config field aliases
+
+The proxy accepts both canonical and short field names in different config
+contexts. The table below summarizes which names are accepted where.
+
+### `[models.*]` inline tables (per-model overrides)
+
+Used in category sections like `[models.default]`, `[models.claude]`, etc.:
+
+```toml
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://api.example.com"
+api_key = "sk-..."
+
+# Per-model override (inline table)
+"my-model" = {target = "real-name", base_url = "https://custom.example.com", api_key = "sk-custom", mode = "openai-completions"}
+```
+
+| Canonical | Short aliases | Notes |
+|---|---|---|
+| `target` | — | **Required for custom/target models.** The upstream model name to route to. Not an alias — this is a distinct field. |
+| `base_url` | `base` | Upstream base URL. `base` is the short alias (changed from `url`). |
+| `api_key` | `key` | Upstream API key. |
+| `upstream_mode` | `mode` | Upstream protocol: `openai-completions`, `anthropic-messages`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. |
+| `transforms` | — | Transform set name (no short alias). |
+
+**Precedence**: When both canonical and short forms are present, the canonical form wins.
+
+### `[models.*]` section-level fields (category defaults)
+
+Fields set directly on the section (not in inline tables):
+
+```toml
+[models.default]
+upstream_mode = "openai-completions"   # ✓ canonical accepted
+base_url = "https://api.example.com"   # ✓ canonical accepted
+api_key = "sk-..."                     # ✓ canonical accepted
+mode = "openai-completions"            # ✗ REJECTED at load time
+base = "https://api.example.com"       # ✗ REJECTED at load time
+key = "sk-..."                         # ✗ REJECTED at load time
+```
+
+| Canonical | Short aliases | Notes |
+|---|---|---|
+| `upstream_mode` | **Not accepted** | Only canonical `upstream_mode` works at section level. |
+| `base_url` | **Not accepted** | Only canonical `base_url` works at section level. |
+| `api_key` | **Not accepted** | Only canonical `api_key` works at section level. |
+
+**Reason**: Section-level defaults must be explicit; short aliases are reserved for inline tables only.
+
+### `[passthrough]` inline tables
+
+One inline table per target under a single `[passthrough]` section:
+
+```toml
+[passthrough]
+openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
+gemini = {base = "https://generativelanguage.googleapis.com", mode = "gemini-generatecontent"}
+```
+
+| Canonical (short form) | Long aliases | Notes |
+|---|---|---|
+| `base` | `base_url`, `url` | **Short form `base` is canonical here.** Long aliases accepted. Required. |
+| `mode` | `upstream_mode` | **Short form `mode` is canonical here.** Required. |
+| `key` | `api_key` | **Short form `key` is canonical here.** Optional. |
+| `share` | — | Weight for weighted random selection. Default `1`. |
+| `timeout` | — | Per-target upstream timeout in ms. Optional. |
+
+**No `target` field**: The inline table key (e.g., `openai`, `gemini`) *is* the target identifier. There is no `target` field inside `[passthrough]` entries.
+
+### Legacy array format (deprecated but supported)
+
+```toml
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://api.example.com"
+# Old format: array of [target, base_url, api_key, mode]
+my-model = ["real-name", "https://custom.example.com", "sk-custom", "openai-completions"]
+```
+
+Positional only — no field names. Order: `target`, `base_url`, `api_key`, `mode`.
+
 ## Core / server environment variables
 
 | Variable | Default | Purpose |

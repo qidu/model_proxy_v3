@@ -2961,11 +2961,11 @@ export function parseSimpleToml(content: string): ProxyConfig {
           if (kv) fields[kv[1]] = kv[2] !== undefined ? kv[2] : kv[3];
         }
         // Inline model tables accept both canonical and short aliases:
-        //   target; upstream_mode | mode; base_url | url; api_key | key.
+        //   target; upstream_mode | mode; base_url | base; api_key | key.
         // Canonical (upstream_mode/base_url/api_key) wins when both are present.
         const target = fields['target'] ?? cleanKey;
         const mode = fields['upstream_mode'] ?? fields['mode'] ?? '';
-        const baseUrl = fields['base_url'] ?? fields['url'] ?? '';
+        const baseUrl = fields['base_url'] ?? fields['base'] ?? '';
         const apiKey = fields['api_key'] ?? fields['key'] ?? '';
         const entry: string[] = [target, baseUrl, apiKey, mode];
         if (fields['transforms']) entry.push(fields['transforms']);

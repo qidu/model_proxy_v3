@@ -98,7 +98,7 @@ Key ideas:
   `upstream_mode` for request/response shape.
 - **Per-model overrides** use an inline table: `"my-model" = {target = "real-name", base_url = "...", api_key = "..."}`.
   Empty fields inherit from the category. Both the canonical keys (`upstream_mode`, `base_url`,
-  `api_key`) and the short aliases (`mode`, `url`, `key`) are accepted; when both are present
+  `api_key`) and the short aliases (`mode`, `base`, `key`) are accepted; when both are present
   the canonical form wins.
 
 ## Notes on thinking / reasoning

@@ -649,6 +649,13 @@ The full field-by-field reference lives in
 Also see [`proxy_config.example.toml`](./proxy_config.example.toml) and
 [`docs/README_DETAILS.md`](./docs/README_DETAILS.md).
 
+**Config field aliases** — The proxy accepts both canonical and short field names
+in different config contexts (e.g., `base_url`/`base`, `upstream_mode`/`mode`,
+`api_key`/`key`). The rules differ between `[models.*]` inline tables,
+section-level defaults, and `[passthrough]` entries. See
+[**Config field aliases**](./docs/configuration-reference.md#config-field-aliases)
+in the configuration reference for the full mapping tables.
+
 ## Testing
 
 ```bash
