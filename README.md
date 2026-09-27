@@ -765,5 +765,3 @@ models you trust. See `src/agent-tools.ts` for the exact checks.
 ## License
 
 This project is licensed under the [MIT License](./LICENSE).
- 
- 
