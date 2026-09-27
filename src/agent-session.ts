@@ -79,7 +79,7 @@ const SYSTEM_PROMPT_FILENAMES = ['AGENTS.md', 'CLAUDE.md'];
 const DEFAULT_SYSTEM_PROMPT = 'You are a helpful coding assistant.';
 // Explicit end-the-session commands for the follow-up task prompt, alongside
 // blank input (both end the loop before the budget is reached).
-const QUIT_COMMANDS = new Set(['/q', '/quit', '/exit']);
+const QUIT_COMMANDS = new Set(['/q', '/quit', '/exit', '/bye']);
 // Confirmed via the `skills` CLI's own bundled agent registry (vercel-labs/skills,
 // dist/cli.mjs): the "pi" agent target's global skills dir is ~/.pi/agent/skills,
 // distinct from project-scoped ".pi/skills" (used by add_skill, agent-tools.ts) and
@@ -916,9 +916,12 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         model,
         tools: createAgentTools(workDir, {
           skillsCliAvailable,
-          getSystemPrompt: () => candidateRef.current!.state.systemPrompt,
-          setSystemPrompt: (prompt: string) => {
-            candidateRef.current!.state.systemPrompt = prompt;
+          appendSystemPrompt: (instructions: string) => {
+            const agent = candidateRef.current!;
+            agent.state.messages = [
+              ...agent.state.messages,
+              { role: 'system', content: instructions, timestamp: Date.now() },
+            ];
           },
         }),
       },

@@ -69,8 +69,7 @@ describe('createAgentTools — tool list', () => {
   it('adds find_skill/add_skill only when skillsCliAvailable is true', () => {
     const tools = createAgentTools(workDir, {
       skillsCliAvailable: true,
-      getSystemPrompt: () => '',
-      setSystemPrompt: () => {},
+      appendSystemPrompt: () => {},
     });
     assert.deepEqual(
       tools.map((t) => t.name),

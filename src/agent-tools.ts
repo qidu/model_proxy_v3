@@ -201,14 +201,14 @@ const addSkillParams = Type.Object({
  * `skillsCliAvailable` gates whether find_skill/add_skill are exposed at all
  * (probed once at session start in agent-session.ts — Rule 8: don't ship tools
  * that are present but always fail).
- * `getSystemPrompt`/`setSystemPrompt` let add_skill mutate the live Agent's
- * system prompt (agent.state.systemPrompt) without agent-tools.ts depending on
- * the Agent class directly.
+ * `appendSystemPrompt` lets add_skill append instructions to the live Agent's
+ * system prompt by pushing a system message — the pi-agent-core 0.87+ API
+ * derives the prompt by replaying transcript system messages, so mutation is
+ * append-only.
  */
 export interface AgentToolsOptions {
   skillsCliAvailable: boolean;
-  getSystemPrompt: () => string;
-  setSystemPrompt: (prompt: string) => void;
+  appendSystemPrompt: (instructions: string) => void;
 }
 
 export function createAgentTools(workDir: string, options?: AgentToolsOptions): AgentTool[] {
@@ -387,7 +387,7 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
         }
 
         const formatted = formatSkillInvocation(added);
-        options.setSystemPrompt(`${options.getSystemPrompt()}\n\n${formatted}`);
+        options.appendSystemPrompt(formatted);
         installedCount += 1;
 
         return {
