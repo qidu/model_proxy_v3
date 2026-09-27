@@ -5,7 +5,7 @@ import type { UsageStats } from './dashboard-stats.js';
  * Wire-contract era this proxy speaks, sent as `version` on every usage record.
  * The stats service does not validate it (the record POST is fire-and-forget),
  * but the field lets the collector tell which era of this contract produced the
- * record. See docs/auth-stats-protocol.md.
+ * record. See docs/architecture/auth-stats-protocol.md.
  */
 export const PROTOCOL_VERSION = 'v1';
 

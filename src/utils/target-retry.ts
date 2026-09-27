@@ -92,7 +92,7 @@ function isNonEmptyString(value: unknown): value is string {
 
 /**
  * Whether an auth `200` body advertises the required `version` field. The
- * version is a hard contract requirement (docs/auth-stats-protocol.md): a body
+ * version is a hard contract requirement (docs/architecture/auth-stats-protocol.md): a body
  * without a non-empty string `version` is rejected by the caller (401) before
  * any `targets[]` are parsed, so a legacy body-less auth service fails loudly
  * instead of being silently trusted. Only the `{ version, targets }` object form

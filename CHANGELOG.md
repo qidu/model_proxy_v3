@@ -431,7 +431,7 @@ The stats **response** body carries no `version`: only the auth `200` body
 advertises the contract era. `tests/scripts/mock-auth-stats-server.js` answers
 `/v1/model-usage` with `{ "ok": true }` (was `{ "version": "v1", "ok": true }`)
 and now logs the received `version` from each record; `PROTOCOL_VERSION` remains
-on the `/v1/validate` response. [docs/auth-stats-protocol.md](docs/auth-stats-protocol.md)
+on the `/v1/validate` response. [docs/architecture/auth-stats-protocol.md](docs/architecture/auth-stats-protocol.md)
 documents the auth `200` example body (`version` + a two-rung `targets[]`
 ladder) and the `ModelUsageRecordPayload` `version` field.
 
@@ -457,7 +457,7 @@ wire-contract era. The auth ladder moved out of the source into
 `tests/scripts/mock_targets.json`, which the server reads at startup (fails loud
 if missing or invalid); `MOCK_TARGETS_JSON` still overrides it inline. The
 `version` field is required by the proxy (see the entry above); see
-[docs/auth-stats-protocol.md](docs/auth-stats-protocol.md).
+[docs/architecture/auth-stats-protocol.md](docs/architecture/auth-stats-protocol.md).
 
 ### change(remote): raise the default `[remote] max_targets` ladder cap from 4 to 16
 
@@ -573,7 +573,7 @@ record_response_body  = false
   auth header, not adds to it) and needs no `auth_passthrough_with = "config_key"`
   opt-in; an entry without a `key` still forwards the caller's credential, so a
   ladder may mix server-pinned and caller-supplied keys. Documented as a Notice
-  in `README.md` and `docs/auth-stats-protocol.md`.
+  in `README.md` and `docs/architecture/auth-stats-protocol.md`.
 - **Two retry axes**: axis 1 advances the ladder on `429` / any `5xx` / transport
   (→`502`) / abort-timeout (→`504`), bounded by `max_targets`; a deterministic
   `4xx` is terminal. Axis 2 re-hits the same rung per a descriptor's `retry_on`,
@@ -1954,7 +1954,7 @@ relevant README summary section:
   composite/fusion/coordinator aliases (incl. `toolset` recipes), token
   limits windowing, schedule aliases, and the routing-hierarchy
   level-by-level details.
-- **`docs/auth-stats-protocol.md`** — wire-level contract for the
+- **`docs/architecture/auth-stats-protocol.md`** — wire-level contract for the
   remote auth and stats sidecars (requests, headers, OTAC linkage,
   dynamic routing override).
 - **`docs/configuration-reference.md`** — all TOML sections

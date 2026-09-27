@@ -560,7 +560,7 @@ service (`[remote] record_server`) that collects per-request usage records after
 the response. The exact wire-level contract — request/response shapes, forwarded headers,
 the `one_time_auth_code` (OTAC) linkage, `auth_with_model` / `auth_with_body` timing, the
 auth `targets[]` failover ladder, and how to combine both services in one backend — is
-documented in [`docs/reference/auth-stats-protocol.md`](./docs/reference/auth-stats-protocol.md).
+documented in [`docs/architecture/auth-stats-protocol.md`](./docs/architecture/auth-stats-protocol.md).
 
 ## Configuration Reference
 
@@ -686,7 +686,7 @@ The [`docs/`](./docs/) folder has deep-dives on specific topics:
 - **API endpoint details** — `docs/api/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
 - **Configuration guide** — `docs/getting-started/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
 - **Configuration reference** — `docs/reference/configuration-reference.md` (all TOML sections + environment variables)
-- **Auth & stats protocol** — `docs/reference/auth-stats-protocol.md` (wire-level contract for the remote auth/stats sidecars)
+- **Auth & stats protocol** — `docs/architecture/auth-stats-protocol.md` (wire-level contract for the remote auth/stats sidecars)
 - **Config loading** — `docs/reference/config_loader.md`
 - **Live stats** — `docs/guides/live-stats.md` (TUI/web dashboard, JSONL usage-dump format, startup stats restoration)
 - **Thinking / reasoning** — `docs/guides/claude-extended-thinking.md`, `docs/guides/claude-adaptive-thinking.md`

@@ -972,7 +972,7 @@ export default {
       let modelUsageOneTimeAuthCode: string | undefined;
       // Auth-response dynamic-routing override: when the auth server returns
       // HTTP 200 with a `targets[]` array, these become a failover ladder for
-      // this request (see docs/auth-stats-protocol.md). Empty ⇒ normal config
+      // this request (see docs/architecture/auth-stats-protocol.md). Empty ⇒ normal config
       // resolution. Populated in doAuthRequest once the body is read.
       let authTargets: RemoteTargetDescriptor[] = [];
       // Client-IP forwarding headers for the auth_server / record_server sidecars.
@@ -1173,7 +1173,7 @@ export default {
       // can rebuild a fresh Request per rung at dispatch — the body-parse `try`
       // below closes before dispatch, so `body` itself is not in scope there.
       // `useAuthLadder` is set when the auth server returned a `targets[]`
-      // override that owns routing for this request (see docs/auth-stats-protocol.md).
+      // override that owns routing for this request (see docs/architecture/auth-stats-protocol.md).
       let routeBody: Record<string, unknown> | undefined;
       let useAuthLadder = false;
       let isGeminiBypass = false;

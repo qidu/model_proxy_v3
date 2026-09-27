@@ -2,7 +2,7 @@
 /**
  * Standalone mock auth + stats sidecar for manual proxy testing.
  *
- * Implements the wire contract in docs/auth-stats-protocol.md so a proxy
+ * Implements the wire contract in docs/architecture/auth-stats-protocol.md so a proxy
  * configured with a `[remote]` auth_server / record_server can be driven
  * end-to-end without a real backend.
  *
