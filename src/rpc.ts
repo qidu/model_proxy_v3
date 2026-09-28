@@ -162,7 +162,8 @@ async function dispatch(source: RpcSource, method: string, params: Record<string
       return unwrap(handleDashboardAgentStats());
 
     case 'stats.requests': {
-      const data = await unwrap(handleDashboardRequestStats()) as Record<string, unknown>;
+      const config = await loadConfigOrThrow(source);
+      const data = await unwrap(handleDashboardRequestStats(config)) as Record<string, unknown>;
       const limit = params.limit;
       if (typeof limit === 'number' && Number.isInteger(limit) && limit >= 0) {
         for (const [key, value] of Object.entries(data)) {

@@ -115,6 +115,40 @@ export interface ProxyConfig {
    * Key = target name, value = target config with base URL, mode, share, etc.
    */
   passthrough?: Record<string, PassthroughTargetConfig>;
+
+  /**
+   * Tool Judge Sidecar configuration. When set, the proxy calls the sidecar
+   * to evaluate each tool's relevance against the user prompt before forwarding.
+   * The sidecar must respond within the timeout (default 50ms) with a relevance
+   * factor for each tool. Tools below the threshold are erased from the request.
+   * Fails OPEN — any sidecar error/timeout keeps all tools.
+   *
+   * The sidecar API:
+   *   POST {url}/judge
+   *   Request: { state: string, questions: { decision: { type: "choice", instructions: string, criteria: string[] } } }
+   *   Response: { answer: { decision: { type: "choice", decision: string, probabilities: { [key]: number } } } }
+   *   Or batch mode (noul):
+   *   Request: { state: string, questions: { keep: { type: "noul", instructions: string } } }
+   *   Response: { answer: { keep: { type: "noul", items: { [toolName]: number } } } }
+   *
+   * `mode`:
+   *   - "choice": per-tool decision (default, uses "decision" question with "keep"/"discard" criteria)
+   *   - "noul": batch scoring (uses "keep" question, returns score per tool)
+   */
+  tool_judge_sidecar?: {
+    /** Sidecar base URL (e.g., "http://localhost:8765"). Required to enable. */
+    url?: string;
+    /** Timeout in milliseconds (default: 50) */
+    timeout_ms?: number;
+    /** Minimum relevance threshold 0.0-1.0 (default: 0.5). Tools below are erased. */
+    threshold?: number;
+    /** Judging mode: "choice" (per-tool) or "noul" (batch). Default: "choice". */
+    mode?: 'choice' | 'noul';
+    /** Optional API key for sidecar authentication */
+    api_key?: string;
+    /** Maximum number of tools to send in a single batch request (default: 50) */
+    max_batch_tools?: number;
+  };
 }
 
 /**

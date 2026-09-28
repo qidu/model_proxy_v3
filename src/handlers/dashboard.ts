@@ -89,6 +89,14 @@ export interface DashboardSnapshot {
   toolStats: ReturnType<typeof getToolUsageStatsDesc>;
   agentToolStats: ReturnType<typeof getAgentToolPanelStats>;
   blockedTools: string[];
+  toolJudgeSidecar?: {
+    enabled: boolean;
+    url?: string;
+    mode?: 'choice' | 'noul';
+    threshold?: number;
+    timeout_ms?: number;
+    max_batch_tools?: number;
+  };
   requestStats: {
     endpoints: ReturnType<typeof getRequestEndpointStatsDesc>;
     upstreams: ReturnType<typeof getRequestUpstreamStatsDesc>;
@@ -168,6 +176,14 @@ export function getDashboardSnapshot(proxyConfig: ProxyConfig, env: Env): Dashbo
     toolStats: getToolUsageStatsDesc(),
     agentToolStats: getAgentToolPanelStats(),
     blockedTools: [...getBlockedTools()],
+    toolJudgeSidecar: proxyConfig.tool_judge_sidecar?.url ? {
+      enabled: true,
+      url: proxyConfig.tool_judge_sidecar.url,
+      mode: proxyConfig.tool_judge_sidecar.mode ?? 'choice',
+      threshold: proxyConfig.tool_judge_sidecar.threshold ?? 0.5,
+      timeout_ms: proxyConfig.tool_judge_sidecar.timeout_ms ?? 50,
+      max_batch_tools: proxyConfig.tool_judge_sidecar.max_batch_tools ?? 50,
+    } : { enabled: false },
     requestStats: {
       endpoints: getRequestEndpointStatsDesc(),
       upstreams: getRequestUpstreamStatsDesc(),
@@ -730,6 +746,13 @@ export function handleDashboardPage(env: Env): Response {
           <thead><tr><th>Metric</th><th class="num">Count</th></tr></thead>
           <tbody><tr><td>filtered Keys (total)</td><td class="num" id="privacyKeysDetected">0</td></tr></tbody>
         </table>
+      </div>
+
+      <div class="request-submodule" id="section-tool-judge-sidecar">
+        <h3>Tool Judge Sidecar</h3>
+        <div id="toolJudgeSidecarStatus">
+          <p style="color:#666;">Loading…</p>
+        </div>
       </div>
 
       <div class="request-submodule">
@@ -3109,12 +3132,39 @@ export function handleDashboardPage(env: Env): Response {
         URL.revokeObjectURL(url);
       });
 
+      function renderToolJudgeSidecar(sidecar) {
+        const container = document.getElementById('toolJudgeSidecarStatus');
+        if (!container) return;
+
+        if (!sidecar || !sidecar.enabled) {
+          container.innerHTML =
+            '<p style="color:#666;">Not configured</p>' +
+            '<p style="font-size:12px;color:#888;">Add <code>[tool_judge_sidecar]</code> section to config to enable</p>';
+          return;
+        }
+
+        const modeLabel = sidecar.mode === 'noul' ? 'Batch (noul)' : 'Single (choice)';
+        const thresholdPct = Math.round((sidecar.threshold || 0.5) * 100);
+
+        container.innerHTML =
+          '<table style="width:100%;border-collapse:collapse;">' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Status</td><td><span style="color:#2e7d32;font-weight:600;">Enabled</span></td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">URL</td><td><code style="font-size:12px;">' + escapeHtml(sidecar.url) + '</code></td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Mode</td><td>' + escapeHtml(modeLabel) + '</td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Threshold</td><td>' + thresholdPct + '% (score >= ' + (sidecar.threshold || 0.5).toFixed(2) + ' → keep)</td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Timeout</td><td>' + (sidecar.timeout_ms || 50) + ' ms</td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Max batch tools</td><td>' + (sidecar.max_batch_tools || 50) + '</td></tr>' +
+          '</table>';
+      }
+
       async function loadRequestStats() {
         const res = await dashboardFetch('/dashboard/api/stats/requests');
         const json = await res.json();
 
         const privacyEl = document.getElementById('privacyKeysDetected');
         if (privacyEl) privacyEl.textContent = fmtStat(json.privacy_keys_detected || 0);
+
+        renderToolJudgeSidecar(json.toolJudgeSidecar);
 
         renderRows('#requestUpstreamStats', json.upstreams || [], (row) =>
           '<tr><td>' + row.upstream_base_url + '</td><td class="num quota-cell" data-base="' + encodeURIComponent(row.upstream_base_url) + '">…</td><td class="num">' + row.responses + '</td></tr>'
@@ -3313,7 +3363,23 @@ export async function handleDashboardToggleToolBlock(request: Request): Promise<
   }
 }
 
-export function handleDashboardRequestStats(): Response {
+export function handleDashboardRequestStats(proxyConfig: ProxyConfig): Response {
+  // Build tool judge sidecar status for the dashboard
+  const sidecarConfig = proxyConfig.tool_judge_sidecar;
+  let toolJudgeSidecar = null;
+  if (sidecarConfig && sidecarConfig.url) {
+    toolJudgeSidecar = {
+      enabled: true,
+      url: sidecarConfig.url,
+      mode: sidecarConfig.mode || 'choice',
+      threshold: sidecarConfig.threshold ?? 0.5,
+      timeout_ms: sidecarConfig.timeout_ms ?? 50,
+      max_batch_tools: sidecarConfig.max_batch_tools ?? 50,
+    };
+  } else {
+    toolJudgeSidecar = { enabled: false };
+  }
+
   return jsonResponse({
     endpoints: getRequestEndpointStatsDesc(),
     upstreams: getRequestUpstreamStatsDesc(),
@@ -3323,6 +3389,7 @@ export function handleDashboardRequestStats(): Response {
     endpoint_timings: getRequestEndpointTimingStatsDesc(),
     model_timings: getRequestModelTimingStatsDesc(),
     privacy_keys_detected: getPrivacyKeysDetected(),
+    toolJudgeSidecar,
   });
 }
 

@@ -1761,6 +1761,17 @@ class DashboardApp {
       return;
     }
 
+    // Build tool judge sidecar status string for display
+    let sidecarStatus = '';
+    const sidecar = (snap as any).toolJudgeSidecar;
+    if (sidecar && sidecar.enabled) {
+      const modeLabel = sidecar.mode === 'noul' ? 'Batch (noul)' : 'Single (choice)';
+      const thresholdPct = Math.round((sidecar.threshold ?? 0.5) * 100);
+      sidecarStatus = `Tool Judge Sidecar: Enabled | ${modeLabel} | Threshold: ${thresholdPct}% | Timeout: ${sidecar.timeout_ms ?? 50}ms | Max batch: ${sidecar.max_batch_tools ?? 50} | ${sidecar.url}`;
+    } else {
+      sidecarStatus = 'Tool Judge Sidecar: Not configured (add [tool_judge_sidecar] to config)';
+    }
+
     if (this.overlay) this.hideOverlay();
     const overlay = new ListOverlay(
       'Tools Statitic and tool blocklist',
@@ -1792,6 +1803,7 @@ class DashboardApp {
         return false;
       },
     );
+    overlay.setStatus(sidecarStatus);
     this.overlay = this.tui.showOverlay(overlay, { width: '90%', maxHeight: '70%', anchor: 'center' });
     this.overlay.focus();
   }

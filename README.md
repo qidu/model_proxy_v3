@@ -205,7 +205,7 @@ npm install
 Copy the example config and edit it:
 
 ```bash
-cp proxy_config.example.toml proxy_config.toml
+cp docs/getting-started/proxy_config.example.toml proxy_config.toml
 ```
 
 A minimal-config walkthrough (model categories, `upstream_mode`, per-model overrides,
@@ -462,7 +462,7 @@ Level-by-level details and worked request-resolution examples are in
 **Docker**
 
 ```bash
-cp proxy_config.example.toml proxy_config.toml
+cp docs/getting-started/proxy_config.example.toml proxy_config.toml
 #COMMIT=$(git rev-parse --short HEAD)
 #docker build --network=host --build-arg VERSION=$COMMIT -t model-proxy-v3:$COMMIT -t model-proxy-v3:latest .
 docker build -t model-proxy-v3 .
@@ -682,7 +682,7 @@ PROXY_URL=http://localhost:8788 API_KEY=sk-test node tests/run-integration-tests
 
 The [`docs/`](./docs/) folder has deep-dives on specific topics:
 
-- **Routing & aliases** — `docs/reference/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `proxy_config.example.toml`, `docs/architecture/routing_refactor.md`, `docs/architecture/routing_config_revision.md`
+- **Routing & aliases** — `docs/reference/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `docs/getting-started/proxy_config.example.toml`, `docs/architecture/routing_refactor.md`, `docs/architecture/routing_config_revision.md`
 - **API endpoint details** — `docs/api/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
 - **Configuration guide** — `docs/getting-started/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
 - **Configuration reference** — `docs/reference/configuration-reference.md` (all TOML sections + environment variables)

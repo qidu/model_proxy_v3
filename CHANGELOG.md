@@ -5,6 +5,16 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(tool-judge): dynamic tool relevance filtering via sidecar
+
+Added a **Tool Judge Sidecar** system that evaluates each tool's relevance against the user prompt before forwarding to the upstream. The proxy calls a local HTTP sidecar (`POST {url}/judge`) with the request state and tool list; the sidecar returns a relevance score (0.0–1.0) per tool. Tools scoring below the configured threshold are erased from the request. Fails OPEN — any sidecar error, timeout, or malformed response keeps all tools and logs a warning.
+
+- **Config** — New `[tool_judge_sidecar]` section in `proxy_config.toml` with `url`, `timeout_ms` (default 50ms), `threshold` (default 0.5), `mode` ("choice" per-tool or "noul" batch), `api_key`, `max_batch_tools` (default 50).
+- **Integration** — Runs after privacy filter & kompress, before model routing and static blocklist (`src/index.ts:1329–1345`).
+- **Protocol** — HTTP/JSON with `state` + `questions` request; `choice` type returns per-tool `keep`/`discard` with probabilities; `noul` type returns batch scores per tool name.
+- **Dashboard** — Web dashboard (`/dashboard`) and TUI (`P` overlay) show sidecar status: enabled/disabled, URL, mode, threshold, timeout, max batch.
+- **Static blocklist merge** — Sidecar-erased tools are merged with the existing dashboard/TUI manual blocklist (`src/utils/tool-blocklist.ts`).
+
 ### fix(cross-platform): replace hardcoded `/tmp` paths with `tmpdir()` and normalize `resolve()` to `join()`
 
 Seven debug log sites across `src/handlers/dashboard.ts`, `src/handlers/messages.ts`,

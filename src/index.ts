@@ -89,6 +89,7 @@ import {
 } from './utils/privacy-filter.js';
 import { getKompressConfig, shouldCompressPath, compressBody } from './utils/kompress.js';
 import { eraseBlockedTools } from './utils/tool-blocklist.js';
+import { judgeTools } from './utils/tool-judge-sidecar.js';
 import { buildModelUsageRecordPayload, recordModelUsageToRemote } from './utils/model-usage-recorder.js';
 import { runHook, applyWriteoutBody, pipeEventTransformer, formatTransformsDebug, type HookContext } from './utils/request-transform.js';
 
@@ -838,7 +839,7 @@ export default {
       }
 
       if (path === '/dashboard/api/stats/requests' && request.method === 'GET') {
-        return applyCorsHeaders(handleDashboardRequestStats(), request, env);
+        return applyCorsHeaders(handleDashboardRequestStats(proxyConfig), request, env);
       }
 
       if (path === '/dashboard/api/test-model' && request.method === 'POST') {
@@ -1328,11 +1329,23 @@ export default {
             }
           }
 
+          // Tool Judge Sidecar: evaluate tool relevance against user prompt before
+          // blocking. Runs after privacy/kompress so it sees the final request body.
+          // Fails OPEN — any error/timeout keeps all tools.
+          let sidecarEraseNames: string[] = [];
+          const judgeResult = await judgeTools(body, proxyConfig, requestId);
+          if (judgeResult.called) {
+            sidecarEraseNames = judgeResult.eraseNames;
+            if (judgeResult.error) {
+              logger.warn(requestId, `Tool judge sidecar: ${judgeResult.error}`);
+            }
+          }
+
           // Erase blocked tools from the request body before routing so every
           // downstream path (single/composite/fusion) operates on the filtered
           // body. Mirrors the privacy-filter pattern above — mutate `body`, then
           // reserialize `bodyText` so the passthrough reconstruction picks it up.
-          const eraseResult = eraseBlockedTools(body, logger, requestId);
+          const eraseResult = eraseBlockedTools(body, logger, requestId, sidecarEraseNames);
           if (eraseResult.erasedNames.length > 0 || eraseResult.toolChoiceReset) {
             bodyText = JSON.stringify(body);
           }

@@ -561,6 +561,54 @@ openai-responses   = ["max_tokens_rename"]
 # timeout_ms = 40000                 # per-call timeout
 
 # ---------------------------------------------------------------------------
+# Tool Judge Sidecar — dynamic, context-aware tool filtering.
+#
+# When enabled, the proxy calls a local HTTP sidecar to evaluate each tool call
+# against the user prompt and returns a relevance score (0.0-1.0). Tools below
+# the threshold are erased from the request before forwarding to the upstream.
+#
+# Two modes:
+#   - "choice" (per-tool): Sidecar receives one tool at a time with the full
+#     user prompt as context. Returns {type: "choice", tool: "...",
+#     probabilities: {"keep": 0.8, "discard": 0.2}}.
+#   - "noul" (batch): Sidecar receives all tools at once with the user prompt.
+#     Returns {type: "noul", items: [{tool: "...", score: 0.8}, ...]}.
+#
+# Fail-open: If the sidecar times out, returns an error, or sends a malformed
+# response, ALL tools are kept (no filtering occurs). The proxy logs a warning
+# but continues normally.
+#
+# Expected sidecar response time: ~50ms per request.
+#
+# Example sidecar server (Python/Flask):
+#   from flask import Flask, request, jsonify
+#   app = Flask(__name__)
+#   @app.post("/judge")
+#   def judge():
+#       data = request.get_json()
+#       # Your ML model inference here - score each tool against the prompt
+#       questions = data.get("questions", {})
+#       if "keep" in questions:  # noul batch mode
+#           return jsonify({"type": "noul", "items": [{"tool": t["tool_name"], "score": 0.8} for t in questions["keep"].get("tools", [])]})
+#       return jsonify({"type": "choice", "tool": "example", "probabilities": {"keep": 0.8, "discard": 0.2}})
+#   app.run(port=8765)
+#
+# Integration: The sidecar is called at the `before_upstream` pipeline hook,
+# after privacy filtering and any request transforms, but before the model
+# routing and static tool blocklist are applied.
+#
+# To enable: set `url` to your sidecar endpoint. The presence of `url` is what
+# activates the feature (no separate `enabled` flag).
+[tool_judge_sidecar]
+# enabled = false        # derived from url presence (set url to enable)
+# url = "http://localhost:8765/judge"        # required to enable
+# mode = "noul"                               # "choice" (per-tool) or "noul" (batch)
+# threshold = 0.5                             # relevance threshold 0.0-1.0
+# timeout_ms = 50                             # sidecar timeout (default 50ms)
+# max_batch_tools = 50                        # batch size limit for noul mode
+# api_key = "optional-bearer-token"           # optional Authorization header
+
+# ---------------------------------------------------------------------------
 # Passthrough mode — verbatim forwarding of /passthrough/v1/* to configured upstreams.
 # ---------------------------------------------------------------------------
 #
