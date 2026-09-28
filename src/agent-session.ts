@@ -1090,7 +1090,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // show a stable suffix so the line doesn't keep flickering for no
     // reason between the agent's text deltas.
     const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
-    const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList}|${toolsList} ${dots}`);
+    const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList} | ${toolsList} ${dots}`);
     if (isStderrTty) {
       process.stderr.write(`\r\x1b[K${line}`);
     } else {

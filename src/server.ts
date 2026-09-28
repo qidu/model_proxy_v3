@@ -194,7 +194,7 @@ let agentSessionPromise: Promise<void> | undefined;
 
 server.listen(port, '0.0.0.0', async () => {
   console.log(`Server running on http://0.0.0.0:${port} (version: ${env.VERSION})`);
-  console.log(` and dashboard at http://0.0.0.0:${port}/dashboard`);
+  console.log(` and dashboard at http://127.0.0.1:${port}/dashboard`);
 
   if (env.DEV_NO_KEY === 'true' || env.DEV_NO_KEY === '1') {
     console.warn('[WARN] DEV_NO_KEY is enabled: model requests may omit authentication headers. Do not use in production.');

@@ -2434,7 +2434,7 @@ export function handleDashboardPage(env: Env): Response {
 
         const compositeBlocks = Object.entries(config.composite || {}).map(([aliasName, targets]) => {
           const rows = compositeEntryRows(aliasName, targets, compositeLimitWindowsSnapshot[aliasName])
-            + '<div class="section-actions"><button type="button" class="test-btn mini-btn" data-action="test-composite" data-alias="' + escapeHtml(aliasName) + '">test model</button>'
+            + '<div class="section-actions"><button type="button" class="test-btn mini-btn" data-action="test-composite" data-alias="' + escapeHtml(aliasName) + '">test it</button>'
             + ' <button type="button" class="mini-btn" data-action="add-composite-target" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add target</button>'
             + ' <button type="button" class="mini-btn danger" data-action="remove-composite-alias" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Remove alias</button></div>';
           const hasError = configErrorsList.some((e) => e.path === 'composite.' + aliasName);
@@ -2662,7 +2662,14 @@ export function handleDashboardPage(env: Env): Response {
         const panel = document.getElementById('testResultPanel');
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
         panel.className = 'testing';
-        panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(modelId) + '…';
+
+        // Timer to show elapsed seconds during testing
+        const startTime = Date.now();
+        const testResultTimer = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(modelId) + ' takes ' + elapsed + 's …';
+        }, 1000);
+
         panel.style.display = 'block';
 
         try {
@@ -2676,6 +2683,7 @@ export function handleDashboardPage(env: Env): Response {
         } catch (err) {
           showTestResult(false, modelId, null, err.message, null);
         } finally {
+          clearInterval(testResultTimer);
           if (btn) {
             btn.disabled = false;
             btn.className = 'test-btn mini-btn';
