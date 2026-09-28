@@ -137,7 +137,7 @@ export interface ProxyConfig {
    */
   tool_judge_sidecar?: {
     /** Sidecar base URL (e.g., "http://localhost:8765"). Required to enable. */
-    url?: string;
+    judge_url?: string;
     /** Timeout in milliseconds (default: 50) */
     timeout_ms?: number;
     /** Minimum relevance threshold 0.0-1.0 (default: 0.5). Tools below are erased. */

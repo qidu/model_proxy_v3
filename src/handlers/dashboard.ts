@@ -91,7 +91,7 @@ export interface DashboardSnapshot {
   blockedTools: string[];
   toolJudgeSidecar?: {
     enabled: boolean;
-    url?: string;
+    judge_url?: string;
     mode?: 'choice' | 'noul';
     threshold?: number;
     timeout_ms?: number;
@@ -176,9 +176,9 @@ export function getDashboardSnapshot(proxyConfig: ProxyConfig, env: Env): Dashbo
     toolStats: getToolUsageStatsDesc(),
     agentToolStats: getAgentToolPanelStats(),
     blockedTools: [...getBlockedTools()],
-    toolJudgeSidecar: proxyConfig.tool_judge_sidecar?.url ? {
+    toolJudgeSidecar: proxyConfig.tool_judge_sidecar?.judge_url ? {
       enabled: true,
-      url: proxyConfig.tool_judge_sidecar.url,
+      judge_url: proxyConfig.tool_judge_sidecar.judge_url,
       mode: proxyConfig.tool_judge_sidecar.mode ?? 'choice',
       threshold: proxyConfig.tool_judge_sidecar.threshold ?? 0.5,
       timeout_ms: proxyConfig.tool_judge_sidecar.timeout_ms ?? 50,
@@ -3149,7 +3149,7 @@ export function handleDashboardPage(env: Env): Response {
         container.innerHTML =
           '<table style="width:100%;border-collapse:collapse;">' +
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Status</td><td><span style="color:#2e7d32;font-weight:600;">Enabled</span></td></tr>' +
-          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">URL</td><td><code style="font-size:12px;">' + escapeHtml(sidecar.url) + '</code></td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">URL</td><td><code style="font-size:12px;">' + escapeHtml(sidecar.judge_url) + '</code></td></tr>' +
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Mode</td><td>' + escapeHtml(modeLabel) + '</td></tr>' +
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Threshold</td><td>' + thresholdPct + '% (score >= ' + (sidecar.threshold || 0.5).toFixed(2) + ' → keep)</td></tr>' +
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Timeout</td><td>' + (sidecar.timeout_ms || 50) + ' ms</td></tr>' +
@@ -3367,10 +3367,10 @@ export function handleDashboardRequestStats(proxyConfig: ProxyConfig): Response 
   // Build tool judge sidecar status for the dashboard
   const sidecarConfig = proxyConfig.tool_judge_sidecar;
   let toolJudgeSidecar = null;
-  if (sidecarConfig && sidecarConfig.url) {
+  if (sidecarConfig && sidecarConfig.judge_url) {
     toolJudgeSidecar = {
       enabled: true,
-      url: sidecarConfig.url,
+      judge_url: sidecarConfig.judge_url,
       mode: sidecarConfig.mode || 'choice',
       threshold: sidecarConfig.threshold ?? 0.5,
       timeout_ms: sidecarConfig.timeout_ms ?? 50,

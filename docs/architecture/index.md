@@ -15,6 +15,10 @@ Design documents, architectural decisions, and planning documents for Model Prox
 - [Design: Request Transform Hooks](./design_request_transform_hooks.md) — Original design for request/response transform hooks
 - [Design: Tauri Tray](./design_tauri_tray.md) — System tray app design (external repo: proxy_tray)
 
+## Sidecar Documentation
+
+- [Sidecar Status & Config](../status_of_sidecars_of_proxy.md) — Summary of all sidecars: remote auth, privacy filter, image fetch, tool judge, kompress, coordinator, fusion, composite, schedule, transforms
+
 ## Implementation Architecture
 
 - [Model Routing Implementation](./model_routing_implementation.md) — Routing hierarchy, lookup logic, and implementation details

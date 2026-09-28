@@ -12,7 +12,7 @@ const logger = createLogger({});
 // Request/Response types matching the design doc
 
 export interface JudgeSidecarConfig {
-  url: string;
+  judge_url: string;
   timeoutMs: number;
   threshold: number;
   mode: 'choice' | 'noul';
@@ -245,7 +245,7 @@ export async function callJudgeSidecar(
       headers['Authorization'] = `Bearer ${config.apiKey}`;
     }
 
-    const resp = await fetch(`${config.url}/judge`, {
+    const resp = await fetch(`${config.judge_url}/judge`, {
       method: 'POST',
       headers,
       body: JSON.stringify(request),
@@ -282,7 +282,7 @@ export async function judgeTools(
   requestId: string,
 ): Promise<JudgeResult> {
   const sidecarConfig = proxyConfig.tool_judge_sidecar;
-  if (!sidecarConfig?.url) {
+  if (!sidecarConfig?.judge_url) {
     return { eraseNames: [], judgedNames: [], called: false };
   }
 
@@ -296,7 +296,7 @@ export async function judgeTools(
   const toolsToJudge = toolNames.slice(0, maxBatch);
 
   const config: JudgeSidecarConfig = {
-    url: sidecarConfig.url,
+    judge_url: sidecarConfig.judge_url,
     timeoutMs: sidecarConfig.timeout_ms ?? 50,
     threshold: sidecarConfig.threshold ?? 0.5,
     mode: sidecarConfig.mode ?? 'choice',

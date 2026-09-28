@@ -597,11 +597,10 @@ openai-responses   = ["max_tokens_rename"]
 # after privacy filtering and any request transforms, but before the model
 # routing and static tool blocklist are applied.
 #
-# To enable: set `url` to your sidecar endpoint. The presence of `url` is what
+# To enable: set `judge_url` to your sidecar endpoint. The presence of `judge_url` is what
 # activates the feature (no separate `enabled` flag).
 [tool_judge_sidecar]
-# enabled = false        # derived from url presence (set url to enable)
-# url = "http://localhost:8765/judge"        # required to enable
+# judge_url = "http://localhost:8765"        # required to enable (base URL, not /judge path)
 # mode = "noul"                               # "choice" (per-tool) or "noul" (batch)
 # threshold = 0.5                             # relevance threshold 0.0-1.0
 # timeout_ms = 50                             # sidecar timeout (default 50ms)
