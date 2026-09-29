@@ -11,6 +11,14 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 **Agent session** (`src/agent-session.ts`): input starting with `!` runs as a shell command in the working directory and its output becomes the new task input (e.g., `!git status`, `!npm test`). Works at both initial and follow-up task prompts.
 
+### feat(agent-session): accumulate multiple `!` shell outputs before task
+
+`src/agent-session.ts:1199–1235,1273–1310` — entering multiple `!cmd` lines accumulates their outputs; only when the user enters a non-`!` prompt are all shell outputs concatenated with the user input as the agent task. Entering nothing after `!` commands skips the turn (agent does nothing).
+
+### feat(tui, dashboard): version display as "(ver <version>)"
+
+`src/tui.ts:1171` and `src/handlers/dashboard.ts:583` — version now shown as `(ver dev)` / `(ver <version>)` instead of bare version string.
+
 ### fix(server): dashboard URL uses 127.0.0.1 instead of 0.0.0.0
 
 `src/server.ts:197` — startup log now shows `http://127.0.0.1:7777/dashboard` (correct for local access) while server still binds to `0.0.0.0`.

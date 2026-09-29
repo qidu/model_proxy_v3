@@ -1194,10 +1194,10 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // them?") — it's appended to the same transcript via prompt(), not a fresh
     // conversation, so the agent picks up right where it left off. Blank input
     // or /q, /quit, /exit end the session early, without waiting for budget.
-    // Input starting with '!' runs as a shell command in workDir and its output
-    // becomes the new task input (allows chaining: !cmd1 && !cmd2).
+    // Input starting with '!' runs as a shell command in workDir — accumulate outputs
+    // Only when user enters a non-! prompt, concat all shell outputs + input as task
     let task = await promptText('\n[π task] What do you want the agent to do?');
-    // Handle ! prefix: run shell command, use output as task
+    let shellOutputs: string[] = [];
     while (task !== null && task.startsWith('!')) {
       const cmd = task.slice(1).trim();
       if (!cmd) {
@@ -1211,12 +1211,22 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         console.log(dim(`[π shell] exit code: ${result.code}`));
         if (output.trim()) {
           console.log(output);
+          shellOutputs.push(output.trim());
         }
-        task = output.trim() || await promptText('\n[π task] What do you want the agent to do?');
+        // Continue prompting for more ! commands or a real task
+        task = await promptText('\n[π task] What do you want the agent to do? ' + dim(`(more !cmd or enter task) (/quit, /exit or ctrl+c to end)`) + ':');
       } catch (err) {
         console.error(dim(`[π shell] error: ${(err as Error).message}`));
         task = await promptText('\n[π task] What do you want the agent to do?');
       }
+    }
+    // If we accumulated shell outputs and user entered a real task, combine them
+    if (shellOutputs.length > 0 && task && task.trim() && !task.startsWith('!')) {
+      task = shellOutputs.join('\n\n') + '\n\n' + task;
+    } else if (shellOutputs.length > 0 && (!task || !task.trim())) {
+      // User entered nothing after shell commands: skip turn
+      console.log(dim('[π shell] no task input — skipping turn'));
+      task = await promptText('\n[π task] What do you want the agent to do?');
     }
     while (task !== null && !QUIT_COMMANDS.has(task.trim().toLowerCase()) && task.trim() && !budgetHit) {
       committedForTurn = false;
@@ -1262,7 +1272,9 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       }
       commitProcessLog();
       task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
-      // Handle ! prefix for follow-up tasks too
+      // Handle ! prefix for follow-up tasks: accumulate shell outputs
+      // Only when user enters a non-! prompt, concat all shell outputs + input as task
+      let shellOutputs: string[] = [];
       while (task !== null && task.startsWith('!')) {
         const cmd = task.slice(1).trim();
         if (!cmd) {
@@ -1276,12 +1288,22 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           console.log(dim(`[π shell] exit code: ${result.code}`));
           if (output.trim()) {
             console.log(output);
+            shellOutputs.push(output.trim());
           }
-          task = output.trim() || await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+          // Continue prompting for more ! commands or a real task
+          task = await promptText('\n[π task] what to do next? ' + dim(`(more !cmd or enter task) (/quit, /exit or ctrl+c to end)`) + ':');
         } catch (err) {
           console.error(dim(`[π shell] error: ${(err as Error).message}`));
           task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
         }
+      }
+      // If we accumulated shell outputs and user entered a real task, combine them
+      if (shellOutputs.length > 0 && task && task.trim() && !task.startsWith('!')) {
+        task = shellOutputs.join('\n\n') + '\n\n' + task;
+      } else if (shellOutputs.length > 0 && (!task || !task.trim())) {
+        // User entered nothing after shell commands: skip turn
+        console.log(dim('[π shell] no task input — skipping turn'));
+        task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
       }
     }
     // Sign off on a user-initiated exit (blank input, /q, /quit, /exit, or a

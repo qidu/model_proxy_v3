@@ -580,7 +580,7 @@ export function handleDashboardPage(env: Env): Response {
     </style>
   </head>
   <body>
-    <h1>Proxy Dashboard <span id="keyStoreLock" hidden title="All config api_keys are STORE_KEY_IN_SYSTEM (stored in the system keychain)" style="font-size:16px;">🔒</span> <span style="color:#9e9e9e;font-size:14px;font-weight:normal;">${env.VERSION || 'dev'}</span></h1>
+    <h1>Proxy Dashboard <span id="keyStoreLock" hidden title="All config api_keys are STORE_KEY_IN_SYSTEM (stored in the system keychain)" style="font-size:16px;">🔒</span> <span style="color:#9e9e9e;font-size:14px;font-weight:normal;">(ver ${env.VERSION || 'dev'})</span></h1>
 
     <div id="compositeAliasWizard" class="modal-overlay" hidden>
       <div class="modal" role="dialog" aria-labelledby="wizTitle" aria-modal="true">
@@ -2622,21 +2622,22 @@ export function handleDashboardPage(env: Env): Response {
 
       let testResultClearTimer = null;
 
-      function showTestResult(success, modelId, status, detail, usage) {
+      function showTestResult(success, modelId, status, detail, usage, elapsedMs) {
         const panel = document.getElementById('testResultPanel');
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
+        const elapsedStr = elapsedMs ? ' (' + status + ', ' + (elapsedMs / 1000).toFixed(1) + 's)' : ' (' + status + ')';
         if (success) {
           panel.className = 'success';
           panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button>'
             + '<span class="result-model">✓ ' + escapeHtml(modelId) + '</span> '
-            + '<span style="opacity:0.7">(' + status + ')</span>'
+            + '<span style="opacity:0.7">' + elapsedStr + '</span>'
             + (usage ? ' <span class="result-usage">usage=' + escapeHtml(usage) + '</span>' : '')
             + (detail ? ' <span style="opacity:0.8">' + escapeHtml(detail) + '</span>' : '');
         } else {
           panel.className = 'error';
           panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button>'
             + '<span class="result-model">x ' + escapeHtml(modelId) + '</span> '
-            + '<span style="opacity:0.7">(' + (status || '?') + ')</span>'
+            + '<span style="opacity:0.7">' + elapsedStr + '</span>'
             + (detail ? ' — ' + escapeHtml(detail) : '');
         }
         panel.style.display = 'block';
@@ -2679,9 +2680,11 @@ export function handleDashboardPage(env: Env): Response {
             body: JSON.stringify({ modelId }),
           });
           const result = await res.json();
-          showTestResult(result.success, result.modelId, result.status, result.detail, result.usage);
+          const elapsedMs = Date.now() - startTime;
+          showTestResult(result.success, result.modelId, result.status, result.detail, result.usage, elapsedMs);
         } catch (err) {
-          showTestResult(false, modelId, null, err.message, null);
+          const elapsedMs = Date.now() - startTime;
+          showTestResult(false, modelId, null, err.message, null, elapsedMs);
         } finally {
           clearInterval(testResultTimer);
           if (btn) {

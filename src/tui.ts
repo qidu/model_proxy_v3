@@ -1168,7 +1168,7 @@ class DashboardView implements Component {
     // 🔒 — every api_key in the local config file is a STORE_KEY_IN_SYSTEM
     // sentinel (keys live in the OS keychain; see help markers).
     const lockSuffix = snap?.config.api_keys_in_system_store ? '🔒 ' : '';
-    lines.push(bold('Proxy TUI') + dim(`  ${hourminTime}`) + `${secondsTime}${inflightIndicator}` + ` ${lockSuffix}` + dim(`${this.app.getVersion()}`));
+    lines.push(bold('Proxy TUI') + dim(`  ${hourminTime}`) + `${secondsTime}${inflightIndicator}` + ` ${lockSuffix}` + dim(`(ver ${this.app.getVersion()})`));
     lines.push(dim('─'.repeat(Math.max(0, width))));
 
     if (!snap) {
@@ -2664,9 +2664,10 @@ class DashboardApp {
     const result = await this.executeModelTest(modelId);
     if (!result) return;
     if (!result.ok) {
-      this.view.setMessage(`${red(`test failed ${result.modelId} (${result.status ?? '?'})`)} ${dim(result.detail)}`, 6000);
+      this.view.setMessage(`${red(`test failed ${result.modelId} (${result.status ?? '?'}, ${(result.elapsedMs / 1000).toFixed(1)}s)`)} ${dim(result.detail)}`, 6000);
     } else {
-      this.view.setMessage(`${green(`${result.modelId} OK (${result.status})`)} ${dim(`usage=${result.usage} ${result.detail}`)}`, 6000);
+      const elapsed = (result.elapsedMs / 1000).toFixed(1);
+      this.view.setMessage(`${green(`${result.modelId} (${result.status}, ${elapsed}s)`)} ${dim(`usage=${result.usage}`)}`, 6000);
     }
     this.requestRender();
   }
@@ -2679,6 +2680,7 @@ class DashboardApp {
     status?: number;
     usage: string;
     detail: string;
+    elapsedMs: number;
   } | null> {
     // Strip ᙅ/Ƒ/Ö marker suffix if present (used only for duplicate disambiguation in the picker)
     const actualModelId = / [ᙅƑÖ]$/.test(modelId) ? modelId.replace(/ [ᙅƑÖ]$/, '').trim() : modelId;
@@ -2741,6 +2743,7 @@ class DashboardApp {
     }
 
     this.modelTestAbortController = new AbortController();
+    const startTime = Date.now();
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -2775,6 +2778,7 @@ class DashboardApp {
         status: response.status,
         usage,
         detail: detailText,
+        elapsedMs: Date.now() - startTime,
       };
     } catch (error) {
       return {
@@ -2782,6 +2786,7 @@ class DashboardApp {
         modelId: testLabel,
         usage: 'n/a',
         detail: (error as Error).message,
+        elapsedMs: Date.now() - startTime,
       };
     } finally {
       this.modelTestAbortController = null;
