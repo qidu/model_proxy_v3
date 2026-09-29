@@ -12,7 +12,7 @@ import { randomUUID } from 'crypto';
 import { access, constants as fsConstants, mkdir, readFile, readdir, stat } from 'fs/promises';
 import { closeSync, openSync, writeSync } from 'fs';
 import { resolve, relative, join } from 'path';
-import { tmpdir, homedir } from 'os';
+import { tmpdir, homedir, platform } from 'os';
 import { execFile } from 'child_process';
 import {
   ProcessTerminal,
@@ -45,6 +45,41 @@ export interface AgentSessionSource {
 // those signal actual failures and should stay visually distinct.
 function dim(text: string): string {
   return `\x1b[90m${text}\x1b[0m`;
+}
+
+// Cross-platform shell resolution: cmd.exe on Windows, sh on Unix.
+function getShell(): { command: string; args: string[] } {
+  if (platform() === 'win32') {
+    return { command: 'cmd', args: ['/c'] };
+  }
+  return { command: 'sh', args: ['-c'] };
+}
+
+/** Run a shell command in the given directory and return its stdout/stderr. */
+async function runShellCommand(command: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  const shell = getShell();
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(
+      shell.command,
+      [...shell.args, command],
+      { cwd, timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const signal = (error as (NodeJS.ErrnoException & { signal?: string }) | null)?.signal;
+        if (error && signal) {
+          rejectPromise(new Error(`Command was killed by signal ${signal} (not a timeout): ${command}`));
+          return;
+        }
+        if (error && typeof error.code === 'string') {
+          rejectPromise(new Error(`Failed to run command: ${error.message}`));
+          return;
+        }
+        // ChildProcess from execFile has exitCode
+        const child = (error as NodeJS.ErrnoException & { child?: { exitCode: number | null } })?.child;
+        const code = child?.exitCode ?? (error ? 1 : 0);
+        resolvePromise({ stdout: stdout || '', stderr: stderr || '', code });
+      }
+    );
+  });
 }
 
 // eslint-disable-next-line no-control-regex
@@ -1159,7 +1194,30 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // them?") — it's appended to the same transcript via prompt(), not a fresh
     // conversation, so the agent picks up right where it left off. Blank input
     // or /q, /quit, /exit end the session early, without waiting for budget.
+    // Input starting with '!' runs as a shell command in workDir and its output
+    // becomes the new task input (allows chaining: !cmd1 && !cmd2).
     let task = await promptText('\n[π task] What do you want the agent to do?');
+    // Handle ! prefix: run shell command, use output as task
+    while (task !== null && task.startsWith('!')) {
+      const cmd = task.slice(1).trim();
+      if (!cmd) {
+        task = await promptText('\n[π task] What do you want the agent to do?');
+        continue;
+      }
+      console.log(dim(`[π shell] running: ${cmd}`));
+      try {
+        const result = await runShellCommand(cmd, workDir);
+        const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+        console.log(dim(`[π shell] exit code: ${result.code}`));
+        if (output.trim()) {
+          console.log(output);
+        }
+        task = output.trim() || await promptText('\n[π task] What do you want the agent to do?');
+      } catch (err) {
+        console.error(dim(`[π shell] error: ${(err as Error).message}`));
+        task = await promptText('\n[π task] What do you want the agent to do?');
+      }
+    }
     while (task !== null && !QUIT_COMMANDS.has(task.trim().toLowerCase()) && task.trim() && !budgetHit) {
       committedForTurn = false;
       printProcessLog();
@@ -1204,6 +1262,27 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       }
       commitProcessLog();
       task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+      // Handle ! prefix for follow-up tasks too
+      while (task !== null && task.startsWith('!')) {
+        const cmd = task.slice(1).trim();
+        if (!cmd) {
+          task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+          continue;
+        }
+        console.log(dim(`[π shell] running: ${cmd}`));
+        try {
+          const result = await runShellCommand(cmd, workDir);
+          const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+          console.log(dim(`[π shell] exit code: ${result.code}`));
+          if (output.trim()) {
+            console.log(output);
+          }
+          task = output.trim() || await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+        } catch (err) {
+          console.error(dim(`[π shell] error: ${(err as Error).message}`));
+          task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+        }
+      }
     }
     // Sign off on a user-initiated exit (blank input, /q, /quit, /exit, or a
     // cancelled prompt). Not printed when the budget stopped the run — that

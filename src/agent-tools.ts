@@ -25,13 +25,21 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { realpathSync } from 'fs';
 import { basename, dirname, isAbsolute, resolve, sep } from 'path';
 import { execFile } from 'child_process';
-import { tmpdir } from 'os';
+import { tmpdir, platform } from 'os';
 
 const BASH_TIMEOUT_MS = 60_000;
 const BASH_MAX_BUFFER = 10 * 1024 * 1024;
 const SKILL_TIMEOUT_MS = 60_000;
 const SKILL_MAX_BUFFER = 10 * 1024 * 1024;
 const MAX_SKILLS = 5;
+
+// Cross-platform shell resolution: cmd.exe on Windows, sh on Unix.
+function getShell(): { command: string; args: string[] } {
+  if (platform() === 'win32') {
+    return { command: 'cmd', args: ['/c'] };
+  }
+  return { command: 'sh', args: ['-c'] };
+}
 
 function resolveInWorkDir(workDir: string, path: string): string {
   return isAbsolute(path) ? path : resolve(workDir, path);
@@ -282,17 +290,10 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
         const timer = setTimeout(() => {
           timedOut = true;
         }, BASH_TIMEOUT_MS);
+        const shell = getShell();
         const child = execFile(
-          // 'sh' (PATH-resolved) rather than the hardcoded '/bin/sh': execFile
-          // calls the OS spawn API directly, bypassing any shell's own path
-          // translation, so an absolute POSIX path isn't valid on Windows even
-          // under Git Bash — Node fails the spawn (ENOENT) before the command
-          // ever runs. Bare 'sh' resolves via PATH on both Unix (always
-          // present) and Windows with Git for Windows installed (this file
-          // already assumes POSIX shell syntax throughout — see the rm/mv
-          // denylist patterns below — so this doesn't add a new dependency).
-          'sh',
-          ['-c', params.command],
+          shell.command,
+          [...shell.args, params.command],
           { cwd: workDir, timeout: BASH_TIMEOUT_MS, maxBuffer: BASH_MAX_BUFFER, signal },
           (error, stdout, stderr) => {
             clearTimeout(timer);

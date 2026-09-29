@@ -5,6 +5,28 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(agent): cross-platform bash tool + shell prefix in task prompt
+
+**Agent bash tool** (`src/agent-tools.ts`) now uses `cmd.exe /c` on Windows and `sh -c` on Unix — no longer requires Git Bash / `sh` in PATH on Windows.
+
+**Agent session** (`src/agent-session.ts`): input starting with `!` runs as a shell command in the working directory and its output becomes the new task input (e.g., `!git status`, `!npm test`). Works at both initial and follow-up task prompts.
+
+### fix(server): dashboard URL uses 127.0.0.1 instead of 0.0.0.0
+
+`src/server.ts:197` — startup log now shows `http://127.0.0.1:7777/dashboard` (correct for local access) while server still binds to `0.0.0.0`.
+
+### fix(dashboard): button text "test model" → "test it"
+
+`src/handlers/dashboard.ts:2437` — composite alias test button renamed for brevity.
+
+### feat(dashboard): elapsed timer during model/alias testing
+
+`src/handlers/dashboard.ts:2653–2693` — test panel shows `Testing <modelId> takes <n>s …` updating every second until completion.
+
+### fix(agent-session): pipe spacing in process log
+
+`src/agent-session.ts:1093` — `results) |(` → `results) | (` for readability.
+
 ### feat(tool-judge): dynamic tool relevance filtering via sidecar
 
 Added a **Tool Judge Sidecar** system that evaluates each tool's relevance against the user prompt before forwarding to the upstream. The proxy calls a local HTTP sidecar (`POST {url}/judge`) with the request state and tool list; the sidecar returns a relevance score (0.0–1.0) per tool. Tools scoring below the configured threshold are erased from the request. Fails OPEN — any sidecar error, timeout, or malformed response keeps all tools and logs a warning.
