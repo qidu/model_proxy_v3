@@ -9,6 +9,7 @@ Design documents, architectural decisions, and planning documents for Model Prox
 
 ## Core Design Documents
 
+- [Design: Persistent TUI of Agent with FollowUp for Task](./design_of_persistent_tui_of_agent_with_followup_for_task.md) — Persistent TUI architecture with mid-run followUp input
 - [Design: Coordinator](./design_and_plan_of_coordinator.md) — Planner→Executor coordinator composite alias design
 - [Design: Fusion Composite Alias](./design_fusion_composite_alias.md) — Fusion fan-out with panel models, judge, and synthesis
 - [Design: Passthrough Mode](./design_passthrough_mode.md) — Verbatim relay mode (`/passthrough`) design

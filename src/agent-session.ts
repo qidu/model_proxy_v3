@@ -22,6 +22,11 @@ import {
   getKeybindings,
   type Component,
   type SelectItem,
+  Box,
+  Spacer,
+  Markdown,
+  type MarkdownTheme,
+  type DefaultTextStyle,
 } from '@earendil-works/pi-tui';
 import { Agent, BACKGROUND_CONTEXT, loadSkills, formatSkillInvocation, type Skill } from '@earendil-works/pi-agent-core';
 import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';
@@ -332,6 +337,206 @@ async function promptText(title: string, defaultValue = ''): Promise<string | nu
     tui.setFocus(screen);
     tui.start();
   });
+}
+
+// Persistent TUI state for the entire agent session
+let persistentTui: TUI | null = null;
+let persistentTerminal: ProcessTerminal | null = null;
+let conversationArea: Box;
+let statusBar: Box;
+let bottomInput: Input;
+let currentAssistantMessage: Markdown | null = null;
+let isAgentRunning = false;
+let nextTaskResolver: ((value: string | null) => void) | null = null;
+let currentTheme: MarkdownTheme;
+let dimStyle: DefaultTextStyle;
+let errorStyle: DefaultTextStyle;
+
+// Variables used in updateStatusBar and runAgentTurn (defined in runAgentSession scope, hoisted here for access)
+let selected: Set<string> = new Set();
+let skillsUsed = 0;
+let toolsUsed = 0;
+let resultsReceived = 0;
+let toolsUsedNames: string[] = [];
+let pendingToolNames: string[] = [];
+let progressTick = 0;
+let committedForTurn = false;
+let runningAgent: Agent | null = null;
+let budgetHit = false;
+let budget: Budget | null = null;
+let tokensUsed = 0;
+let turnsUsed = 0;
+let currentAssistantMessageContent = '';
+
+/** Default theme for Markdown rendering */
+function getDefaultTheme(): MarkdownTheme {
+  const colors = {
+    reset: '\x1b[0m',
+    bold: '\x1b[1m',
+    dim: '\x1b[2m',
+    italic: '\x1b[3m',
+    underline: '\x1b[4m',
+    strikethrough: '\x1b[9m',
+    black: '\x1b[30m',
+    red: '\x1b[31m',
+    green: '\x1b[32m',
+    yellow: '\x1b[33m',
+    blue: '\x1b[34m',
+    magenta: '\x1b[35m',
+    cyan: '\x1b[36m',
+    white: '\x1b[37m',
+    gray: '\x1b[90m',
+    bgBlack: '\x1b[40m',
+    bgRed: '\x1b[41m',
+    bgGreen: '\x1b[42m',
+    bgYellow: '\x1b[43m',
+    bgBlue: '\x1b[44m',
+    bgMagenta: '\x1b[45m',
+    bgCyan: '\x1b[46m',
+    bgWhite: '\x1b[47m',
+  };
+  return {
+    bold: (t: string) => `${colors.bold}${t}${colors.reset}`,
+    italic: (t: string) => `${colors.italic}${t}${colors.reset}`,
+    underline: (t: string) => `${colors.underline}${t}${colors.reset}`,
+    strikethrough: (t: string) => `${colors.strikethrough}${t}${colors.reset}`,
+    heading: (t: string) => `${colors.bold}${colors.cyan}${t}${colors.reset}`,
+    code: (t: string) => `${colors.green}${t}${colors.reset}`,
+    codeBlock: (t: string) => `${colors.gray}${t}${colors.reset}`,
+    codeBlockBorder: (t: string) => `${colors.dim}${t}${colors.reset}`,
+    codeBlockIndent: '  ',
+    link: (t: string) => `${colors.blue}${colors.underline}${t}${colors.reset}`,
+    linkUrl: (t: string) => `${colors.dim}${t}${colors.reset}`,
+    quote: (t: string) => `${colors.cyan}${t}${colors.reset}`,
+    quoteBorder: (t: string) => `${colors.cyan}${t}${colors.reset}`,
+    listBullet: (t: string) => `${colors.cyan}${t}${colors.reset}`,
+    hr: (t: string) => `${colors.dim}${t}${colors.reset}`,
+    highlightCode: undefined,
+  };
+}
+
+/** Initialize the persistent TUI with conversation area, status bar, and input */
+async function startPersistentTui(): Promise<void> {
+  currentTheme = getDefaultTheme();
+  dimStyle = { color: (t: string) => `\x1b[2m${t}\x1b[0m` };
+  errorStyle = { color: (t: string) => `\x1b[31m${t}\x1b[0m`, bold: true };
+
+  persistentTerminal = new ProcessTerminal();
+  persistentTui = new TUI(persistentTerminal);
+
+  // Status bar at top
+  statusBar = new Box(1, 0);
+
+  // Conversation area (flex-grow)
+  conversationArea = new Box(1, 1);
+
+  // Bottom input
+  bottomInput = new Input();
+  bottomInput.onSubmit = handleInputSubmit;
+  bottomInput.onEscape = () => {
+    // Escape during idle = quit
+    if (!isAgentRunning && nextTaskResolver) {
+      nextTaskResolver(null);
+    }
+  };
+
+  // Root container: statusBar | conversationArea | bottomInput
+  const root = new Box(0, 0);
+  root.addChild(statusBar);
+  root.addChild(conversationArea);
+  root.addChild(bottomInput);
+
+  persistentTui.addChild(root);
+  persistentTui.setFocus(bottomInput);
+  persistentTui.start();
+
+  // Initial render
+  updateStatusBar();
+  requestRender();
+}
+
+/** Stop the persistent TUI and restore terminal */
+function stopPersistentTui(): void {
+  if (persistentTui) {
+    persistentTui.stop();
+    persistentTui = null;
+  }
+  if (persistentTerminal) {
+    persistentTerminal = null;
+  }
+}
+
+/** Request a re-render of the TUI */
+function requestRender(): void {
+  persistentTui?.requestRender();
+}
+
+/** Update the status bar with current stats */
+function updateStatusBar(): void {
+  if (!statusBar) return;
+  const skillsList = selected.size > 0 ? `(${[...selected].join(',')})` : '';
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const name of [...toolsUsedNames, ...pendingToolNames]) {
+    if (!seen.has(name)) { seen.add(name); ordered.push(name); }
+  }
+  const toolsList = ordered.length > 0 ? `(${ordered.join(',')})` : '';
+  const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
+  const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList} | ${toolsList} ${dots}`);
+
+  // Create a temporary Markdown component for the status bar
+  statusBar.clear();
+  const statusMarkdown = new Markdown(line, 0, 0, currentTheme, { color: dim });
+  statusBar.addChild(statusMarkdown);
+  requestRender();
+}
+
+/** Handle input submission from the bottom input */
+function handleInputSubmit(value: string): void {
+  bottomInput.setValue('');
+
+  if (isAgentRunning) {
+    // Mid-run: send as followUp (UserMessage object)
+    runningAgent?.followUp({
+      role: 'user',
+      content: value,
+      timestamp: Date.now(),
+    });
+    // Visual feedback: add as user message immediately
+    const userMsg = new Markdown(`> ${value}`, 1, 1, currentTheme, dimStyle);
+    conversationArea.addChild(userMsg);
+    requestRender();
+  } else {
+    // Idle: resolve the next task promise
+    nextTaskResolver?.(value);
+  }
+}
+
+/** Run a single agent turn with the given task */
+async function runAgentTurn(task: string): Promise<void> {
+  isAgentRunning = true;
+  committedForTurn = false;
+
+  // Add user message to conversation
+  const userMsg = new Markdown(`> ${task}`, 1, 1, currentTheme, dimStyle);
+  conversationArea.addChild(userMsg);
+  updateStatusBar();
+  requestRender();
+
+  try {
+    await runningAgent!.prompt(task);
+    while (!budgetHit && runningAgent!.hasQueuedMessages()) {
+      await runningAgent!.continue();
+    }
+  } catch (err) {
+    // Show error in conversation
+    const errMsg = new Markdown(`[error] ${(err as Error).message}`, 1, 1, currentTheme, errorStyle);
+    conversationArea.addChild(errMsg);
+    requestRender();
+  } finally {
+    isAgentRunning = false;
+    currentAssistantMessage = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1233,9 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   }
   console.log(dim(`[budget: ${formatBudget(budget)}]`));
 
+  // Start persistent TUI for the interactive session
+  startPersistentTui();
+
   // Proxy-request logging (e.g. "/v1/messages for ... to ..." and the
   // per-request upstream summary line, both logged at info) is very noisy
   // against the compact [tool]/streamed-text output this session already
@@ -1061,11 +1269,11 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // Names of tools the agent has called so far (de-duped) plus the in-flight
   // one — rendered as `<a, b, c>` in the process-log line so the user can
   // see what's currently happening without scrolling the transcript.
-  const toolsUsedNames: string[] = [];
+  toolsUsedNames = [];
   // Names of tools currently in-flight (start without matching end). Joined
   // with toolsUsedNames in the log so a tool that's been running a while is
   // still visible at the tail of the list.
-  const pendingToolNames: string[] = [];
+  pendingToolNames = [];
   // Print a process-log line in place by clearing the current row and
   // returning the cursor to column 0 — successive calls overwrite each
   // other so the terminal shows the latest totals on a single line, rather
@@ -1135,29 +1343,46 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   const commitProcessLog = () => {
     if (isTty) process.stdout.write('\n');
   };
-  // Set when the first text delta of a turn has moved past the in-place
-  // process-log line (so we know to leave the cursor alone on subsequent
-  // deltas). Reset to false at the start of every new task below.
-  let committedForTurn = false;
-  let budgetHit = false;
-  const runningAgent = agent;
+  // Note: committedForTurn, budgetHit, runningAgent, budget, tokensUsed, turnsUsed,
+  // toolsUsed, resultsReceived, toolsUsedNames, pendingToolNames, progressTick,
+  // selected, skillsUsed are defined at module scope and initialized here:
+  committedForTurn = false;
+  budgetHit = false;
+  runningAgent = agent;
+  budget = budget; // budget is already set from the prompt
+  tokensUsed = 0;
+  turnsUsed = 0;
+  toolsUsed = 0;
+  resultsReceived = 0;
+  toolsUsedNames = [];
+  pendingToolNames = [];
+  progressTick = 0;
 
   const unsubscribeBudget = runningAgent.subscribe((event) => {
     if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
-      // First text delta after the process log: move to a fresh line so the
-      // agent's reply doesn't sit on the same row as the in-place log line.
-      if (isTty && !committedForTurn) {
-        process.stdout.write('\n');
+      // First text delta after the process log: create/update the assistant message component
+      if (!committedForTurn) {
+        currentAssistantMessage = new Markdown('', 0, 0, currentTheme, dimStyle);
+        conversationArea.clear();
+        conversationArea.addChild(currentAssistantMessage);
+        currentAssistantMessageContent = '';
         committedForTurn = true;
+        requestRender();
       }
-      process.stdout.write(event.assistantMessageEvent.delta);
+      // Append delta to the current assistant message
+      if (currentAssistantMessage) {
+        // Track content separately since Markdown doesn't expose it
+        currentAssistantMessageContent += event.assistantMessageEvent.delta;
+        currentAssistantMessage.setText(currentAssistantMessageContent);
+        requestRender();
+      }
     }
     if (event.type === 'tool_execution_start') {
       toolsUsed += 1;
       if (!toolsUsedNames.includes(event.toolName)) toolsUsedNames.push(event.toolName);
       pendingToolNames.push(event.toolName);
       startProgressInterval();
-      printProcessLog();
+      updateStatusBar();
     }
     if (event.type === 'tool_execution_end') {
       resultsReceived += 1;
@@ -1169,7 +1394,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         progressTick = 0;
         stopProgressInterval();
       }
-      printProcessLog();
+      updateStatusBar();
     }
     if (event.type === 'turn_end') {
       turnsUsed += 1;
@@ -1182,42 +1407,64 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         (budget!.tokens !== undefined && tokensUsed >= budget!.tokens);
       if (exceeded) {
         budgetHit = true;
-        runningAgent.abort();
+        runningAgent?.abort();
       }
+      // Mark assistant message as complete
+      committedForTurn = false;
+      currentAssistantMessage = null;
+      currentAssistantMessageContent = '';
+      updateStatusBar();
     }
   });
 
   try {
-    // -- Task loop: run a task, summarize what changed, ask for the next one --
-    // Follow-up input also doubles as how you answer a clarifying question the
-    // agent asked at the end of its last turn (e.g. "Want me to consolidate
-    // them?") — it's appended to the same transcript via prompt(), not a fresh
-    // conversation, so the agent picks up right where it left off. Blank input
-    // or /q, /quit, /exit end the session early, without waiting for budget.
+    // -- Task loop (persistent TUI): run a task, summarize what changed, wait for next task via nextTaskResolver --
+    // The bottom input row is pinned; user types there. When agent is running,
+    // input goes to followUp(). When idle, input resolves nextTaskResolver.
+    // Blank input or /q, /quit, /exit end the session early, without waiting for budget.
     // Input starting with '!' runs as a shell command in workDir — accumulate outputs
     // Only when user enters a non-! prompt, concat all shell outputs + input as task
-    let task = await promptText('\n[π task] What do you want the agent to do?');
+
+    // Get first task via the nextTaskResolver promise
+    let task: string | null = await new Promise<string | null>((resolve) => {
+      nextTaskResolver = resolve;
+    });
+
     let shellOutputs: string[] = [];
     while (task !== null && task.startsWith('!')) {
       const cmd = task.slice(1).trim();
       if (!cmd) {
-        task = await promptText('\n[π task] What do you want the agent to do?');
+        task = await new Promise<string | null>((resolve) => {
+          nextTaskResolver = resolve;
+        });
         continue;
       }
-      console.log(dim(`[π shell] running: ${cmd}`));
+      // Show shell command in conversation
+      const shellMsg = new Markdown(dim(`[π shell] running: ${cmd}`), 1, 1, currentTheme, dimStyle);
+      conversationArea.addChild(shellMsg);
+      requestRender();
       try {
         const result = await runShellCommand(cmd, workDir);
         const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
-        console.log(dim(`[π shell] exit code: ${result.code}`));
+        const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 1, 1, currentTheme, dimStyle);
+        conversationArea.addChild(exitMsg);
         if (output.trim()) {
-          console.log(output);
+          const outMsg = new Markdown(output, 1, 1, currentTheme, dimStyle);
+          conversationArea.addChild(outMsg);
           shellOutputs.push(output.trim());
         }
+        requestRender();
         // Continue prompting for more ! commands or a real task
-        task = await promptText('\n[π task] What do you want the agent to do? ' + dim(`(more !cmd or enter task) (/quit, /exit or ctrl+c to end)`) + ':');
+        task = await new Promise<string | null>((resolve) => {
+          nextTaskResolver = resolve;
+        });
       } catch (err) {
-        console.error(dim(`[π shell] error: ${(err as Error).message}`));
-        task = await promptText('\n[π task] What do you want the agent to do?');
+        const errMsg = new Markdown(dim(`[π shell] error: ${(err as Error).message}`), 1, 1, currentTheme, errorStyle);
+        conversationArea.addChild(errMsg);
+        requestRender();
+        task = await new Promise<string | null>((resolve) => {
+          nextTaskResolver = resolve;
+        });
       }
     }
     // If we accumulated shell outputs and user entered a real task, combine them
@@ -1225,76 +1472,98 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       task = shellOutputs.join('\n\n') + '\n\n' + task;
     } else if (shellOutputs.length > 0 && (!task || !task.trim())) {
       // User entered nothing after shell commands: skip turn
-      console.log(dim('[π shell] no task input — skipping turn'));
-      task = await promptText('\n[π task] What do you want the agent to do?');
+      const skipMsg = new Markdown(dim('[π shell] no task input — skipping turn'), 1, 1, currentTheme, dimStyle);
+      conversationArea.addChild(skipMsg);
+      requestRender();
+      task = await new Promise<string | null>((resolve) => {
+        nextTaskResolver = resolve;
+      });
     }
+
+    // Take initial snapshot before the first task
+    let beforeSnapshot = await snapshotWorkDir(workDir);
+
     while (task !== null && !QUIT_COMMANDS.has(task.trim().toLowerCase()) && task.trim() && !budgetHit) {
-      committedForTurn = false;
-      printProcessLog();
-      const beforeSnapshot = await snapshotWorkDir(workDir);
-      try {
-        await runningAgent.prompt(task);
-        while (!budgetHit && runningAgent.hasQueuedMessages()) {
-          await runningAgent.continue();
-        }
-      } catch (err) {
-        console.error(`\n[π agent] run failed: ${(err as Error).message}`);
-      }
+      // Run the agent turn
+      await runAgentTurn(task);
 
-      // Commit the in-place process-log line so the post-run summary and the
-      // "Next task" prompt each start on a fresh row instead of overwriting it.
-      // Defensive: if the run died mid-tool (catch path, budget abort) without
-      // a matching tool_execution_end, the interval might still be ticking.
-      stopProgressInterval();
-      commitProcessLog();
-
+      // Snapshot and show diff
       const afterSnapshot = await snapshotWorkDir(workDir);
       const { created, modified } = diffWorkDirSnapshots(beforeSnapshot, afterSnapshot);
+      beforeSnapshot = afterSnapshot; // Update for next iteration
       const changeSummary = created.length === 0 && modified.length === 0
         ? '(No files are created or modified.)'
         : [
             created.length > 0 ? `created: ${created.join(', ')}` : null,
             modified.length > 0 ? `modified: ${modified.join(', ')}` : null,
           ].filter(Boolean).join(' | ');
-      console.log(dim(
-        `\n[π ${budgetHit ? 'Budget reached' : 'task done'} (${tokensUsed} tokens, ${turnsUsed} turns used, budget limit: ${formatBudget(budget)})]\n` +
-        `${changeSummary}\n`,
-      ));
+
+      const summaryMsg = new Markdown(
+        dim(`\n[π ${budgetHit ? 'Budget reached' : 'task done'} (${tokensUsed} tokens, ${turnsUsed} turns used, budget limit: ${formatBudget(budget)})]\n`) +
+        changeSummary,
+        1, 1, currentTheme, dimStyle
+      );
+      conversationArea.addChild(summaryMsg);
+      requestRender();
 
       if (budgetHit) {
         // Budget enforcement stops the agent, not the session — require an
         // explicit acknowledgment before exiting so this reads as a deliberate
         // stop, not a hang (Rule 8: fail loud, don't just trail off).
-        commitProcessLog();
-        await promptText('\n[π budget] reached — press enter or type /q to exit:');
+        const ackMsg = new Markdown(dim('\n[π budget] reached — press enter or type /q to exit:'), 1, 1, currentTheme, dimStyle);
+        conversationArea.addChild(ackMsg);
+        requestRender();
+        // Wait for acknowledgment
+        await new Promise<void>((resolve) => {
+          nextTaskResolver = (value) => {
+            if (value === null || QUIT_COMMANDS.has(value.trim().toLowerCase())) {
+              resolve();
+            }
+          };
+        });
         restoreTerminalTitle();
         break;
       }
-      commitProcessLog();
-      task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+
+      // Wait for next task via nextTaskResolver
+      task = await new Promise<string | null>((resolve) => {
+        nextTaskResolver = resolve;
+      });
+
       // Handle ! prefix for follow-up tasks: accumulate shell outputs
-      // Only when user enters a non-! prompt, concat all shell outputs + input as task
-      let shellOutputs: string[] = [];
+      shellOutputs = [];
       while (task !== null && task.startsWith('!')) {
         const cmd = task.slice(1).trim();
         if (!cmd) {
-          task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+          task = await new Promise<string | null>((resolve) => {
+            nextTaskResolver = resolve;
+          });
           continue;
         }
-        console.log(dim(`[π shell] running: ${cmd}`));
+        const shellMsg = new Markdown(dim(`[π shell] running: ${cmd}`), 1, 1, currentTheme, dimStyle);
+        conversationArea.addChild(shellMsg);
+        requestRender();
         try {
           const result = await runShellCommand(cmd, workDir);
           const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
-          console.log(dim(`[π shell] exit code: ${result.code}`));
+          const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 1, 1, currentTheme, dimStyle);
+          conversationArea.addChild(exitMsg);
           if (output.trim()) {
-            console.log(output);
+            const outMsg = new Markdown(output, 1, 1, currentTheme, dimStyle);
+            conversationArea.addChild(outMsg);
             shellOutputs.push(output.trim());
           }
-          // Continue prompting for more ! commands or a real task
-          task = await promptText('\n[π task] what to do next? ' + dim(`(more !cmd or enter task) (/quit, /exit or ctrl+c to end)`) + ':');
+          requestRender();
+          task = await new Promise<string | null>((resolve) => {
+            nextTaskResolver = resolve;
+          });
         } catch (err) {
-          console.error(dim(`[π shell] error: ${(err as Error).message}`));
-          task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+          const errMsg = new Markdown(dim(`[π shell] error: ${(err as Error).message}`), 1, 1, currentTheme, errorStyle);
+          conversationArea.addChild(errMsg);
+          requestRender();
+          task = await new Promise<string | null>((resolve) => {
+            nextTaskResolver = resolve;
+          });
         }
       }
       // If we accumulated shell outputs and user entered a real task, combine them
@@ -1302,8 +1571,12 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         task = shellOutputs.join('\n\n') + '\n\n' + task;
       } else if (shellOutputs.length > 0 && (!task || !task.trim())) {
         // User entered nothing after shell commands: skip turn
-        console.log(dim('[π shell] no task input — skipping turn'));
-        task = await promptText('\n[π task] what to do next? ' + dim(` (/quit, /exit or ctrl+c to end)`) + ':');
+        const skipMsg = new Markdown(dim('[π shell] no task input — skipping turn'), 1, 1, currentTheme, dimStyle);
+        conversationArea.addChild(skipMsg);
+        requestRender();
+        task = await new Promise<string | null>((resolve) => {
+          nextTaskResolver = resolve;
+        });
       }
     }
     // Sign off on a user-initiated exit (blank input, /q, /quit, /exit, or a
@@ -1311,11 +1584,13 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // path already prints its own "Budget reached" acknowledgment above, and
     // the session ended on its own terms rather than because the user asked.
     if (!budgetHit) {
-      commitProcessLog();
-      console.log(dim('π: bye!'));
+      const byeMsg = new Markdown(dim('π: bye!'), 1, 1, currentTheme, dimStyle);
+      conversationArea.addChild(byeMsg);
+      requestRender();
       restoreTerminalTitle();
     }
   } finally {
     unsubscribeBudget();
+    stopPersistentTui();
   }
 }

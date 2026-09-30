@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(agent-session): persistent TUI with mid-run followUp input
+
+`src/agent-session.ts` — Replaced throwaway TUI screens with a single persistent TUI that stays alive for the entire session. The conversation area streams assistant replies (text deltas, tool calls, tool results) as Markdown components; a pinned input row at the bottom accepts new prompts at any time. While the agent is running, submitted input is queued via `agent.followUp()` (one message per `followUpMode: "one-at-a-time"` drain) and rendered immediately as a user message. Between tasks, input becomes the next task prompt. Status bar shows live counts of skills/tools/results and budget usage.
+
 ### feat(agent): cross-platform bash tool + shell prefix in task prompt
 
 **Agent bash tool** (`src/agent-tools.ts`) now uses `cmd.exe /c` on Windows and `sh -c` on Unix — no longer requires Git Bash / `sh` in PATH on Windows.
