@@ -14,8 +14,12 @@ import {
   DEFAULT_BUDGET,
   BUDGET_PROMPT_DEFAULT,
   buildModelPickerItems,
+  RuledInput,
+  SPINNER_CHARS,
+  SPINNER_MD,
 } from '../../src/agent-session.js';
 import type { ProxyConfig } from '../../src/utils/config-loader.js';
+import { CURSOR_MARKER, Input, Markdown, visibleWidth, type MarkdownTheme } from '@earendil-works/pi-tui';
 
 /**
  * Unit tests for gatherSkillCandidates / loadSelectedSkills: load skills from
@@ -512,5 +516,183 @@ describe('buildModelPickerItems', () => {
 
   it('returns [] for no aliases', () => {
     assert.deepEqual(buildModelPickerItems([], config), []);
+  });
+});
+
+/** Strip ANSI SGR sequences so assertions compare visible text, not styling. */
+const plain = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, '');
+
+describe('RuledInput', () => {
+  it('prepends a rule of exactly the render width, made only of ─', () => {
+    const lines = new RuledInput(new Input()).render(40);
+    assert.equal(plain(lines[0]), '─'.repeat(40));
+    // visibleWidth, not length: '─' is East-Asian-Width ambiguous, so this is
+    // what actually decides whether the rule can wrap onto a second line.
+    assert.equal(visibleWidth(lines[0]), 40);
+  });
+
+  it('adds exactly one line and never wraps, at narrow and wide widths', () => {
+    for (const width of [1, 5, 40, 200]) {
+      const wrapped = new RuledInput(new Input()).render(width);
+      const bare = new Input().render(width);
+      assert.equal(wrapped.length, bare.length + 1, `width ${width}: line count`);
+      assert.equal(visibleWidth(wrapped[0]), width, `width ${width}: rule width`);
+    }
+  });
+
+  it('hands the inner Input the full width — no columns are subtracted', () => {
+    const width = 40;
+    const bare = new Input();
+    const wrapped = new RuledInput(new Input());
+    assert.deepEqual(wrapped.render(width).slice(1), bare.render(width));
+  });
+
+  it('keeps the cursor marker on the input line, never on the rule', () => {
+    const row = new RuledInput(new Input());
+    row.focused = true;
+    const lines = row.render(40);
+    // The marker must exist at all — the TUI derives the hardware cursor column
+    // from it, so a wrapper that lost it would hide the cursor.
+    assert.ok(
+      lines.slice(1).some((l) => l.includes(CURSOR_MARKER)),
+      'cursor marker missing from the input lines',
+    );
+    assert.equal(lines[0].includes(CURSOR_MARKER), false, 'cursor marker leaked onto the rule');
+  });
+
+  it('delegates focused and handleInput to the inner Input', () => {
+    const input = new Input();
+    const row = new RuledInput(input);
+    assert.equal(row.focused, false);
+    row.focused = true;
+    assert.equal(input.focused, true);
+    row.handleInput('abc');
+    assert.match(plain(row.render(40).slice(1).join('\n')), /abc/);
+  });
+
+  it('renders an empty rule at zero width instead of throwing', () => {
+    // String.repeat throws RangeError on a negative count; a pathologically
+    // narrow terminal must not take the TUI down with it.
+    const lines = new RuledInput(new Input()).render(0);
+    assert.equal(lines[0], '');
+  });
+});
+
+describe('SPINNER_MD', () => {
+  // Identity theme: every MarkdownTheme value is a style fn returning its input.
+  // These assertions are about line text, not styling, and a Proxy keeps working
+  // if pi-tui adds theme keys — unlike a hand-built partial object.
+  const theme = new Proxy({} as MarkdownTheme, { get: () => (t: string) => t });
+  const dimStyle = { color: (t: string) => t };
+
+  /** Render `${frame} ${text}` the way the in-flight task line does, and return its first visible char. */
+  function leadChar(frame: string): string {
+    const md = new Markdown(`${frame} run the tests`, 1, 1, theme, dimStyle);
+    const line = md.render(60).map(plain).find((l) => l.trim() !== '');
+    assert.ok(line, `no rendered line for frame ${JSON.stringify(frame)}`);
+    return line!.trimStart()[0];
+  }
+
+  it('holds the \\|/+ frames in order, escaped only where Markdown needs it', () => {
+    assert.deepEqual(SPINNER_CHARS, ['\\', '|', '/', '+']);
+    assert.equal(SPINNER_MD.length, SPINNER_CHARS.length);
+    assert.deepEqual(SPINNER_MD, ['\\', '|', '/', '\\+']);
+  });
+
+  it('renders every frame literally as the leading character of the task line', () => {
+    for (let i = 0; i < SPINNER_CHARS.length; i++) {
+      assert.equal(
+        leadChar(SPINNER_MD[i]),
+        SPINNER_CHARS[i],
+        `frame ${JSON.stringify(SPINNER_CHARS[i])} did not render literally`,
+      );
+    }
+  });
+
+  it('regression: an unescaped "+" is Markdown list syntax and renders as "-"', () => {
+    // This is why SPINNER_MD exists. Passing SPINNER_CHARS straight to Markdown
+    // silently animated `\ | / -` while the docs advertised `\ | / +`.
+    assert.equal(leadChar('+'), '-');
+    assert.equal(leadChar('\\+'), '+');
+  });
+});
+
+describe('output trimming before Markdown', () => {
+  // Identity theme: every MarkdownTheme value is a style fn returning its input.
+  const theme = new Proxy({} as MarkdownTheme, { get: () => (t: string) => t });
+  const dimStyle = { color: (t: string) => t };
+
+  /**
+   * Markdown always emits one blank row above the paragraph as its own top
+   * margin — even `"hello world"` renders at index 1. So "no leading blanks"
+   * means exactly MARGIN, never zero.
+   */
+  const MARGIN = 1;
+
+  function render(src: string): string[] {
+    return new Markdown(src, 1, 1, theme, dimStyle).render(40).map(plain);
+  }
+
+  /** Leading-blank count, whether a ``` fence appeared, and the first visible line. */
+  function lead(src: string): { blanks: number; fenced: boolean; first: string } {
+    const lines = render(src);
+    const idx = lines.findIndex((l) => l.trim() !== '');
+    assert.notEqual(idx, -1, `nothing visible rendered for ${JSON.stringify(src)}`);
+    return { blanks: idx, fenced: lines.some((l) => l.includes('```')), first: lines[idx].replace(/\s+$/, '') };
+  }
+
+  it('baseline: plain text carries exactly one blank row of component margin', () => {
+    assert.deepEqual(lead('hello world'), { blanks: MARGIN, fenced: false, first: ' hello world' });
+  });
+
+  it('regression: untrimmed 4-space-indented output becomes a Markdown code block', () => {
+    // This is the trap trimming exists to avoid. `ls` output like "    a.ts"
+    // starts at column 4, which Markdown reads as an indented code block and
+    // pi-tui draws inside ``` fences — so ordinary command output was rendered
+    // as syntax-highlighted code.
+    const raw = lead('    file1\n    file2');
+    assert.equal(raw.fenced, true, 'raw 4-space output should fence');
+    assert.equal(raw.first, ' ```', 'raw output should open with a fence line');
+  });
+
+  it('trims command output to the margin, with no fence and no source indentation', () => {
+    // Cases are the shapes real shell output takes: a tree/ls listing that
+    // starts indented, output preceded by blank lines, and a padded one-liner.
+    const cases: Array<[string, string, string]> = [
+      ['4-space indented', '    file1\n    file2', ' file1'],
+      ['leading newlines', '\n\n\nDone in 1.2s\n', ' Done in 1.2s'],
+      ['leading spaces', '   ok\n', ' ok'],
+    ];
+    for (const [name, src, wantFirst] of cases) {
+      assert.deepEqual(lead(src.trim()), { blanks: MARGIN, fenced: false, first: wantFirst }, name);
+    }
+  });
+
+  it('trims leading blank lines from streamed agent output', () => {
+    // The agent path uses trimStart, not trim: trailing whitespace is
+    // provisional mid-stream, and Markdown's two-space soft break would
+    // flicker if it were stripped on every delta.
+    const raw = lead('\n\nI fixed the bug.');
+    const trimmed = lead('\n\nI fixed the bug.'.trimStart());
+    assert.equal(raw.blanks, MARGIN + 1, 'untrimmed reply should show an extra blank row');
+    assert.equal(trimmed.blanks, MARGIN, 'trimStart should leave only the component margin');
+    assert.equal(trimmed.first, ' I fixed the bug.');
+  });
+
+  it('preserves interior indentation that the author intended', () => {
+    // Trimming only removes leading whitespace; a nested listing keeps its
+    // indentation instead of being flattened to column 1. Rendered lines are
+    // right-padded to the full width, so compare visible text only.
+    const lines = render('src\n    a.ts\n    b.ts'.trim())
+      .filter((l) => l.trim() !== '')
+      .map((l) => l.replace(/\s+$/, ''));
+    assert.deepEqual(lines, [' src', '     a.ts', '     b.ts']);
+    assert.equal(lead('src\n    a.ts\n    b.ts'.trim()).fenced, false);
+  });
+
+  it('still renders an intended code block as a code block after trimming', () => {
+    // trimStart must not flatten real Markdown structure: a reply that opens
+    // with prose and then indents a code block keeps it as a code block.
+    assert.equal(lead("Here's the code:\n\n    indented thing".trim()).fenced, true);
   });
 });

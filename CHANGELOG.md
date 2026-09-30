@@ -5,9 +5,31 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(agent-session): live progress and elapsed time during model verification
+
+`src/agent-session.ts` — The `AGENT=true` model picker verifies the chosen model with a loopback `/v1/messages` call before starting the session, and that round-trip can sit for many seconds with no output at all, so a slow or hung proxy was indistinguishable from a working one. The verify loop now prints a live in-place progress line — `\ checking… 3.1s` — reusing the existing `SPINNER_CHARS` set and `dim()` helper rather than introducing a second progress mechanism, at the same 150ms cadence as the TUI's running-task spinner.
+
+The elapsed total is appended to the outcome line either way, so a redirected run still reports duration: `[proxy] replied ok (3.1s)`, or `[proxy] verifying failed: model returned an empty reply (3.1s).`
+
+The animation is gated on `process.stdout.isTTY` and stays silent when stdout is redirected — the verification output goes to stdout via `console.log` (unlike the status bar, which deliberately uses stderr), and a line every 150ms would flood a log file. `stopVerifyProgress()` is idempotent, erases the partial line, and is called before every `console.error` so error text is never appended to a half-written progress line; error output stays plain, per the convention at the top of the file. The timer is declared inside the `while` body and cleared in `finally`, so picking a different model cannot leak an interval.
+
+**Not covered by tests**: the verify loop is inside `runAgentSession`, which is module-private, so this has no unit test — exercising the real path needs a live proxy and model. Only the escape-sequence logic was checked, by a byte-stream replica.
+
+### feat(agent-session): `/q` `/quit` `/exit` `/bye` end the loop from the TUI input row
+
+`src/agent-session.ts` — The four quit commands already existed as `QUIT_COMMANDS` and were honored at the task prompt, but `handleInputSubmit` forwarded **every** mid-run submission to `agent.followUp()`, so typing `/q` while the agent was working sent the literal string `/q` to the model as a prompt instead of stopping it. Quit commands are now intercepted before the `followUp()` branch: they set a new module-scope `quitRequested` flag, print `[π quit] exiting agent loop`, then call `agent.abort()` if a turn is in flight or resolve the pending next-task wait with `null` if idle.
+
+`quitRequested` also stops the queued-follow-up drain in `runAgentTurn`, exits the task loop, and suppresses the `[error]` render for the abort's own rejection (a deliberate quit is not an error). The per-turn summary reads `[π quit requested …]` rather than `[π task done …]` so an aborted turn is not reported as completed. The quit check runs before the budget acknowledgment, so a user who already asked to stop is not asked to confirm it again.
+
+Also fixed: the budget acknowledgment prompt reads "press enter or type /q to exit", but its resolver only accepted `null` or a quit command — blank input did nothing. It now accepts blank input too, matching the top-level loop's existing treatment of blank as end-of-session.
+
+**Not covered by tests**: `handleInputSubmit` and the task loop are module-private and the module's export surface is only its pure helpers, so the quit path has no unit test. Adding one would mean exporting TUI internals or driving a real PTY — a design change, not a test.
+
 ### feat(agent-session): persistent TUI with mid-run followUp input
 
 `src/agent-session.ts` — Replaced throwaway TUI screens with a single persistent TUI that stays alive for the entire session. The conversation area streams assistant replies (text deltas, tool calls, tool results) as Markdown components; a pinned input row at the bottom accepts new prompts at any time. While the agent is running, submitted input is queued via `agent.followUp()` (one message per `followUpMode: "one-at-a-time"` drain) and rendered immediately as a user message. Between tasks, input becomes the next task prompt. Status bar shows live counts of skills/tools/results and budget usage.
+
+The in-flight task's line now animates its leading `>` through a `\ | / _` spinner (150ms per frame) and reverts to a static `>` once the turn settles, so the transcript itself shows which task is still running. Also fixed: the first text delta of each turn called `conversationArea.clear()`, which discarded the task line and all prior history — the conversation area now accumulates across turns as designed.
 
 ### feat(agent): cross-platform bash tool + shell prefix in task prompt
 
