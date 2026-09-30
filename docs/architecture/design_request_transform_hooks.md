@@ -1,7 +1,52 @@
-# Proposal: Per-Model / Per-Upstream Request Transform Layer + Hook-Point Lifecycle
+# Per-Model / Per-Upstream Request Transform Layer + Hook-Point Lifecycle
 
-Status: draft / for review
+Status: **implemented**
 Scope: request & response rewriting for models that share an endpoint or `upstream_mode`
+
+---
+
+## 0. Current Transform Architecture (Implemented)
+
+This section summarizes the as-built system for quick reference.
+
+### Two-Tier Transform Engine
+
+| Tier | Description | Examples |
+|------|-------------|----------|
+| **Tier-1 (Generic Ops)** | Shallow field rewrites via declared paths | `rename`, `set`, `default`, `remove`, `map_value` |
+| **Tier-2 (Built-ins)** | Named functions for deep/cross-message logic | `lowercase_tool_schema_types`, `recover_tool_message_name`, `inject_missing_tool_results`, `filter_anthropic_beta`, `ensure_tool_config_cache_ttl`, `assemble_sse_chunks`, `project_program_to_node_tool` |
+
+### Hook Points (Lifecycle — Axis 1)
+
+| Hook | When | Body Schema | Can Branch on Target? |
+|------|------|-------------|----------------------|
+| `request_ingress` | After JSON parse, before routing | Client | **No** (target-agnostic) |
+| `before_conversion` | After routing, before format converter | Client | Yes |
+| `before_upstream` | After format conversion, before `fetch()` | Upstream | Yes |
+| `after_upstream` | After `fetch()`, before error check | Upstream Response | Yes |
+| `response_egress` | Before returning to client | Client Response | Yes |
+
+### Declaration Scope (Axis 2)
+
+Transform sets are merged: **mode-defaults → sector-defaults → entry transforms** (left-to-right fold)
+
+### Path Shapes (Shallow Only)
+
+| Shape | Example | Targets |
+|-------|---------|---------|
+| Top-level | `max_tokens` | Single key on body root |
+| Message field | `messages[role=assistant].content` | Every message matching role filter |
+| Response field | `$response.id` | Top-level key on response body |
+
+Deep/complex paths (e.g., `tools[].function.parameters`) require Tier-2 built-ins.
+
+### Specialized Header Config
+
+`anthropic_beta_map` — allow-list + rename for `anthropic-beta` headers (consumed by `filter_anthropic_beta` builtin).
+
+### Streaming
+
+`after_upstream` / `response_egress` support SSE via per-event `transformEvent` callback; header transforms run once.
 
 ---
 
@@ -64,63 +109,70 @@ Generic ops:
 
 #### Tier 2 — named built-in ops (the gnarly cases stay in code)
 
-The two operations that would force a real path-matcher (deep JSON-Schema recursion,
-cross-message id lookup) remain **named built-ins**, referenced by name — not expressed as
-paths. This keeps the engine free of a `**` recursor and a `[id=$.x]` join.
+The operations that would force a real path-matcher (deep JSON-Schema recursion,
+cross-message id lookup, streaming assembly, response reconstruction) remain
+**named built-ins**, referenced by name — not expressed as paths. This keeps the
+engine free of a `**` recursor and a `[id=$.x]` join.
 
-| built-in | what it does (ports the existing inline logic verbatim) |
-|----------|---------|
+| built-in | what it does |
+|----------|--------------|
 | `lowercase_tool_schema_types` | recurse `tools[].function.parameters` / `tools[].input_schema`, lowercase every `type` (`chat-completions.ts:20-36`) |
 | `recover_tool_message_name`   | fill missing `tool` message `name` from the matching prior `assistant.tool_calls[].function.name` by `tool_call_id` (`chat-completions.ts:94-110`) |
+| `inject_missing_tool_results` | for Anthropic→OpenAI: ensure every `tool_call` has a matching `tool` result message; synthesize empty results for missing ones |
+| `filter_anthropic_beta`       | filter/remap `anthropic-beta` headers per `anthropic_beta_map` (drop unmapped, rename mapped, drop entries mapped to `""`) |
+| `ensure_tool_config_cache_ttl`| translate Anthropic `system[n].cache_control` → `cache_control_injection_points` with `tool_config` location for Bedrock/litellm |
+| `assemble_sse_chunks`         | buffer upstream SSE stream, reconstruct `choices[]` sorted by index (supports `n>1` interleaved), produce non-streaming response |
+| `project_program_to_node_tool`| downgrade Responses `program`/`program_output` items to `node` function calls for OpenAI-completions upstreams (experimental) |
 
 Adding a *new* deep-field quirk means adding a new named built-in (one function) — not new
 config syntax. New shallow-field quirks need only config.
 
-#### Example — the current quirks
+#### Example — the current quirks (hook-scoped syntax)
 
 ```toml
 [transforms.deepseek_compat]
-schema = "openai-completions"      # which message schema the paths refer to
-builtins = [ "lowercase_tool_schema_types", "recover_tool_message_name" ]
-ops = [
+schema = "openai-completions"
+before_conversion.builtins = [ "lowercase_tool_schema_types" ]   # client-schema
+before_upstream.builtins = [ "recover_tool_message_name" ]       # upstream-schema
+before_upstream.ops = [
   # assistant content:"" → null when tool_calls present
   { op = "map_value", path = "messages[role=assistant].content", when_sibling = "tool_calls", from = "", to = null },
   # rename max_tokens for upstreams that want the Responses-style param
   { op = "rename", path = "max_tokens", to = "max_completion_tokens" },
   { op = "remove", path = "output_config" },
 ]
-headers = { set = { }, remove = [ ] }
+response_egress.headers = { remove = [ "openai-organization" ] }
 
 [transforms.minimax_compat]
 schema = "openai-completions"
-ops = [
+before_upstream.ops = [
   { op = "map_value", path = "messages[role=assistant].content", when_sibling = "tool_calls", from = "", to = null },
 ]
 
-# the max_tokens rename lives here, bound to the two openai upstream modes (open-question #3)
+# the max_tokens rename lives here, bound to the two openai upstream modes
 [transforms.max_tokens_completion]
 schema = "openai-completions"
-ops = [ { op = "rename", path = "max_tokens", to = "max_completion_tokens" } ]
+before_upstream.ops = [ { op = "rename", path = "max_tokens", to = "max_completion_tokens" } ]
 
 # qnaigc opt-out: undo the mode default (keeps legacy max_tokens)
 [transforms.no_max_completion_tokens]
 schema = "openai-completions"
-ops = [ { op = "rename", path = "max_completion_tokens", to = "max_tokens" } ]
+before_upstream.ops = [ { op = "rename", path = "max_completion_tokens", to = "max_tokens" } ]
 
-# mode-level defaults: auto-applied to every route with that upstream_mode (open-question #3 sub)
+# mode-level defaults: auto-applied to every route with that upstream_mode
 [transform_defaults]
 openai-completions = ["max_tokens_completion"]
 openai-responses   = ["max_tokens_completion"]
 
 [models.free]
 upstream_mode = "openai-completions"
-deepseek-v4-comp = { target = "deepseek-v4-flash", base_url = "https://api.deepseek.com", api_key = "…", transforms = ["deepseek_compat"] }
-max-m3-comp      = { target = "MiniMax-M3", base_url = "https://api.minimaxi.com", api_key = "…", transforms = ["minimax_compat"] }
+deepseek-v4-comp = { target = "deepseek-v4-flash", base_url = "https://api.deepseek.com", api_key = "…", transforms = "deepseek_compat" }
+max-m3-comp      = { target = "MiniMax-M3", base_url = "https://api.minimaxi.com", api_key = "…", transforms = "minimax_compat" }
 # qnaigc entry opts out of the mode default:
-gpt-x-qnaigc     = { target = "gpt-x", base_url = "https://api.qnaigc.com", api_key = "…", transforms = ["no_max_completion_tokens"] }
+gpt-x-qnaigc     = { target = "gpt-x", base_url = "https://api.qnaigc.com", api_key = "…", transforms = "no_max_completion_tokens" }
 ```
 
-- `transforms` is a **list of named transform sets**, applied in order.
+- `transforms` is a **comma-separated string of named transform sets**, applied left-to-right.
 - Each set declares its `schema` (`openai-completions` | `anthropic-messages` |
   `openai-responses` | `gemini-generatecontent`) so `ops` paths validate against the right
   field vocabulary at config load.
@@ -128,7 +180,7 @@ gpt-x-qnaigc     = { target = "gpt-x", base_url = "https://api.qnaigc.com", api_
   route of that mode. Effective order per route (see #8): **mode-defaults → sector-defaults
   → entry `transforms`**, so an entry set can override/undo a mode default (the qnaigc
   opt-out above renames `max_completion_tokens` back).
-- A sector can set a default `transforms = [...]` that individual entries inherit/extend.
+- A sector can set a default `transforms = "..."` that individual entries inherit/extend.
 - Named sets are reusable across models (A and B can share `deepseek_compat` or not).
 
 ### 3b. Resolution — extend `ModelRouteConfig`
@@ -163,7 +215,7 @@ applyRequestTransforms(
 ): { body, headers }
 ```
 
-It implements the Tier-1 generic ops (`rename` / `set` / `default` / `remove` / `map_value`) over shallow field paths, plus a small registry of Tier-2 named built-ins (`lowercase_tool_schema_types`, `recover_tool_message_name`) that wrap the existing inline logic. No `**` recursor or cross-message join in the engine.
+It implements the Tier-1 generic ops (`rename` / `set` / `default` / `remove` / `map_value`) over shallow field paths, plus a registry of Tier-2 named built-ins (see §3a table) that wrap the existing inline logic. No `**` recursor or cross-message join in the engine.
 
 ### 3d. Migrate the scattered fixes
 
@@ -172,7 +224,8 @@ Replace the inline `if` blocks in `chat-completions.ts`, `openai.ts`, `responses
 ## 4. Why this shape (tradeoffs)
 
 - **Declarative named sets** (vs. inline per-entry keys) — because A and B frequently share the *same* quirk set; naming avoids copy-paste and keeps `[models.*]` readable. Cost: one extra indirection.
-- **Two-tier engine** (shallow generic ops + named built-ins for the deep cases) rather than a full path DSL with recursion/joins — keeps it safe (no arbitrary code in config), matches CLAUDE.md "simplicity first," and reuses the exact tested logic. A fully-generic rule DSL would be over-engineering for the current quirk set; the two gnarly cases stay as one function each.
+- **Two-tier engine** (shallow generic ops + named built-ins for the deep cases) rather than a full path DSL with recursion/joins — keeps it safe (no arbitrary code in config), matches CLAUDE.md "simplicity first," and reuses the exact tested logic. A fully-generic rule DSL would be over-engineering for the current quirk set; the seven gnarly cases (schema recursion, cross-message join, streaming assembly, beta filtering, cache translation, SSE reconstruction, programmatic tool downgrade) stay as one function each.
+- **Hook-scoped config syntax** — ops/builtins declared under `request_ingress.`, `before_conversion.`, `before_upstream.`, `after_upstream.`, `response_egress.` makes the target schema explicit at declaration time (client vs upstream vs response). Avoids the ambiguity of flat lists where the hook is implicit.
 - **Hook at route resolution + single apply point** — one obvious place to add model C; no handler edits.
 
 ---
@@ -252,7 +305,7 @@ type HeaderHook = (headers: Record<string, string>, ctx: HookContext) => Record<
 type EventHook  = (event: Record<string, unknown>, ctx: HookContext) => Record<string, unknown> | null; // null = drop event
 ```
 
-A `TransformSet` groups its `ops` under the hook at which they fire. Each op still uses
+A `TransformSet` groups its `ops` and `builtins` under the hook at which they fire. Each op still uses
 the canonical field-path + operation vocabulary of §3a; the hook only decides *when* it
 runs (and therefore which schema shape the path resolves against — client vs upstream):
 
@@ -270,6 +323,27 @@ response_egress.headers = { remove = [ "openai-organization" ] }
 ```
 
 The engine resolves `route.transforms` → a `{ [hook]: { ops, builtins } }` map and a single dispatcher `runHook(hook, payload, ctx)` is called at each of the five seams.
+
+### 3e. Specialized header config — `anthropic_beta_map`
+
+For Anthropic `anthropic-beta` headers, a dedicated map provides drop/rename filtering that is
+awkward to express with generic `headers.set`/`remove`:
+
+```toml
+[transforms.bedrock_beta_compat]
+schema = "anthropic-messages"
+anthropic_beta_map = {
+  "computer-use-2025-01-24" = "computer-use-2025-01-24",
+  "advanced-tool-use-2025-11-20" = "tool-search-tool-2025-10-19",
+  "unsupported-feature" = ""
+}
+before_upstream.builtins = ["filter_anthropic_beta"]
+```
+
+- Keys = incoming beta header values; values = output header values.
+- Value `""` (empty string) = drop that beta.
+- Keys not in the map = dropped (allow-list behavior).
+- The `filter_anthropic_beta` builtin reads this map at `before_upstream`.
 
 ---
 
@@ -306,10 +380,11 @@ The engine resolves `route.transforms` → a `{ [hook]: { ops, builtins } }` map
 ## 7. Status
 
 All §6 questions (#1–#8) and both sub-questions (#3, #4) are **decided** — see inline
-**DECIDED** notes. No open items remain. No code written yet; this doc is ready to drive
-implementation.
+**DECIDED** notes. **Implementation complete** — the transform layer is live in
+`src/utils/request-transform.ts`, wired at the five hook points, and configured via
+`[transforms.*]` / `[transform_defaults]` in `proxy_config.toml`.
 
-Implementation outline:
+Implementation outline (completed):
 1. Config types + parse: `[transforms.*]`, `[transform_defaults]` on `ProxyConfig`;
    `validateTransformSet` (schema-path + builtin-name validation, fail-loud) in
    `src/utils/config-loader.ts`.
