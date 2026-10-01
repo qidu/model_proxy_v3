@@ -4,6 +4,9 @@
  * Wraps the Workers fetch handler with a native HTTP server
  */
 
+// Must stay the first import: it normalizes --tui/--agent into the TUI/AGENT env
+// vars at import time, before utils/logger.ts freezes AGENT_MODE. See mode-flags.ts.
+import { MODE_FLAGS } from './mode-flags.js';
 import { createServer } from 'http';
 import type { Env } from './types/shared.js';
 import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit, resolveDefaultProxyConfigPath } from './utils/config-loader.js';
@@ -77,15 +80,17 @@ console.log = console.error;
 console.info = console.error;
 console.debug = console.error;
 
-// `--rpc` is a *mode*, not a runCli() command: runCli() rejects unknown args and
-// exits after every command, so strip it before the scan. A real command beside
-// it (`--rpc --list-models`) still runs and exits as usual.
+// The MODE_FLAGS (`--rpc`, `--tui`, `--agent`) are *modes*, not runCli() commands:
+// runCli() rejects unknown args and exits after every command, so strip them before
+// the scan. A real command beside them (`--rpc --list-models`) still runs and exits
+// as usual. mode-flags.ts already turned --tui/--agent into the TUI/AGENT env vars
+// that the rest of this file reads.
 const argv = process.argv.slice(2);
 const rpcEnabled = argv.includes('--rpc');
 
 // CLI subcommands exit before the server starts. No args (runCli returns null)
 // preserves the previous behavior of starting the HTTP server.
-const cliExitCode = runCli(argv.filter((arg) => arg !== '--rpc'), env);
+const cliExitCode = runCli(argv.filter((arg) => !(MODE_FLAGS as readonly string[]).includes(arg)), env);
 if (cliExitCode !== null) {
   process.exit(cliExitCode);
 }

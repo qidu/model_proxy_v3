@@ -59,7 +59,7 @@ Each screen:
 │  │ Tool Call / Result (Markdown) │  │
 │  └───────────────────────────────┘  │
 ├─────────────────────────────────────┤
-│        Bottom Input (Input)         │  ← Pinned, `│ ` gutter, onSubmit handler
+│        Bottom Input (Input)         │  ← Pinned, full-width `──` rule above, onSubmit handler
 └─────────────────────────────────────┘
 ```
 
@@ -85,7 +85,21 @@ let errorStyle: DefaultTextStyle;
 // Running-task spinner
 let tuiSpinnerInterval: ReturnType<typeof setInterval> | null = null;
 let spinnerTick = 0;
-const SPINNER_CHARS = ['\\', '|', '/', '_'];
+export const SPINNER_CHARS = ['\\', '|', '/', '+', '-'];
+// Same frames escaped for Markdown line starts — `+ ` and `- ` are list syntax,
+// so pi-tui draws a `-` bullet instead of the frame. Only for Markdown components;
+// the model-verification spinner writes to stdout and needs the bare SPINNER_CHARS.
+export const SPINNER_MD = SPINNER_CHARS.map((c) =>
+  c === '+' || c === '-' ? `\\${c}` : c
+);
+
+// Window title (OSC 0). Module scope, not locals of runAgentSession: runAgentTurn
+// drives the spinner and is not nested inside it.
+const AGENT_TITLE = 'Agent π in proxy v3';
+const IS_STDOUT_TTY = Boolean(process.stdout.isTTY);
+export function agentTitleGlyph(tick: number): string {
+  return Math.floor((tick - 1) / 2) % 2 === 0 ? 'π' : '*';
+}
 
 // Agent runtime state
 let isAgentRunning = false;
@@ -247,13 +261,29 @@ runningAgent.subscribe((event) => {
 
 ### 6. Running-Task Indicator
 
-**Decision**: The in-flight task's own conversation line animates its leading `>` through `\ | / _` at 150ms per frame, and reverts to a static `>` in `runAgentTurn`'s `finally` block.
+**Decision**: The in-flight task's own conversation line animates its leading `>` through `\ | / + -` at 150ms per frame, and reverts to a static `>` in `runAgentTurn`'s `finally` block. Frames come from `SPINNER_MD`, the Markdown-escaped copy of `SPINNER_CHARS`.
 
 **Rationale**:
 - Marks *which* task is running, not merely *that* something is running — a spinner in the status bar cannot distinguish the current task from a queued follow-up
 - Uses the same `Markdown.setText()` mechanism as assistant streaming, so no extra component type is needed
 - Own `spinnerTick` counter rather than reusing `progressTick`, which drives the status bar's `.`/`..`/`...` dots on a 3-frame cycle; sharing one counter made the dots render a fourth frame
 - Mid-run follow-up lines keep a static `>` — they are queued, not in flight
+- `SPINNER_MD` rather than `SPINNER_CHARS`: the task line is a `Markdown`, and both `+ ` and `- ` at the start of a line are list syntax. A bare `+` drew a `-` bullet, so pi-tui animated `\ | / -` while the docs advertised `\ | / +`. A bare `-` draws the right character but as a list item, whose wrapped continuation lines carry a hanging indent a paragraph's do not — visible as the task text jumping sideways whenever the `-` frame came around. Escaping both list markers was necessary; the other three frames are inert. The model-verification spinner still uses bare `SPINNER_CHARS` because it writes straight to stdout and never goes through a Markdown parser — so the two constants must stay separate rather than one replacing the other
+
+### 6b. Window Title
+
+**Decision**: The session sets the terminal window title to `Agent π in proxy v3` via OSC 0 (`\x1b]0;<title>\x07`) at session start. While a task is in flight the title alternates its π with `*`, holding each glyph for two ticks (`π π * * π π * *` at 150ms/tick, so 300ms per glyph). Idle shows a plain π; the two user-facing exit paths (`bye!`, `Budget reached`) hand the title back to the shell default with an empty OSC 0.
+
+**Rationale**:
+- The transcript already shows which task is running, but it can be scrolled off screen — the window/tab title is visible regardless
+- Two ticks per glyph rather than one: a flip on every 150ms frame reads as a flicker at the edge of perception, while 300ms per glyph reads as a deliberate blink
+- `agentTitleGlyph(tick)` is exported as a pure function, following the `SPINNER_CHARS`/`SPINNER_MD` precedent, so the cadence is testable without a PTY. `Math.floor((tick - 1) / 2)` is deliberate — `tick` is 1-based (the interval increments before its first glyph), so the obvious `Math.floor(tick / 2) % 2` would make the opening π run a single tick
+- Module-scope `AGENT_TITLE`/`IS_STDOUT_TTY` rather than `runAgentSession` locals: `runAgentTurn` drives the spinner and is a module-level function, so it cannot see that function's locals
+- All title writes are gated on `IS_STDOUT_TTY` — when stdout is piped the OSC 0 escape would be logged as garbage, the same reasoning as the verification spinner
+- Early-return paths (no model picked, cancelled prompt, missing API key) deliberately do *not* restore the shell's title: the process is still the proxy server, so there is nothing to hand back
+- `stopTuiSpinner(clear = false)` gained its parameter to fix a teardown ordering bug — the exit paths clear the title inside the `try`, then the `finally` runs `stopPersistentTui()` → `stopTuiSpinner()`, which had unconditionally re-written π after the session ended. `stopPersistentTui` now calls `stopTuiSpinner(true)`
+
+**The `taskLabel` split**: `runAgentTurn(task, taskLabel = task)` separates the prompt *payload* from the transcript *label*. When `!cmd` shell output is accumulated and then prepended to the user's real task, `task` becomes `shellOutputs.join('\n\n') + '\n\n' + userPrompt` — so a spinner written into `task`'s first line landed on the first line of a *command output*, not on the user's words. Callers that prepend therefore pass the bare input as `taskLabel`; `currentTaskText` and the task `Markdown` use `taskLabel`, while `prompt()` receives `task`. The echo of the shell output stays where it already ran, so nothing is duplicated.
 
 ### 7. Quit Commands: Intercept Before `followUp()`
 
@@ -271,19 +301,33 @@ runningAgent.subscribe((event) => {
 
 **Gap**: `/q` typed while a `!cmd` shell command is *executing* lands on an already-resolved `nextTaskResolver`, so it takes effect at the next re-await rather than instantly. `quitRequested` is still set, so the loop exits at its next condition check rather than hanging.
 
-### 8. Bottom Input Gutter: Wrap, Don't Fork
+### 8. Bottom Input Rule: Wrap, Don't Fork
 
-**Decision**: `PrefixedInput` wraps the bottom `Input` and prepends a `│ ` gutter to each rendered line. `bottomInput` itself stays a bare `Input`; the wrapper is what gets mounted in the root `Box` and handed to `setFocus`.
+**Decision**: `RuledInput` wraps the bottom `Input` and renders one full-width `──` rule *above* it as an extra line. `bottomInput` itself stays a bare `Input`; the wrapper is what gets mounted in the root `Box` and handed to `setFocus`.
 
-**Alternative considered**: Patching pi-tui's `Input` to make its `> ` prompt configurable, or forking the component into this repo.
+**Alternative considered**: Patching pi-tui's `Input` to make its `> ` prompt configurable, or forking the component into this repo. Also considered — and rejected — a leading `│ ` gutter prefixed to each input line: it pushed the `> ` prompt two columns right, which is the one thing the user did not want.
 
 **Rationale**:
-- `Input.render()` hardcodes `const prompt = "> "` and the class exposes no prefix property, so a gutter cannot be configured — it has to be applied to the rendered output
+- `Input.render()` hardcodes `const prompt = "> "` and the class exposes no prefix property, so neither a gutter nor a rule can be configured — it has to be applied to the rendered output
 - Forking the component would mean owning its cursor, kill-ring, undo and bracketed-paste logic; the wrapper is ~20 lines that delegate all of it
-- `focused` is forwarded as a getter/setter pair because `Input` only emits `CURSOR_MARKER` when focused, and the TUI needs that marker to place the hardware cursor
-- The inner `Input` renders at `width - visibleWidth(prefix)`, so the composed line still fills exactly the viewport; without the subtraction the line is two columns too wide
-- Cursor column needs no adjustment: the TUI derives it from `visibleWidth()` of the text before the marker, so the gutter shifts it correctly by construction
+- `focused` is forwarded as a getter/setter pair because `Input` only emits `CURSOR_MARKER` when focused, and the TUI needs that marker to place the hardware cursor. The rule is prepended as a separate array element rather than string-concatenated onto the input line, so the marker stays on the input line and can never leak onto the rule
+- The rule is its own line, so the inner `Input` still renders at the full `width` — no columns are subtracted and the `> ` prompt stays at column 0
+- `visibleWidth` matters for the rule, not `length`: `─` is East-Asian-Width ambiguous, so a width derived from `String.length` could wrap onto a second line
+- `'─'.repeat(Math.max(0, width))` guards `String.repeat`'s `RangeError` on a pathologically narrow or zero-width terminal
 - Keeping `bottomInput` as the bare `Input` leaves `onSubmit`, `onEscape` and the `setValue('')` in `handleInputSubmit` untouched — only the mounted component changed
+
+### 9. Trim Transcript Text Before It Reaches `Markdown`
+
+**Decision**: Command output is trimmed once at the source — `[stdout, stderr].filter(Boolean).join('\n').trim()` — so the guard, the displayed `Markdown` and the prompt payload all see the same string. Streamed agent output is `trimStart()`ed on the display copy only, leaving `currentAssistantMessageContent` a raw delta accumulator.
+
+**Rationale**:
+- This was not only cosmetic. Markdown parses 4+ leading spaces as an *indented code block*, so shell output that starts indented — an `ls`/tree listing, a padded one-liner — was rendered inside ``` fences with per-character syntax highlighting instead of as plain text
+- Leading blank lines rendered as actual blank rows, adding vertical noise between transcript entries
+- The first shell loop was internally inconsistent: `if (output.trim())` guarded and `shellOutputs.push(output.trim())` trimmed, but `new Markdown(output, …)` rendered the *untrimmed* string. Hoisting the single `.trim()` to the declaration removes the divergence rather than adding a second call
+- `.trim()` for command output but `.trimStart()` for the agent stream: a one-shot shell result is complete, while trailing whitespace mid-stream is provisional — and Markdown's two-space soft break would flicker if the tail were stripped on every delta
+- Trimming only touches the *leading* edge, so interior indentation a user or model intended survives: `src\n    a.ts\n    b.ts` still renders nested, and a reply that opens with prose followed by an indented code block still renders that code block as a code block
+
+**Alternative considered**: rendering command output with pi-tui's `Text` component instead of `Markdown`. `Text` draws literally, so it would structurally remove every Markdown-syntax trap in shell output — a leading `#` becoming a heading, `*` becoming emphasis, 4-space indentation becoming a code block — rather than only the leading-whitespace symptom. Not adopted here because it changes the transcript's styling and exceeds the ask; see the open question below.
 
 ## FollowUp Queue Behavior
 
@@ -333,8 +377,8 @@ async function startPersistentTui(): Promise<void> {
   root.addChild(statusBar);
   root.addChild(conversationArea);
   // `bottomInput` stays the bare Input so the onSubmit / setValue call sites
-  // below are unchanged; the wrapper exists only to draw the '│ ' gutter.
-  const inputRow = new PrefixedInput(bottomInput);
+  // below are unchanged; the wrapper exists only to draw the '──' rule above it.
+  const inputRow = new RuledInput(bottomInput);
   root.addChild(inputRow);
 
   persistentTui.addChild(root);
@@ -463,7 +507,9 @@ process.on('SIGINT', async () => {
 - Quit-command interception (Decision 7)
 - Ctrl+C teardown
 
-The running-task spinner and the quit path have **no unit coverage**, and cannot get it without a design change: `handleInputSubmit`, `runAgentTurn` and the task loop are module-private, and the module's export surface is deliberately only its pure helpers (`gatherSkillCandidates`, `loadSelectedSkills`, `snapshotWorkDir`, `diffWorkDirSnapshots`, `parseBudget`, `formatBudget`, `buildModelPickerItems`) plus `startAgentSession`, which needs a TTY, a model choice and an API key. Testing the meaningful property — "given `/q` while running, `followUp` is not called and `abort` is" — would require exporting TUI internals with injectable agent state, or driving a real PTY. Both are larger than the feature; neither is a smoke test worth faking.
+**Covered**: the pure helpers (`gatherSkillCandidates`, `loadSelectedSkills`, `snapshotWorkDir`, `diffWorkDirSnapshots`, `parseBudget`, `formatBudget`, `buildModelPickerItems`), plus four rendering units that were exported specifically to make them testable — `agentTitleGlyph` (the exact `π π * * π π * *` sequence over the first eight ticks, each glyph held for exactly two, and no tick ever yielding anything but π or `*`), `RuledInput` (rule width via `visibleWidth`, exactly one added line that never wraps, the inner `Input` handed the full width, `CURSOR_MARKER` staying on the input line and never on the rule, `focused`/`handleInput` delegation, zero-width safety), `SPINNER_CHARS`/`SPINNER_MD` (every frame rendering literally as the task line's leading character, with the unescaped-`+`-becomes-`-` regression pinned), and the Markdown leading-whitespace trimming (the 4-space-indented-output-becomes-a-code-block trap, the component's own 1-row top margin as the correct baseline, and interior indentation surviving).
+
+**Not covered**: the running-task spinner's *animation and wiring*, and the quit path — and these cannot get coverage without a design change: `handleInputSubmit`, `runAgentTurn` and the task loop are module-private, and `startAgentSession` needs a TTY, a model choice and an API key. Testing the meaningful property — "given `/q` while running, `followUp` is not called and `abort` is" — would require exporting TUI internals with injectable agent state, or driving a real PTY. Both are larger than the feature; neither is a smoke test worth faking. Note that the frame-escaping tests cover *what a frame renders as*, not that the interval actually advances `spinnerTick`; the `taskLabel` payload/label split is likewise untested, since exercising it needs a real agent turn. The title has the same split: `agentTitleGlyph` covers *which glyph a tick produces*, while the OSC 0 write and the teardown ordering are untested — `writeAgentTitle`/`clearAgentTitle` are module-private and `IS_STDOUT_TTY` is frozen at import, so exercising them needs a real PTY.
 
 ## Future Enhancements
 

@@ -15,11 +15,15 @@ import {
   BUDGET_PROMPT_DEFAULT,
   buildModelPickerItems,
   RuledInput,
+  setProxyLogRow,
+  captureConsoleOutput,
+  restoreConsoleOutput,
   SPINNER_CHARS,
   SPINNER_MD,
+  agentTitleGlyph,
 } from '../../src/agent-session.js';
 import type { ProxyConfig } from '../../src/utils/config-loader.js';
-import { CURSOR_MARKER, Input, Markdown, visibleWidth, type MarkdownTheme } from '@earendil-works/pi-tui';
+import { CURSOR_MARKER, Box, Input, Markdown, visibleWidth, type MarkdownTheme } from '@earendil-works/pi-tui';
 
 /**
  * Unit tests for gatherSkillCandidates / loadSelectedSkills: load skills from
@@ -578,6 +582,126 @@ describe('RuledInput', () => {
   });
 });
 
+describe('captureConsoleOutput', () => {
+  // While the persistent TUI owns the screen, proxy log lines (routed to stderr
+  // by the console redirect in src/server.ts) would otherwise be written on top
+  // of the '>' prompt row. The contract that matters: capturing diverts every
+  // console method before it reaches stderr, and teardown hands the genuine
+  // methods back — a capture that failed to restore would silently swallow all
+  // later logging. `console` is process-global, so each test restores it.
+  const methods = ['log', 'info', 'debug', 'warn', 'error'] as const;
+
+  it('diverts every method that can reach stderr, writing none of it', () => {
+    const lines: string[] = [];
+    const stderrChunks: string[] = [];
+    const realWrite = process.stderr.write;
+    process.stderr.write = ((chunk: unknown) => {
+      stderrChunks.push(String(chunk));
+      return true;
+    }) as typeof realWrite;
+    try {
+      // console.log/info/debug are aliased onto console.error's original
+      // function by src/server.ts, so replacing console.error alone would leave
+      // the proxy logger's own channel still writing to stderr.
+      captureConsoleOutput((line) => lines.push(line));
+      for (const method of methods) console[method](`boom-${method}`);
+    } finally {
+      restoreConsoleOutput();
+      process.stderr.write = realWrite;
+    }
+    assert.deepEqual(lines, methods.map((m) => `boom-${m}`));
+    assert.deepEqual(stderrChunks.filter((chunk) => chunk.includes('boom')), []);
+  });
+
+  it('splits a multi-line message into one callback per line', () => {
+    const lines: string[] = [];
+    const realWrite = process.stderr.write;
+    process.stderr.write = (() => true) as typeof realWrite;
+    try {
+      captureConsoleOutput((line) => lines.push(line));
+      console.error('first\nsecond\n\nthird');
+    } finally {
+      restoreConsoleOutput();
+      process.stderr.write = realWrite;
+    }
+    assert.deepEqual(lines, ['first', 'second', 'third']);
+  });
+
+  it('restores the original methods on teardown', () => {
+    const before = methods.map((m) => console[m]);
+    const realWrite = process.stderr.write;
+    process.stderr.write = (() => true) as typeof realWrite;
+    try {
+      captureConsoleOutput(() => {});
+      for (const [i, method] of methods.entries()) {
+        assert.notEqual(console[method], before[i], `console.${method} was not replaced`);
+      }
+      restoreConsoleOutput();
+    } finally {
+      process.stderr.write = realWrite;
+    }
+    for (const [i, method] of methods.entries()) {
+      assert.equal(console[method], before[i], `console.${method} was not restored`);
+    }
+  });
+
+  it('is idempotent — a second capture never adopts the first as the original', () => {
+    // Without the guard, the second call would save the capturing function as
+    // the "original" and restoring it would leave the console diverted forever.
+    const before = methods.map((m) => console[m]);
+    const realWrite = process.stderr.write;
+    process.stderr.write = (() => true) as typeof realWrite;
+    try {
+      captureConsoleOutput(() => {});
+      captureConsoleOutput(() => {});
+      restoreConsoleOutput();
+    } finally {
+      process.stderr.write = realWrite;
+    }
+    for (const [i, method] of methods.entries()) {
+      assert.equal(console[method], before[i], `console.${method} was not restored`);
+    }
+  });
+});
+
+describe('setProxyLogRow', () => {
+  // The row is one line by contract: a proxy warning that wrapped would push the
+  // '─' rule and the '>' prompt down a row mid-session, and two logs sharing the
+  // row would concatenate into one unreadable line. Box + TruncatedText is what
+  // delivers both properties, so assert them on the real render at the widths a
+  // terminal actually reports.
+  it('shows only the newest line — the previous one is replaced, not concatenated', () => {
+    const row = new Box(0, 0);
+    setProxyLogRow(row, 'first warning');
+    setProxyLogRow(row, 'second warning');
+    const lines = row.render(60);
+    assert.equal(lines.length, 1, 'row must stay one line tall');
+    assert.match(plain(lines[0]), /second warning/);
+    assert.equal(plain(lines[0]).includes('first warning'), false, 'stale line still visible');
+  });
+
+  it('renders no row at all before the first log', () => {
+    // A blank row here would permanently eat a line of the transcript.
+    assert.deepEqual(new Box(0, 0).render(40), []);
+  });
+
+  it('truncates a long warning to exactly the render width instead of wrapping', () => {
+    for (const width of [10, 30, 120]) {
+      const row = new Box(0, 0);
+      setProxyLogRow(row, `[WARN] ${'target ladder '.repeat(30)}`);
+      const lines = row.render(width);
+      assert.equal(lines.length, 1, `width ${width}: wrapped onto a second row`);
+      assert.equal(visibleWidth(lines[0]), width, `width ${width}: row is not exactly full width`);
+    }
+  });
+
+  it('renders the line dimmed, keeping the log visually subordinate to the task', () => {
+    const row = new Box(0, 0);
+    setProxyLogRow(row, 'x');
+    assert.match(row.render(20)[0], /\x1b\[90m/);
+  });
+});
+
 describe('SPINNER_MD', () => {
   // Identity theme: every MarkdownTheme value is a style fn returning its input.
   // These assertions are about line text, not styling, and a Proxy keeps working
@@ -593,10 +717,10 @@ describe('SPINNER_MD', () => {
     return line!.trimStart()[0];
   }
 
-  it('holds the \\|/+ frames in order, escaped only where Markdown needs it', () => {
-    assert.deepEqual(SPINNER_CHARS, ['\\', '|', '/', '+']);
+  it('holds the \\|/+- frames in order, escaped only where Markdown needs it', () => {
+    assert.deepEqual(SPINNER_CHARS, ['\\', '|', '/', '+', '-']);
     assert.equal(SPINNER_MD.length, SPINNER_CHARS.length);
-    assert.deepEqual(SPINNER_MD, ['\\', '|', '/', '\\+']);
+    assert.deepEqual(SPINNER_MD, ['\\', '|', '/', '\\+', '\\-']);
   });
 
   it('renders every frame literally as the leading character of the task line', () => {
@@ -614,6 +738,62 @@ describe('SPINNER_MD', () => {
     // silently animated `\ | / -` while the docs advertised `\ | / +`.
     assert.equal(leadChar('+'), '-');
     assert.equal(leadChar('\\+'), '+');
+  });
+
+  it('regression: unescaped list markers wrap with a hanging indent, so every frame is escaped', () => {
+    // `-` is the subtle one: a list bullet is also drawn as `-`, so leadChar
+    // cannot tell it apart from a paragraph. What differs is the wrap — a list
+    // item indents its continuation lines, a paragraph does not. On a long task
+    // description that shows up as the text jumping sideways whenever the
+    // spinner reaches the `+` or `-` frame.
+    const text = 'a task description long enough to wrap across several lines in the terminal';
+    /** Indent of the second visible line, i.e. where wrapped text resumes. */
+    const wrapIndent = (frame: string): number => {
+      const lines = new Markdown(`${frame} ${text}`, 1, 1, theme, dimStyle)
+        .render(40)
+        .map(plain)
+        .filter((l) => l.trim() !== '');
+      assert.ok(lines.length > 1, `text did not wrap for frame ${JSON.stringify(frame)}`);
+      return lines[1].length - lines[1].trimStart().length;
+    };
+
+    const paragraph = wrapIndent('\\'); // inert frame: the paragraph baseline
+    assert.equal(wrapIndent('-'), paragraph + 2, 'unescaped "-" should still be a list item');
+    assert.equal(wrapIndent('+'), paragraph + 2, 'unescaped "+" should still be a list item');
+    for (const frame of SPINNER_MD) {
+      assert.equal(
+        wrapIndent(frame),
+        paragraph,
+        `frame ${JSON.stringify(frame)} wraps unlike a paragraph`,
+      );
+    }
+  });
+});
+
+describe('agentTitleGlyph', () => {
+  it('starts on π and runs π π * * π π * * over the first eight ticks', () => {
+    // Ticks are 1-based: startTuiSpinner increments spinnerTick before its first
+    // glyph, so tick 0 never reaches this function.
+    const seq = [1, 2, 3, 4, 5, 6, 7, 8].map(agentTitleGlyph);
+    assert.deepEqual(seq, ['π', 'π', '*', '*', 'π', 'π', '*', '*']);
+  });
+
+  it('holds each glyph for exactly two ticks', () => {
+    // The hold length is what the user asked for (2 πs then 2 *s, not a flip on
+    // every 150ms frame). Assert it directly rather than only in the sequence.
+    for (let start = 1; start <= 8; start += 2) {
+      assert.equal(agentTitleGlyph(start), agentTitleGlyph(start + 1));
+      assert.notEqual(agentTitleGlyph(start), agentTitleGlyph(start + 2));
+    }
+  });
+
+  it('returns only π or *, for every tick', () => {
+    for (let tick = 1; tick <= 200; tick++) {
+      assert.ok(
+        agentTitleGlyph(tick) === 'π' || agentTitleGlyph(tick) === '*',
+        `unexpected glyph at tick ${tick}`,
+      );
+    }
   });
 });
 

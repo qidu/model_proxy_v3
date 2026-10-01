@@ -42,6 +42,11 @@ Modes:
   --rpc                        Serve the JSON-RPC 2.0 control channel on stdio
                                (newline-delimited JSON) alongside the HTTP server.
                                Mutually exclusive with the AGENT and TUI modes.
+  --tui                        Start the live terminal dashboard alongside the HTTP
+                               server (same as TUI=true). Requires a TTY.
+  --agent                      Start the interactive agent session alongside the
+                               HTTP server (same as AGENT=true). Requires a TTY,
+                               and takes precedence over --tui.
 
 Options:
   --json               Machine-readable output for --list-models (dashboard config shape)

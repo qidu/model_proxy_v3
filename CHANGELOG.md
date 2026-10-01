@@ -5,6 +5,104 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(agent-session): proxy warn/error log shows on one dedicated row above the `──` rule, not on the `>` prompt row
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — `src/server.ts` routes every proxy diagnostic to stderr (`console.log`/`info`/`debug` are aliased onto `console.error`'s original function there, keeping stdout free for CLI payloads), and the shared `Logger` emits *every* level — WARN and ERROR included — through `console.log`. A raw stderr write lands on whichever row the TUI parked the cursor on, which is the `>` input row, so a proxy warning smeared across the user's half-typed prompt. `TUI=true` resolves the same conflict by silencing every console method outright; in `AGENT=true` the lines are wanted, so while the persistent TUI owns the screen `captureConsoleOutput(append)` replaces all five methods and shows each line in `proxyLogLine` — a single dedicated row mounted between the conversation area and the `──` rule — then `restoreConsoleOutput()` hands the genuine methods back as the first statement of `stopPersistentTui`.
+
+**Why all five methods, not just `console.error`:** replacing `console.error` alone would leave the proxy logger's own channel (`console.log`) still writing straight to stderr, which is the exact path the bug arrives on.
+
+**Layout — one row, newest replaces the previous:** the proxy can emit warnings per attempt on this branch, so the display is deliberately fixed-height: `setProxyLogRow(row, line)` does `row.clear()` then adds a single `TruncatedText(dim(line), 0, 0)`, the replace-a-child convention `updateStatusBar` already uses. `TruncatedText` clips to exactly one row (ANSI-aware, pad to the render width) so a long warning cannot wrap and push the `──` rule and the `>` row down mid-session; `addChild` without the `clear()` would stack rows instead, growing the layout by one line per warning. The row is a `Box(0, 0)`, and an empty `Box` renders no rows at all, so nothing is consumed before the first log arrives. An earlier cut of this fix appended every line to the conversation area as a dim `Markdown`; that grew the transcript without bound and is what this replaces.
+
+**Why `captureConsoleOutput` takes the sink as a parameter** rather than closing over `proxyLogLine`/`currentTheme`: the redirection/restoration contract is then unit-testable without a real terminal. `requestRender()` inside the capture is null-guarded (`persistentTui?.requestRender()`), so capturing while no TUI exists is a safe no-op. `util.format` reproduces what the real console methods would have printed, including inspected objects for non-string args; multi-line messages (a few of the proxy's startup notices are multi-line) are delivered one callback per non-blank line, so with a single-row display the message's last line is what remains visible.
+
+Restoration is guarded by `savedConsoleMethods`, making capture idempotent: a second capture would otherwise adopt the capturing function as the "original" and restoring it would leave the console diverted for the rest of the process. The early returns in `runAgentSession` (no model picked, cancelled, missing API key) all happen before the TUI starts, so `restoreConsoleOutput()` is a no-op on those paths.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` → `captureConsoleOutput` (4 tests) assert that capturing diverts all five methods and writes **nothing** to `process.stderr` (asserted against a stubbed `process.stderr.write`, so the test fails if any method escapes the capture), that a multi-line message yields one callback per non-blank line, that teardown restores the *identical* original function objects, and that a second capture is a no-op. `setProxyLogRow` (4 tests) render the real component: the second log replaces the first rather than concatenating (one row, stale text gone), an empty row renders **zero** lines, a long warning is truncated to exactly the render width at widths 10/30/120 (`visibleWidth`, so a wrap is a failure), and the line is dim. Both properties were confirmed to bite by rendering the rejected alternatives: a `Markdown` child in place of `TruncatedText` produced 16 rows at width 30, and two children without the `clear()` produced 2. The aliased-console case was additionally verified against a byte-level replica of `src/server.ts`'s redirect: with `console.log === console.error`, both channels are captured and zero proxy text reaches stderr.
+
+**Not covered by tests**: the on-screen placement (needs a real PTY) and the `AGENT=true` end-to-end path.
+
+**Known limitation, deliberately not addressed**: a multi-line log shows only its last line, since each split line overwrites the row. Separately, `printProcessLog`'s raw `process.stderr.write` (`src/agent-session.ts:1592`, written every 400ms while a tool runs, gated only on `isStderrTty`) bypasses `console` entirely and so is **not** captured — it corrupts the prompt row the same way. Routing it through the capture would take the in-flight progress line off the terminal, which is a behavior change beyond this fix.
+
+### fix(agent-session): dim the `──` rule, and show the `|` tool separator only when a tool has been used
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — The `──` rule above the `>` row was drawn in the terminal's default foreground, which made it compete with the conversation text. `RuledInput.render` now wraps it in `dim()`, the same dark-gray helper the status bar and transcript notices already use.
+
+The status bar's tool segment always emitted the `|` that separates the skills list from the tool list, so an empty tool list rendered a dangling `… (results) (skills) |  ` — a separator with nothing on its right. It is now `const separator = toolsList ? ' | ' : ' ';`, so the `|` appears only once at least one tool has actually been called. (The status line itself was already `dim()`ed; only the rule gained it.)
+
+`dim()` is applied to the rule rather than the whole row, and the zero-width guard is kept: `dim('')` would emit stray SGR bytes for an invisible line, so a non-positive width still yields `''` rather than a styled empty string.
+
+**Covered by tests**: the `RuledInput` suite asserts the rule is exactly `width` `─` chars on the first row at widths 1/5/40/200, checking `visibleWidth` — `─` is East-Asian-Width ambiguous, so that is what actually decides whether the rule wraps onto a second line. The assertions strip ANSI before comparing, which proves the `dim()` wrapper did not change the rule's geometry; the zero-width case still asserts `lines[0] === ''`.
+
+**Not covered by tests**: that the rule is actually dim, and the status-bar ` | ` separator — `updateStatusBar` reads the module-scope `toolsUsedNames`/`pendingToolNames`/`selected` and writes into the module-scope `statusBar`, so it is not callable in isolation. Both are visible-only changes verified by eye in a real TUI; the geometry tests are what guard them against regressing silently.
+
+### feat(agent-session): window title `Agent π in proxy v3`, alternating π/`*` while a task runs
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — The agent session sets the terminal window title to `Agent π in proxy v3` via OSC 0 (`\x1b]0;<title>\x07`) at session start, so the window is distinguishable from the proxy's other TUI/TRAJ sessions. While a task is in flight the title alternates its π with `*`, two ticks each — `π π * * π π * *` at 150ms/tick, so each glyph is held 300ms — because the transcript with the running-task spinner may be scrolled off screen. While idle the title shows a plain π.
+
+`agentTitleGlyph(tick)` is extracted as an exported pure function (`tick` is 1-based; `startTuiSpinner` increments `spinnerTick` before its first glyph, so tick 0 never fires) rather than inlined in the interval, following the file's existing convention of exporting `SPINNER_CHARS`/`SPINNER_MD` for tests. The `Math.floor((tick - 1) / 2)` form is deliberate: the obvious `Math.floor(tick / 2) % 2` would make the opening π run a single tick, since tick 0 never occurs.
+
+`AGENT_TITLE` and `IS_STDOUT_TTY` live at module scope, not inside `runAgentSession`: `runAgentTurn` drives the spinner and is a module-level function, so it cannot see that function's locals. All title writes are gated on `IS_STDOUT_TTY` — piped stdout would otherwise log the escapes as garbage. The two user-facing exit paths (`bye!` and `Budget reached`) hand the title back to the shell default with an empty OSC 0; early-return paths (no model picked, cancelled prompt, missing API key) deliberately do not, because the process is still the proxy server and there is nothing to hand back.
+
+`stopTuiSpinner(clear = false)` gained its parameter to fix a teardown ordering bug: those exit paths clear the title inside the `try`, then the `finally` runs `stopPersistentTui()` → `stopTuiSpinner()`, which had unconditionally re-written π after the session had ended. `stopPersistentTui` now calls `stopTuiSpinner(true)`.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` → `agentTitleGlyph` (3 tests) assert the exact π π * * π π * * sequence over the first eight ticks, that each glyph is held for exactly two ticks (tick *n* = tick *n+1*, tick *n* ≠ tick *n+2*), and that no tick ever yields a glyph other than π or `*`.
+
+**Not covered by tests**: the OSC 0 write itself and the teardown ordering — `writeAgentTitle`/`clearAgentTitle` are module-private and `IS_STDOUT_TTY` is frozen at import, so exercising them needs a real PTY with a TTY stdout.
+
+### feat(server): add `--tui` and `--agent` flags to start dashboard / agent session
+
+`src/mode-flags.ts` (new), `src/server.ts`, `src/cli.ts` — The interactive dashboard (`TUI=true`) and the loopback agent session (`AGENT=true`) were reachable only via environment variables. Two argv flags now spell the same modes: `--tui` and `--agent`, documented in `src/cli.ts` USAGE and forwardable through `npm run server -- --tui` / `--agent`.
+
+**Why a dedicated module at import time:** Six code paths already read `process.env.TUI` / `process.env.AGENT` — `server.ts`'s `env` literal, `LOG_LEVEL` default, `--rpc` conflict check, mode dispatch; `agent-session.ts`'s `agentMode`; and `logger.ts`'s module-scope `AGENT_MODE` (frozen at import). `server.ts`'s first project import (`utils/config-loader.ts` → `utils/logger.ts`) reaches `logger.ts` before `server.ts`'s own body runs, so argv parsed anywhere in the body is too late. The fix is a self-executing module (`src/mode-flags.ts`) placed as `server.ts`'s very first import: it normalizes `--tui`/`--agent` into `process.env` at import time, leaving all six read sites byte-identical. A flag wins over a contradicting env var (`AGENT=0 --agent` starts the agent), being the more specific request.
+
+**Why strip before `runCli`:** `runCli()` treats unknown args as usage errors. A mode flag beside a command (`--tui --list-models`) would otherwise exit 2 with "Unknown argument: --tui". `MODE_FLAGS = ['--rpc','--tui','--agent']` is stripped in `server.ts` before the `runCli` scan; the strip is idempotent and `runCli` exits before the server starts anyway.
+
+**Covered by tests**: `tests/unit/mode-flags.test.ts` (13 tests) — `applyModeFlags` sets the canonical `true` values, leaves unrelated argv alone, overrides contradicting env vars, matches exactly not by prefix, and is idempotent; `MODE_FLAGS` lists exactly the three modes; every mode flag is rejected by `runCli` (proving the strip is necessary); stripping lets a real command through and prints output; stripping all flags leaves empty argv so `runCli` returns `null` (server starts in the requested mode).
+
+**Not covered by tests**: the import-order timing constraint (hard to test in isolation without a separate process); the pre-existing no-TTY silent-fallthrough — with `--tui`/`--agent` and no TTY the existing `&& process.stdin.isTTY && process.stdout.isTTY` guard silently falls through to the plain HTTP server, same as `TUI=true`/`AGENT=true`.
+
+### feat(agent-session): add `-` frame to the running-task spinner
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts`, `docs/architecture/design_of_persistent_tui_of_agent_with_followup_for_task.md` — The in-flight task's animated `>` marker cycles through `\ | / +` at 150ms/frame. A user requested the fifth common spinner frame `-` (`\|/+-+`). Adding `-` required escaping it for Markdown: a bare `- ` at a line start is list syntax, and while pi-tui draws the bullet as `-` (same character), the list item's wrapped continuation lines carry a hanging indent that a paragraph's do not — causing the task text to jump sideways on that frame. Both list markers (`+` and `-`) are now escaped in `SPINNER_MD`; the stdout verification spinner keeps bare `SPINNER_CHARS` because it never goes through Markdown.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` SPINNER_MD suite — the new wrapping regression test asserts that every frame in `SPINNER_MD` wraps its continuation lines at the paragraph indent, and would fail if `-` (or `+`) were unescaped; the existing `renders every frame literally` test still passes; the array-length assertions updated to 5 frames.
+
+**Not covered by tests**: visual confirmation of the 5-frame animation (requires a real PTY); the stdout spinner still uses the bare 5-frame set.
+
+### fix(deps): migrate to pi-tui 0.87's `TuiMainScreen` for the removed `TUI` constructor
+
+`package.json`, `src/tui.ts`, `src/agent-session.ts` — Bumping `@earendil-works/pi-tui` from `^0.76.0` to `^0.87.1` aligns it with `@earendil-works/pi-agent-core`, already at `^0.87.1`, but breaks the build: in 0.87 `TUI` is exported as a **type only**, so the five `new TUI(terminal)` construction sites are no longer valid. The package now ships two implementations of that interface, both extending `abstract class TuiBase`: `TuiMainScreen` (`mode: "regular"`, renders into the main terminal buffer and preserves terminal scrollback) and `TuiAltScreen` (`mode: "fullscreen"`, a fixed-height application-owned viewport in the alternate buffer, with mouse capture, scrollbars and search).
+
+All five sites take `TuiMainScreen`, the behavior-preserving successor. Both the dashboard and the agent screens render inline into the main buffer and rely on the terminal's own scrollback, so `TuiAltScreen` would be a UX change nobody asked for — and would begin capturing mouse input. Its constructor also differs (`(terminal, showHardwareCursor?, logDirectory?, options?)`), so it is not a drop-in even ignoring that.
+
+The five constructor errors were `TS2693`; each degraded the enclosing field's inferred type to `any`, which in turn produced 28 further errors across `src/tui.ts` (`TS2531` on every `this.overlay`/`this.tui` member access, `TS18047` on the `persistentTui` calls, `TS7006` on a callback that lost parameter inference) — 33 in total, all from the one root cause. Fixing the five sites cleared all 33, and `npm run typecheck` and `npm run build` are both clean.
+
+Note that neither `tsconfig.json` nor `tsconfig.server.json` sets `noEmitOnError`, so `npm run build` had been writing a `dist/` that did not typecheck; a fresh `dist/` timestamp is not evidence of a clean build.
+
+`src/tui.ts` used `TUI` only as a value, so its import is replaced outright rather than kept as an unused `type TUI`. `src/agent-session.ts` also uses it in a type position (`let persistentTui: TUI | null`), so it keeps `type TUI` and adds `TuiMainScreen`.
+
+**Not covered by tests**: no test constructs a TUI — the five sites are inside module-private entry points that need a real PTY. Verification was `npm run typecheck` (0 errors), `npm run build`, and the existing unit suite, which imports `src/agent-session.ts` and so would fail at import time were the `TuiMainScreen` export missing. That suite reports 12 pre-existing failures unrelated to this change and unreachable from pi-tui: 10 in `tests/unit/agent-tools.test.ts`, whose path-confinement assertions hardcode POSIX `/tmp/` while `src/agent-tools.ts` deliberately reports the platform temp dir (`C:\Users\<user>\AppData\Local\Temp` on Windows), and 2 in `tests/unit/config-loader.test.ts`, where a `url` alias inside an inline-table `[models.*]` entry parses to `''` instead of the URL.
+
+### fix(agent-session): trim transcript text before it reaches `Markdown`
+
+`src/agent-session.ts` — Every transcript line is handed to pi-tui's `Markdown`, which parses 4+ leading spaces as an indented code block. Ordinary command output — an `ls` or tree listing, a padded one-liner — therefore rendered inside ``` fences with per-character syntax highlighting, and output or replies opening with blank lines rendered as blank rows pushing the transcript down.
+
+Both `!` shell loops now `.trim()` the combined stdout/stderr once, at the source, before constructing the `Markdown`. This also removes an inconsistency in the first loop, which already guarded with `if (output.trim())` and pushed `output.trim()` into `shellOutputs` while rendering the untrimmed `output` — the transcript and the task prompt could show the same output differently.
+
+The streamed agent reply uses `.trimStart()` on the display copy only (`currentAssistantMessage.setText(…)`), leaving the `currentAssistantMessageContent` accumulator holding raw deltas: trailing whitespace is provisional mid-stream, and stripping it on every delta would flicker Markdown's two-space soft break.
+
+Interior indentation is preserved — a nested listing keeps its own 4-space children, since only the leading edge of the whole string is removed — and a genuine indented code block still renders as one.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` → `output trimming before Markdown` (6 tests) pin the component's own one-row top margin as the baseline, assert that untrimmed 4-space output does fence (the regression), assert trimmed output reaches exactly that margin with no fence and no source indentation, and assert interior indentation and intended code blocks survive.
+
+### feat(agent-session): full-width `──` rule above the bottom input row
+
+`src/agent-session.ts:329–349` — `RuledInput` wraps the pinned bottom `Input` and prepends a `'─'.repeat(width)` row, so the input row reads as visually separate from the scrolling conversation above it. pi-tui ships no separator component, so this is a wrapper rather than a fork: it forwards `focused`, `handleInput` and `invalidate` to the inner `Input` and renders the rule on its own line, leaving the inner component the full terminal width for its own text and cursor. `Math.max(0, width)` guards `String.repeat`'s `RangeError` on a pathologically narrow or zero-width terminal.
+
+An earlier iteration put a `│ ` gutter in front of the prompt character instead; that was removed at request and the class renamed from `PrefixedInput`.
+
+**Covered by tests**: 6 tests in `tests/unit/agent-session.test.ts` → `RuledInput` assert the rule is exactly `width` chars on the first row, that the inner input still renders from row 1 at full width, that the cursor marker stays on the input line and never leaks onto the rule, and that `focused` reads and writes pass through.
+
 ### feat(agent-session): live progress and elapsed time during model verification
 
 `src/agent-session.ts` — The `AGENT=true` model picker verifies the chosen model with a loopback `/v1/messages` call before starting the session, and that round-trip can sit for many seconds with no output at all, so a slow or hung proxy was indistinguishable from a working one. The verify loop now prints a live in-place progress line — `\ checking… 3.1s` — reusing the existing `SPINNER_CHARS` set and `dim()` helper rather than introducing a second progress mechanism, at the same 150ms cadence as the TUI's running-task spinner.
@@ -29,7 +127,11 @@ Also fixed: the budget acknowledgment prompt reads "press enter or type /q to ex
 
 `src/agent-session.ts` — Replaced throwaway TUI screens with a single persistent TUI that stays alive for the entire session. The conversation area streams assistant replies (text deltas, tool calls, tool results) as Markdown components; a pinned input row at the bottom accepts new prompts at any time. While the agent is running, submitted input is queued via `agent.followUp()` (one message per `followUpMode: "one-at-a-time"` drain) and rendered immediately as a user message. Between tasks, input becomes the next task prompt. Status bar shows live counts of skills/tools/results and budget usage.
 
-The in-flight task's line now animates its leading `>` through a `\ | / _` spinner (150ms per frame) and reverts to a static `>` once the turn settles, so the transcript itself shows which task is still running. Also fixed: the first text delta of each turn called `conversationArea.clear()`, which discarded the task line and all prior history — the conversation area now accumulates across turns as designed.
+The in-flight task's line now animates its leading `>` through a `\ | / +` spinner (150ms per frame) and reverts to a static `>` once the turn settles, so the transcript itself shows which task is still running. Also fixed: the first text delta of each turn called `conversationArea.clear()`, which discarded the task line and all prior history — the conversation area now accumulates across turns as designed.
+
+Because that task line is rendered as `Markdown`, the `+` frame needs escaping: `+ ` at a line start is list syntax, and pi-tui draws it as a `-` bullet rather than a plus. `SPINNER_MD` therefore holds the same frames with `+` written `\+`, while `SPINNER_CHARS` stays bare for the stdout verification spinner, which is not Markdown. `runAgentTurn` also takes a `taskLabel` parameter defaulting to `task`, splitting what is sent to the model (`task`, the full payload including accumulated shell output) from what is shown in the transcript (`taskLabel`, the line the user actually typed).
+
+**Covered by tests**: 3 tests in `tests/unit/agent-session.test.ts` → `SPINNER_MD` assert each frame's escaped form and that rendering a frame through `Markdown` yields the intended glyph rather than a list bullet. **Not covered**: that the 150ms interval advances `spinnerTick`, and the `taskLabel` split — both are module-private wiring.
 
 ### feat(agent): cross-platform bash tool + shell prefix in task prompt
 

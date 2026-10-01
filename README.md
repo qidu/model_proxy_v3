@@ -248,6 +248,8 @@ Point it elsewhere with
 Start with the terminal dashboard:
 
 ```bash
+npm run server -- --tui
+# equivalent:
 TUI=true npm run server
 ```
 
@@ -704,10 +706,13 @@ provider — useful for exercising the proxy's routing/quotas/transforms through
 agent loop without a separate client:
 
 ```bash
+npm run server -- --agent
+# equivalent:
 AGENT=true npm run server
 ```
 
-`AGENT` and `TUI` are mutually exclusive; if both are set, `AGENT` wins with a warning.
+`--agent`/`AGENT` and `--tui`/`TUI` are mutually exclusive; if both are set, `AGENT` wins
+with a warning.
 
 **Flow:** pick a working directory (tools are confined to it) → system prompt loads
 `AGENTS.md`/`CLAUDE.md` from that directory, with an optional multi-select for
@@ -720,6 +725,14 @@ enter a free-text task. The agent runs with `read_file`/`write_file`/`bash` tool
 installs/session) until the task completes or the budget is hit, then prompts for a
 follow-up task in the same conversation. Set `TRAJ=true` to also log the full session
 transcript to a private (`0600`), per-session file under `os.tmpdir()`.
+
+**Logging:** proxy diagnostics (every `console` level, including WARN/ERROR) are shown on a
+single dedicated row above the `──` rule rather than written to the terminal directly — a raw
+stderr write lands on the row the TUI parked the cursor on, which is the `>` input row, and
+would smear across your prompt. Only the newest line is kept: each one replaces the previous,
+truncated to the terminal width so it never wraps, and the row takes no space at all until the
+first log arrives. Console output goes back to the real stderr when the session ends, so
+background/non-agent logging is unaffected.
 
 **Dependencies:** `pi-agent-core` (bundled), and optionally the `skills` CLI
 (`npm install skills`) for the dynamic skill-install tools — omitted with a notice if

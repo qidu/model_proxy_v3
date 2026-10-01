@@ -9,7 +9,7 @@ import {
   Input,
   ProcessTerminal,
   SelectList,
-  TUI,
+  TuiMainScreen,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -1347,7 +1347,7 @@ class DashboardView implements Component {
 
 class DashboardApp {
   private readonly terminal = new ProcessTerminal();
-  private readonly tui = new TUI(this.terminal);
+  private readonly tui = new TuiMainScreen(this.terminal);
   private readonly view = new DashboardView(this, () => this.scheduleRender());
   private overlay: OverlayHandle | null = null;
   private compositeOverlay: CompositeAliasesOverlay | null = null;

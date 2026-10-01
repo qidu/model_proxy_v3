@@ -14,10 +14,12 @@ import { closeSync, openSync, writeSync } from 'fs';
 import { resolve, relative, join } from 'path';
 import { tmpdir, homedir, platform } from 'os';
 import { execFile } from 'child_process';
+import { format } from 'util';
 import {
   ProcessTerminal,
   SelectList,
-  TUI,
+  type TUI,
+  TuiMainScreen,
   Input,
   getKeybindings,
   type Component,
@@ -26,6 +28,7 @@ import {
   Box,
   Spacer,
   Markdown,
+  TruncatedText,
   type MarkdownTheme,
   type DefaultTextStyle,
 } from '@earendil-works/pi-tui';
@@ -166,7 +169,7 @@ class PickerScreen implements Component {
 /** Show a single-selection picker in its own throwaway TUI screen; resolves with the chosen value, or null on cancel (Ctrl+C/Esc). */
 async function pickFromList(title: string, items: SelectItem[]): Promise<string | null> {
   const terminal = new ProcessTerminal();
-  const tui = new TUI(terminal);
+  const tui = new TuiMainScreen(terminal);
   const screen = new PickerScreen(title, items);
   return new Promise((resolvePick) => {
     let settled = false;
@@ -263,7 +266,7 @@ class MultiSelectScreen implements Component {
  *  null on cancel (Ctrl+C/Esc). Space toggles, Enter confirms. */
 async function pickMultiFromList(title: string, items: SelectItem[]): Promise<Set<string> | null> {
   const terminal = new ProcessTerminal();
-  const tui = new TUI(terminal);
+  const tui = new TuiMainScreen(terminal);
   const fullTitle = `${title}\n(space: toggle, enter: confirm)`;
   const screen = new MultiSelectScreen(fullTitle, items);
   return new Promise((resolvePick) => {
@@ -341,9 +344,10 @@ export class RuledInput implements Component, Focusable {
     this.input.invalidate();
   }
   render(width: number): string[] {
-    // Math.max guards String.repeat's RangeError on a pathologically narrow
-    // (or zero-width) terminal.
-    const rule = '─'.repeat(Math.max(0, width));
+    // A non-positive width (pathologically narrow or zero-width terminal)
+    // yields no rule at all: String.repeat would throw RangeError, and
+    // dim('') would emit stray SGR bytes for an invisible line.
+    const rule = width > 0 ? dim('─'.repeat(width)) : '';
     return [rule, ...this.input.render(width)];
   }
 }
@@ -351,7 +355,7 @@ export class RuledInput implements Component, Focusable {
 /** Show a single-line text prompt in its own throwaway TUI screen; resolves with the entered text (possibly ''), or null on cancel. */
 async function promptText(title: string, defaultValue = ''): Promise<string | null> {
   const terminal = new ProcessTerminal();
-  const tui = new TUI(terminal);
+  const tui = new TuiMainScreen(terminal);
   const screen = new PromptScreen(title, defaultValue);
   return new Promise((resolvePrompt) => {
     let settled = false;
@@ -379,6 +383,7 @@ let persistentTui: TUI | null = null;
 let persistentTerminal: ProcessTerminal | null = null;
 let conversationArea: Box;
 let statusBar: Box;
+let proxyLogLine: Box;
 let bottomInput: Input;
 let currentAssistantMessage: Markdown | null = null;
 let currentTaskMessage: Markdown | null = null;
@@ -460,13 +465,17 @@ async function startPersistentTui(): Promise<void> {
   errorStyle = { color: (t: string) => `\x1b[31m${t}\x1b[0m`, bold: true };
 
   persistentTerminal = new ProcessTerminal();
-  persistentTui = new TUI(persistentTerminal);
+  persistentTui = new TuiMainScreen(persistentTerminal);
 
   // Status bar at top
   statusBar = new Box(1, 0);
 
   // Conversation area (flex-grow)
   conversationArea = new Box(1, 1);
+
+  // Proxy log line: a single row between the conversation area and the '─' rule.
+  // No padding at all, so it renders zero rows until the first log arrives.
+  proxyLogLine = new Box(0, 0);
 
   // Bottom input
   bottomInput = new Input();
@@ -478,10 +487,11 @@ async function startPersistentTui(): Promise<void> {
     }
   };
 
-  // Root container: statusBar | conversationArea | inputRow
+  // Root container: statusBar | conversationArea | proxyLogLine | inputRow
   const root = new Box(0, 0);
   root.addChild(statusBar);
   root.addChild(conversationArea);
+  root.addChild(proxyLogLine);
   // `bottomInput` stays the bare Input (onSubmit/setValue call sites below are
   // unchanged); the wrapper exists only to draw the '─' rule above it, so it is
   // what gets mounted and focused.
@@ -491,6 +501,11 @@ async function startPersistentTui(): Promise<void> {
   persistentTui.addChild(root);
   persistentTui.setFocus(inputRow);
   persistentTui.start();
+  // Proxy log lines show in the single row directly above the '─' rule, newest
+  // replacing the previous one (see captureConsoleOutput).
+  captureConsoleOutput((line) => {
+    setProxyLogRow(proxyLogLine, line);
+  });
 
   // Initial render
   updateStatusBar();
@@ -499,7 +514,11 @@ async function startPersistentTui(): Promise<void> {
 
 /** Stop the persistent TUI and restore terminal */
 function stopPersistentTui(): void {
-  stopTuiSpinner();
+  // Console output goes back to the real stderr before teardown, so anything
+  // logged while the TUI is being torn down is not swallowed.
+  restoreConsoleOutput();
+  // Teardown: clear the title (the caller already did too; idempotent).
+  stopTuiSpinner(true);
   if (persistentTui) {
     persistentTui.stop();
     persistentTui = null;
@@ -514,15 +533,106 @@ function requestRender(): void {
   persistentTui?.requestRender();
 }
 
+/** Show `line` as the single row of `row`, replacing whatever it showed before.
+ *  TruncatedText clips to one row (a long warning must not wrap onto a second
+ *  row or push the '─' rule down), which is why the row is not a Markdown. */
+export function setProxyLogRow(row: Box, line: string): void {
+  row.clear();
+  row.addChild(new TruncatedText(dim(line), 0, 0));
+}
+
+// Proxy logging while the persistent TUI owns the screen. src/server.ts routes
+// every proxy log line to stderr (console.log/info/debug are aliased to
+// console.error there, keeping stdout free for CLI payloads), and a raw stderr
+// write lands on whichever row the TUI parked the cursor on — the '>' input row
+// — so a proxy warning or error smears across the user's prompt. TUI=true
+// resolves the same conflict by silencing the console outright; here the lines
+// are wanted, so while the TUI is up each one is shown in a single dedicated row
+// above the '─' rule (newest replaces the previous one) and the original methods
+// are restored on teardown, leaving background/non-agent logging unaffected.
+const CONSOLE_METHODS = ['log', 'info', 'debug', 'warn', 'error'] as const;
+type ConsoleMethod = (...args: unknown[]) => void;
+let savedConsoleMethods: Record<string, ConsoleMethod> | null = null;
+
+/** Append console output to `append` (one call per line) instead of letting it
+ *  reach raw stderr. No-op if output is already being captured. */
+export function captureConsoleOutput(append: (line: string) => void): void {
+  if (savedConsoleMethods) return;
+  const sink = console as unknown as Record<string, ConsoleMethod>;
+  const capture: ConsoleMethod = (...args) => {
+    // util.format mirrors what the real console methods would have printed,
+    // including inspected objects for non-string args. Multi-line messages (a
+    // few of the proxy's startup notices are multi-line) are split and delivered
+    // line by line, so a one-row display ends up showing the message's last line
+    // rather than losing it inside a block.
+    const lines = format(...args).split('\n').filter((line) => line.trim() !== '');
+    if (lines.length === 0) return;
+    for (const line of lines) append(line);
+    requestRender();
+  };
+  // Every method is replaced, not just console.error: server.ts aliases
+  // console.log/info/debug onto console.error's original function at startup, so
+  // replacing console.error alone would leave the proxy logger's own channel
+  // still writing straight to stderr.
+  const saved: Record<string, ConsoleMethod> = {};
+  for (const method of CONSOLE_METHODS) {
+    saved[method] = sink[method];
+    sink[method] = capture;
+  }
+  savedConsoleMethods = saved;
+}
+
+/** Restore the console methods captureConsoleOutput replaced. */
+export function restoreConsoleOutput(): void {
+  if (!savedConsoleMethods) return;
+  const sink = console as unknown as Record<string, ConsoleMethod>;
+  for (const method of CONSOLE_METHODS) {
+    sink[method] = savedConsoleMethods[method];
+  }
+  savedConsoleMethods = null;
+}
+
 // TUI spinner interval for running status
 let tuiSpinnerInterval: ReturnType<typeof setInterval> | null = null;
 let spinnerTick = 0;
-export const SPINNER_CHARS = ['\\', '|', '/', '+'];
-// Same frames, escaped for Markdown line starts: `+ ` is list syntax and pi-tui
-// draws it as a `-` bullet, so the bare frame would show the wrong character.
-// The other three are inert. Use this only for Markdown components — the model
-// verification spinner writes straight to stdout and needs SPINNER_CHARS.
-export const SPINNER_MD = SPINNER_CHARS.map((c) => (c === '+' ? '\\+' : c));
+export const SPINNER_CHARS = ['\\', '|', '/', '+', '-'];
+// Same frames, escaped for Markdown line starts: `+ ` and `- ` are both list
+// syntax. A bare `+` is drawn as a `-` bullet, so it showed the wrong character;
+// a bare `-` draws the right character but as a list item, whose wrapped
+// continuation lines are indented, so long task text jumped sideways on that
+// frame. The other three are inert. Use this only for Markdown components — the
+// model verification spinner writes straight to stdout and needs SPINNER_CHARS.
+export const SPINNER_MD = SPINNER_CHARS.map((c) =>
+  c === '+' || c === '-' ? `\\${c}` : c
+);
+
+// The terminal window title, set once at session start (see runAgentSession)
+// and animated while a task runs. Module-level rather than a local of
+// runAgentSession because runAgentTurn, which drives the spinner, is not
+// nested inside it.
+const AGENT_TITLE = 'Agent π in proxy v3';
+const IS_STDOUT_TTY = Boolean(process.stdout.isTTY);
+
+/** Write the agent's window title with `glyph` in place of the π. Writes only
+ *  on a TTY — when stdout is piped the OSC 0 escape would be logged as
+ *  garbage. */
+function writeAgentTitle(glyph: string): void {
+  if (!IS_STDOUT_TTY) return;
+  process.stdout.write(`\x1b]0;${AGENT_TITLE.replace('π', glyph)}\x07`);
+}
+
+/** Hand the window title back to the shell default (empty OSC 0) */
+function clearAgentTitle(): void {
+  if (!IS_STDOUT_TTY) return;
+  process.stdout.write('\x1b]0;\x07');
+}
+
+/** Which glyph the window title shows on a given spinner tick. Each glyph is
+ *  held for two ticks (300ms), so the title reads π π * * … rather than
+ *  flipping on every 150ms frame. Ticks start at 1 (see startTuiSpinner). */
+export function agentTitleGlyph(tick: number): string {
+  return Math.floor((tick - 1) / 2) % 2 === 0 ? 'π' : '*';
+}
 
 /** Start the TUI spinner interval when agent is running */
 function startTuiSpinner(): void {
@@ -535,16 +645,25 @@ function startTuiSpinner(): void {
       currentTaskMessage.setText(`${SPINNER_MD[spinnerTick % SPINNER_MD.length]} ${currentTaskText}`);
       requestRender();
     }
+    // Also alternate the title's π with * so the window tab itself shows that
+    // the agent is busy — the transcript may be scrolled off screen.
+    writeAgentTitle(agentTitleGlyph(spinnerTick));
   }, 150);
 }
 
-/** Stop the TUI spinner interval */
-function stopTuiSpinner(): void {
+/** Stop the TUI spinner interval. `clear` hands the title back to the shell
+ *  (session teardown); otherwise π is restored for the next turn. */
+function stopTuiSpinner(clear = false): void {
   if (tuiSpinnerInterval !== null) {
     clearInterval(tuiSpinnerInterval);
     tuiSpinnerInterval = null;
   }
   spinnerTick = 0;
+  if (clear) {
+    clearAgentTitle();
+  } else {
+    writeAgentTitle('π');
+  }
 }
 
 /** Update the status bar with current stats */
@@ -558,7 +677,8 @@ function updateStatusBar(): void {
   }
   const toolsList = ordered.length > 0 ? `(${ordered.join(',')})` : '';
   const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
-  const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList} | ${toolsList} ${dots}`);
+  const separator = toolsList ? ' | ' : ' ';
+  const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList}${separator}${toolsList} ${dots}`);
 
   // Create a temporary Markdown component for the status bar
   statusBar.clear();
@@ -1110,7 +1230,7 @@ export async function startAgentSession(source: AgentSessionSource): Promise<voi
 async function runAgentSession(source: AgentSessionSource): Promise<void> {
   const { env, loadConfig, port } = source;
 
-  // Label the terminal window with the agent's own identity so it's
+    // Label the terminal window with the agent's own identity so it's
   // distinguishable from the proxy's other TUI/TRAJ sessions running
   // elsewhere. Only writes on a TTY — when stdout is piped (e.g. logged to
   // a file) the OSC 0 escape would just appear as garbage. The proxy
@@ -1120,14 +1240,9 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // there is done. Early-return paths (no model picked, cancelled
   // prompt, missing API key) skip the restore on purpose — the process
   // is still the proxy server and there is nothing to hand back.
-  const agentTitle = 'Agent π in proxy v3';
-  const isStdoutTty = Boolean(process.stdout.isTTY);
-  if (isStdoutTty) {
-    process.stdout.write(`\x1b]0;${agentTitle}\x07`);
+  if (IS_STDOUT_TTY) {
+    process.stdout.write(`\x1b]0;${AGENT_TITLE}\x07`);
   }
-  const restoreTerminalTitle = () => {
-    if (isStdoutTty) process.stdout.write(`\x1b]0;\x07`);
-  };
 
   // No OS-level sandbox: the bash tool runs commands via a plain `/bin/sh -c`
   // child process with this user's full privileges (see README "Tool safety
@@ -1294,7 +1409,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // total elapsed is reported in the result line either way.
     const verifyStartedAt = Date.now();
     let verifyTick = 0;
-    let verifyTimer: ReturnType<typeof setInterval> | null = isStdoutTty
+    let verifyTimer: ReturnType<typeof setInterval> | null = IS_STDOUT_TTY
       ? setInterval(() => {
           verifyTick += 1;
           const secs = ((Date.now() - verifyStartedAt) / 1000).toFixed(1);
@@ -1305,7 +1420,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // appended to the half-written progress line.
     const stopVerifyProgress = () => {
       if (verifyTimer !== null) { clearInterval(verifyTimer); verifyTimer = null; }
-      if (isStdoutTty) process.stdout.write('\r\x1b[K');
+      if (IS_STDOUT_TTY) process.stdout.write('\r\x1b[K');
     };
     const unsubscribe = candidate.subscribe((event) => {
       if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
@@ -1660,7 +1775,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       // An explicit quit outranks the budget acknowledgment: the user already
       // said to stop, so don't ask them to confirm it a second time.
       if (quitRequested) {
-        restoreTerminalTitle();
+        clearAgentTitle();
         break;
       }
 
@@ -1681,7 +1796,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
             }
           };
         });
-        restoreTerminalTitle();
+        clearAgentTitle();
         break;
       }
 
@@ -1750,7 +1865,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       const byeMsg = new Markdown(dim('π: bye!'), 1, 1, currentTheme, dimStyle);
       conversationArea.addChild(byeMsg);
       requestRender();
-      restoreTerminalTitle();
+      clearAgentTitle();
     }
   } finally {
     unsubscribeBudget();
