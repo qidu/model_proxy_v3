@@ -5,6 +5,30 @@ plus the `model_proxy_tokens.jsonl` usage-dump format and the startup
 stats-restoration rules. Split out of the
 [README Quick Start](../README.md#4-watch-live-stats-optional).
 
+## Mode-flag gating: what gets tracked
+
+The proxy only records detailed stats and enforces token limits when **at least one**
+of `--dashboard`, `--tui`, `--agent`, or `--rpc` is enabled (or their env-var
+equivalents `DASHBOARD=true`, `TUI=true`, `AGENT=true`, `RPC=true`). In "plain proxy"
+mode (no flags), memory usage is minimal:
+
+| Store | Flags set | No flags |
+|-------|-----------|----------|
+| `modelStats` (per-model totals) | ✅ | ✅ |
+| `dailyTokenStats` (daily rollup) | ✅ | ✅ |
+| `tokenHeatmapEvents` (sliding-window events) | ✅ | ❌ |
+| `compositeAliasStates.events` (alias limit windows) | ✅ | ❌ |
+| `agentStats` / `toolRequestChars` / `upstreamResponseToolStats` | ✅ | ❌ |
+| `requestEndpointStats` / timing / upstream / status codes | ✅ | ❌ |
+
+**Token limits enforced:** ✅ Global + Composite alias | ❌ **Both disabled**
+
+This means without any UI/runtime flag the proxy runs with minimal overhead —
+only cumulative per-model and daily totals are kept, no heatmap, no tool tracking,
+and no token-limit enforcement.
+
+---
+
 ## Terminal dashboard
 
 Start with the terminal dashboard:
@@ -21,8 +45,10 @@ JSONL now, `Ctrl+C` to quit. A web dashboard is also available at `GET /dashboar
 
 ## JSONL usage dump
 
-When `TUI=true` or `DUMP=true` is set, token stats are appended to
-`model_proxy_tokens.jsonl` in the working directory. Each line is one JSON dump:
+When `TUI=true`, `DASHBOARD=true` or `DUMP=true` is set, token stats are appended to
+`model_proxy_tokens.jsonl` in the working directory. `--dashboard` is the argv spelling
+of `DASHBOARD=true`, and `--tui`/`--agent` imply it; a bare `TUI=true`/`AGENT=true` env
+var does not (set `DASHBOARD=true` explicitly there). Each line is one JSON dump:
 
 ```json
 {

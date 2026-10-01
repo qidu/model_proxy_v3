@@ -1,6 +1,7 @@
 /**
- * Unit tests for the --tui / --agent mode flags (src/mode-flags.ts), plus the
- * invariant that forces server.ts to strip MODE_FLAGS before calling runCli().
+ * Unit tests for the --tui / --agent / --dashboard mode flags (src/mode-flags.ts),
+ * plus the invariant that forces server.ts to strip MODE_FLAGS before calling
+ * runCli().
  *
  * Run with:
  *   npx tsx --test tests/unit/mode-flags.test.ts
@@ -38,14 +39,16 @@ after(() => {
   rmSync(tempDir, { recursive: true, force: true });
 });
 
-// applyModeFlags writes to the real process.env, so snapshot and restore the two
+// applyModeFlags writes to the real process.env, so snapshot and restore the three
 // vars it owns around every case to keep the rest of the file's assertions honest.
 let savedTui: string | undefined;
 let savedAgent: string | undefined;
+let savedDashboard: string | undefined;
 
 beforeEach(() => {
   savedTui = process.env.TUI;
   savedAgent = process.env.AGENT;
+  savedDashboard = process.env.DASHBOARD;
 });
 
 afterEach(() => {
@@ -53,6 +56,8 @@ afterEach(() => {
   else process.env.TUI = savedTui;
   if (savedAgent === undefined) delete process.env.AGENT;
   else process.env.AGENT = savedAgent;
+  if (savedDashboard === undefined) delete process.env.DASHBOARD;
+  else process.env.DASHBOARD = savedDashboard;
 });
 
 /** Run runCli with stdout/stderr redirected, returning the captured streams. */
@@ -76,54 +81,96 @@ function capture(argv: string[], env: Partial<Env>): { code: number | null; out:
 // ---------------------------------------------------------------------------
 
 describe('applyModeFlags', () => {
-  it('--agent sets AGENT=true and leaves TUI unset', () => {
+  it('--agent sets AGENT=true, leaves TUI unset, and implies DASHBOARD', () => {
     delete process.env.AGENT;
     delete process.env.TUI;
+    delete process.env.DASHBOARD;
 
     applyModeFlags(['--agent']);
 
     assert.equal(process.env.AGENT, 'true', '--agent must set the exact value the six AGENT readers compare against');
     assert.equal(process.env.TUI, undefined, '--agent must not enable the dashboard TUI');
+    assert.equal(process.env.DASHBOARD, 'true', 'the agent session shows token stats, so it implies their persistence');
   });
 
-  it('--tui sets TUI=true and leaves AGENT unset', () => {
+  it('--tui sets TUI=true, leaves AGENT unset, and implies DASHBOARD', () => {
     delete process.env.AGENT;
     delete process.env.TUI;
+    delete process.env.DASHBOARD;
 
     applyModeFlags(['--tui']);
 
     assert.equal(process.env.TUI, 'true', '--tui must set the exact value the TUI readers compare against');
     assert.equal(process.env.AGENT, undefined, '--tui must not enable the agent session');
+    assert.equal(process.env.DASHBOARD, 'true', 'the dashboard TUI renders token stats, so it implies their persistence');
   });
 
-  it('both flags set both vars, leaving precedence to server.ts', () => {
+  it('--dashboard sets DASHBOARD=true and starts no UI', () => {
     delete process.env.AGENT;
     delete process.env.TUI;
+    delete process.env.DASHBOARD;
+
+    applyModeFlags(['--dashboard']);
+
+    assert.equal(process.env.DASHBOARD, 'true', '--dashboard must set the exact value server.ts compares against');
+    assert.equal(process.env.TUI, undefined, '--dashboard must not start the terminal dashboard');
+    assert.equal(process.env.AGENT, undefined, '--dashboard must not start the agent session');
+  });
+
+  it('--dashboard overrides a contradicting DASHBOARD env var', () => {
+    process.env.DASHBOARD = '0';
+
+    applyModeFlags(['--dashboard']);
+
+    assert.equal(process.env.DASHBOARD, 'true');
+  });
+
+  it('both tui and agent flags set both vars and imply DASHBOARD, leaving precedence to server.ts', () => {
+    delete process.env.AGENT;
+    delete process.env.TUI;
+    delete process.env.DASHBOARD;
 
     applyModeFlags(['--tui', '--agent']);
 
     assert.equal(process.env.TUI, 'true');
     assert.equal(process.env.AGENT, 'true');
+    assert.equal(process.env.DASHBOARD, 'true');
   });
 
-  it('argv without a mode flag leaves both vars exactly as they were', () => {
+  it('argv without a mode flag leaves all three vars exactly as they were', () => {
     process.env.TUI = '1';
     process.env.AGENT = '0';
+    process.env.DASHBOARD = '0';
 
     applyModeFlags(['--list-models', '--json']);
 
     assert.equal(process.env.TUI, '1', 'an unrelated command must not touch TUI');
     assert.equal(process.env.AGENT, '0', 'an unrelated command must not touch AGENT');
+    assert.equal(process.env.DASHBOARD, '0', 'an unrelated command must not touch DASHBOARD');
   });
 
-  it('an empty argv leaves both vars exactly as they were', () => {
+  it('an empty argv leaves all three vars exactly as they were', () => {
     process.env.TUI = '1';
     process.env.AGENT = '0';
+    process.env.DASHBOARD = '0';
 
     applyModeFlags([]);
 
     assert.equal(process.env.TUI, '1');
     assert.equal(process.env.AGENT, '0');
+    assert.equal(process.env.DASHBOARD, '0');
+  });
+
+  it('the bare TUI/AGENT env vars do not imply DASHBOARD — only the flags do', () => {
+    // The implication is flag -> flag by design: a supervisor exporting AGENT=true
+    // must not silently start appending model_proxy_tokens.jsonl.
+    process.env.TUI = 'true';
+    process.env.AGENT = 'true';
+    delete process.env.DASHBOARD;
+
+    applyModeFlags([]);
+
+    assert.equal(process.env.DASHBOARD, undefined, 'env vars alone must not opt into stats persistence');
   });
 
   it('a flag overrides a contradicting env var (the command line is the more specific request)', () => {
@@ -147,11 +194,13 @@ describe('applyModeFlags', () => {
   it('matches flags exactly, not by prefix', () => {
     delete process.env.AGENT;
     delete process.env.TUI;
+    delete process.env.DASHBOARD;
 
-    applyModeFlags(['--agent-mode', '--tuix', '--rpc']);
+    applyModeFlags(['--agent-mode', '--tuix', '--rpc', '--dashboards']);
 
     assert.equal(process.env.AGENT, undefined, 'a lookalike flag must not enable the agent session');
     assert.equal(process.env.TUI, undefined, 'a lookalike flag must not enable the dashboard TUI');
+    assert.equal(process.env.DASHBOARD, undefined, 'a lookalike flag must not enable stats persistence');
   });
 
   it('ignores a mode flag appearing after a command', () => {
@@ -168,8 +217,8 @@ describe('applyModeFlags', () => {
 // ---------------------------------------------------------------------------
 
 describe('MODE_FLAGS', () => {
-  it('lists exactly the three stdout-owning startup modes', () => {
-    assert.deepEqual([...MODE_FLAGS], ['--rpc', '--tui', '--agent']);
+  it('lists exactly the startup modes server.ts strips before runCli', () => {
+    assert.deepEqual([...MODE_FLAGS], ['--rpc', '--tui', '--agent', '--dashboard']);
   });
 
   it('every mode flag is rejected by runCli, which is why server.ts must strip them', () => {
@@ -185,7 +234,7 @@ describe('MODE_FLAGS', () => {
   });
 
   it('stripping MODE_FLAGS from argv lets a real command through and prints its output', () => {
-    const argv = ['--tui', '--agent', '--list-models'];
+    const argv = ['--tui', '--agent', '--dashboard', '--list-models'];
 
     const stripped = argv.filter((arg) => !(MODE_FLAGS as readonly string[]).includes(arg));
     assert.deepEqual(stripped, ['--list-models'], 'only the mode flags are removed');
@@ -197,7 +246,7 @@ describe('MODE_FLAGS', () => {
   });
 
   it('stripping every mode flag leaves argv empty, so runCli returns null and the server starts', () => {
-    const argv = ['--tui', '--agent'];
+    const argv = ['--tui', '--agent', '--dashboard'];
 
     const stripped = argv.filter((arg) => !(MODE_FLAGS as readonly string[]).includes(arg));
     assert.deepEqual(stripped, []);
@@ -206,5 +255,13 @@ describe('MODE_FLAGS', () => {
     assert.equal(result.code, null, 'null means "no command": start the server in the requested mode');
     assert.equal(result.out, '');
     assert.equal(result.err, '');
+  });
+
+  it('--dashboard alone reaches runCli as a usage error when not stripped, like the other modes', () => {
+    // Guards the reason --dashboard must stay in MODE_FLAGS: it is not a runCli
+    // command, so an unstripped `--dashboard` would exit 2 before the server starts.
+    const result = capture(['--dashboard'], { PROXY_CONFIG_PATH: goodPath });
+    assert.equal(result.code, 2);
+    assert.match(result.err, /Unknown argument: --dashboard/);
   });
 });

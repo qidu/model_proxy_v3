@@ -1099,9 +1099,14 @@ export default {
 
       const useConfigKey = proxyConfig.remote?.auth_passthrough_with === 'config_key';
 
-      // Global token limit check: only applies to model API requests, not dashboard/health
+      // Global token limit check: only applies when mode flags are enabled (--dashboard/--tui/--agent/--rpc)
+      const modeFlagsEnabled =
+        process.env.DASHBOARD === 'true' ||
+        process.env.TUI === 'true' ||
+        process.env.AGENT === 'true' ||
+        process.env.RPC === 'true';
       const globalTokenLimitRaw = proxyConfig.general?.global_token_limit;
-      if (globalTokenLimitRaw) {
+      if (modeFlagsEnabled && globalTokenLimitRaw) {
         const parsedGlobal = parseHumanTokenLimit(globalTokenLimitRaw.trim());
         if (parsedGlobal && parsedGlobal.num > 0) {
           const cutoff = getWindowCutoff(parseWindowSpec(parsedGlobal.duration));
@@ -1469,7 +1474,7 @@ export default {
               const fusionPlan = resolveFusionPlan(modelName, proxyConfig);
               if (fusionPlan) {
                 // token_limit check (covers all panel+judge+synth targets under the alias)
-                if (proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
+                if (modeFlagsEnabled && proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
                   const limitCfg = proxyConfig.composite[modelName].token_limit!;
                   const allTargets = [
                     ...fusionPlan.panel.map(p => p.route.modelAlias || p.modelName),
@@ -1499,7 +1504,7 @@ export default {
             compositeAliasName = (compositeCandidates.length > 0 || (request as any)._coordCandidate) ? modelName : undefined;
 
             // Token-limit enforcement: check tokens in the current duration window against the alias-level limit.
-            if (compositeCandidates.length > 0 && proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
+            if (modeFlagsEnabled && compositeCandidates.length > 0 && proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
               const limitCfg = proxyConfig.composite[modelName].token_limit!;
               const targetModels = compositeCandidates.map((c) => c.route.modelAlias || c.modelName);
               const totalUsed = getCompositeAliasTokenUsage(modelName, targetModels);

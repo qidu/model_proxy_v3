@@ -26,6 +26,7 @@ Design documents, architectural decisions, and planning documents for Model Prox
 - [Multiple Upstream Analysis](./multiple_upstream_analysis.md) — Analysis of multi-upstream routing strategies
 - [Proxy Implementation](./proxy_impementation.md) — Core proxy architecture (note: filename typo "impementation")
 - [Proxy Plan for v3](./proxy_plan_for_v3.md) — Original v3 implementation plan (phases 0-6)
+- [Dashboard / TUI / Agent Overhead on Routing](./dashboard_tui_agent_routing_overhead.md) — Which stats instrumentation sits in the request hot path, and what each UI mode, the CLI, and the JSON-RPC channel add
 
 ## Routing Architecture
 

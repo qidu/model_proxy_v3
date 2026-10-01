@@ -4,13 +4,14 @@
  * Wraps the Workers fetch handler with a native HTTP server
  */
 
-// Must stay the first import: it normalizes --tui/--agent into the TUI/AGENT env
-// vars at import time, before utils/logger.ts freezes AGENT_MODE. See mode-flags.ts.
+// Must stay the first import: it normalizes --tui/--agent/--dashboard into the
+// TUI/AGENT/DASHBOARD env vars at import time, before utils/logger.ts freezes
+// AGENT_MODE. See mode-flags.ts.
 import { MODE_FLAGS } from './mode-flags.js';
 import { createServer } from 'http';
 import type { Env } from './types/shared.js';
 import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit, resolveDefaultProxyConfigPath } from './utils/config-loader.js';
-import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled } from './utils/dashboard-stats.js';
+import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled, setTokenRetentionWindow } from './utils/dashboard-stats.js';
 import { runCli } from './cli.js';
 
 const port = parseInt(process.env.PORT || '8788', 10);
@@ -80,11 +81,11 @@ console.log = console.error;
 console.info = console.error;
 console.debug = console.error;
 
-// The MODE_FLAGS (`--rpc`, `--tui`, `--agent`) are *modes*, not runCli() commands:
-// runCli() rejects unknown args and exits after every command, so strip them before
-// the scan. A real command beside them (`--rpc --list-models`) still runs and exits
-// as usual. mode-flags.ts already turned --tui/--agent into the TUI/AGENT env vars
-// that the rest of this file reads.
+// The MODE_FLAGS (`--rpc`, `--tui`, `--agent`, `--dashboard`) are *modes*, not
+// runCli() commands: runCli() rejects unknown args and exits after every command,
+// so strip them before the scan. A real command beside them (`--rpc --list-models`)
+// still runs and exits as usual. mode-flags.ts already turned --tui/--agent/
+// --dashboard into the TUI/AGENT/DASHBOARD env vars that the rest of this file reads.
 const argv = process.argv.slice(2);
 const rpcEnabled = argv.includes('--rpc');
 
@@ -206,14 +207,21 @@ server.listen(port, '0.0.0.0', async () => {
   }
 
   // Token stats persistence (JSONL dump + restore) is opt-in: it only runs
-  // when the TUI dashboard or the standalone DUMP timer is active. Without
-  // it, stats live purely in memory, capped at the 30d retention window by
-  // recordTokenHeatmapEvent.
+  // when the dashboard is enabled (--dashboard, or --tui/--agent which imply
+  // it) or the standalone DUMP timer is active. Without it, stats live purely
+  // in memory, capped at the 30d retention window by recordTokenHeatmapEvent.
   let tuiEnabled = process.env.TUI === 'true' || process.env.TUI === '1';
   const agentEnabled = process.env.AGENT === 'true' || process.env.AGENT === '1';
   const dumpEnabled = process.env.DUMP === 'true' || process.env.DUMP === '1';
-  const persistenceEnabled = tuiEnabled || dumpEnabled;
+  const dashboardEnabled = process.env.DASHBOARD === 'true' || process.env.DASHBOARD === '1';
+  const persistenceEnabled = dashboardEnabled || tuiEnabled || dumpEnabled;
   setStatsPersistenceEnabled(persistenceEnabled);
+
+  // Retention window: 31 days when any mode flag is set (--dashboard/--tui/--agent/--rpc),
+  // 1 day in plain proxy mode. This controls the in-memory tokenHeatmapEvents cap,
+  // which feeds global token limit enforcement (1w/1m windows) and the dashboard heatmap.
+  const anyModeFlag = dashboardEnabled || tuiEnabled || agentEnabled || rpcEnabled || dumpEnabled;
+  setTokenRetentionWindow(anyModeFlag ? 31 : 1);
 
   if (agentEnabled && tuiEnabled) {
     console.warn('[WARN] Both AGENT and TUI are set; AGENT takes precedence and the dashboard TUI will not start.');

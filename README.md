@@ -253,6 +253,10 @@ npm run server -- --tui
 TUI=true npm run server
 ```
 
+`--dashboard` (or `DASHBOARD=true`) turns on token-stats persistence on its own — the
+JSONL dump and the startup restore below — without starting a UI; `--tui` and `--agent`
+imply it. It composes with every other mode (`--rpc --dashboard` is fine).
+
 You get a live view of configured models, token usage, response times, and tool stats;
 a web dashboard is also available at `GET /dashboard`. The `Q` key (documented in the
 `h` help panel) opens a model picker with a per-row usage suffix — `(58%)`,
@@ -267,6 +271,27 @@ e.g. `[0.11/2.12/63.93s] (58% left)` or `(6930/12000, 42% left)` for count-based
 providers. The TUI key bindings, the
 `model_proxy_tokens.jsonl` usage-dump format, and the startup stats-restoration rules
 are documented in [`docs/guides/live-stats.md`](./docs/guides/live-stats.md).
+
+#### Mode-flag gating: what gets tracked
+
+The proxy only records detailed stats and enforces token limits when **at least one**
+of `--dashboard`, `--tui`, `--agent`, or `--rpc` is enabled. In "plain proxy" mode
+(no flags), memory usage is minimal:
+
+| Store | Flags set | No flags |
+|-------|-----------|----------|
+| `modelStats` (per-model totals) | ✅ | ✅ |
+| `dailyTokenStats` (daily rollup) | ✅ | ✅ |
+| `tokenHeatmapEvents` (sliding-window events) | ✅ | ❌ |
+| `compositeAliasStates.events` (alias limit windows) | ✅ | ❌ |
+| `agentStats` / `toolRequestChars` / `upstreamResponseToolStats` | ✅ | ❌ |
+| `requestEndpointStats` / timing / upstream / status codes | ✅ | ❌ |
+
+**Token limits enforced:** ✅ Global + Composite alias | ❌ **Both disabled**
+
+This means without any UI/runtime flag the proxy runs with minimal overhead —
+only cumulative per-model and daily totals are kept, no heatmap, no tool tracking,
+and no token-limit enforcement.
 
 ## CLI Commands
 
@@ -712,7 +737,7 @@ AGENT=true npm run server
 ```
 
 `--agent`/`AGENT` and `--tui`/`TUI` are mutually exclusive; if both are set, `AGENT` wins
-with a warning.
+with a warning. Either flag also enables `--dashboard` (token-stats persistence).
 
 **Flow:** pick a working directory (tools are confined to it) → system prompt loads
 `AGENTS.md`/`CLAUDE.md` from that directory, with an optional multi-select for

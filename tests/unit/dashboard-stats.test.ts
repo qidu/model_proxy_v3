@@ -121,6 +121,9 @@ describe('getWindowCutoff (calendar week)', () => {
 
 describe('composite alias token storage', () => {
   beforeEach(() => {
+    // Enable mode flags so recordCompositeTokenUsage / recordTokenHeatmapEvent
+    // will record events (they're gated by --dashboard/--tui/--agent/--rpc).
+    process.env.DASHBOARD = 'true';
     // Isolation: clear known test aliases.
     clearCompositeLimit('__test_sliding__');
     clearCompositeLimit('__test_calendar__');

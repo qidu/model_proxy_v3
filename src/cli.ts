@@ -47,6 +47,9 @@ Modes:
   --agent                      Start the interactive agent session alongside the
                                HTTP server (same as AGENT=true). Requires a TTY,
                                and takes precedence over --tui.
+  --dashboard                  Persist token stats to model_proxy_tokens.jsonl and
+                               restore them at startup (same as DASHBOARD=true).
+                               Implied by --tui and --agent; composes with any mode.
 
 Options:
   --json               Machine-readable output for --list-models (dashboard config shape)
