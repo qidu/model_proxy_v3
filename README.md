@@ -293,6 +293,17 @@ This means without any UI/runtime flag the proxy runs with minimal overhead —
 only cumulative per-model and daily totals are kept, no heatmap, no tool tracking,
 and no token-limit enforcement.
 
+#### Performance benchmarks (10,000 rpm ≈ 167 req/s)
+
+| Mode | Heap (stats) | Concurrency (30 s streams) | Total RSS | `tokenHeatmapEvents` shift CPU |
+|------|--------------|----------------------------|-----------|--------------------------------|
+| **Plain (no flags)** | ~50 KB | 5,000 × ~50 KB = **250 MB** | **~300–400 MB** | 0% (events disabled) |
+| **Flags + 1-day retention** | 14.4M events = **922 MB** | 250 MB | **~1.2 GB** | **~283%** (2.8× realtime) |
+
+*CPU figures measured on Node 22.23.2: `Array.prototype.shift()` on object arrays is O(n) memmove (no left-trim optimization). Benchmark: 100k→443 µs/op, 1M→2.7 ms/op, 10M→12 ms/op. At 167 ops/s, 1-day retention (14.4M array) saturates ~3 CPU cores on `shift()` alone.*
+
+**Takeaway:** plain mode scales to 10k+ rpm with flat ~350 MB. Enabling any dashboard flag (`--dashboard`, `--tui`, `--agent`, `--rpc`) at 10k rpm requires per-second event aggregation or a ring buffer — the current per-request array + `shift()` design caps at ~1–2k rpm with 1-day retention.
+
 ## CLI Commands
 
 The server binary doubles as a config inspection tool. With no arguments it starts
