@@ -35,6 +35,7 @@ Commands:
   --list-models                List configured target models and aliases
   --export-pi-models           Print a ~/.pi/agent/models.json provider entry for this proxy
   --export-openclaw-providers  Print a ~/.openclaw/openclaw.json models.providers entry for this proxy
+  --export-dsh                 Print a deepseek-harness (dsh) llm-pi-ai provider config for this proxy
   --validate-config            Validate the config file and report errors/warnings
   --help, -h                   Show this help
 
@@ -65,13 +66,15 @@ plus the providers block (for ~/.pi/agent/models.json).
 
 --export-openclaw-providers prints the models.providers block (for ~/.openclaw/openclaw.json).
 
+--export-dsh prints a YAML config block for ~/.dsh/settings.yaml (llm-pi-ai provider).
+
 Exit codes:
   0  success (for --validate-config: no errors)
   1  command failed (unreadable config, or config with errors)
   2  usage error
 `;
 
-const COMMANDS = ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--validate-config'] as const;
+const COMMANDS = ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--export-dsh', '--validate-config'] as const;
 type Command = (typeof COMMANDS)[number];
 
 /**
@@ -136,6 +139,8 @@ export function runCli(argv: string[], env: Env): number | null {
       return exportPiModels(configPath, proxyLoopbackBaseUrl(env.PORT), defaultModel);
     case '--export-openclaw-providers':
       return exportOpenClawProviders(configPath, proxyLoopbackBaseUrl(env.PORT));
+    case '--export-dsh':
+      return exportDsh(configPath, proxyLoopbackBaseUrl(env.PORT));
     case '--validate-config':
       return validateConfig(configPath);
   }
@@ -366,6 +371,43 @@ function exportOpenClawProviders(configPath: string, baseUrl: string): number {
     },
   };
   process.stdout.write(`${JSON.stringify(openclaw, null, 2)}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --export-dsh
+// ---------------------------------------------------------------------------
+
+function exportDsh(configPath: string, baseUrl: string): number {
+  const config = tryLoadConfig(configPath);
+  if (!config) return 1;
+
+  const ids = getConfiguredModelIds(config);
+  if (ids.length === 0) {
+    process.stderr.write('Cannot export DSH config: the config defines no models\n');
+    return 1;
+  }
+
+  // DSH uses the OpenAI-compatible route with /v1/models endpoint.
+  // The baseURL must include /v1 because dsh appends /chat/completions to it.
+  const dshBaseUrl = `${baseUrl}/v1`;
+
+  const modelsYaml = ids.map((id) => `        - id: ${id}`).join('\n');
+
+  const output = `llm-pi-ai:
+  providers:
+    proxyv3:
+      apiKeyEnv: PROXYV3_API_KEY
+      api: openai-completions
+      baseURL: ${dshBaseUrl}
+      models:
+${modelsYaml}
+
+agent-default-model:
+  provider: proxyv3
+  model: ${ids[0]}
+`;
+  process.stdout.write(output);
   return 0;
 }
 
