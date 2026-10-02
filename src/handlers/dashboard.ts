@@ -459,14 +459,13 @@ export function handleDashboardPage(env: Env): Response {
 
       .config-block { border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-top: 10px; }
       .config-block h3 { position: relative; padding-right: 34px; }
-      .config-block-title { background: #fff; padding: 3px 8px; border-radius: 4px; }
+      .config-block-title { background: #fff; padding: 1px 8px; border-radius: 4px; }
       .config-block.collapsed > *:not(h3) { display: none; }
       .collapse-btn { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); width: 22px; height: 22px; padding: 0; font-size: 12px; line-height: 1; color: #555; background: #fff; border: 1px solid #bdbdbd; border-radius: 4px; cursor: pointer; }
       .collapse-btn:hover { background: #f5f5f5; }
       .config-row { display: grid; grid-template-columns: 260px 1fr 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
       .config-row label { font-weight: 600; }
       input[type="text"], input[type="number"], select {
-        width: 100%;
         padding: 6px 10px;
         border: 1px solid #bdbdbd;
         border-radius: 6px;
@@ -701,7 +700,7 @@ export function handleDashboardPage(env: Env): Response {
       <div class="wildcard-test-row">
         <label for="wildcardModelInput">Wildcard model test:</label>
         <input type="text" id="wildcardModelInput" placeholder="model id matched by wildcard" autocomplete="off" />
-        <button id="testWildcardModel" type="button" class="test-btn mini-btn">test</button>
+        <button id="testWildcardModel" type="button" class="test-btn mini-btn">test it</button>
         <span id="wildcardRouteHint"></span>
         <span id="wildcardTestStatus"></span>
       </div>
@@ -2442,7 +2441,7 @@ export function handleDashboardPage(env: Env): Response {
           const aliasKeys = Object.keys(targets || {}).filter((k) => k !== 'token_limit' && k !== 'fusion_options');
           const isCoordHead = aliasKeys.some((k) => { const c = (targets || {})[k] || {}; return typeof c.coord === 'number' && c.coord > 0; });
           const isFusionHead = !isCoordHead && !!targets.fusion_options;
-          const aliasTypeTag = isCoordHead ? ' <span style="font-size:11px;color:#555;"><b>Ö</b></span>' : isFusionHead ? ' <span style="font-size:11px;color:#555;"><b>Ƒ</b></span>' : ' <span style="font-size:11px;color:#555;"><b>ᙅ</b></span>';
+          const aliasTypeTag = isCoordHead ? ' <span style="font-size:13px;color:#555;"><b>Ö</b></span>' : isFusionHead ? ' <span style="font-size:13px;color:#555;"><b>Ƒ</b></span>' : ' <span style="font-size:13px;color:#555;"><b>ᙅ</b></span>';
           const blockId = 'composite.' + aliasName;
           const collapsed = collapsedBlockIds.has(blockId);
           return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">composite.' + escapeHtml(aliasName) + '</span>' + aliasTypeTag + errorMark + collapseButtonHtml(collapsed) + '</h3>' + rows + '</div>';
