@@ -5,9 +5,8 @@
  */
 
 import { Logger } from '../utils/logger.js';
-import { ClaudeModelsResponse } from '../types/claude.js';
-import { OpenAIModelsResponse } from '../types/openai.js';
-import { convertOpenAIModelsToClaude, mergeClaudeModelsResponse } from '../converters/openai-to-claude.js';
+import type { OpenAIModelsResponse } from '../types/openai.js';
+import { mergeOpenAIModelsResponse } from '../converters/openai-to-claude.js';
 import { validateModelsRequestParams } from '../utils/validation.js';
 import { handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
@@ -15,7 +14,7 @@ import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fe
 
 // In-memory cache for model list
 interface CacheEntry {
-  data: ClaudeModelsResponse;
+  data: OpenAIModelsResponse;
   timestamp: number;
 }
 
@@ -48,7 +47,7 @@ function isCacheValid(entry: CacheEntry, ttl: number): boolean {
 /**
  * Get cached model list
  */
-export function getCachedModels(ttl: number): ClaudeModelsResponse | null {
+export function getCachedModels(ttl: number): OpenAIModelsResponse | null {
   const entry = modelCache.get('models');
   if (entry && isCacheValid(entry, ttl)) {
     return entry.data;
@@ -59,7 +58,7 @@ export function getCachedModels(ttl: number): ClaudeModelsResponse | null {
 /**
  * Set cached model list
  */
-export function setCachedModels(data: ClaudeModelsResponse): void {
+export function setCachedModels(data: OpenAIModelsResponse): void {
   modelCache.set('models', {
     data,
     timestamp: Date.now(),
@@ -123,12 +122,12 @@ export async function getModelCount(
 
     const responseText = await response.text();
     const openaiResponse: OpenAIModelsResponse = JSON.parse(responseText);
-    const claudeResponse: ClaudeModelsResponse = convertOpenAIModelsToClaude(openaiResponse);
+    const mergedResponse = mergeOpenAIModelsResponse(openaiResponse, []);
 
     // Cache the response
-    setCachedModels(claudeResponse);
+    setCachedModels(mergedResponse);
 
-    return { count: claudeResponse.data.length, cached: false };
+    return { count: mergedResponse.data.length, cached: false };
   } catch (error) {
     logger.error(requestId, `Error fetching model count: ${(error as Error).message}`);
     return { count: 0, cached: false };
@@ -163,7 +162,7 @@ export async function handleModelsRequest(
     const cachedModels = getCachedModels(cacheTTL);
     if (cachedModels) {
       logger.debug(requestId, `Using cached model list (TTL: ${cacheTTL}ms)`);
-      const mergedCachedModels = mergeClaudeModelsResponse(cachedModels, extraModelIds);
+      const mergedCachedModels = mergeOpenAIModelsResponse(cachedModels, extraModelIds);
       return new Response(JSON.stringify(mergedCachedModels), {
         status: 200,
         headers: {
@@ -177,7 +176,7 @@ export async function handleModelsRequest(
 
   logger.debug(requestId, `Cache miss or invalid, fetching from upstream: ${targetUrl}`);
 
-  let upstreamModels: ClaudeModelsResponse = { data: [], first_id: null, has_more: false, last_id: null };
+  let upstreamModels: OpenAIModelsResponse = { object: "list", data: [] };
 
   try {
     // Build target API URL with query parameters
@@ -208,7 +207,7 @@ export async function handleModelsRequest(
 
     // Parse target API response
     const openaiResponse: OpenAIModelsResponse = JSON.parse(await response.text());
-    upstreamModels = convertOpenAIModelsToClaude(openaiResponse);
+    upstreamModels = mergeOpenAIModelsResponse(openaiResponse, []);
 
     // Cache the response (only for non-paginated requests)
     if (!afterId && !beforeId && !limit) {
@@ -218,10 +217,10 @@ export async function handleModelsRequest(
     logger.warn(requestId, `Upstream models fetch failed, returning config-only models: ${(error as Error).message}`);
   }
 
-  const claudeResponse = mergeClaudeModelsResponse(upstreamModels, extraModelIds);
+  const finalResponse = mergeOpenAIModelsResponse(upstreamModels, extraModelIds);
 
-  // Return response with Claude headers
-  return new Response(JSON.stringify(claudeResponse), {
+  // Return response with OpenAI headers
+  return new Response(JSON.stringify(finalResponse), {
     status: 200,
     headers: {
       'Content-Type': 'application/json',

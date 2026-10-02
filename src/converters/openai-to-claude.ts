@@ -309,32 +309,54 @@ function unixToRFC3339(timestamp: number): string {
     return date.toISOString();
 }
 
+const DEFAULT_CONTEXT_LENGTH = 262144;
+const DEFAULT_MAX_TOKENS = 65536;
+
 /**
- * Convert OpenAI models response to Claude format
+ * Merge extra model IDs into OpenAI models response
  */
-function addExtraModels(models: ClaudeModel[], extraModelIds: string[]): ClaudeModel[] {
-    const modelsMap = new Map(models.map((model) => [model.id, model] as const));
-    const now = new Date().toISOString();
+export function mergeOpenAIModelsResponse(
+    openaiResponse: OpenAIModelsResponse,
+    extraModelIds: string[] = []
+): OpenAIModelsResponse {
+    const modelsMap = new Map(openaiResponse.data.map((model) => [model.id, model] as const));
+    const now = Math.floor(Date.now() / 1000);
 
     for (const modelId of extraModelIds) {
         if (!modelsMap.has(modelId)) {
             modelsMap.set(modelId, {
                 id: modelId,
-                type: "model",
-                created_at: now,
-                display_name: modelId,
+                object: "model",
+                created: now,
+                owned_by: "system",
+                context_length: DEFAULT_CONTEXT_LENGTH,
+                max_tokens: DEFAULT_MAX_TOKENS,
             });
         }
     }
 
-    return [...modelsMap.values()];
+    return {
+        object: "list",
+        data: [...modelsMap.values()],
+    };
 }
 
-export function mergeClaudeModelsResponse(
-    claudeResponse: ClaudeModelsResponse,
+/**
+ * Convert OpenAI models response to Claude format (legacy, for backwards compatibility)
+ */
+export function convertOpenAIModelsToClaude(
+    openaiResponse: OpenAIModelsResponse,
     extraModelIds: string[] = []
-): ClaudeModelsResponse {
-    const models = addExtraModels(claudeResponse.data, extraModelIds);
+): import('../types/claude.js').ClaudeModelsResponse {
+    const merged = mergeOpenAIModelsResponse(openaiResponse, extraModelIds);
+    const models: import('../types/claude.js').ClaudeModel[] = merged.data.map(model => ({
+        id: model.id,
+        type: "model" as const,
+        created_at: unixToRFC3339(model.created),
+        display_name: model.id,
+        context_length: model.context_length ?? DEFAULT_CONTEXT_LENGTH,
+        max_tokens: model.max_tokens ?? DEFAULT_MAX_TOKENS,
+    }));
 
     return {
         data: models,
@@ -342,23 +364,4 @@ export function mergeClaudeModelsResponse(
         has_more: false,
         last_id: models.length > 0 ? models[models.length - 1].id : null,
     };
-}
-
-export function convertOpenAIModelsToClaude(
-    openaiResponse: OpenAIModelsResponse,
-    extraModelIds: string[] = []
-): ClaudeModelsResponse {
-    const models: ClaudeModel[] = openaiResponse.data.map(model => ({
-        id: model.id,
-        type: "model",
-        created_at: unixToRFC3339(model.created),
-        display_name: model.id,
-    }));
-
-    return mergeClaudeModelsResponse({
-        data: models,
-        first_id: models.length > 0 ? models[0].id : null,
-        has_more: false,
-        last_id: models.length > 0 ? models[models.length - 1].id : null,
-    }, extraModelIds);
 }

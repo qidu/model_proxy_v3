@@ -162,7 +162,7 @@ class PickerScreen implements Component {
     this.list.invalidate();
   }
   render(width: number): string[] {
-    return [this.title, '', ...this.list.render(width)];
+    return [dim(this.title), '', ...this.list.render(width)];
   }
 }
 
@@ -257,7 +257,7 @@ class MultiSelectScreen implements Component {
     this.list.invalidate();
   }
   render(width: number): string[] {
-    return [this.title, ...this.list.render(width)];
+    return [dim(this.title), ...this.list.render(width)];
   }
 }
 
@@ -313,7 +313,7 @@ class PromptScreen implements Component {
     // clause to its own line) — each line must be a separate array element,
     // since the TUI renderer tracks one row per element for cursor repositioning.
     // No blank row between title and input (removed to place '>' directly under title).
-    return [...this.title.split('\n'), ...this.input.render(width)];
+    return [...this.title.split('\n').map(dim), ...this.input.render(width)];
   }
 }
 
@@ -595,7 +595,8 @@ export function restoreConsoleOutput(): void {
 // TUI spinner interval for running status
 let tuiSpinnerInterval: ReturnType<typeof setInterval> | null = null;
 let spinnerTick = 0;
-export const SPINNER_CHARS = ['\\', '|', '/', '+', '-'];
+// Custom spinner frames: ·✢✶✳✻✽
+export const SPINNER_CHARS = ['·', '✢', '✶', '✳', '✻', '✽'];
 // Same frames, escaped for Markdown line starts: `+ ` and `- ` are both list
 // syntax. A bare `+` is drawn as a `-` bullet, so it showed the wrong character;
 // a bare `-` draws the right character but as a list item, whose wrapped

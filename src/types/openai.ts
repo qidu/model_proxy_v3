@@ -152,6 +152,8 @@ export interface OpenAIModel {
     object: "model";
     created: number;
     owned_by: string;
+    context_length?: number;
+    max_tokens?: number;
 }
 
 // --- Streaming Types ---

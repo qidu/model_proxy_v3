@@ -1153,12 +1153,11 @@ class DashboardView implements Component {
     let secondsTime: string;
     let inflightIndicator: string;
     if (activeRequests > 0) {
-      // Cycle through shading blocks (light -> solid) while requests are in
-      // flight, instead of the idle color-cycling seconds display.
-      const shadeFrames = ['░', '▒', '▓', '█'];
-      const shade = shadeFrames[Math.floor(sec) % shadeFrames.length];
+      // Cycle through braille spinner frames while requests are in flight.
+      const spinnerFrames = ['⠏', '⠹', '⠼', '⠧'];
+      const frame = spinnerFrames[Math.floor(sec) % spinnerFrames.length];
       secondsTime = lightWhite(this.lastTime.slice(-2));
-      inflightIndicator = ` ${green(shade)}`;
+      inflightIndicator = ` ${green(frame)}`;
     } else {
       // Idle: seconds display resets to the normal (non-blinking) color.
       secondsTime = lightWhite(this.lastTime.slice(-2));
