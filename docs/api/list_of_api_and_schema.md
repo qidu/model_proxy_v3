@@ -83,6 +83,7 @@ dashboard routes.
 |---|---|---|---|
 | `GET /health` (also `GET /`) | `src/server.ts` | Health check; probes default upstream `/v1/models` | None |
 | `GET /favicon.ico` | `src/server.ts` | Returns `204 No Content` | None |
+| `HEAD /api/hello` | `src/index.ts` | Claude Code connection-warming probe; returns `200` with empty body, answered before the auth gate and never forwarded upstream | None |
 | `GET /config-reload` | `src/server.ts` | Reload config from `PROXY_CONFIG_CONSUL` / `PROXY_CONFIG_APOLLO` | Loopback |
 
 ### 1.4 Dashboard endpoints

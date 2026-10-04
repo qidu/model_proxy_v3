@@ -5,6 +5,20 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(router): answer Claude Code's `HEAD /api/hello` startup probe with a local `200`
+
+`src/index.ts`, `tests/unit/api-hello.test.ts` — `HEAD /api/hello` is the connection-warming probe Claude Code fires at startup, before its first real inference request, so a gateway can pay the TLS and TCP setup cost on traffic the model never sees (`docs/api/llm-gateway-protocol-for-claude-code.md:60`). The path matched no route, so it fell through to the auth presence check and was answered `401` — or, with a credential, died in `parseFixedRoute` with `Unsupported fixed route: /api/hello`. It is now answered with `200` and an empty body, next to `/favicon.ico` and before the auth gate.
+
+**Why before the auth gate:** Claude Code sends the probe with no credentials, which is exactly what the presence check rejects, so any placement after it would return `401` and re-create the bug it is meant to avoid. Answering it locally also keeps it off the upstream entirely. The spec calls this traffic "best-effort startup traffic [the gateway] can reject without breaking anything" — a `401` would indeed be survivable, so this buys latency and log noise, not correctness; the client is documented as skipping the probe when an HTTP proxy or client certificate is configured, in which case it is not sent at all.
+
+**Path-only matching, like the other operational endpoints:** `/favicon.ico` and `/health` both match on path alone, so `/api/hello` does too and `GET /api/hello` also returns `200`. No method check means no second, subtly different code path for a probe that exists only to be fast. The body is `null` rather than an empty string, which is what `HEAD` wants and what both the Workers and the Node adapter (`src/server.ts`, which already skips body-stream construction for `GET`/`HEAD`) expect.
+
+**Covered by tests**: `tests/unit/api-hello.test.ts` (6 tests) — the probe returns `200` with no auth header, makes **no upstream `fetch` call** (asserted against a mocked `globalThis.fetch` recording every call, so a regression that proxied it instead of answering it locally would fail), returns an empty body, is still answered `200` with `DEV_NO_KEY: 'false'`, that is, before the auth presence check; `GET /api/hello` returns `200`, pinning the deliberate no-method-check choice; and an adjacent unknown path, `/api/not-hello`, is still rejected `401`, so the exemption cannot silently widen.
+
+**Not covered by tests**: the end-to-end Claude Code client behaviour — that Claude Code actually issues this probe, and that it treats any response as a warming success, are both taken from the protocol doc and are not driven from a real client here.
+
+**Known limitation, deliberately not addressed**: the handler sits after `loadProxyConfig(env)`, so if the TOML config fails to load, the probe fails too. Matching `/config-reload` — which also loads config before answering — was the closer convention than the `loadProxyConfig` bypass used by the dashboard, and the probe is best-effort by definition.
+
 ### feat(server): add `--dashboard` flag; `--tui` and `--agent` imply it
 
 `src/mode-flags.ts`, `src/server.ts`, `src/cli.ts`, `src/utils/dashboard-stats.ts`, `tests/unit/mode-flags.test.ts` — `--dashboard` is the argv spelling of `DASHBOARD=true`: it turns on token-stats persistence (append to `model_proxy_tokens.jsonl` + restore at startup). `--tui` and `--agent` now set it too, since both render the same token stats the dashboard serves, so asking for either is asking for the stats to survive a restart.

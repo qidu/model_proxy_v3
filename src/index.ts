@@ -11,7 +11,7 @@ import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
 import { createErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { createLogger, type Logger } from './utils/logger.js';
-import { handleModelsRequest, getModelCount } from './handlers/models.js';
+import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled } from './handlers/models.js';
 import { handleTokenCountingRequest } from './handlers/token-counting.js';
 import { handleMessagesRequest } from './handlers/messages.js';
 import { handleResponsesRequest, handleResponsesCompactRequest, handleResponsesInputTokensRequest, handleResponsesRetrievalRequest } from './handlers/responses.js';
@@ -905,6 +905,16 @@ export default {
       // Skip favicon requests
       if (path === '/favicon.ico') {
         return new Response(null, { status: 204 });
+      }
+
+      // Claude Code sends `HEAD /api/hello` at startup to warm the connection
+      // before its first real inference request. It is best-effort traffic the
+      // client ignores either way, but answering it locally keeps it off the
+      // upstream and off the auth path — Claude Code sends it with no
+      // credentials, so the presence check below would reject it with 401.
+      // Answered before the auth gate on purpose; no body, per HEAD semantics.
+      if (path === '/api/hello') {
+        return new Response(null, { status: 200 });
       }
 
       // Health check endpoint (also for root path)
@@ -2366,37 +2376,43 @@ export default {
 
         switch (attemptHandlerType) {
           case 'models':
-            response = await handleModelsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>, configuredModelIds);
+            // Check if Anthropic model discovery is enabled (gate)
+            if (isAnthropicModelDiscoveryEnabled(env as unknown as Record<string, unknown>)) {
+              // Use Anthropic model discovery handler: 3s timeout, redirect=error, filter, forward both auth headers
+              response = await handleAnthropicModelsDiscovery(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>);
+            } else {
+              response = await handleModelsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>, configuredModelIds);
 
-            // Check if User-Agent contains 'claude-cli' to return Anthropic model list format
-            const userAgent = request.headers.get('user-agent') || '';
-            if (userAgent.includes('claude-cli')) {
-              try {
-                const body = await response.json();
-                // Transform OpenAI response to Anthropic format
-                if (body.object === 'list' && Array.isArray(body.data)) {
-                  const anthropicModels = body.data.map((model: any) => ({
-                    id: model.id,
-                    type: 'model',
-                    created_at: new Date(model.created * 1000).toISOString(),
-                    display_name: model.id,
-                  }));
-                  const transformedResponse = {
-                    data: anthropicModels,
-                    first_id: anthropicModels[0]?.id || '',
-                    last_id: anthropicModels[anthropicModels.length - 1]?.id || '',
-                    has_more: false,
-                  };
-                  response = new Response(JSON.stringify(transformedResponse), {
-                    status: response.status,
-                    headers: {
-                      'Content-Type': 'application/json',
-                      'x-request-id': requestId,
-                    },
-                  });
+              // Check if User-Agent contains 'claude-cli' to return Anthropic model list format (legacy)
+              const userAgent = request.headers.get('user-agent') || '';
+              if (userAgent.includes('claude-cli')) {
+                try {
+                  const body: any = await response.json();
+                  // Transform OpenAI response to Anthropic format
+                  if (body.object === 'list' && Array.isArray(body.data)) {
+                    const anthropicModels = body.data.map((model: any) => ({
+                      id: model.id,
+                      type: 'model',
+                      created_at: new Date(model.created * 1000).toISOString(),
+                      display_name: model.id,
+                    }));
+                    const transformedResponse = {
+                      data: anthropicModels,
+                      first_id: anthropicModels[0]?.id || '',
+                      last_id: anthropicModels[anthropicModels.length - 1]?.id || '',
+                      has_more: false,
+                    };
+                    response = new Response(JSON.stringify(transformedResponse), {
+                      status: response.status,
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'x-request-id': requestId,
+                      },
+                    });
+                  }
+                } catch {
+                  // If transformation fails, return original response
                 }
-              } catch {
-                // If transformation fails, return original response
               }
             }
             break;

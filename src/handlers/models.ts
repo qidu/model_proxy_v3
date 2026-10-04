@@ -229,3 +229,220 @@ export async function handleModelsRequest(
     },
   });
 }
+
+/**
+ * Anthropic Model Discovery shape (per Claude Code Gateway spec)
+ */
+export interface AnthropicModel {
+  id: string;
+  display_name?: string;
+  description?: string;
+}
+
+export interface AnthropicModelsResponse {
+  object: 'list';
+  data: AnthropicModel[];
+}
+
+/**
+ * Check if Anthropic model discovery is enabled via environment variable
+ */
+export function isAnthropicModelDiscoveryEnabled(env?: Record<string, unknown>): boolean {
+  const value = env?.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY as string | undefined;
+  return value === '1' || value === 'true';
+}
+
+/**
+ * Handle Anthropic-format model discovery request
+ * Per spec: GET /v1/models?limit=1000, 3s timeout, redirect=error
+ * Filters to models with 'claude' or 'anthropic' in id (case-insensitive)
+ * Forwards both Authorization and x-api-key headers to upstream
+ */
+export async function handleAnthropicModelsDiscovery(
+  request: Request,
+  targetUrl: string,
+  authHeaders: Record<string, string>,
+  requestId: string,
+  logger: Logger,
+  env?: Record<string, unknown>
+): Promise<Response> {
+  // Check if discovery is enabled
+  if (!isAnthropicModelDiscoveryEnabled(env)) {
+    return new Response(JSON.stringify({ object: 'list', data: [] }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-request-id': requestId,
+      },
+    });
+  }
+
+  logger.debug(requestId, `Anthropic model discovery request to: ${targetUrl}`);
+
+  // Build target API URL with limit=1000 as per spec
+  const targetApiUrl = new URL(targetUrl);
+  targetApiUrl.searchParams.set('limit', '1000');
+
+  // Extract credentials from incoming request (both Authorization and x-api-key)
+  // Per spec: Claude Code sends both, omitting ones that don't resolve
+  const authHeader = request.headers.get('Authorization');
+  const apiKeyHeader = request.headers.get('x-api-key');
+
+  const upstreamHeaders: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  // Forward both headers if present (upstream model discovery endpoint needs them)
+  if (authHeader) {
+    upstreamHeaders['Authorization'] = authHeader;
+  }
+  if (apiKeyHeader) {
+    upstreamHeaders['x-api-key'] = apiKeyHeader;
+  }
+
+  // Also include any auth headers that were already extracted (for backward compat)
+  if (authHeaders['Authorization'] && !upstreamHeaders['Authorization']) {
+    upstreamHeaders['Authorization'] = authHeaders['Authorization'];
+  }
+  if (authHeaders['x-api-key'] && !upstreamHeaders['x-api-key']) {
+    upstreamHeaders['x-api-key'] = authHeaders['x-api-key'];
+  }
+
+  // 3 second timeout as per spec
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+  try {
+    const response = await fetch(targetApiUrl.toString(), {
+      method: 'GET',
+      headers: upstreamHeaders,
+      signal: controller.signal,
+      redirect: 'error', // Treat redirect as failure per spec
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error(requestId, `Upstream model discovery failed: ${response.status} ${errorText}`);
+      // Return error to client rather than silently degraded list
+      return new Response(JSON.stringify({
+        error: {
+          type: 'upstream_error',
+          message: `Model discovery failed: ${response.status} ${errorText}`,
+        },
+      }), {
+        status: response.status,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-request-id': requestId,
+        },
+      });
+    }
+
+    const upstreamResponse: any = await response.json();
+
+    // Transform to Anthropic shape and filter
+    let models: AnthropicModel[] = [];
+
+    // Handle different upstream response formats
+    if (upstreamResponse.data && Array.isArray(upstreamResponse.data)) {
+      // OpenAI format: { object: 'list', data: [{ id, ... }] }
+      models = upstreamResponse.data
+        .filter((model: any) => model.id && typeof model.id === 'string')
+        .map((model: any) => ({
+          id: model.id,
+          display_name: model.display_name || model.id,
+          description: model.description,
+        }));
+    } else if (Array.isArray(upstreamResponse)) {
+      // Direct array format
+      models = upstreamResponse
+        .filter((model: any) => model.id && typeof model.id === 'string')
+        .map((model: any) => ({
+          id: model.id,
+          display_name: model.display_name || model.id,
+          description: model.description,
+        }));
+    } else if (upstreamResponse.models && Array.isArray(upstreamResponse.models)) {
+      // Some providers use { models: [...] }
+      models = upstreamResponse.models
+        .filter((model: any) => model.id && typeof model.id === 'string')
+        .map((model: any) => ({
+          id: model.id,
+          display_name: model.display_name || model.id,
+          description: model.description,
+        }));
+    }
+
+    // Filter: keep only models with 'claude' or 'anthropic' in id (case-insensitive)
+    const filteredModels = models.filter((model) => {
+      const idLower = model.id.toLowerCase();
+      return idLower.includes('claude') || idLower.includes('anthropic');
+    });
+
+    logger.debug(requestId, `Model discovery: ${models.length} upstream models, ${filteredModels.length} after filter`);
+
+    const anthropicResponse: AnthropicModelsResponse = {
+      object: 'list',
+      data: filteredModels,
+    };
+
+    return new Response(JSON.stringify(anthropicResponse), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-request-id': requestId,
+      },
+    });
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    // Handle specific error types
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      logger.error(requestId, 'Model discovery timed out after 3s');
+      return new Response(JSON.stringify({
+        error: {
+          type: 'timeout',
+          message: 'Model discovery timed out after 3 seconds',
+        },
+      }), {
+        status: 504,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-request-id': requestId,
+        },
+      });
+    }
+
+    if (error instanceof TypeError && error.message.includes('redirect')) {
+      logger.error(requestId, 'Model discovery redirect treated as failure');
+      return new Response(JSON.stringify({
+        error: {
+          type: 'redirect_failed',
+          message: 'Model discovery redirect not allowed',
+        },
+      }), {
+        status: 502,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-request-id': requestId,
+        },
+      });
+    }
+
+    logger.error(requestId, `Model discovery error: ${(error as Error).message}`);
+    return new Response(JSON.stringify({
+      error: {
+        type: 'internal_error',
+        message: 'Model discovery failed',
+      },
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-request-id': requestId,
+      },
+    });
+  }
+}
