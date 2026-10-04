@@ -143,6 +143,16 @@ export function classifyTransportError(error: unknown): ClaudeProxyError | null 
 
 /**
  * Create a Claude API error response
+ *
+ * Per Anthropic API spec, error response format:
+ * {
+ *   "type": "error",
+ *   "error": {
+ *     "type": "error_type",
+ *     "message": "error message"
+ *   }
+ * }
+ * The top-level "type" is always "error", not the specific error type.
  */
 export function createErrorResponse(
   error: Error | ClaudeProxyError,
@@ -150,12 +160,12 @@ export function createErrorResponse(
   customStatus?: number
 ): Response {
   let responseStatus = customStatus ?? 500;
-  let type = 'error';
+  let errorType = 'error';
   let message = error.message;
 
   if (error instanceof ClaudeProxyError) {
     responseStatus = error.status;
-    type = error.type;
+    errorType = error.type;
   } else if (customStatus === undefined) {
     // No explicit status and not a ClaudeProxyError — this is the outer-catch
     // path where transport errors (DNS / refused / TLS / abort) surface as
@@ -166,15 +176,17 @@ export function createErrorResponse(
     const classified = classifyTransportError(error);
     if (classified) {
       responseStatus = classified.status;
-      type = classified.type;
+      errorType = classified.type;
       message = classified.message;
     }
   }
 
+  // Per Anthropic spec: top-level type is always "error"
+  // The specific error type goes in error.type
   const errorResponse: ClaudeErrorResponse = {
-    type: type as any,
+    type: 'error',
     error: {
-      type,
+      type: errorType,
       message,
     },
   };

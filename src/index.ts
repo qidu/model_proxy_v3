@@ -2367,6 +2367,38 @@ export default {
         switch (attemptHandlerType) {
           case 'models':
             response = await handleModelsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>, configuredModelIds);
+
+            // Check if User-Agent contains 'claude-cli' to return Anthropic model list format
+            const userAgent = request.headers.get('user-agent') || '';
+            if (userAgent.includes('claude-cli')) {
+              try {
+                const body = await response.json();
+                // Transform OpenAI response to Anthropic format
+                if (body.object === 'list' && Array.isArray(body.data)) {
+                  const anthropicModels = body.data.map((model: any) => ({
+                    id: model.id,
+                    type: 'model',
+                    created_at: new Date(model.created * 1000).toISOString(),
+                    display_name: model.id,
+                  }));
+                  const transformedResponse = {
+                    data: anthropicModels,
+                    first_id: anthropicModels[0]?.id || '',
+                    last_id: anthropicModels[anthropicModels.length - 1]?.id || '',
+                    has_more: false,
+                  };
+                  response = new Response(JSON.stringify(transformedResponse), {
+                    status: response.status,
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'x-request-id': requestId,
+                    },
+                  });
+                }
+              } catch {
+                // If transformation fails, return original response
+              }
+            }
             break;
 
           case 'token-counting':
