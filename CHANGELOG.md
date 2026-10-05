@@ -5,6 +5,14 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(converters): implement `mergeClaudeModelsResponse` for `/v1/models` fallback
+
+`src/converters/openai-to-claude.ts`, `tests/unit/openai-to-claude.test.ts` — The previously documented but unimplemented `mergeClaudeModelsResponse` function is now exported. It merges extra model IDs (from `extraModelIds` in the handler) into a `ClaudeModelsResponse`, deduplicating by `id` and setting `first_id`/`last_id` from the merged list. This enables the `/v1/models` fallback path when the upstream URL is invalid (see CHANGELOG entry "Fix: `/v1/models` falls back to local models when upstream URL is invalid"). Covered by `tests/unit/openai-to-claude.test.ts` (1 test in `mergeClaudeModelsResponse` suite).
+
+### fix(config-loader): align tests with documented `base` short alias for `base_url` in inline tables
+
+`tests/unit/config-loader.test.ts` — Two tests in the `parseSimpleToml` suite used `url = "..."` as the short alias for `base_url` in `[models.*]` inline-table entries. The documented and implemented short alias is `base` (matching the `mode`/`key`/`base` 4-letter pattern). Tests updated to use `base = "..."` instead of `url = "..."`, and test names updated from "url" to "base". The inline-table parser in `src/utils/config-loader.ts:3002` already expects `base`; the tests were out of sync since commit d99f62e ("fix(config) update for short alias consistant").
+
 ### feat(router): answer Claude Code's `HEAD /api/hello` startup probe with a local `200`
 
 `src/index.ts`, `tests/unit/api-hello.test.ts` — `HEAD /api/hello` is the connection-warming probe Claude Code fires at startup, before its first real inference request, so a gateway can pay the TLS and TCP setup cost on traffic the model never sees (`docs/api/llm-gateway-protocol-for-claude-code.md:60`). The path matched no route, so it fell through to the auth presence check and was answered `401` — or, with a credential, died in `parseFixedRoute` with `Unsupported fixed route: /api/hello`. It is now answered with `200` and an empty body, next to `/favicon.ico` and before the auth gate.

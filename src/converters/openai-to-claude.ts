@@ -365,3 +365,41 @@ export function convertOpenAIModelsToClaude(
         last_id: models.length > 0 ? models[models.length - 1].id : null,
     };
 }
+
+/**
+ * Merge extra model IDs into a Claude models response
+ */
+export function mergeClaudeModelsResponse(
+    claudeResponse: import('../types/claude.js').ClaudeModelsResponse,
+    extraModelIds: string[] = []
+): import('../types/claude.js').ClaudeModelsResponse {
+    const modelsMap = new Map<string, import('../types/claude.js').ClaudeModel>(
+        claudeResponse.data.map((model) => [model.id, model] as const)
+    );
+
+    const now = new Date().toISOString();
+    const DEFAULT_CONTEXT_LENGTH = 262144;
+    const DEFAULT_MAX_TOKENS = 65536;
+
+    for (const modelId of extraModelIds) {
+        if (!modelsMap.has(modelId)) {
+            modelsMap.set(modelId, {
+                id: modelId,
+                type: "model",
+                created_at: now,
+                display_name: modelId,
+                context_length: DEFAULT_CONTEXT_LENGTH,
+                max_tokens: DEFAULT_MAX_TOKENS,
+            });
+        }
+    }
+
+    const mergedModels = [...modelsMap.values()];
+
+    return {
+        data: mergedModels,
+        first_id: mergedModels.length > 0 ? mergedModels[0].id : null,
+        has_more: false,
+        last_id: mergedModels.length > 0 ? mergedModels[mergedModels.length - 1].id : null,
+    };
+}

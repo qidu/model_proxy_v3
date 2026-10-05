@@ -1,10 +1,17 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, platform } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { createAgentTools } from '../../src/agent-tools.js';
+
+const IS_WIN32 = platform() === 'win32';
+// The real OS temp root (e.g. /var/folders/.../T on macOS, C:\Users\...\AppData\Local\Temp on Windows)
+const TMP_ROOT = tmpdir();
+// Escape for use in regex: only escape regex metacharacters, not path separators.
+// The error message uses raw path with single backslashes on Windows.
+const TMP_ROOT_REGEX = TMP_ROOT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * Unit tests for the hand-authored AGENT=true tools: read_file/write_file/bash,
@@ -109,7 +116,7 @@ describe('read_file', () => {
 
     await assert.rejects(
       () => readFileTool.execute('t1', { path: target }),
-      /read_file path is outside the working directory and outside \/tmp\//,
+      new RegExp(`read_file path is outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
   });
 
@@ -126,7 +133,7 @@ describe('read_file', () => {
 
     await assert.rejects(
       () => readFileTool.execute('t1', { path: 'innocent.txt' }),
-      /read_file path is outside the working directory and outside \/tmp\//,
+      new RegExp(`read_file path is outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
   });
 });
@@ -166,7 +173,7 @@ describe('write_file', () => {
 
     await assert.rejects(
       () => writeFileTool.execute('t1', { path: target, content: 'x' }),
-      /outside the working directory and outside \/tmp\//,
+      new RegExp(`outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(existsSync(target), false);
   });
@@ -189,7 +196,7 @@ describe('write_file', () => {
 
     await assert.rejects(
       () => writeFileTool.execute('t1', { path: 'innocent.txt', content: 'PWNED' }),
-      /outside the working directory and outside \/tmp\//,
+      new RegExp(`outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(readFileSync(outsideTarget, 'utf-8'), 'ORIGINAL', 'symlink target must not be overwritten');
   });
@@ -208,7 +215,7 @@ describe('write_file', () => {
 
     await assert.rejects(
       () => writeFileTool.execute('t1', { path: 'linkdir/new-file.txt', content: 'x' }),
-      /outside the working directory and outside \/tmp\//,
+      new RegExp(`outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(existsSync(join(OUTSIDE_ROOT, 'new-file.txt')), false);
   });
@@ -230,7 +237,9 @@ describe('bash — normal execution', () => {
     writeFileSync(join(workDir, 'a.txt'), '');
     writeFileSync(join(workDir, 'b.txt'), '');
 
-    const result = await bashTool.execute('t1', { command: 'ls' });
+    // Use cross-platform command: dir on Windows, ls on Unix
+    const listCmd = IS_WIN32 ? 'dir /b' : 'ls';
+    const result = await bashTool.execute('t1', { command: listCmd });
 
     assert.equal(result.details.code, 0);
     assert.match(result.details.stdout, /a\.txt/);
@@ -316,7 +325,8 @@ describe('bash — Section 12 rm/mv path confinement', () => {
     const bashTool = getTool(tools, 'bash');
     writeFileSync(join(workDir, 'scratch.txt'), 'x');
 
-    await bashTool.execute('t1', { command: 'rm ./scratch.txt' });
+    const deleteCmd = IS_WIN32 ? 'del .\\scratch.txt' : 'rm ./scratch.txt';
+    await bashTool.execute('t1', { command: deleteCmd });
 
     assert.equal(existsSync(join(workDir, 'scratch.txt')), false);
   });
@@ -327,12 +337,12 @@ describe('bash — Section 12 rm/mv path confinement', () => {
     const tmpFile = join(tmpdir(), `agent-tools-test-rm-${process.pid}.txt`);
     writeFileSync(tmpFile, 'x');
 
-    // Single-quoted: on win32 the command runs under Git Bash's sh -c, which
-    // treats an unquoted backslash (from a Windows-native tmpdir() path) as
-    // its own escape character and strips it, mangling the path before rm
-    // ever sees it. Quoting is what a real shell-safe command would do
-    // anyway, so this isn't a workaround specific to the test.
-    await bashTool.execute('t1', { command: `rm '${tmpFile}'` });
+    // On Windows, use cmd.exe's native 'del' (no quotes needed for typical temp paths).
+    // On Unix, use 'rm' with single quotes.
+    const deleteCmd = IS_WIN32
+      ? `del ${tmpFile}`
+      : `rm '${tmpFile}'`;
+    await bashTool.execute('t1', { command: deleteCmd });
 
     assert.equal(existsSync(tmpFile), false);
   });
@@ -345,7 +355,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `rm ${outsideFile}` }),
-      /rm targeting a path outside the working directory and outside \/tmp\//,
+      new RegExp(`rm targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(existsSync(outsideFile), true);
   });
@@ -358,7 +368,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `mv config.toml ${dest}` }),
-      /mv targeting a path outside the working directory and outside \/tmp\//,
+      new RegExp(`mv targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(existsSync(join(workDir, 'config.toml')), true, 'source must not be moved');
     assert.equal(existsSync(dest), false, 'destination must not be created');
@@ -372,7 +382,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `mv ${src} inside-dest.txt` }),
-      /mv targeting a path outside the working directory and outside \/tmp\//,
+      new RegExp(`mv targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(existsSync(src), true);
     assert.equal(existsSync(join(workDir, 'inside-dest.txt')), false);
@@ -383,7 +393,8 @@ describe('bash — Section 12 rm/mv path confinement', () => {
     const bashTool = getTool(tools, 'bash');
     writeFileSync(join(workDir, 'from.txt'), 'moved content');
 
-    await bashTool.execute('t1', { command: 'mv from.txt to.txt' });
+    const moveCmd = IS_WIN32 ? 'move from.txt to.txt' : 'mv from.txt to.txt';
+    await bashTool.execute('t1', { command: moveCmd });
 
     assert.equal(existsSync(join(workDir, 'from.txt')), false);
     assert.equal(readFileSync(join(workDir, 'to.txt'), 'utf-8'), 'moved content');
@@ -403,7 +414,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `echo hi && rm ${outsideFile}` }),
-      /rm targeting a path outside the working directory and outside \/tmp\//,
+      new RegExp(`rm targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(existsSync(outsideFile), true);
   });
@@ -417,7 +428,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `rm scratch.txt ; mv config.toml ${dest}` }),
-      /mv targeting a path outside the working directory and outside \/tmp\//,
+      new RegExp(`mv targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
     );
     assert.equal(existsSync(join(workDir, 'config.toml')), true, 'source must not be moved');
     assert.equal(existsSync(dest), false, 'destination must not be created');
@@ -429,7 +440,9 @@ describe('bash — Section 12 rm/mv path confinement', () => {
     writeFileSync(join(workDir, 'a.txt'), 'x');
     writeFileSync(join(workDir, 'b.txt'), 'y');
 
-    await bashTool.execute('t1', { command: 'rm a.txt && mv b.txt c.txt' });
+    const rmCmd = IS_WIN32 ? 'del a.txt' : 'rm a.txt';
+    const mvCmd = IS_WIN32 ? 'move b.txt c.txt' : 'mv b.txt c.txt';
+    await bashTool.execute('t1', { command: `${rmCmd} && ${mvCmd}` });
 
     assert.equal(existsSync(join(workDir, 'a.txt')), false);
     assert.equal(existsSync(join(workDir, 'b.txt')), false);

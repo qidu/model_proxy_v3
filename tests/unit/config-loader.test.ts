@@ -286,13 +286,13 @@ describe('parseSimpleToml', () => {
     assert.equal(entry[5], '4096');
   });
 
-  it('accepts upstream_mode / url / key aliases in inline-table entries', () => {
+  it('accepts upstream_mode / base / key aliases in inline-table entries', () => {
     const cfg = parseSimpleToml(`
       [models.free]
       upstream_mode = "openai-completions"
       base_url = "https://default.example"
       api_key = "default-key"
-      "glm-5.2-a" = {target = "glm-5.2", upstream_mode = "anthropic-messages", url = "https://open.bigmodel.cn/api/anthropic", key = "bigmodel-key"}
+      "glm-5.2-a" = {target = "glm-5.2", upstream_mode = "anthropic-messages", base = "https://open.bigmodel.cn/api/anthropic", key = "bigmodel-key"}
     `);
     const entry = (cfg.models?.free as Record<string, unknown>)['glm-5.2-a'] as string[];
     assert.deepEqual(entry, ['glm-5.2', 'https://open.bigmodel.cn/api/anthropic', 'bigmodel-key', 'anthropic-messages']);
@@ -509,7 +509,7 @@ describe('parseSimpleToml', () => {
     const cfg = parseSimpleToml(`
       [models.x]
       upstream_mode = "anthropic-messages"
-      "m1" = {target = "t1", url = "https://b.dev", key = "sk-b", mode = "openai-completions"}
+      "m1" = {target = "t1", base = "https://b.dev", key = "sk-b", mode = "openai-completions"}
     `) as any;
     assert.deepEqual(cfg.models.x.m1, ['t1', 'https://b.dev', 'sk-b', 'openai-completions']);
     assert.deepEqual(cfg._validationErrors, []);
