@@ -19,7 +19,6 @@ import {
   captureConsoleOutput,
   restoreConsoleOutput,
   SPINNER_CHARS,
-  SPINNER_MD,
   agentTitleGlyph,
 } from '../../src/agent-session.js';
 import type { ProxyConfig } from '../../src/utils/config-loader.js';
@@ -702,7 +701,7 @@ describe('setProxyLogRow', () => {
   });
 });
 
-describe('SPINNER_MD', () => {
+describe('SPINNER_CHARS', () => {
   // Identity theme: every MarkdownTheme value is a style fn returning its input.
   // These assertions are about line text, not styling, and a Proxy keeps working
   // if pi-tui adds theme keys — unlike a hand-built partial object.
@@ -717,16 +716,14 @@ describe('SPINNER_MD', () => {
     return line!.trimStart()[0];
   }
 
-  it('holds the \\|/+- frames in order, escaped only where Markdown needs it', () => {
-    assert.deepEqual(SPINNER_CHARS, ['\\', '|', '/', '+', '-']);
-    assert.equal(SPINNER_MD.length, SPINNER_CHARS.length);
-    assert.deepEqual(SPINNER_MD, ['\\', '|', '/', '\\+', '\\-']);
+  it('holds the ·✢✶✳✻✽ frames in order, unescaped because none is Markdown-significant', () => {
+    assert.deepEqual(SPINNER_CHARS, ['·', '✢', '✶', '✳', '✻', '✽']);
   });
 
   it('renders every frame literally as the leading character of the task line', () => {
     for (let i = 0; i < SPINNER_CHARS.length; i++) {
       assert.equal(
-        leadChar(SPINNER_MD[i]),
+        leadChar(SPINNER_CHARS[i]),
         SPINNER_CHARS[i],
         `frame ${JSON.stringify(SPINNER_CHARS[i])} did not render literally`,
       );
@@ -734,13 +731,14 @@ describe('SPINNER_MD', () => {
   });
 
   it('regression: an unescaped "+" is Markdown list syntax and renders as "-"', () => {
-    // This is why SPINNER_MD exists. Passing SPINNER_CHARS straight to Markdown
-    // silently animated `\ | / -` while the docs advertised `\ | / +`.
+    // No shipped frame is a list marker, but this is the trap if one is ever
+    // added: passing a bare `+` to Markdown silently draws a `-` bullet, which
+    // is what a retired five-frame `\ | / + -` set did before the current six.
     assert.equal(leadChar('+'), '-');
     assert.equal(leadChar('\\+'), '+');
   });
 
-  it('regression: unescaped list markers wrap with a hanging indent, so every frame is escaped', () => {
+  it('regression: unescaped list markers wrap with a hanging indent, which no shipped frame is', () => {
     // `-` is the subtle one: a list bullet is also drawn as `-`, so leadChar
     // cannot tell it apart from a paragraph. What differs is the wrap — a list
     // item indents its continuation lines, a paragraph does not. On a long task
@@ -760,7 +758,7 @@ describe('SPINNER_MD', () => {
     const paragraph = wrapIndent('\\'); // inert frame: the paragraph baseline
     assert.equal(wrapIndent('-'), paragraph + 2, 'unescaped "-" should still be a list item');
     assert.equal(wrapIndent('+'), paragraph + 2, 'unescaped "+" should still be a list item');
-    for (const frame of SPINNER_MD) {
+    for (const frame of SPINNER_CHARS) {
       assert.equal(
         wrapIndent(frame),
         paragraph,

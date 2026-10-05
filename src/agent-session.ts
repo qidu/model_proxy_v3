@@ -595,17 +595,10 @@ export function restoreConsoleOutput(): void {
 // TUI spinner interval for running status
 let tuiSpinnerInterval: ReturnType<typeof setInterval> | null = null;
 let spinnerTick = 0;
-// Custom spinner frames: ·✢✶✳✻✽
+// Custom spinner frames: ·✢✶✳✻✽. None is Markdown-significant, so the same
+// frames go to both consumers: the in-flight task line (a Markdown component)
+// and the model-verification spinner (which writes straight to stdout).
 export const SPINNER_CHARS = ['·', '✢', '✶', '✳', '✻', '✽'];
-// Same frames, escaped for Markdown line starts: `+ ` and `- ` are both list
-// syntax. A bare `+` is drawn as a `-` bullet, so it showed the wrong character;
-// a bare `-` draws the right character but as a list item, whose wrapped
-// continuation lines are indented, so long task text jumped sideways on that
-// frame. The other three are inert. Use this only for Markdown components — the
-// model verification spinner writes straight to stdout and needs SPINNER_CHARS.
-export const SPINNER_MD = SPINNER_CHARS.map((c) =>
-  c === '+' || c === '-' ? `\\${c}` : c
-);
 
 // The terminal window title, set once at session start (see runAgentSession)
 // and animated while a task runs. Module-level rather than a local of
@@ -643,7 +636,7 @@ function startTuiSpinner(): void {
     // The in-flight task's line animates its leading `>` through the spinner
     // frames, so the transcript itself shows which task is still running.
     if (currentTaskMessage) {
-      currentTaskMessage.setText(`${SPINNER_MD[spinnerTick % SPINNER_MD.length]} ${currentTaskText}`);
+      currentTaskMessage.setText(`${SPINNER_CHARS[spinnerTick % SPINNER_CHARS.length]} ${currentTaskText}`);
       requestRender();
     }
     // Also alternate the title's π with * so the window tab itself shows that
@@ -742,7 +735,7 @@ async function runAgentTurn(task: string, taskLabel: string = task): Promise<voi
   // Add the task to the conversation. Its leading `>` is replaced by the
   // spinner frames while the task runs, then restored once it settles.
   currentTaskText = taskLabel;
-  currentTaskMessage = new Markdown(`${SPINNER_MD[0]} ${taskLabel}`, 1, 1, currentTheme, dimStyle);
+  currentTaskMessage = new Markdown(`${SPINNER_CHARS[0]} ${taskLabel}`, 1, 1, currentTheme, dimStyle);
   conversationArea.addChild(currentTaskMessage);
   startTuiSpinner();
   updateStatusBar();
