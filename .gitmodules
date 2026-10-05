@@ -10,3 +10,6 @@
 [submodule "submodules/node-keytar"]
 	path = submodules/node-keytar
 	url = git@github.com:github/node-keytar.git
+[submodule "submodules/laya-mlx"]
+	path = submodules/laya-mlx
+	url = git@github.com:qidu/laya-mlx.git

@@ -265,7 +265,7 @@ const judgeResult = await callToolJudgeSidecar({
   upstreamMode,
   body,
   userPrompt: extractUserPrompt(body),
-  tools: extractTools(body),
+  tools: extractToolRecords(body),
   context: buildContext(requestId),
 });
 
@@ -450,6 +450,25 @@ threshold = 0.5            # noul threshold or probabilities.keep threshold
 send_context = true
 context_window = 3         # number of recent messages/tool_calls to include
 ```
+
+> **Implementation status (proxy v3).** The shipped `[tool_judge_sidecar]` schema
+> differs from the block above; `src/utils/config-loader.ts` is authoritative:
+>
+> | Key | Shipped |
+> |---|---|
+> | `judge_url` | yes — **base URL** (`http://127.0.0.1:8081`); the client appends `/judge`. Its presence alone activates the feature |
+> | `timeout_ms` | yes (default 50) |
+> | `mode` | yes (default `"choice"`) |
+> | `threshold` | yes (default 0.5) |
+> | `max_batch_tools` | yes (default 50) — tools past the cap are kept and counted in the log |
+> | `api_key` | yes — sent as `Authorization: Bearer` |
+> | `enabled` | **not implemented** — activation is by `judge_url` |
+> | `url` | **not implemented** — the key is `judge_url` |
+> | `thresholds` | **not implemented** — a single global `threshold` |
+> | `send_context`, `context_window` | **not implemented** — context is always sent, capped by the constants in `src/utils/tool-judge-sidecar.ts` |
+>
+> The wrapper serving this protocol for the Laya model lives in
+> `submodules/laya-mlx/serve_judge.py`.
 
 ---
 

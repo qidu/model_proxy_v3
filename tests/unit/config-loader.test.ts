@@ -301,7 +301,7 @@ describe('parseSimpleToml', () => {
   it('canonical upstream_mode/base_url/api_key win over short aliases when both present', () => {
     const cfg = parseSimpleToml(`
       [models.free]
-      "m" = {upstream_mode = "anthropic-messages", mode = "openai-completions", base_url = "https://canonical", url = "https://short", api_key = "ck", key = "sk"}
+      "m" = {upstream_mode = "anthropic-messages", mode = "openai-completions", base_url = "https://canonical", base = "https://short", api_key = "ck", key = "sk"}
     `);
     const entry = (cfg.models?.free as Record<string, unknown>)['m'] as string[];
     assert.equal(entry[1], 'https://canonical');
@@ -432,6 +432,52 @@ describe('parseSimpleToml', () => {
       whitelist_add = ["deadbeef", "cafef00d"]
     `);
     assert.deepEqual(cfg.privacy_filter?.whitelist_add, ['deadbeef', 'cafef00d']);
+  });
+
+  // Without a dispatch branch for this section the parser silently dropped it,
+  // so `judgeTools` always took its `!sidecarConfig?.judge_url` early return and
+  // the sidecar could not be enabled from a config file at all.
+  it('parses [tool_judge_sidecar] numeric and string fields', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      timeout_ms = 2000
+      threshold = 0.65
+      mode = "noul"
+      max_batch_tools = 8
+      api_key = "judge-secret"
+    `);
+    assert.deepEqual(cfg.tool_judge_sidecar, {
+      judge_url: 'http://127.0.0.1:8081',
+      timeout_ms: 2000,
+      threshold: 0.65,
+      mode: 'noul',
+      max_batch_tools: 8,
+      api_key: 'judge-secret',
+    });
+  });
+
+  it('parses unquoted [tool_judge_sidecar] string values', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = http://127.0.0.1:8081
+      mode = choice
+    `);
+    assert.equal(cfg.tool_judge_sidecar?.judge_url, 'http://127.0.0.1:8081');
+    assert.equal(cfg.tool_judge_sidecar?.mode, 'choice');
+  });
+
+  it('drops unknown keys and wrong-typed values in [tool_judge_sidecar]', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      enabled = true
+      threshold = "high"
+      timeout_ms = "2000"
+    `);
+    // Only allowlisted keys with the right type land; the rest are ignored
+    // rather than coerced, so `enabled` never becomes a second activation path.
+    assert.deepEqual(cfg.tool_judge_sidecar, { judge_url: 'http://127.0.0.1:8081' });
   });
 
   it('parses [dashboard] and [remote] sections', () => {

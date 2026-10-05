@@ -4,6 +4,7 @@ import { dirname } from 'path';
 import { stringify } from './stringify.js';
 import type { TokenLimitDuration } from './config-loader.js';
 import { isSlidingDuration } from './config-loader.js';
+import { extractToolRecords, toolNameOf } from './tool-shapes.js';
 
 export type UsageStats = {
   input_tokens?: number;
@@ -915,33 +916,11 @@ export function extractUserAgentPrefix(userAgent: string | null): string {
 }
 
 export function extractToolNamesFromBody(body: Record<string, unknown> | undefined): string[] {
-  if (!body) {
-    return ['none'];
-  }
-
-  const tools = body.tools;
-  if (!Array.isArray(tools) || tools.length === 0) {
-    return ['none'];
-  }
-
   const names = new Set<string>();
-  for (const tool of tools) {
-    if (!tool || typeof tool !== 'object') {
-      continue;
-    }
-
-    const claudeToolName = (tool as Record<string, unknown>).name;
-    if (typeof claudeToolName === 'string' && claudeToolName.trim()) {
-      names.add(claudeToolName.trim());
-      continue;
-    }
-
-    const openAiFunction = (tool as Record<string, unknown>).function;
-    if (openAiFunction && typeof openAiFunction === 'object') {
-      const openAiName = (openAiFunction as Record<string, unknown>).name;
-      if (typeof openAiName === 'string' && openAiName.trim()) {
-        names.add(openAiName.trim());
-      }
+  for (const tool of extractToolRecords(body)) {
+    const name = tool.name.trim();
+    if (name) {
+      names.add(name);
     }
   }
 
@@ -1104,16 +1083,7 @@ export function extractToolRequestCharLengthsFromBody(body: Record<string, unkno
     }
 
     const record = tool as Record<string, unknown>;
-    const claudeToolName = typeof record.name === 'string' && record.name.trim()
-      ? record.name.trim()
-      : undefined;
-    const openAiFunction = record.function && typeof record.function === 'object'
-      ? (record.function as Record<string, unknown>)
-      : undefined;
-    const openAiName = typeof openAiFunction?.name === 'string' && openAiFunction.name.trim()
-      ? openAiFunction.name.trim()
-      : undefined;
-    const toolName = claudeToolName || openAiName;
+    const toolName = toolNameOf(record)?.trim();
     if (!toolName) {
       continue;
     }

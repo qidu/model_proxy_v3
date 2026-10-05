@@ -21,8 +21,11 @@ import {
   recordCompositeTokenUsage,
   getCompositeAliasTokenUsage,
   compositeAliasStates,
+  extractToolNamesFromBody,
+  extractToolRequestCharLengthsFromBody,
   type WindowSpec,
 } from '../../src/utils/dashboard-stats.js';
+import { stringify } from '../../src/utils/stringify.js';
 
 // ---------------------------------------------------------------------------
 // parseWindowSpec
@@ -185,5 +188,86 @@ describe('composite alias token storage', () => {
     // After clear, falls back to all-time model total (0 for unknown model).
     const used = getCompositeAliasTokenUsage('__test_sliding__', ['__unknown_model__']);
     assert.equal(used, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractToolNamesFromBody — adapter over the shared tool-shape walker
+// ---------------------------------------------------------------------------
+
+describe('extractToolNamesFromBody', () => {
+  it('reports the [none] sentinel when there is nothing to name', () => {
+    assert.deepEqual(extractToolNamesFromBody(undefined), ['none']);
+    assert.deepEqual(extractToolNamesFromBody({}), ['none']);
+    assert.deepEqual(extractToolNamesFromBody({ tools: [] }), ['none']);
+    assert.deepEqual(extractToolNamesFromBody({ tools: 'Read' }), ['none']);
+    assert.deepEqual(extractToolNamesFromBody({ tools: [{ name: '   ' }] }), ['none']);
+  });
+
+  it('trims names and de-duplicates after trimming', () => {
+    assert.deepEqual(
+      extractToolNamesFromBody({ tools: [{ name: ' Read ' }, { name: 'Read' }, { name: 'grep' }] }),
+      ['Read', 'grep'],
+    );
+  });
+
+  it('names both Claude and OpenAI shapes', () => {
+    assert.deepEqual(
+      extractToolNamesFromBody({
+        tools: [{ name: 'Read', input_schema: {} }, { type: 'function', function: { name: 'grep' } }],
+      }),
+      ['Read', 'grep'],
+    );
+  });
+
+  it('names every Gemini functionDeclaration instead of reporting [none]', () => {
+    // Regression: the snake_case key left this returning ['none'], so the
+    // dashboard recorded every Gemini-native request as tool-less.
+    assert.deepEqual(
+      extractToolNamesFromBody({
+        tools: [{ functionDeclarations: [{ name: 'ls' }, { name: 'cat' }] }],
+      }),
+      ['ls', 'cat'],
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractToolRequestCharLengthsFromBody — keeps its own per-entry loop
+// ---------------------------------------------------------------------------
+
+describe('extractToolRequestCharLengthsFromBody', () => {
+  it('charges a named tool its own serialized length', () => {
+    const tool = { name: 'Read', input_schema: { type: 'object' } };
+    const [entry] = extractToolRequestCharLengthsFromBody({ tools: [tool] });
+    assert.equal(entry.tool_name, 'Read');
+    assert.equal(entry.request_chars, stringify(tool).length);
+  });
+
+  it('sums the system text once per tool name it mentions', () => {
+    const tool = { name: 'Read', input_schema: {} };
+    const body = { system: 'always call Read first', tools: [tool] };
+    const [entry] = extractToolRequestCharLengthsFromBody(body);
+    assert.equal(entry.request_chars, stringify(tool).length + body.system.length);
+
+    const [quiet] = extractToolRequestCharLengthsFromBody({ system: 'nothing here', tools: [tool] });
+    assert.equal(quiet.request_chars, stringify(tool).length);
+  });
+
+  it('accumulates a repeated tool name across entries', () => {
+    const a = { name: 'Read', input_schema: { n: 1 } };
+    const b = { name: 'Read', parameters: { n: 2 } };
+    const entries = extractToolRequestCharLengthsFromBody({ tools: [a, b] });
+    assert.deepEqual(entries, [
+      { tool_name: 'Read', request_chars: stringify(a).length + stringify(b).length },
+    ]);
+  });
+
+  it('ignores entries it cannot name, including a Gemini wrapper', () => {
+    // A Gemini wrapper holds many declarations and no per-entry name, so it has
+    // no single tool to charge — same accounting as before this refactor.
+    assert.deepEqual(extractToolRequestCharLengthsFromBody({ tools: [{ functionDeclarations: [{ name: 'ls' }] }] }), []);
+    assert.deepEqual(extractToolRequestCharLengthsFromBody({ tools: [{ name: '   ' }, null, 42] }), []);
+    assert.deepEqual(extractToolRequestCharLengthsFromBody(undefined), []);
   });
 });

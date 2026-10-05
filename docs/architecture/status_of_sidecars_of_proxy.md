@@ -115,20 +115,31 @@ allow_private_ips = false             # SSRF guard
 ```toml
 [tool_judge_sidecar]
 # No `enabled` flag — activated by presence of `judge_url`
-judge_url = "http://localhost:8083"
-timeout_ms = 5000
+judge_url = "http://localhost:8081"   # base URL; the client appends /judge
+timeout_ms = 50
 mode = "choice"              # "choice" | "noul"
-batch_size = 64              # Max tools per call
-fail_open = true             # FAIL-OPEN: pass all tools on error
+threshold = 0.5              # keep iff score > threshold
+max_batch_tools = 50         # tools past the cap are kept (not judged)
+api_key = "..."              # optional Authorization: Bearer
 ```
+
+Wire format: `docs/architecture/design_tool_judge_sidecar_protocol.md` —
+request `{state, questions: {<qid>: <question>}}`, response `{<qid>: <answer>}`.
 
 **Implementation** (`src/utils/tool-judge-sidecar.ts`):
 - **Modes**:
-  - `choice`: Sidecar returns selected tool names array
-  - `noul`: Sidecar returns `{name, reason}` objects with relevance scores
-- **Fail-OPEN**: Errors log + return all tools unfiltered
-- **Batch limiting**: Splits large tool sets into `batch_size` chunks
-- **Used by**: `filter_tools` builtin transform
+  - `choice`: one request per tool, question id `decision`, answer
+    `{type:"choice", probabilities:{keep, discard}, ...}`; `keep` iff
+    `probabilities.keep > threshold`
+  - `noul`: one request for all tools, one question per tool name, answer
+    `{type:"noul", noul: 0.0-1.0, ...}`; `keep` iff `noul > threshold`
+- **Fail-OPEN**: errors log + return all tools unfiltered; tools the sidecar did
+  not answer for, and tools over `max_batch_tools`, are kept and reported as
+  counts in the log line
+- **Reference server**: `submodules/laya-mlx/serve_judge.py` (stdlib
+  `http.server`, serves `POST /judge` + `GET /health`)
+- **Called by**: `src/index.ts` directly at the `before_upstream` hook, before
+  `eraseBlockedTools` — there is no `filter_tools` builtin transform
 
 ---
 
@@ -248,10 +259,11 @@ entries = [
 [transforms.my_set]
 request_ingress = []
 before_conversion = [
-  { op = "filter_tools", config = { mode = "choice" } },     # Tool judge
   { op = "redact_pii" },                                       # Privacy filter
   { op = "inject_system_prompt", config = { prompt = "..." } },
 ]
+# The tool judge is not a builtin transform: it is wired into the proxy's
+# `before_upstream` hook in src/index.ts, configured via [tool_judge_sidecar].
 before_upstream = [
   { op = "ensure_inline_images" },                             # Image fetch
 ]

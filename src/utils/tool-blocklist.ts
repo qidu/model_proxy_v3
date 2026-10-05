@@ -1,4 +1,5 @@
 import { isToolBlocked } from './dashboard-stats.js';
+import { toolNameOf } from './tool-shapes.js';
 import type { Logger } from '../types/shared.js';
 
 export type EraseResult = {
@@ -66,7 +67,7 @@ export function eraseBlockedTools(
       continue;
     }
     // Claude / OpenAI / Responses shape
-    const name = extractToolName(t);
+    const name = toolNameOf(t);
     if (name && (isToolBlocked(name) || sidecarBlocked.has(name))) {
       result.erasedNames.push(name);
       continue;
@@ -92,17 +93,6 @@ export function eraseBlockedTools(
   }
 
   return result;
-}
-
-function extractToolName(tool: Record<string, unknown>): string | undefined {
-  // Claude / Responses (rare): { name, ... }
-  if (typeof tool.name === 'string') return tool.name;
-  // OpenAI / Responses: { type: 'function', function: { name, ... } }
-  if (tool.function && typeof tool.function === 'object') {
-    const fn = tool.function as Record<string, unknown>;
-    if (typeof fn.name === 'string') return fn.name;
-  }
-  return undefined;
 }
 
 function sanitizeToolChoice(

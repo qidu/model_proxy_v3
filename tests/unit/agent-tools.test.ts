@@ -7,11 +7,6 @@ import { join, resolve } from 'node:path';
 import { createAgentTools } from '../../src/agent-tools.js';
 
 const IS_WIN32 = platform() === 'win32';
-// The real OS temp root (e.g. /var/folders/.../T on macOS, C:\Users\...\AppData\Local\Temp on Windows)
-const TMP_ROOT = tmpdir();
-// Escape for use in regex: only escape regex metacharacters, not path separators.
-// The error message uses raw path with single backslashes on Windows.
-const TMP_ROOT_REGEX = TMP_ROOT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * Unit tests for the hand-authored AGENT=true tools: read_file/write_file/bash,
@@ -25,6 +20,19 @@ const TMP_ROOT_REGEX = TMP_ROOT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // "Outside" location for negative tests: outside workDir AND outside /tmp/ — a
 // scratch dir under this repo's own tests/unit, neither allowed root.
 const OUTSIDE_ROOT = resolve('tests/unit/.agent-tools-outside-scratch');
+
+// The confinement messages interpolate the OS temp root itself (node:os
+// tmpdir()), not a hardcoded "/tmp/": /tmp on Linux, /tmp or /var/folders/.../T
+// on macOS, C:\Users\<user>\AppData\Local\Temp on Windows. The expected text is
+// built the same way, so these hold on every platform. TMP_ROOT is inserted as
+// a literal, so its regex metacharacters must be escaped — on Windows the path
+// contains backslashes.
+const TMP_ROOT = tmpdir();
+const TMP_ROOT_RE = TMP_ROOT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const READ_BLOCKED_RE = new RegExp(`read_file path is outside the working directory and outside ${TMP_ROOT_RE} \\(`);
+const WRITE_BLOCKED_RE = new RegExp(`outside the working directory and outside ${TMP_ROOT_RE} \\(`);
+const RM_BLOCKED_RE = new RegExp(`rm targeting a path outside the working directory and outside ${TMP_ROOT_RE} \\(`);
+const MV_BLOCKED_RE = new RegExp(`mv targeting a path outside the working directory and outside ${TMP_ROOT_RE} \\(`);
 
 // fs.symlinkSync requires elevated privileges (or Developer Mode) to create
 // symlinks as a regular user on Windows — unlike Unix, where any user can
@@ -116,7 +124,7 @@ describe('read_file', () => {
 
     await assert.rejects(
       () => readFileTool.execute('t1', { path: target }),
-      new RegExp(`read_file path is outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      READ_BLOCKED_RE,
     );
   });
 
@@ -133,7 +141,7 @@ describe('read_file', () => {
 
     await assert.rejects(
       () => readFileTool.execute('t1', { path: 'innocent.txt' }),
-      new RegExp(`read_file path is outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      READ_BLOCKED_RE,
     );
   });
 });
@@ -173,7 +181,7 @@ describe('write_file', () => {
 
     await assert.rejects(
       () => writeFileTool.execute('t1', { path: target, content: 'x' }),
-      new RegExp(`outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      WRITE_BLOCKED_RE,
     );
     assert.equal(existsSync(target), false);
   });
@@ -196,7 +204,7 @@ describe('write_file', () => {
 
     await assert.rejects(
       () => writeFileTool.execute('t1', { path: 'innocent.txt', content: 'PWNED' }),
-      new RegExp(`outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      WRITE_BLOCKED_RE,
     );
     assert.equal(readFileSync(outsideTarget, 'utf-8'), 'ORIGINAL', 'symlink target must not be overwritten');
   });
@@ -215,7 +223,7 @@ describe('write_file', () => {
 
     await assert.rejects(
       () => writeFileTool.execute('t1', { path: 'linkdir/new-file.txt', content: 'x' }),
-      new RegExp(`outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      WRITE_BLOCKED_RE,
     );
     assert.equal(existsSync(join(OUTSIDE_ROOT, 'new-file.txt')), false);
   });
@@ -355,7 +363,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `rm ${outsideFile}` }),
-      new RegExp(`rm targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      RM_BLOCKED_RE,
     );
     assert.equal(existsSync(outsideFile), true);
   });
@@ -368,7 +376,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `mv config.toml ${dest}` }),
-      new RegExp(`mv targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      MV_BLOCKED_RE,
     );
     assert.equal(existsSync(join(workDir, 'config.toml')), true, 'source must not be moved');
     assert.equal(existsSync(dest), false, 'destination must not be created');
@@ -382,7 +390,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `mv ${src} inside-dest.txt` }),
-      new RegExp(`mv targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      MV_BLOCKED_RE,
     );
     assert.equal(existsSync(src), true);
     assert.equal(existsSync(join(workDir, 'inside-dest.txt')), false);
@@ -414,7 +422,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `echo hi && rm ${outsideFile}` }),
-      new RegExp(`rm targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      RM_BLOCKED_RE,
     );
     assert.equal(existsSync(outsideFile), true);
   });
@@ -428,7 +436,7 @@ describe('bash — Section 12 rm/mv path confinement', () => {
 
     await assert.rejects(
       () => bashTool.execute('t1', { command: `rm scratch.txt ; mv config.toml ${dest}` }),
-      new RegExp(`mv targeting a path outside the working directory and outside ${TMP_ROOT_REGEX}`),
+      MV_BLOCKED_RE,
     );
     assert.equal(existsSync(join(workDir, 'config.toml')), true, 'source must not be moved');
     assert.equal(existsSync(dest), false, 'destination must not be created');

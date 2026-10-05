@@ -2858,6 +2858,10 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'privacy_filter';
         currentCategory = null;
         config.privacy_filter = {};
+      } else if (parts[0] === 'tool_judge_sidecar') {
+        currentSection = 'tool_judge_sidecar';
+        currentCategory = null;
+        config.tool_judge_sidecar = {};
       } else if (parts[0] === 'fetch') {
         currentSection = 'fetch';
         currentCategory = null;
@@ -2945,6 +2949,12 @@ export function parseSimpleToml(content: string): ProxyConfig {
         // numeric thresholds are coerced in the unquoted branch below.
         if (cleanKey === 'filter_mode' || cleanKey === 'filter_url' || cleanKey === 'whitelist_file') {
           (config.privacy_filter as any)[cleanKey] = value;
+        }
+      } else if (currentSection === 'tool_judge_sidecar' && config.tool_judge_sidecar) {
+        // judge_url, mode and api_key are stored as strings; the numeric keys
+        // are coerced in the unquoted branch below.
+        if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
+          (config.tool_judge_sidecar as any)[cleanKey] = value;
         }
       } else if (currentSection === 'fetch' && config.fetch) {
         if (cleanKey === 'image_encode') {
@@ -3266,6 +3276,16 @@ export function parseSimpleToml(content: string): ProxyConfig {
         } else if (typeof cleanValueAny === 'string') {
           if (cleanKey === 'filter_mode' || cleanKey === 'filter_url' || cleanKey === 'whitelist_file') {
             (config.privacy_filter as any)[cleanKey] = cleanValueAny;
+          }
+        }
+      } else if (currentSection === 'tool_judge_sidecar' && config.tool_judge_sidecar) {
+        if (typeof cleanValueAny === 'number') {
+          if (cleanKey === 'timeout_ms' || cleanKey === 'threshold' || cleanKey === 'max_batch_tools') {
+            (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
+          }
+        } else if (typeof cleanValueAny === 'string') {
+          if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
+            (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
           }
         }
       } else if (currentSection === 'fetch' && config.fetch) {
