@@ -2778,6 +2778,10 @@ export function parseSimpleToml(content: string): ProxyConfig {
   // long name is accepted, e.g. `mode` in a [models.*] section). Merged into
   // validateProxyConfig's result below so they reach the TUI/dashboard.
   const sectionFieldErrors: ConfigValidationError[] = [];
+  // Same idea for header-level problems that are not fatal (unknown section
+  // header, bare [transforms]). Kept separate from sectionFieldErrors so they
+  // surface as warnings rather than blocking startup.
+  const sectionFieldWarnings: ConfigValidationError[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
@@ -2866,11 +2870,23 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'fetch';
         currentCategory = null;
         config.fetch = {};
-      } else if (parts[0] === 'transforms' && parts[1]) {
-        currentSection = 'transforms';
-        currentCategory = parts[1];
-        if (!config.transforms) config.transforms = {};
-        config.transforms[currentCategory] = { name: currentCategory, schema: 'openai-completions' };
+      } else if (parts[0] === 'transforms') {
+        if (!parts[1]) {
+          // A bare [transforms] names no transform set, so it matches no branch
+          // below and its keys would be absorbed into whatever section preceded
+          // it. Report it and drop the keys instead.
+          sectionFieldWarnings.push({
+            path: 'transforms',
+            message: `[transforms] needs a name — use [transforms.<name>]; keys under [transforms] at line ${i + 1} are ignored`,
+          });
+          currentSection = null;
+          currentCategory = null;
+        } else {
+          currentSection = 'transforms';
+          currentCategory = parts[1];
+          if (!config.transforms) config.transforms = {};
+          config.transforms[currentCategory] = { name: currentCategory, schema: 'openai-completions' };
+        }
       } else if (parts[0] === 'transform_defaults') {
         currentSection = 'transform_defaults';
         currentCategory = null;
@@ -2882,6 +2898,19 @@ export function parseSimpleToml(content: string): ProxyConfig {
         if (parts[1]) {
           console.warn(`[config] [passthrough.${parts[1]}] sections are not supported at line ${i + 1} — declare targets as inline tables under [passthrough]: ${parts[1]} = {base = "...", mode = "..."}`);
         }
+      } else {
+        // No branch claims this header. Leaving currentSection as it was would
+        // make every following key land in the PREVIOUS section instead of being
+        // dropped — that is how the missing [tool_judge_sidecar] branch once sent
+        // the sidecar's keys into [privacy_filter] with no message at all, which
+        // left `judgeTools` permanently disabled. Point currentSection at nothing
+        // so the keys are discarded, and say so.
+        sectionFieldWarnings.push({
+          path: section,
+          message: `unknown section header at line ${i + 1} — keys under it are ignored (check for a typo, or a section this version does not support)`,
+        });
+        currentSection = null;
+        currentCategory = null;
       }
       continue;
     }
@@ -3313,6 +3342,7 @@ export function parseSimpleToml(content: string): ProxyConfig {
   // Validate config and log errors/warnings
   const validation = validateProxyConfig(config);
   validation.errors.push(...sectionFieldErrors);
+  validation.warnings.push(...sectionFieldWarnings);
   for (const err of validation.errors) {
     const level = err.message.includes('Routing cycle detected') ? '[FATAL]' : '[ERROR]';
     console.error(`${level} ${err.path}: ${err.message}`);

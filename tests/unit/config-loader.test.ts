@@ -480,6 +480,68 @@ describe('parseSimpleToml', () => {
     assert.deepEqual(cfg.tool_judge_sidecar, { judge_url: 'http://127.0.0.1:8081' });
   });
 
+  // A section header with no dispatch branch used to leave currentSection
+  // pointing at the previous section, so an unknown section's keys were
+  // silently absorbed by whatever came before it — that is how a missing
+  // [tool_judge_sidecar] branch once sent the sidecar's keys into
+  // [privacy_filter], leaving `judgeTools` permanently disabled with no message.
+  // The keys must be dropped, and the drop must be loud.
+  it('drops keys under an unknown section instead of leaking them into the previous one', () => {
+    const cfg = parseSimpleToml(`
+      [defaults]
+      max_tokens = "100"
+
+      [tool_judge_sidecar_typo]
+      judge_url = "http://127.0.0.1:8081"
+      mode = "noul"
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.deepEqual(
+      cfg.defaults,
+      { max_tokens: '100' },
+      'keys under the unknown section must not be absorbed by the preceding section'
+    );
+    assert.equal(cfg.tool_judge_sidecar, undefined);
+    // Parsing continues cleanly: a known section after the unknown one still lands.
+    assert.equal(cfg.general?.global_token_limit, 1234);
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'tool_judge_sidecar_typo'),
+      `expected a warning naming the unknown section, got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('accepts an unknown section as the very first header without crashing', () => {
+    const cfg = parseSimpleToml(`
+      [nonsense]
+      a = "b"
+    `) as any;
+    assert.deepEqual(
+      Object.keys(cfg).filter(k => !k.startsWith('_')),
+      [],
+      'an unknown first section contributes no config keys'
+    );
+  });
+
+  it('rejects a bare [transforms] header (it needs a name) and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [defaults]
+      max_tokens = "100"
+
+      [transforms]
+      schema = "anthropic-messages"
+    `) as any;
+    assert.deepEqual(cfg.defaults, { max_tokens: '100' });
+    assert.equal(cfg.transforms, undefined);
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'transforms'),
+      `expected a warning for the bare [transforms] header, got ${JSON.stringify(warnings)}`
+    );
+  });
+
   it('parses [dashboard] and [remote] sections', () => {
     const cfg = parseSimpleToml(`
       [dashboard]

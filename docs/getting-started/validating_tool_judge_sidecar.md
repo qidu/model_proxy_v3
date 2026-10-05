@@ -488,7 +488,7 @@ CAUSE:   tsx script under /tmp. Wrap the body in `async function main() {}`.
 
 
 -------------------------------------------------------------------------------
-7. KNOWN OPEN QUESTIONS (only item 3 is still open; 1, 2, 4 and 5 are resolved)
+7. KNOWN OPEN QUESTIONS (all five are now resolved)
 -------------------------------------------------------------------------------
 
 RESOLVED since this file was written:
@@ -503,16 +503,20 @@ RESOLVED since this file was written:
    (the second inlined in extractToolRequestCharLengthsFromBody, the fourth in
    tool-blocklist.ts). All four now go through src/utils/tool-shapes.ts, with the
    per-caller trimming and sentinel behaviour kept in thin adapters.
-
-Still open:
-
-3. Unknown TOML sections in proxy_config.toml are still accepted silently, with
-   no warning. Worse than "dropped": src/utils/config-loader.ts dispatches on
-   parts[0] with no terminal `else`, so an unrecognised `[section]` leaves
-   `currentSection` pointing at the PREVIOUS section and every following
-   key-value line is absorbed into it -- mis-attributed, not discarded. That is
-   what hid the bug above. Parser-wide policy, not fixed here. (The
-   `[passthrough.<x>]` branch is the one path that does console.warn.)
+3. Unknown TOML sections were accepted silently, and worse than "dropped":
+   src/utils/config-loader.ts dispatched on parts[0] with no terminal `else`, so
+   an unrecognised `[section]` left `currentSection` pointing at the PREVIOUS
+   section and every following key-value line was absorbed into it --
+   mis-attributed, not discarded. That is what hid the bug above. Fixed: the
+   dispatch chain now ends in an `else` that records a warning naming the
+   section and its source line, then points `currentSection` at nothing so the
+   keys are dropped. A bare `[transforms]` (which needs a `.name`) is treated
+   the same way. The warning goes into `_validationWarnings`, so it reaches both
+   the `[WARN] <section>: …` log line and the `Result: N errors, M warnings`
+   count that `proxy config validate` prints (src/cli.ts:431) -- a bare
+   console.warn would reach the log and nothing else. Confirmed against every
+   TOML in the repo: none emits the warning, including the serializer's own
+   output.
 
 RESOLVED since this file was written (continued):
 
