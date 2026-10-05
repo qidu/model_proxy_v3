@@ -20,7 +20,8 @@ usage stats and some configs modification.
                                ▼            privacy-filter
                         ┌─────────────┐     compression
      sidecar plugins <- │ Model Proxy │ ->  image-fetch & encoding
-                        └─────────────┘     auth & usage stats
+                        └─────────────┘     tool judge
+                                            auth & usage stats
                                │ 
         ┌──────────────┬───────┴───────┬──────────────┐
         ▼              ▼               ▼              ▼
@@ -166,8 +167,9 @@ full wire-level contract.
   in a web dashboard or a live terminal UI.
 - **Token limits** — global and per-alias token caps over a configurable window (sliding `Nh`/`Nd` or calendar `1w`/`1m`). Returns HTTP 413 when exceeded.
 - **Sidecars** — optional privacy-filter (sidecar or local hash-only mode),
-  compression, and image-encode sidecars for redacting, shrinking, or fetching
-  request payloads before they reach the upstream.
+  compression, image-encode, and tool-judge sidecars: redact or shrink request
+  payloads, fetch images, or prune irrelevant tools before the request reaches
+  the upstream.
 - **Runs anywhere** — Node.js server or Docker.
 
 ## Quick Start

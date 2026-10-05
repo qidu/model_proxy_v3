@@ -29,6 +29,10 @@ const MAX_CONTEXT_TOOL_CALLS = 5;
 
 export interface JudgeSidecarConfig {
   judge_url: string;
+  /**
+   * Per-question budget; a request carrying N questions gets N × this, capped
+   * at 2000ms total. See {@link requestTimeoutMs}.
+   */
   timeoutMs: number;
   threshold: number;
   mode: 'choice' | 'noul';
@@ -310,6 +314,30 @@ export function parseNoulResponse(
 }
 
 /**
+ * Ceiling on what a single request may be budgeted, however many tools it
+ * batches. The proxy is blocked on this call, so an unbounded scale would let a
+ * large batch stall a user's request far past the point of usefulness.
+ */
+const MAX_REQUEST_TIMEOUT_MS = 2000;
+
+/**
+ * `timeout_ms` is a per-question budget, not a per-request one. `noul` mode
+ * packs one question per tool into a single request, so a flat budget would
+ * make a 50-tool batch more likely to time out than a 1-tool one and fail the
+ * whole batch open. Scaling by question count also puts the two modes on the
+ * same footing: N tools get at most N × `timeout_ms` either way, since choice
+ * mode spends that as N sequential single-question requests.
+ *
+ * The cap bounds the scaling, not an explicitly larger `timeout_ms` — a base
+ * budget already above the cap is never shrunk to it.
+ */
+export function requestTimeoutMs(config: JudgeSidecarConfig, questionCount: number): number {
+  const budget = config.timeoutMs * Math.max(1, questionCount);
+  const ceiling = Math.max(config.timeoutMs, MAX_REQUEST_TIMEOUT_MS);
+  return Math.min(budget, ceiling);
+}
+
+/**
  * Call the judge sidecar with the given request. Returns null on any failure
  * (timeout, non-2xx, malformed body) so the caller can fail open.
  */
@@ -318,8 +346,10 @@ export async function callJudgeSidecar(
   request: JudgeRequest,
   requestId: string,
 ): Promise<JudgeResponse | null> {
+  const questionCount = Object.keys(request.questions).length;
+  const timeoutMs = requestTimeoutMs(config, questionCount);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), config.timeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const headers: Record<string, string> = {
@@ -360,7 +390,10 @@ export async function callJudgeSidecar(
   } catch (err) {
     clearTimeout(timeoutId);
     if (err instanceof Error && err.name === 'AbortError') {
-      logger.warn(requestId, `Tool judge sidecar timeout (${config.timeoutMs}ms)`);
+      logger.warn(
+        requestId,
+        `Tool judge sidecar timeout (${timeoutMs}ms for ${questionCount} question(s))`,
+      );
     } else {
       logger.warn(requestId, `Tool judge sidecar error: ${err instanceof Error ? err.message : String(err)}`);
     }

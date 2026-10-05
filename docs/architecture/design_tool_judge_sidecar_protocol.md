@@ -29,7 +29,7 @@ Content-Type: application/json
 
 ```json
 {
-  "state": "User prompt: \"Please create a new file called hello.py with a hello world function\"\n\nTool: file_write\nSchema: {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}\n\nRecent context:\n- User: \"I need to write a Python script\"\n- User: \"Can you help me create a file?\"\n- Assistant called: file_read(main.py)",
+  "state": "User prompt: \"Please create a new file called hello.py with a hello world function\"\n\nTools to evaluate:\n1. file_write: {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}\n\nRecent context:\n- User: \"I need to write a Python script\"\n- User: \"Can you help me create a file?\"\n- Assistant called: file_read({\"path\": \"main.py\"})",
   "questions": {
     "decision": {
       "type": "choice",
@@ -279,7 +279,12 @@ body = eraseToolsFromBody(body, erasedTools);
 ```typescript
 async function callToolJudgeSidecar(input: JudgeInput): Promise<JudgeDecision[] | null> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), config.timeout_ms);
+  // `timeout_ms` is a per-question budget. `noul` packs one question per tool
+  // into a single request, so the request's budget scales with the question
+  // count (capped at 2000ms total); a flat budget would fail a large batch open
+  // sooner than a small one.
+  const questionCount = Object.keys(input.questions).length;
+  const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs(config, questionCount));
 
   try {
     // Build request per config.mode ("noul" | "choice")
@@ -321,7 +326,7 @@ async function callToolJudgeSidecar(input: JudgeInput): Promise<JudgeDecision[] 
 |----------|----------------|
 | Sidecar returns 200 with valid response | Parse decisions, apply threshold |
 | Sidecar returns 5xx / 4xx | Log warning, **keep all tools** |
-| Sidecar timeout (50ms) | Log warning, **keep all tools** |
+| Sidecar timeout (N × `timeout_ms`, capped at 2000ms) | Log warning, **keep all tools** |
 | Sidecar returns malformed JSON | Log error, **keep all tools** |
 | Sidecar missing tool in batch response | Default `factor=1.0` (keep) for missing |
 | Network error (ECONNREFUSED) | Log warning, **keep all tools** |
@@ -457,7 +462,7 @@ context_window = 3         # number of recent messages/tool_calls to include
 > | Key | Shipped |
 > |---|---|
 > | `judge_url` | yes — **base URL** (`http://127.0.0.1:8081`); the client appends `/judge`. Its presence alone activates the feature |
-> | `timeout_ms` | yes (default 50) |
+> | `timeout_ms` | yes (default 50) — a **per-tool** budget, so a request carrying N tools gets N × this, capped at 2000ms total (see `requestTimeoutMs`) |
 > | `mode` | yes (default `"choice"`) |
 > | `threshold` | yes (default 0.5) |
 > | `max_batch_tools` | yes (default 50) — tools past the cap are kept and counted in the log |
@@ -477,10 +482,15 @@ context_window = 3         # number of recent messages/tool_calls to include
 ### 9.1 Proxy Logs
 
 ```
-[INFO]  req-abc123  Sidecar judge (noul): 3 tools, 23ms, kept=1 erased=2
-[WARN]  req-def456  Sidecar timeout (50ms), failing open - keeping all 4 tools
-[WARN]  req-ghi789  Sidecar HTTP 503, failing open
+[INFO]  req-abc123  Tool judge sidecar (mode=noul, threshold=0.5): 3/3 judged, 2 to erase in 23ms
+[WARN]  req-def456  Tool judge sidecar timeout (200ms for 4 question(s))
+[WARN]  req-ghi789  Tool judge sidecar returned 503: Service Unavailable
 ```
+
+Each of the three is fail-open: the tools are kept. The timeout line reports the
+budget the request was actually given and how many questions it carried, so a
+large batch that exhausts its scaled budget is distinguishable from a sidecar
+that is simply down.
 
 ### 9.2 Metrics
 

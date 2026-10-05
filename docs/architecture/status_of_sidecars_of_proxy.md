@@ -116,7 +116,7 @@ allow_private_ips = false             # SSRF guard
 [tool_judge_sidecar]
 # No `enabled` flag — activated by presence of `judge_url`
 judge_url = "http://localhost:8081"   # base URL; the client appends /judge
-timeout_ms = 50
+timeout_ms = 50              # per-question budget; N questions get N × this, 2000 ms cap
 mode = "choice"              # "choice" | "noul"
 threshold = 0.5              # keep iff score > threshold
 max_batch_tools = 50         # tools past the cap are kept (not judged)
@@ -137,7 +137,9 @@ request `{state, questions: {<qid>: <question>}}`, response `{<qid>: <answer>}`.
   not answer for, and tools over `max_batch_tools`, are kept and reported as
   counts in the log line
 - **Reference server**: `submodules/laya-mlx/serve_judge.py` (stdlib
-  `http.server`, serves `POST /judge` + `GET /health`)
+  `http.server`, serves `POST /judge` + `GET /health`); warms the model with one
+  throwaway inference per question type before binding the port, so the first
+  real request does not pay MLX's lazy pipeline setup (`--no-warmup` to skip)
 - **Called by**: `src/index.ts` directly at the `before_upstream` hook, before
   `eraseBlockedTools` — there is no `filter_tools` builtin transform
 

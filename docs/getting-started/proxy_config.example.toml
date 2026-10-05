@@ -584,10 +584,14 @@ openai-responses   = ["max_tokens_rename"]
 # response, ALL tools are kept (no filtering occurs). The proxy logs a warning
 # but continues normally.
 #
-# Expected sidecar response time: ~50ms per request.
+# Expected sidecar response time: ~15ms per question once warm (first question
+# ~30ms). A request is budgeted N x timeout_ms for its N questions, capped at
+# 2000ms total, so a batch is not penalised for being large.
 #
 # Reference sidecar server: submodules/laya-mlx/serve_judge.py, which serves this
-# protocol from the Laya typed-decisions model:
+# protocol from the Laya typed-decisions model. It warms the model with one
+# throwaway inference per question type before binding its port (~70ms), so the
+# first real request does not pay the lazy pipeline setup:
 #   python submodules/laya-mlx/serve_judge.py --model convaiinnovations/laya --port 8081
 #
 # Integration: The sidecar is called at the `before_upstream` pipeline hook,
@@ -600,7 +604,7 @@ openai-responses   = ["max_tokens_rename"]
 # judge_url = "http://localhost:8081"        # required to enable (base URL, not /judge path)
 # mode = "noul"                               # "choice" (per-tool) or "noul" (batch)
 # threshold = 0.5                             # relevance threshold 0.0-1.0
-# timeout_ms = 50                             # sidecar timeout (default 50ms)
+# timeout_ms = 50                             # per-question budget (default 50ms); N questions get N × this, capped at 2000ms
 # max_batch_tools = 50                        # batch size limit for noul mode
 # api_key = "optional-bearer-token"           # optional Authorization header
 

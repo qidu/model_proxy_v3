@@ -3162,7 +3162,7 @@ export function handleDashboardPage(env: Env): Response {
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">URL</td><td><code style="font-size:12px;">' + escapeHtml(sidecar.judge_url) + '</code></td></tr>' +
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Mode</td><td>' + escapeHtml(modeLabel) + '</td></tr>' +
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Threshold</td><td>' + thresholdPct + '% (score >= ' + (sidecar.threshold || 0.5).toFixed(2) + ' → keep)</td></tr>' +
-          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Timeout</td><td>' + (sidecar.timeout_ms || 50) + ' ms</td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Timeout</td><td>' + (sidecar.timeout_ms || 50) + ' ms per tool (a batch of N tools gets N × this, capped at 2000 ms)</td></tr>' +
           '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Max batch tools</td><td>' + (sidecar.max_batch_tools || 50) + '</td></tr>' +
           '</table>';
       }

@@ -319,6 +319,8 @@ async function main() {
 
   // A generous timeout on purpose: this layer tests the client's parsing, not
   // its latency budget. Layer B is where timeout_ms is exercised for real.
+  // 30_000 also probes the ceiling rule: the 2000 ms cap bounds the per-question
+  // SCALING only, so a base already above it is used as-is, not shrunk to 2000.
   function cfg(mode: 'choice' | 'noul') {
     return { tool_judge_sidecar: { judge_url: 'http://127.0.0.1:8081',
       timeout_ms: 30_000, threshold: 0.5, mode } } as never;
@@ -387,14 +389,23 @@ checkpoint and ~35 s of model load, so it cannot run in CI.
 4. OPERATIONAL NOTES (measured, not theoretical)
 -------------------------------------------------------------------------------
 
-COLD START: 35.5 s to load the checkpoint and bind. Budget for it.
+COLD START: ~35 s to load the checkpoint and bind. Budget for it. The server now
+warms itself first (one throwaway inference per question type, ~70 ms) before
+binding the port, so the first real request is not the one that pays MLX's lazy
+pipeline setup (`--no-warmup` skips it).
 
-timeout_ms IS PER HTTP REQUEST, NOT PER TOOL-SET.
-  "choice" mode issues one HTTP request PER TOOL. The client's total time can
-  therefore exceed timeout_ms while every individual request stays inside it.
-  Observed: "1 to erase in 68ms" under a timeout_ms = 50 config, with per-request
-  times of 15-39 ms.
-  => timeout_ms is a per-call budget, not a per-request wall clock.
+timeout_ms IS A PER-QUESTION BUDGET, NOT A PER-TOOL-SET ONE.
+  "noul" mode packs one question PER TOOL into a SINGLE request. A flat budget
+  would therefore make a bigger batch MORE likely to time out than a one-tool
+  request -- exactly backwards. So the client gives a request N x timeout_ms for
+  N questions, capped at 2000 ms total (requestTimeoutMs, in
+  src/utils/tool-judge-sidecar.ts).
+  => "choice" mode asks one question per request, so each individual request gets
+     the plain timeout_ms -- but the tool-set as a whole still spends N of them
+     in sequence. Observed: "1 to erase in 68ms" under a timeout_ms = 50 config,
+     with per-request times of 15-39 ms.
+  => The cap bounds the SCALING only: a configured timeout_ms already above
+     2000 ms is never shrunk to it.
   => If you see "judged 0/N - failing open", RAISE timeout_ms. Do not conclude
      the judge is broken.
   The default 50 ms is fine on a warm judge; 3/3 runs judged 2/2 at that setting
@@ -420,7 +431,7 @@ countTokens paths.
 FAIL-OPEN BY DESIGN: on 4xx/5xx/timeout/malformed response, tools are KEPT.
 Since the fix, this is reported rather than silent -- the summary line carries
 counts of unjudged and over-max_batch_tools tools, and a total failure logs
-"Sidecar judged none of N tools - failing open" at warn level.
+"Sidecar judged none of N tools — failing open" at warn level.
 
 TOOLS OVER max_batch_tools ARE KEPT, not judged, and counted in the log line.
 
@@ -477,7 +488,7 @@ CAUSE:   tsx script under /tmp. Wrap the body in `async function main() {}`.
 
 
 -------------------------------------------------------------------------------
-7. KNOWN OPEN QUESTIONS (items 1-2 are resolved, 3-5 are not)
+7. KNOWN OPEN QUESTIONS (only item 3 is still open; 1, 2, 4 and 5 are resolved)
 -------------------------------------------------------------------------------
 
 RESOLVED since this file was written:
@@ -495,9 +506,23 @@ RESOLVED since this file was written:
 
 Still open:
 
-3. Gemini bodies use `contents`, not `messages`, so the judge silently gets no
-   prompt context on Gemini requests.
-4. Unknown TOML sections are still dropped silently, with no warning. This is
-   what hid the bug above and remains parser-wide policy, not fixed here.
-5. Design doc 2.2's "Tool:/Schema:" state example contradicts 4.1's numbered
-   form; the client follows 4.1.
+3. Unknown TOML sections in proxy_config.toml are still accepted silently, with
+   no warning. Worse than "dropped": src/utils/config-loader.ts dispatches on
+   parts[0] with no terminal `else`, so an unrecognised `[section]` leaves
+   `currentSection` pointing at the PREVIOUS section and every following
+   key-value line is absorbed into it -- mis-attributed, not discarded. That is
+   what hid the bug above. Parser-wide policy, not fixed here. (The
+   `[passthrough.<x>]` branch is the one path that does console.warn.)
+
+RESOLVED since this file was written (continued):
+
+4. Gemini bodies carry `contents`, not `messages`, so the judge used to see a
+   Gemini request's tools but not its prompt or context. Fixed: buildStateText
+   goes through conversationTurns(), which falls back to body.contents and maps
+   Gemini's `model` role to assistant and its `parts` to the message content
+   (messages wins when a body carries both). See the CHANGELOG entry for the
+   Gemini tool-schema/prompt-context fix.
+5. Design doc 2.2's "Tool:/Schema:" state example contradicted 4.1's numbered
+   form. Fixed in the design doc itself, which now shows the numbered
+   "Tools to evaluate:\n1. name: {schema}" form the client actually emits
+   (src/utils/tool-judge-sidecar.ts buildStateText).

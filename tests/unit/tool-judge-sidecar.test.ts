@@ -23,6 +23,7 @@ import {
   parseChoiceResponse,
   parseNoulResponse,
   judgeTools,
+  requestTimeoutMs,
   type JudgeResponse,
 } from '../../src/utils/tool-judge-sidecar.js';
 
@@ -44,6 +45,30 @@ function stubFetch(
     const request = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
     calls.push({ url: String(input), request });
     return respond(String(input), request, calls.length - 1);
+  }) as typeof fetch;
+  return calls;
+}
+
+/**
+ * A fetch that never answers, rejecting on abort instead — so the client's own
+ * timeout is the only thing that ever settles the call, and the wall-clock time
+ * to fail open measures the budget it was actually given.
+ */
+function hangingFetch(): Array<{ url: string; request: Record<string, unknown>; signal?: AbortSignal }> {
+  const calls: Array<{ url: string; request: Record<string, unknown>; signal?: AbortSignal }> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({
+      url: String(input),
+      request: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>,
+      signal: init?.signal ?? undefined,
+    });
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    });
   }) as typeof fetch;
   return calls;
 }
@@ -496,5 +521,75 @@ describe('judgeTools', () => {
     assert.deepEqual(result.eraseNames, []);
     assert.deepEqual(result.unjudgedNames, ['Bash']);
     assert.equal(result.called, true);
+  });
+
+  it('gives a noul batch one request whose budget covers every tool in it', async () => {
+    const calls = hangingFetch();
+
+    const tools = ['Bash', 'Read', 'Grep', 'Glob'].map((name) => ({ name, input_schema: {} }));
+    const started = Date.now();
+    const result = await judgeTools({ tools, messages: [] }, proxyConfig({ timeout_ms: 10, mode: 'noul' }), 'req-1');
+    const elapsed = Date.now() - started;
+
+    assert.equal(calls.length, 1, 'noul mode batches every tool into a single request');
+    assert.equal(Object.keys(calls[0].request.questions as object).length, 4);
+    assert.ok(elapsed >= 30, `4 tools × 10ms should hold the request open ~40ms, not ~10ms (waited ${elapsed}ms)`);
+    assert.deepEqual(result.eraseNames, []);
+    assert.deepEqual(result.unjudgedNames, tools.map((t) => t.name));
+  });
+
+  it('leaves a choice request on the single-question budget', async () => {
+    const calls = hangingFetch();
+    const started = Date.now();
+    const result = await judgeTools(
+      { tools: [{ name: 'Bash', input_schema: {} }, { name: 'Read', input_schema: {} }], messages: [] },
+      proxyConfig({ timeout_ms: 10 }),
+      'req-1',
+    );
+    const elapsed = Date.now() - started;
+
+    // Choice mode asks one question per request, so each gets the plain budget.
+    assert.equal(calls.length, 2, 'choice mode issues one request per tool');
+    assert.ok(elapsed >= 13, `two 10ms budgets should take ~20ms (took ${elapsed}ms)`);
+    assert.ok(elapsed < 60, `the per-request budget must not scale with tool count (took ${elapsed}ms)`);
+    assert.deepEqual(result.eraseNames, []);
+    assert.deepEqual(result.unjudgedNames, ['Bash', 'Read']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// requestTimeoutMs
+// ---------------------------------------------------------------------------
+
+describe('requestTimeoutMs', () => {
+  const config = (timeoutMs: number) => ({
+    judge_url: 'http://127.0.0.1:8081',
+    timeoutMs,
+    threshold: 0.5,
+    mode: 'noul' as const,
+    maxBatchTools: 50,
+  });
+
+  it('scales a request budget with the number of questions it carries', () => {
+    assert.equal(requestTimeoutMs(config(50), 1), 50);
+    assert.equal(requestTimeoutMs(config(50), 3), 150);
+    assert.equal(requestTimeoutMs(config(25), 4), 100);
+  });
+
+  it('treats an empty request as one question', () => {
+    assert.equal(requestTimeoutMs(config(50), 0), 50);
+  });
+
+  it('caps the total at 2000ms', () => {
+    // The default worst case: 50 tools × 50ms would be 2500ms uncapped.
+    assert.equal(requestTimeoutMs(config(50), 40), 2000);
+    assert.equal(requestTimeoutMs(config(50), 50), 2000);
+    assert.equal(requestTimeoutMs(config(50), 500), 2000);
+  });
+
+  it('does not shrink a base budget that already exceeds the cap', () => {
+    // A caller who asked for 5s per question keeps it; the cap only bounds scaling.
+    assert.equal(requestTimeoutMs(config(5000), 1), 5000);
+    assert.equal(requestTimeoutMs(config(5000), 10), 5000);
   });
 });
