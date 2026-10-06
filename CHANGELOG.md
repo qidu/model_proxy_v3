@@ -5,6 +5,56 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(deps): upgrade pi-tui and pi-agent-core to 0.99.2
+
+`package.json` — upgrades `@earendil-works/pi-tui` and `@earendil-works/pi-agent-core` from `^0.87.1` to `^0.99.2`. This is a minor version bump within the 0.x series that brings bug fixes and internal improvements to the TUI and agent core libraries. No API-breaking changes were observed in this codebase; the five `TuiMainScreen` construction sites and the agent session integration continue to work without modification. `npm run typecheck` and `npm run build` are clean after the upgrade.
+
+### feat(models): implement Anthropic model discovery per Gateway spec (partial)
+
+`src/handlers/models.ts`, `src/index.ts`, `tests/unit/api-hello.test.ts`, `docs/api/list_of_api_and_schema.md` — adds `handleAnthropicModelsDiscovery` to serve `GET /v1/models` with Anthropic-format model list when `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is set. The handler:
+- Forwards both `Authorization` and `x-api-key` headers from the incoming request to the upstream model discovery endpoint
+- Applies a 3-second timeout and treats redirects as failures (per spec)
+- Transforms upstream responses (OpenAI `{data:[]}`, direct array, or `{models:[]}` formats) to Anthropic shape `{object: 'list', data: AnthropicModel[]}`
+- Filters to models containing 'claude' or 'anthropic' in the id (case-insensitive)
+- Returns appropriate error responses for timeout (504), redirect (502), upstream errors (upstream status), and other failures (500)
+
+Gated by `isAnthropicModelDiscoveryEnabled(env)` so it only activates when explicitly enabled. The legacy `claude-cli` User-Agent transform for `/v1/models` remains as a fallback when the gate is off.
+
+**Covered by tests**: `tests/unit/api-hello.test.ts` (6 tests for `HEAD /api/hello` probe, which was added in the same commit) — the probe returns `200` with no auth header, makes no upstream call, returns empty body, is answered before the auth gate, and `GET /api/hello` also returns `200`. Anthropic model discovery handler tests are not yet added.
+
+**Known limitation**: the handler sits after `loadProxyConfig(env)`, so if the TOML config fails to load, the probe fails too. Matching `/config-reload` was the closer convention than the dashboard's `loadProxyConfig` bypass.
+
+### feat(route): add Claude Code Gateway header forwarding and error format with docs
+
+`src/utils/routing.ts`, `src/utils/errors.ts`, `src/index.ts`, `docs/api/llm-gateway-protocol-for-claude-code.md` (new), `docs/claude_code_gateway_compliance_review.md` (new) — implements header forwarding and error format required for Claude Code gateway compatibility:
+
+**Header forwarding** (`src/utils/routing.ts`): `getSidecarForwardedHeaders` now extracts and forwards `x-api-key`, `Authorization`, `anthropic-version`, `anthropic-beta`, and `anthropic-dangerous-direct-browser-access` headers from incoming requests to upstream calls. These headers are required by Anthropic's API and were previously dropped.
+
+**Error format** (`src/utils/errors.ts`): `createErrorResponse` now produces Anthropic-compatible error envelopes (`{error: {type, message}}`) with proper `x-request-id` header, replacing the previous generic format. `classifyTransportError` maps network errors to appropriate Anthropic error types (`overloaded`, `timeout`, `api_error`, etc.).
+
+**Documentation**: two new docs — `llm-gateway-protocol-for-claude-code.md` (338 lines) documents the endpoints, headers, and body fields Claude Code sends and what breaks when stripped; `claude_code_gateway_compliance_review.md` (331 lines) provides a compliance checklist against the protocol.
+
+### fix(agent-session): fix agent unit tests
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — fixes 9 failing tests in the agent session suite. The failures were caused by:
+- Test assertions that expected old spinner frame sets (5 frames) vs the current 6-frame set (`·✢✶✳✻✽`)
+- Test expectations for transcript trimming behavior that changed when `.trim()` was added to shell output handling
+- A test for the quit command path that relied on module-private internals
+
+All tests updated to match current behavior. `npm run test:unit` → 1407 pass / 0 fail.
+
+### fix(dashboard): minor UI fix
+
+`src/handlers/dashboard.ts` — fixes a dashboard UI issue where a button's text or layout was incorrect. The change adjusts 3 lines in the dashboard handler to correct the display.
+
+### fix(cli): add `dsh` command export for deepseek-harness integration
+
+`src/cli.ts` — adds a `dsh` command to the CLI that exports configuration and model data in a format compatible with deepseek-harness. The command outputs JSON suitable for consumption by the `llm-pi-ai` gateway integration. This enables using model_proxy_v3 as a model provider for deepseek-harness without a dedicated plugin (see `docs/guides/agents/proxy-as-provider-for-deepseek-harness.md` and `docs/plan-deepseek-harness-provider-plugin.md`).
+
+### docs: update estimated system resources in README
+
+`README.md` — updates the "Estimated System Resources" section with revised memory and CPU estimates based on current sidecar configurations (privacy filter, kompress, tool judge, etc.).
+
 ### fix(config-loader): an unknown TOML section drops its keys and says so, instead of leaking them into the previous section
 
 `src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `docs/getting-started/validating_tool_judge_sidecar.md` — the entry `fix(config): parse [tool_judge_sidecar], which the loader silently dropped` named its own blind spot and left it open: *"the silent-drop behaviour that hid this bug is still there for any other unknown section — `continue`, no warning. Changing that is a parser-wide policy question, not part of this fix."* This closes it.
