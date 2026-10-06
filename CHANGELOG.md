@@ -9,6 +9,17 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 `package.json` — upgrades `@earendil-works/pi-tui` and `@earendil-works/pi-agent-core` from `^0.87.1` to `^0.99.2`. This is a minor version bump within the 0.x series that brings bug fixes and internal improvements to the TUI and agent core libraries. No API-breaking changes were observed in this codebase; the five `TuiMainScreen` construction sites and the agent session integration continue to work without modification. `npm run typecheck` and `npm run build` are clean after the upgrade.
 
+### feat(agent-session): add command history with up/down arrow navigation
+
+`src/agent-session.ts` — adds in-memory input history (up to 100 entries) across all agent session prompts with up/down arrow key navigation:
+
+- **History storage**: New `inputHistory` array (max 100 entries) with `addToHistory()`, `historyPrev()`, `historyNext()`, `historyReset()` functions. This is an **in-memory store only** — it is not persisted to disk, so history is scoped to the lifetime of the agent session process and is lost on exit.
+- **Scope**: Applies to both initial setup prompts (`promptText` for model/provider/key) and the persistent TUI input (`RuledInput` / `PromptScreen`)
+- **Filtering**: Excludes empty strings, quit commands (`/q`, `/quit`, `/exit`, `/bye`), and command output lines (starting with `[` like `[π shell]`)
+- **Deduplication**: Consecutive duplicate inputs are not stored
+- **Navigation**: Up arrow (`\x1b[A` / `\x1bOA`) recalls older entries; down arrow (`\x1b[B` / `\x1bOB`) recalls newer entries; at end of history, down arrow clears input for new entry
+- **Cursor handling**: After recalling history entry, cursor moves to end of line (Ctrl+E / `\x05`) for immediate editing
+
 ### feat(models): implement Anthropic model discovery per Gateway spec (partial)
 
 `src/handlers/models.ts`, `src/index.ts`, `tests/unit/api-hello.test.ts`, `docs/api/list_of_api_and_schema.md` — adds `handleAnthropicModelsDiscovery` to serve `GET /v1/models` with Anthropic-format model list when `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is set. The handler:

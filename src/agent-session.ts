@@ -124,6 +124,52 @@ const DEFAULT_SYSTEM_PROMPT = 'You are a helpful coding assistant.';
 // Explicit end-the-session commands for the follow-up task prompt, alongside
 // blank input (both end the loop before the budget is reached).
 const QUIT_COMMANDS = new Set(['/q', '/quit', '/exit', '/bye']);
+
+// History management for user inputs (up to 100 entries, excludes command outputs)
+const MAX_HISTORY_SIZE = 100;
+const inputHistory: string[] = [];
+let historyIndex = -1; // -1 means at the "new input" position (end of history)
+
+/** Add a user input to history. Excludes empty strings and command outputs (lines starting with '['). */
+function addToHistory(input: string): void {
+  const trimmed = input.trim();
+  if (!trimmed) return;
+  // Don't add command output lines (they start with '[' like '[π shell]')
+  if (trimmed.startsWith('[')) return;
+  // Don't add quit commands
+  if (QUIT_COMMANDS.has(trimmed.toLowerCase())) return;
+  // Avoid consecutive duplicates
+  if (inputHistory.length > 0 && inputHistory[inputHistory.length - 1] === trimmed) return;
+  inputHistory.push(trimmed);
+  if (inputHistory.length > MAX_HISTORY_SIZE) {
+    inputHistory.shift();
+  }
+  historyIndex = inputHistory.length; // Reset to "new input" position
+}
+
+/** Get the previous history entry (older). Returns the entry or null if at the beginning. */
+function historyPrev(): string | null {
+  if (inputHistory.length === 0) return null;
+  if (historyIndex <= 0) return null;
+  historyIndex -= 1;
+  return inputHistory[historyIndex];
+}
+
+/** Get the next history entry (newer). Returns the entry or null if at the end. */
+function historyNext(): string | null {
+  if (inputHistory.length === 0) return null;
+  if (historyIndex >= inputHistory.length - 1) {
+    historyIndex = inputHistory.length;
+    return null; // Signal to clear input
+  }
+  historyIndex += 1;
+  return inputHistory[historyIndex];
+}
+
+/** Reset history index to the "new input" position. */
+function historyReset(): void {
+  historyIndex = inputHistory.length;
+}
 // Confirmed via the `skills` CLI's own bundled agent registry (vercel-labs/skills,
 // dist/cli.mjs): the "pi" agent target's global skills dir is ~/.pi/agent/skills,
 // distinct from project-scoped ".pi/skills" (used by add_skill, agent-tools.ts) and
@@ -298,11 +344,33 @@ class PromptScreen implements Component {
     // cursorLineEnd keybinding (ctrl+e, \x05) to place it at the end, same
     // as if the user had pressed End/ctrl+e themselves.
     this.input.handleInput('\x05');
+    historyReset();
   }
   get inputComponent(): Input {
     return this.input;
   }
   handleInput(data: string): void {
+    // Handle up/down arrow keys for history navigation
+    // Up: \x1b[A or \x1bOA, Down: \x1b[B or \x1bOB
+    if (data === '\x1b[A' || data === '\x1bOA') {
+      const prev = historyPrev();
+      if (prev !== null) {
+        this.input.setValue(prev);
+        this.input.handleInput('\x05'); // Move cursor to end
+      }
+      return;
+    }
+    if (data === '\x1b[B' || data === '\x1bOB') {
+      const next = historyNext();
+      if (next !== null) {
+        this.input.setValue(next);
+        this.input.handleInput('\x05'); // Move cursor to end
+      } else {
+        // At the end of history, clear the input for new entry
+        this.input.setValue('');
+      }
+      return;
+    }
     this.input.handleInput(data);
   }
   invalidate(): void {
@@ -330,7 +398,9 @@ class PromptScreen implements Component {
  * columns, so there is nothing to subtract.
  */
 export class RuledInput implements Component, Focusable {
-  constructor(private readonly input: Input) {}
+  constructor(private readonly input: Input) {
+    historyReset();
+  }
   get focused(): boolean {
     return this.input.focused;
   }
@@ -338,6 +408,27 @@ export class RuledInput implements Component, Focusable {
     this.input.focused = value;
   }
   handleInput(data: string): void {
+    // Handle up/down arrow keys for history navigation
+    // Up: \x1b[A or \x1bOA, Down: \x1b[B or \x1bOB
+    if (data === '\x1b[A' || data === '\x1bOA') {
+      const prev = historyPrev();
+      if (prev !== null) {
+        this.input.setValue(prev);
+        this.input.handleInput('\x05'); // Move cursor to end
+      }
+      return;
+    }
+    if (data === '\x1b[B' || data === '\x1bOB') {
+      const next = historyNext();
+      if (next !== null) {
+        this.input.setValue(next);
+        this.input.handleInput('\x05'); // Move cursor to end
+      } else {
+        // At the end of history, clear the input for new entry
+        this.input.setValue('');
+      }
+      return;
+    }
     this.input.handleInput(data);
   }
   invalidate(): void {
@@ -367,7 +458,10 @@ async function promptText(title: string, defaultValue = ''): Promise<string | nu
       // the agent's streamed reply, the next prompt) doesn't butt up against
       // the input line. Skipped on cancel (null), where the session is exiting
       // and the caller prints its own "Cancelled/exiting" notice anyway.
-      if (value !== null) console.log('');
+      if (value !== null) {
+        console.log('');
+        addToHistory(value);
+      }
       resolvePrompt(value);
     };
     screen.inputComponent.onSubmit = (value) => finish(value);
@@ -684,6 +778,9 @@ function updateStatusBar(): void {
 /** Handle input submission from the bottom input */
 function handleInputSubmit(value: string): void {
   bottomInput.setValue('');
+
+  // Add to history (skip quit commands, empty strings, and command outputs)
+  addToHistory(value);
 
   // Quit commands end the session from either state. Intercepted before
   // followUp() so `/q` is never handed to the model as a prompt. Mid-run
