@@ -5,6 +5,21 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refactor(routing): collapse the four duplicated route→target tables into one helper
+
+`src/index.ts` — replaces four copies of the same `(path, upstream_mode) → {targetUrl, handlerType, upstreamMode, forceStreaming}` dispatch with a single `resolveUpstreamTarget()` helper (`src/index.ts:457`); the file goes from 2852 to 2645 lines. The four sites were `parseFixedRoute` (fixed routes), the `compositeAttempts.map()` candidate builder, `buildRouteAttempt` (fusion and retry rungs), and the `/v1/chat/completions` model-passthrough block. `safeModel` and `isNativeMode` were recomputed at three of them; both now exist once, inside the helper.
+
+- **Pure dedupe, not a reconciliation**: the four copies did not agree with each other. Every disagreement is kept, tagged "dialect difference" in place at the branch that owns it, so the drift is visible in one region instead of four. The dialect is an explicit helper input (`dialect: 'fixed-route' | 'model-route'`) precisely because the same `(path, upstream_mode)` pair has two answers.
+- **Divergence 1** — `/v1/messages` with a Gemini mode: a fixed route addresses the `v1beta/models` collection (that path carries no model id), while a model route addresses `v1beta/models/{model}:generateContent`, or `:streamGenerateContent?alt=sse` when the body sets `stream: true`.
+- **Divergence 2** — `/v1/interactions` with a Gemini mode: fixed forwards to the API-version root; model routes use the model URL.
+- **Divergence 3** — `:countTokens`: a fixed route reports `handlerType: 'token-counting'`, model routes report `'generateContent'`.
+- **Divergence 4** — `/v1/chat/completions` under `anthropic-messages` or a Gemini mode: model routes build a native target (`v1/messages`, `v1beta/models/{model}:generateContent`); a fixed route falls through to `openai-completions`.
+- **Divergence 5** — the Gemini version prefix: fixed routes honour `GEMINI_API_VERSION`, model-route path-style URLs hardcode `v1beta`, and `/v1/responses` honours the env var in both dialects.
+- **Latent gap carried over, then surfaced**: the `compositeAttempts.map()` copy had no `/v1/chat/completions` branch at all and left `candidateTargetUrl = ''` for that path. It is unreachable there (the path is dispatched earlier), so behaviour is unchanged; the call site now throws on an unmapped path instead of silently forwarding an empty target.
+- **New loud failure (rule 8)**: for a Gemini target the helper throws when the model id is empty, where the originals built a URL with an empty model segment. Reachable only when a candidate has neither an alias nor a name.
+
+**Verification status**: `npm run typecheck` is clean on the final state. `npm run build`, `npm run test:unit`, and a purpose-built differential test (old vs new route table over 28 paths × 7 upstream modes × 3 base URLs × 3 `GEMINI_API_VERSION` values × 4 config shapes) had **not been run** when this entry was written — shell execution was unavailable in that session. Equivalence was instead established by reading each of the four replaced regions against a pre-change copy of `src/index.ts`. Re-run those three commands and replace this paragraph with their results before relying on this change.
+
 ### feat(routing): add ENABLE_DYNAMIC_ROUTING env var, disabled by default
 
 `src/types/shared.ts`, `src/index.ts`, `src/server.ts`, `wrangler.toml`, `tests/unit/dynamic-route-gate.test.ts` (new), `tests/run-integration-tests.js`, `README.md`, `docs/api/api-endpoints.md`, `docs/api/list_of_api_and_schema.md`, `docs/reference/configuration-reference.md`, `docs/getting-started/README_DETAILS.md` — gates per-request dynamic routing (`/{protocol}/{host}/...`) behind a new opt-in flag, **disabled by default**:

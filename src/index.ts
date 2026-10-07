@@ -386,9 +386,244 @@ function isDynamicRoutingEnabled(env: Env): boolean {
 }
 
 /**
+ * Handler types the shared routing table can produce. Mirrors the union declared
+ * by `parseFixedRoute` and by `RouteAttempt['handlerType']`.
+ */
+type UpstreamHandlerType =
+  | 'messages' | 'interactions' | 'generateContent' | 'token-counting'
+  | 'responses' | 'responses-compact' | 'responses-input-tokens' | 'chat-completions';
+
+/** Endpoint family a resolved target belongs to. */
+type UpstreamTargetKind =
+  | 'messages' | 'interactions' | 'count-tokens' | 'generate-content'
+  | 'chat-completions' | 'responses' | 'responses-input-tokens' | 'responses-compact';
+
+/** `targetEndpoint` labels reported by `parseFixedRoute`, keyed by resolved kind. */
+const FIXED_ROUTE_ENDPOINTS: Record<UpstreamTargetKind, string> = {
+  messages: 'v1/messages',
+  interactions: 'v1/interactions',
+  'count-tokens': 'v1beta/models/countTokens',
+  'generate-content': 'v1beta/models/generateContent',
+  'chat-completions': 'v1/chat/completions',
+  responses: 'v1/responses',
+  'responses-input-tokens': 'v1/responses/input_tokens',
+  'responses-compact': 'v1/responses/compact',
+};
+
+/**
+ * Two routing dialects share the table below:
+ *
+ * - `fixed-route`: `[models.default]` / `[default_upstream]` routing (parseFixedRoute).
+ * - `model-route`: the per-model builders — composite candidates, fusion, the
+ *   remote auth-target ladder and the /v1/chat/completions model passthrough.
+ *
+ * They disagree on five paths, each marked "dialect difference" below:
+ * /v1/messages+gemini, /v1/interactions+gemini, the :countTokens handler type,
+ * /v1/chat/completions with a native mode, and whether the Gemini version prefix
+ * honours GEMINI_API_VERSION. This helper removes the duplicated dispatch; it
+ * deliberately does NOT reconcile those differences — every call site keeps the
+ * behaviour it had before.
+ */
+type RouteDialect = 'fixed-route' | 'model-route';
+
+interface ResolveUpstreamTargetInput {
+  path: string;
+  baseUrl: string;
+  upstreamMode: string;
+  dialect: RouteDialect;
+  /** Gemini version prefix, i.e. `env.GEMINI_API_VERSION || 'v1beta'`. */
+  geminiApiVersion: string;
+  /** Model id embedded in path-style Gemini URLs (fixed routes read it from the path, model routes pass the resolved alias). */
+  pathModel?: string;
+  /** `body.stream === true`. Model-route dialect only. */
+  bodyStream?: boolean;
+  /** Explicit streaming override. Model-route dialect only. */
+  forceStream?: boolean;
+}
+
+interface ResolvedUpstreamTarget {
+  kind: UpstreamTargetKind;
+  targetUrl: string;
+  handlerType: UpstreamHandlerType;
+  upstreamMode?: string;
+  forceStreaming?: boolean;
+}
+
+/**
+ * Resolve `(path, upstream_mode) → targetUrl / handlerType / upstreamMode / forceStreaming`.
+ * Returns `undefined` for paths whose target does not depend on the upstream mode
+ * (/v1/models, /v1/embeddings, /v1/messages/count_tokens) — callers keep those.
+ */
+function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstreamTarget | undefined {
+  const { path, baseUrl, upstreamMode, geminiApiVersion, dialect } = input;
+  const fixed = dialect === 'fixed-route';
+  const upstreamUrl = (suffix: string) => buildUpstreamUrl(baseUrl, suffix);
+  const isAnthropic = upstreamMode === 'anthropic-messages';
+  const isResponses = upstreamMode === 'openai-responses';
+  const isGemini = upstreamMode === 'gemini-generatecontent' || upstreamMode === 'gemini-interactions';
+  const isModelPath = path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/');
+  const isStreamEndpoint = path.includes(':streamGenerateContent');
+  const model = input.pathModel ? encodeURIComponent(input.pathModel) : '';
+
+  // Path-style Gemini model URL. The model-route dialect always addresses v1beta
+  // (the env override is not honoured there); the fixed-route dialect uses it
+  // except on /v1/messages — see the dialect differences below.
+  const geminiModelUrl = (action: string): string => {
+    if (!model) {
+      throw new Error(`Gemini routing for ${path} requires a model id`);
+    }
+    return upstreamUrl(`${fixed ? geminiApiVersion : 'v1beta'}/models/${model}:${action}`);
+  };
+  const geminiStreamingAction = input.bodyStream === true ? 'streamGenerateContent?alt=sse' : 'generateContent';
+
+  // 1. /v1/messages → multiple upstream modes
+  if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
+    if (isAnthropic) {
+      // Native Claude API
+      return { kind: 'messages', targetUrl: upstreamUrl('v1/messages'), handlerType: 'messages', upstreamMode: 'anthropic-messages' };
+    }
+    if (isGemini) {
+      // Native Gemini API - not typically used for /v1/messages but supported
+      // Dialect difference: a fixed route has no model id for this path and
+      // addresses the Gemini collection endpoint instead of a model.
+      return {
+        kind: 'messages',
+        targetUrl: fixed ? upstreamUrl('v1beta/models') : geminiModelUrl(geminiStreamingAction),
+        handlerType: 'messages',
+        upstreamMode,
+      };
+    }
+    if (isResponses) {
+      // OpenAI Responses API upstream
+      return { kind: 'messages', targetUrl: upstreamUrl('v1/responses'), handlerType: 'messages', upstreamMode: 'openai-responses' };
+    }
+    // OpenAI-compatible upstream
+    return { kind: 'messages', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'messages', upstreamMode: 'openai-completions' };
+  }
+
+  // 2. /v1/interactions → multiple upstream modes
+  if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
+    if (isGemini) {
+      // Native Gemini API
+      // Dialect difference: a fixed route forwards to the API version root.
+      return {
+        kind: 'interactions',
+        targetUrl: fixed ? upstreamUrl(geminiApiVersion) : geminiModelUrl(geminiStreamingAction),
+        handlerType: 'interactions',
+        upstreamMode,
+      };
+    }
+    if (isAnthropic) {
+      return { kind: 'interactions', targetUrl: upstreamUrl('v1/messages'), handlerType: 'interactions', upstreamMode: 'anthropic-messages' };
+    }
+    if (isResponses) {
+      return { kind: 'interactions', targetUrl: upstreamUrl('v1/responses'), handlerType: 'interactions', upstreamMode: 'openai-responses' };
+    }
+    // OpenAI-compatible upstream
+    return { kind: 'interactions', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'interactions', upstreamMode: 'openai-completions' };
+  }
+
+  // 3. /v1beta/models/{model}:countTokens → forward to Gemini upstream
+  if (isModelPath && path.includes(':countTokens')) {
+    if (isGemini) {
+      return { kind: 'count-tokens', targetUrl: geminiModelUrl('countTokens'), handlerType: 'generateContent', upstreamMode };
+    }
+    // countTokens has no OpenAI equivalent — proxy the request upstream as-is and return the raw JSON.
+    // Dialect difference: a fixed route reports the handler as token-counting.
+    return {
+      kind: 'count-tokens',
+      targetUrl: upstreamUrl('v1/messages/count_tokens'),
+      handlerType: fixed ? 'token-counting' : 'generateContent',
+      upstreamMode: 'openai-completions',
+    };
+  }
+
+  // 4. /v1beta/models/{model}:generateContent or :streamGenerateContent → multiple upstream modes
+  // Also support /v1/models/{model}:generateContent (some Gemini APIs use v1 instead of v1beta)
+  if (isModelPath && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
+    const streaming = input.forceStream ?? isStreamEndpoint;
+    if (isGemini) {
+      // Native Gemini - pass through the exact endpoint
+      const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
+      // Preserve query string if present, or add ?alt=sse for streamGenerateContent
+      let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
+      if (isStreamEndpoint && !queryString.includes('alt=sse')) {
+        queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse';
+      }
+      return { kind: 'generate-content', targetUrl: geminiModelUrl(`${endpoint}${queryString}`), handlerType: 'generateContent', upstreamMode };
+    }
+    // Through openai-completions transforming: the handler converts the
+    // generateContent body → openai-completions → the configured mode.
+    if (isAnthropic) {
+      return { kind: 'generate-content', targetUrl: upstreamUrl('v1/messages'), handlerType: 'generateContent', upstreamMode: 'anthropic-messages', forceStreaming: streaming };
+    }
+    if (isResponses) {
+      return { kind: 'generate-content', targetUrl: upstreamUrl('v1/responses'), handlerType: 'generateContent', upstreamMode: 'openai-responses', forceStreaming: streaming };
+    }
+    // OpenAI-compatible upstream
+    return { kind: 'generate-content', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'generateContent', upstreamMode: 'openai-completions', forceStreaming: streaming };
+  }
+
+  // 5. /v1/chat/completions
+  if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
+    if (isResponses) {
+      return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/responses'), handlerType: 'chat-completions', upstreamMode: 'openai-responses' };
+    }
+    // Dialect difference: a fixed route forwards anthropic/gemini modes to
+    // openai-completions instead of building a native target.
+    if (!fixed && isAnthropic) {
+      return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/messages'), handlerType: 'chat-completions', upstreamMode: 'anthropic-messages' };
+    }
+    if (!fixed && isGemini) {
+      // The chat-completions handler handles non-streaming (:generateContent);
+      // streaming lands in Phase 3.
+      return { kind: 'chat-completions', targetUrl: geminiModelUrl('generateContent'), handlerType: 'chat-completions', upstreamMode };
+    }
+    return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'chat-completions', upstreamMode: 'openai-completions' };
+  }
+
+  // 6. /v1/responses/input_tokens → count input tokens
+  if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
+    if (isResponses) {
+      return { kind: 'responses-input-tokens', targetUrl: upstreamUrl('v1/responses/input_tokens'), handlerType: 'responses-input-tokens', upstreamMode: 'openai-responses' };
+    }
+    return { kind: 'responses-input-tokens', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'responses-input-tokens', upstreamMode: 'openai-completions' };
+  }
+
+  // 7. /v1/responses/compact → compact a conversation
+  if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
+    if (isResponses) {
+      return { kind: 'responses-compact', targetUrl: upstreamUrl('v1/responses/compact'), handlerType: 'responses-compact', upstreamMode: 'openai-responses' };
+    }
+    return { kind: 'responses-compact', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'responses-compact', upstreamMode: 'openai-completions' };
+  }
+
+  // 8. /v1/responses → multiple upstream modes
+  if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
+    if (isResponses) {
+      // Pass through to OpenAI Responses API
+      return { kind: 'responses', targetUrl: upstreamUrl('v1/responses'), handlerType: 'responses', upstreamMode: 'openai-responses' };
+    }
+    if (isAnthropic) {
+      // Convert Responses API to Claude Messages and forward to native Anthropic upstream
+      return { kind: 'responses', targetUrl: upstreamUrl('v1/messages'), handlerType: 'responses', upstreamMode: 'anthropic-messages' };
+    }
+    if (isGemini) {
+      // Convert Responses API to Claude Messages and forward to Gemini upstream
+      return { kind: 'responses', targetUrl: upstreamUrl(geminiApiVersion), handlerType: 'responses', upstreamMode };
+    }
+    // Convert to OpenAI Chat Completions
+    return { kind: 'responses', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'responses', upstreamMode: 'openai-completions' };
+  }
+
+  return undefined;
+}
+
+/**
  * Parse fixed route and return target configuration
  * Fixed route: /v1/messages -> /v1/chat/completions
  * Uses [models.default] and [default_upstream] from proxy_config.toml
+ * The mode → target mapping is shared with model-specific routing (resolveUpstreamTarget).
  */
 function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   targetUrl: string;
@@ -407,266 +642,14 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   const defaultBaseUrl = defaultCategoryConfig?.base_url || 
                         proxyConfig.default_upstream?.default_base_url;
 
-  // 1. /v1/messages → multiple upstream modes
-  if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
-    if (defaultMode === 'anthropic-messages') {
-      // Native Claude API
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: 'anthropic-messages',
-      };
-    } else if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Native Gemini API - not typically used for /v1/messages but supported
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1beta/models'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: defaultMode,
-      };
-    } else if (defaultMode === 'openai-responses') {
-      // OpenAI Responses API upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      // OpenAI-compatible upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 2. /v1/interactions → multiple upstream modes
-  if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
-    if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Native Gemini API
-      const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', apiVersion),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: defaultMode,
-      };
-    } else if (defaultMode === 'anthropic-messages') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: 'anthropic-messages',
-      };
-    } else if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      // OpenAI-compatible upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 3a. /v1beta/models/{model}:countTokens → forward to Gemini upstream
-  if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && path.includes(':countTokens')) {
-    const modelMatch = path.match(/\/(v1beta|v1)\/models\/([^:?]+):countTokens/);
-    const modelId = modelMatch ? decodeURIComponent(modelMatch[2]) : 'gemini-no-id-at-proxy';
-    const safeModelId = encodeURIComponent(modelId);
-    const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-    if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', `${apiVersion}/models/${safeModelId}:countTokens`),
-        targetEndpoint: 'v1beta/models/countTokens',
-        handlerType: 'generateContent',
-        upstreamMode: defaultMode,
-        modelId,
-      };
-    } else {
-      // countTokens has no OpenAI equivalent — proxy the request upstream as-is and return the raw JSON.
-      // The handler will fall through to handleOpenAIRequest which passes the body through.
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages/count_tokens'),
-        targetEndpoint: 'v1beta/models/countTokens',
-        handlerType: 'token-counting',
-        upstreamMode: 'openai-completions',
-        modelId,
-      };
-    }
-  }
-
-  // 3. /v1beta/models/{model}:generateContent or :streamGenerateContent → multiple upstream modes
-  // Also support /v1/models/{model}:generateContent (some Gemini APIs use v1 instead of v1beta)
-  if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
-    const modelMatch = path.match(/\/(v1beta|v1)\/models\/([^:?]+):(stream)?[Gg]enerateContent/);
-    const modelId = modelMatch ? decodeURIComponent(modelMatch[2]) : 'gemini-no-id-at-proxy';
-    const safeModelId = encodeURIComponent(modelId);
-    const isStreamEndpoint = path.includes(':streamGenerateContent');
-    
-    if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Native Gemini - pass through the exact endpoint
-      const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-      const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
-      // Preserve query string if present, or add ?alt=sse for streamGenerateContent
-      let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
-      if (isStreamEndpoint && !queryString.includes('alt=sse')) {
-        queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse';
-      }
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', `${apiVersion}/models/${safeModelId}:${endpoint}${queryString}`),
-        targetEndpoint: `v1beta/models/${endpoint}`,
-        handlerType: 'generateContent',
-        upstreamMode: defaultMode,
-        modelId,
-      };
-    } else if (defaultMode === 'anthropic-messages') {
-      // Route through openai-completions transforming: handler converts
-      // generateContent body → openai-completions → anthropic-messages.
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1beta/models/generateContent',
-        handlerType: 'generateContent',
-        upstreamMode: 'anthropic-messages',
-        modelId,
-        forceStreaming: isStreamEndpoint,
-      };
-    } else if (defaultMode === 'openai-responses') {
-      // Route through openai-completions transforming: handler converts
-      // generateContent body → openai-completions → openai-responses.
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1beta/models/generateContent',
-        handlerType: 'generateContent',
-        upstreamMode: 'openai-responses',
-        modelId,
-        forceStreaming: isStreamEndpoint,
-      };
-    } else {
-      // OpenAI-compatible upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1beta/models/generateContent',
-        handlerType: 'generateContent',
-        upstreamMode: 'openai-completions',
-        modelId,
-        forceStreaming: isStreamEndpoint,
-      };
-    }
-  }
-
-  // 4. /v1/chat/completions — passthrough
-  if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
-    if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/chat/completions',
-        handlerType: 'chat-completions' as const,
-        upstreamMode: 'openai-responses',
-      };
-    }
-    return {
-      targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-      targetEndpoint: 'v1/chat/completions',
-      handlerType: 'chat-completions' as const,
-      upstreamMode: 'openai-completions',
-    };
-  }
-
-  // Token counting endpoint
+  // Endpoints whose target does not depend on the upstream mode keep their own
+  // branches; everything else goes through the shared (path × upstream_mode) table.
   if (path === '/v1/messages/count_tokens' || path.startsWith('/v1/messages/count_tokens?')) {
     return {
       targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages/count_tokens'),
       targetEndpoint: 'v1/messages/count_tokens',
       handlerType: 'token-counting',
     };
-  }
-
-  // 5. /v1/responses/input_tokens → count input tokens
-  if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
-    if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses/input_tokens'),
-        targetEndpoint: 'v1/responses/input_tokens',
-        handlerType: 'responses-input-tokens',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/responses/input_tokens',
-        handlerType: 'responses-input-tokens',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 6. /v1/responses/compact → compact a conversation
-  if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
-    if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses/compact'),
-        targetEndpoint: 'v1/responses/compact',
-        handlerType: 'responses-compact',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/responses/compact',
-        handlerType: 'responses-compact',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 6. /v1/responses → multiple upstream modes
-  if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
-    if (defaultMode === 'openai-responses') {
-      // Pass through to OpenAI Responses API
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: 'openai-responses',
-      };
-    } else if (defaultMode === 'anthropic-messages') {
-      // Convert Responses API to Claude Messages and forward to native Anthropic upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: 'anthropic-messages',
-      };
-    } else if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Convert Responses API to Claude Messages and forward to Gemini upstream
-      const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', apiVersion),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: defaultMode,
-      };
-    } else {
-      // Convert to OpenAI Chat Completions
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: 'openai-completions',
-      };
-    }
   }
 
   // Models endpoint
@@ -691,7 +674,41 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
     };
   }
 
-  throw new Error(`Unsupported fixed route: ${path}`);
+  // A fixed route has no route entry to take the Gemini model id from, so it comes
+  // from the path (the countTokens and generateContent guards both accept
+  // /v1beta/models/ and /v1/models/).
+  const isGeminiModelEndpoint = (path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) &&
+    (path.includes(':countTokens') || path.includes(':generateContent') || path.includes(':streamGenerateContent'));
+  const modelMatch = path.includes(':countTokens')
+    ? path.match(/\/(v1beta|v1)\/models\/([^:?]+):countTokens/)
+    : path.match(/\/(v1beta|v1)\/models\/([^:?]+):(stream)?[Gg]enerateContent/);
+  const modelId = modelMatch ? decodeURIComponent(modelMatch[2]) : 'gemini-no-id-at-proxy';
+
+  const resolved = resolveUpstreamTarget({
+    path,
+    baseUrl: defaultBaseUrl || '',
+    upstreamMode: defaultMode,
+    dialect: 'fixed-route',
+    geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+    pathModel: isGeminiModelEndpoint ? modelId : undefined,
+  });
+  if (!resolved) {
+    throw new Error(`Unsupported fixed route: ${path}`);
+  }
+
+  const isGeminiMode = defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions';
+  const targetEndpoint = resolved.kind === 'generate-content' && isGeminiMode
+    ? `v1beta/models/${path.includes(':streamGenerateContent') ? 'streamGenerateContent' : 'generateContent'}`
+    : FIXED_ROUTE_ENDPOINTS[resolved.kind];
+
+  return {
+    targetUrl: resolved.targetUrl,
+    targetEndpoint,
+    handlerType: resolved.handlerType,
+    upstreamMode: resolved.upstreamMode,
+    modelId: isGeminiModelEndpoint ? modelId : undefined,
+    forceStreaming: resolved.forceStreaming,
+  };
 }
 
 /**
@@ -1419,22 +1436,20 @@ export default {
             const fixedRoute = parseFixedRoute(path, proxyConfig, env);
 
             if (modelRoute && modelRoute.targetUrl) {
-              let upstreamPath: string;
-              if (modelRoute.upstreamMode === 'openai-responses') {
-                upstreamPath = 'v1/responses';
-              } else if (modelRoute.upstreamMode === 'anthropic-messages') {
-                upstreamPath = 'v1/messages';
-              } else if (modelRoute.upstreamMode === 'gemini-generatecontent'
-                  || modelRoute.upstreamMode === 'gemini-interactions') {
-                // Gemini generateContent URL embeds the target model id and the
-                // action. The chat-completions handler handles non-streaming
-                // (:generateContent); streaming lands in Phase 3.
-                const targetModel = modelRoute.modelAlias || modelName || 'gemini-no-id-at-proxy';
-                upstreamPath = `v1beta/models/${encodeURIComponent(targetModel)}:generateContent`;
-              } else {
-                upstreamPath = 'v1/chat/completions';
+              // Mode → target mapping shared with the other model-route builders.
+              const resolved = resolveUpstreamTarget({
+                path,
+                baseUrl: modelRoute.targetUrl,
+                upstreamMode: modelRoute.upstreamMode,
+                dialect: 'model-route',
+                geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+                pathModel: modelRoute.modelAlias || modelName || 'gemini-no-id-at-proxy',
+              });
+              // This branch only runs for /v1/chat/completions, which the table always maps.
+              if (!resolved) {
+                throw new Error(`Unsupported upstream target for ${path}`);
               }
-              targetUrl = buildUpstreamUrl(modelRoute.targetUrl, upstreamPath);
+              targetUrl = resolved.targetUrl;
               upstreamMode = modelRoute.upstreamMode || fixedRoute.upstreamMode;
             } else {
               targetUrl = fixedRoute.targetUrl;
@@ -1551,7 +1566,6 @@ export default {
               logger.debug(requestId, `Composite candidate ${modelName} -> ${candidateName} via ${route.targetUrl} (${route.upstreamMode}) [client ${clientAddress}:${clientPort}]`);
 
               const upstreamModelName = route.modelAlias || candidateName;
-              const safeModel = encodeURIComponent(upstreamModelName);
               const forwardedBodyText = JSON.stringify({
                 ...body,
                 model: upstreamModelName,
@@ -1575,138 +1589,20 @@ export default {
                 }
               }
 
-              const isNativeMode = route.upstreamMode === 'anthropic-messages' ||
-                                  route.upstreamMode === 'gemini-generatecontent' ||
-                                  route.upstreamMode === 'gemini-interactions' ||
-                                  route.upstreamMode === 'openai-responses';
+              const resolved = resolveUpstreamTarget({
+                path,
+                baseUrl: route.targetUrl,
+                upstreamMode: route.upstreamMode,
+                dialect: 'model-route',
+                geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+                pathModel: upstreamModelName,
+                bodyStream: body?.stream === true,
+              });
 
-              let candidateTargetUrl = '';
-              let candidateHandlerType: RouteAttempt['handlerType'] = 'messages';
-              let candidateUpstreamMode: string | undefined;
-              let candidateForceStreaming = false;
-
-              if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
-                candidateHandlerType = 'messages';
-                if (isNativeMode) {
-                  const requestBody = JSON.parse(forwardedBodyText) as Record<string, unknown>;
-                  const isStreaming = requestBody.stream === true;
-
-                  if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                    candidateTargetUrl = isStreaming
-                      ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-                      : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-                  } else if (route.upstreamMode === 'openai-responses') {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                  } else {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                  }
-                  candidateUpstreamMode = route.upstreamMode;
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
-                candidateHandlerType = 'interactions';
-                if (isNativeMode) {
-                  if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                    const requestBody = JSON.parse(forwardedBodyText) as Record<string, unknown>;
-                    const isStreaming = requestBody.stream === true;
-                    candidateTargetUrl = isStreaming
-                      ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-                      : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-                    candidateUpstreamMode = route.upstreamMode;
-                  } else if (route.upstreamMode === 'anthropic-messages') {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                    candidateUpstreamMode = 'anthropic-messages';
-                  } else if (route.upstreamMode === 'openai-responses') {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                    candidateUpstreamMode = 'openai-responses';
-                  } else {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                    candidateUpstreamMode = 'openai-completions';
-                  }
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && path.includes(':countTokens')) {
-                candidateHandlerType = 'generateContent';
-                if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:countTokens`);
-                  candidateUpstreamMode = route.upstreamMode;
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages/count_tokens');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
-                candidateHandlerType = 'generateContent';
-                const isStreamEndpoint = path.includes(':streamGenerateContent');
-                if (isNativeMode) {
-                  if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                    const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
-                    let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
-                    if (isStreamEndpoint && !queryString.includes('alt=sse')) {
-                      queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse';
-                    }
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:${endpoint}${queryString}`);
-                    candidateUpstreamMode = route.upstreamMode;
-                  } else if (route.upstreamMode === 'anthropic-messages') {
-                    // Through openai-completions transforming: handler converts
-                    // generateContent body → openai-completions → anthropic-messages.
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                    candidateUpstreamMode = 'anthropic-messages';
-                    candidateForceStreaming = isStreamEndpoint;
-                  } else if (route.upstreamMode === 'openai-responses') {
-                    // Through openai-completions transforming: handler converts
-                    // generateContent body → openai-completions → openai-responses.
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                    candidateUpstreamMode = 'openai-responses';
-                    candidateForceStreaming = isStreamEndpoint;
-                  } else {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                    candidateUpstreamMode = 'openai-completions';
-                    candidateForceStreaming = isStreamEndpoint;
-                  }
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                  candidateForceStreaming = isStreamEndpoint;
-                }
-              } else if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
-                candidateHandlerType = 'responses';
-                if (route.upstreamMode === 'openai-responses') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                  candidateUpstreamMode = 'openai-responses';
-                } else if (route.upstreamMode === 'anthropic-messages') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                  candidateUpstreamMode = 'anthropic-messages';
-                } else if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                  const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, apiVersion);
-                  candidateUpstreamMode = route.upstreamMode;
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
-                candidateHandlerType = 'responses-input-tokens';
-                if (route.upstreamMode === 'openai-responses') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/input_tokens');
-                  candidateUpstreamMode = 'openai-responses';
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
-                candidateHandlerType = 'responses-compact';
-                if (route.upstreamMode === 'openai-responses') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/compact');
-                  candidateUpstreamMode = 'openai-responses';
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              }
+              const candidateTargetUrl = resolved?.targetUrl ?? '';
+              const candidateHandlerType: RouteAttempt['handlerType'] = resolved?.handlerType ?? 'messages';
+              const candidateUpstreamMode = resolved?.upstreamMode;
+              const candidateForceStreaming = resolved?.forceStreaming ?? false;
 
               return {
                 request: candidateRequest,
@@ -1859,7 +1755,8 @@ export default {
       }
 
       // Build a RouteAttempt for a given {modelName, route} pair and a body object.
-      // Mirrors the inline logic in the compositeAttempts.map() block above.
+      // Shares the mode → target table with the compositeAttempts.map() block above
+      // (resolveUpstreamTarget).
       const buildRouteAttempt = (
         candidateName: string,
         route: ModelRouteConfig,
@@ -1867,7 +1764,6 @@ export default {
         forceStreamOverride?: boolean,
       ): RouteAttempt => {
         const upstreamModelName = route.modelAlias || candidateName;
-        const safeModel = encodeURIComponent(upstreamModelName);
         const forwardedBodyText = JSON.stringify({ ...bodyObj, model: upstreamModelName });
         const candidateRequest = new Request(request.url, {
           method: request.method,
@@ -1895,140 +1791,21 @@ export default {
           }
         }
 
-        const isNativeMode = route.upstreamMode === 'anthropic-messages' ||
-                             route.upstreamMode === 'gemini-generatecontent' ||
-                             route.upstreamMode === 'gemini-interactions' ||
-                             route.upstreamMode === 'openai-responses';
+        const resolved = resolveUpstreamTarget({
+          path,
+          baseUrl: route.targetUrl,
+          upstreamMode: route.upstreamMode,
+          dialect: 'model-route',
+          geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+          pathModel: upstreamModelName,
+          bodyStream: bodyObj.stream === true,
+          forceStream: forceStreamOverride,
+        });
 
-        let candidateTargetUrl = '';
-        let candidateHandlerType: RouteAttempt['handlerType'] = 'messages';
-        let candidateUpstreamMode: string | undefined;
-        let candidateForceStreaming = forceStreamOverride ?? false;
-
-        const bodyStream = (bodyObj.stream === true);
-
-        if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
-          candidateHandlerType = 'messages';
-          if (isNativeMode) {
-            if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-              candidateTargetUrl = bodyStream
-                ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-                : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-            } else if (route.upstreamMode === 'openai-responses') {
-              candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            } else {
-              candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            }
-            candidateUpstreamMode = route.upstreamMode;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
-          candidateHandlerType = 'interactions';
-          if (isNativeMode && (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions')) {
-            candidateTargetUrl = bodyStream
-              ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-              : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-            candidateUpstreamMode = route.upstreamMode;
-          } else if (isNativeMode && route.upstreamMode === 'anthropic-messages') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            candidateUpstreamMode = 'anthropic-messages';
-          } else if (isNativeMode && route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            candidateUpstreamMode = 'openai-responses';
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && path.includes(':countTokens')) {
-          candidateHandlerType = 'generateContent';
-          if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:countTokens`);
-            candidateUpstreamMode = route.upstreamMode;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages/count_tokens');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
-          candidateHandlerType = 'generateContent';
-          const isStreamEndpoint = path.includes(':streamGenerateContent');
-          if (isNativeMode && (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions')) {
-            const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
-            let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
-            if (isStreamEndpoint && !queryString.includes('alt=sse')) { queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse'; }
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:${endpoint}${queryString}`);
-            candidateUpstreamMode = route.upstreamMode;
-          } else if (isNativeMode && route.upstreamMode === 'anthropic-messages') {
-            // Through openai-completions transforming: handler converts
-            // generateContent body → openai-completions → anthropic-messages.
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            candidateUpstreamMode = 'anthropic-messages';
-            candidateForceStreaming = forceStreamOverride ?? isStreamEndpoint;
-          } else if (isNativeMode && route.upstreamMode === 'openai-responses') {
-            // Through openai-completions transforming: handler converts
-            // generateContent body → openai-completions → openai-responses.
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            candidateUpstreamMode = 'openai-responses';
-            candidateForceStreaming = forceStreamOverride ?? isStreamEndpoint;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-            candidateForceStreaming = forceStreamOverride ?? isStreamEndpoint;
-          }
-        } else if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
-          candidateHandlerType = 'responses';
-          if (route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            candidateUpstreamMode = 'openai-responses';
-          } else if (route.upstreamMode === 'anthropic-messages') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            candidateUpstreamMode = 'anthropic-messages';
-          } else if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-            const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, apiVersion);
-            candidateUpstreamMode = route.upstreamMode;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
-          candidateHandlerType = 'responses-input-tokens';
-          if (route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/input_tokens');
-            candidateUpstreamMode = 'openai-responses';
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
-          candidateHandlerType = 'responses-compact';
-          if (route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/compact');
-            candidateUpstreamMode = 'openai-responses';
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
-          // Mirrors the passthrough routing block's mode→URL mapping. The
-          // chat-completions handler forwards non-streaming bodies; Gemini
-          // streaming for this path lands in Phase 3.
-          candidateHandlerType = 'chat-completions';
-          if (route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            candidateUpstreamMode = 'openai-responses';
-          } else if (route.upstreamMode === 'anthropic-messages') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            candidateUpstreamMode = 'anthropic-messages';
-          } else if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-            candidateUpstreamMode = route.upstreamMode;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        }
+        const candidateTargetUrl = resolved?.targetUrl ?? '';
+        const candidateHandlerType: RouteAttempt['handlerType'] = resolved?.handlerType ?? 'messages';
+        const candidateUpstreamMode = resolved?.upstreamMode;
+        const candidateForceStreaming = resolved?.forceStreaming ?? forceStreamOverride ?? false;
 
         return {
           request: candidateRequest,
