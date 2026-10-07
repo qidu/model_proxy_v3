@@ -36,10 +36,14 @@ import { Agent, BACKGROUND_CONTEXT, loadSkills, formatSkillInvocation, type Skil
 import { NodeExecutionEnv } from '@earendil-works/pi-agent-core/node';
 import { createModels, createProvider, type Model } from '@earendil-works/pi-ai';
 import { anthropicMessagesApi } from '@earendil-works/pi-ai/api/anthropic-messages.lazy';
+import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
+import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy';
+import { googleGenerativeAIApi } from '@earendil-works/pi-ai/api/google-generative-ai.lazy';
+import { piMessagesApi } from '@earendil-works/pi-ai/api/pi-messages.lazy';
 import type { Env } from './types/shared.js';
 import type { ProxyConfig } from './utils/config-loader.js';
 import { getConfiguredModelIds } from './utils/config-loader.js';
-import { PROXY_PROVIDER_ID, buildProxyPiModel } from './utils/pi-model-catalog.js';
+import { PROXY_PROVIDER_ID, buildProxyPiModel, proxyBaseUrlForApi, type ProxyApiType } from './utils/pi-model-catalog.js';
 import { createAgentTools } from './agent-tools.js';
 
 export interface AgentSessionSource {
@@ -1223,7 +1227,7 @@ export function diffWorkDirSnapshots(before: Map<string, number>, after: Map<str
 // Provider wiring
 // ---------------------------------------------------------------------------
 
-function buildSelfModel(alias: string, port: number): Model<'anthropic-messages'> {
+function buildSelfModel(alias: string, port: number): Model<ProxyApiType> {
   return buildProxyPiModel(alias, `http://127.0.0.1:${port}`);
 }
 
@@ -1426,7 +1430,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // doesn't print the proxy's per-request info lines.
   const models = createModels();
   const provider = createProvider({
-    id: PROVIDER_ID,
+    id: PROXY_PROVIDER_ID,
     baseUrl: `http://127.0.0.1:${port}`,
     auth: {
       apiKey: clientApiKey
@@ -1434,7 +1438,13 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         : { name: 'model_proxy_v3 (DEV_NO_KEY)', resolve: async () => ({ auth: {} }) },
     },
     models: aliases.map((alias) => buildSelfModel(alias, port)),
-    api: anthropicMessagesApi(),
+    api: {
+      'anthropic-messages': anthropicMessagesApi(),
+      'openai-completions': openAICompletionsApi(),
+      'openai-responses': openAIResponsesApi(),
+      'google-generative-ai': googleGenerativeAIApi(),
+      'pi-messages': piMessagesApi(),
+    },
   });
   models.setProvider(provider);
 
@@ -1550,6 +1560,61 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   }
 
   if (!agent) return; // unreachable, satisfies TS narrowing
+
+  // -- Endpoint schema (API type) picker --
+  let selectedApi: ProxyApiType = 'anthropic-messages';
+  const apiChoices = [
+    { value: 'anthropic-messages' as ProxyApiType, label: 'Anthropic Messages', description: 'Default: /v1/messages (Claude format)' },
+    { value: 'openai-completions' as ProxyApiType, label: 'OpenAI Completions', description: '/v1/chat/completions (OpenAI chat format)' },
+    { value: 'openai-responses' as ProxyApiType, label: 'OpenAI Responses', description: '/v1/responses (OpenAI Responses API)' },
+    { value: 'google-generative-ai' as ProxyApiType, label: 'Google Generative AI', description: '/v1beta/models/{model}:generateContent (Gemini format)' },
+    { value: 'pi-messages' as ProxyApiType, label: 'Pi Messages', description: 'unsupported: posts /messages, which this proxy does not serve' },
+  ];
+  const apiChoice = await pickFromList(
+    `\nSelect endpoint schema for ${selectedAlias} (default: Anthropic Messages):`,
+    apiChoices,
+  ) as ProxyApiType | null;
+  if (apiChoice) {
+    selectedApi = apiChoice;
+  }
+  console.log(dim(`[proxy] using endpoint schema: ${selectedApi}`));
+
+  // Build model with selected API and create new agent for the session.
+  // The base URL is per-API: each SDK appends its own path and they disagree
+  // about where the version segment lives, so a bare origin made every api
+  // but anthropic-messages request an unversioned path the proxy rejects.
+  const baseUrl = proxyBaseUrlForApi(port, selectedApi);
+  if (selectedApi === 'pi-messages') {
+    console.warn(
+      `[proxy] warning: pi-messages posts the pi {model, context, options} body to ${baseUrl}/messages, ` +
+      'which this proxy does not serve — pick another endpoint schema for a working session.',
+    );
+  }
+  const sessionModel = buildProxyPiModel(selectedAlias, baseUrl, selectedApi);
+  models.setProvider(provider); // ensure provider is still registered
+  const sessionModels = createModels();
+  sessionModels.setProvider(provider);
+
+  // Create new agent with the selected API model
+  const candidateRef: { current: Agent | null } = { current: null };
+  agent = new Agent({
+    initialState: {
+      systemPrompt,
+      model: sessionModel,
+      tools: createAgentTools(workDir, {
+        skillsCliAvailable,
+        appendSystemPrompt: (instructions: string) => {
+          const ag = candidateRef.current!;
+          ag.state.messages = [
+            ...ag.state.messages,
+            { role: 'system', content: instructions, timestamp: Date.now() },
+          ];
+        },
+      }),
+    },
+    streamFn: sessionModels.streamSimple.bind(sessionModels),
+  });
+  candidateRef.current = agent;
 
   // -- Budget prompt --
   let budget: Budget | null = null;

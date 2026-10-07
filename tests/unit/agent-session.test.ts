@@ -769,19 +769,18 @@ describe('SPINNER_CHARS', () => {
 });
 
 describe('agentTitleGlyph', () => {
-  it('starts on π and runs π π * * π π * * over the first eight ticks', () => {
+  it('starts on π and holds it for 13 ticks, then * for 7', () => {
     // Ticks are 1-based: startTuiSpinner increments spinnerTick before its first
     // glyph, so tick 0 never reaches this function.
-    const seq = [1, 2, 3, 4, 5, 6, 7, 8].map(agentTitleGlyph);
-    assert.deepEqual(seq, ['π', 'π', '*', '*', 'π', 'π', '*', '*']);
+    const seq = Array.from({ length: 20 }, (_, i) => agentTitleGlyph(i + 1));
+    assert.deepEqual(seq, [...Array(13).fill('π'), ...Array(7).fill('*')]);
   });
 
-  it('holds each glyph for exactly two ticks', () => {
-    // The hold length is what the user asked for (2 πs then 2 *s, not a flip on
-    // every 150ms frame). Assert it directly rather than only in the sequence.
-    for (let start = 1; start <= 8; start += 2) {
-      assert.equal(agentTitleGlyph(start), agentTitleGlyph(start + 1));
-      assert.notEqual(agentTitleGlyph(start), agentTitleGlyph(start + 2));
+  it('repeats that 20-tick cycle', () => {
+    // The cycle is the property the animation depends on, so assert it separately
+    // from the first cycle's exact contents.
+    for (let tick = 1; tick <= 20; tick++) {
+      assert.equal(agentTitleGlyph(tick + 20), agentTitleGlyph(tick), `tick ${tick} does not repeat`);
     }
   });
 
