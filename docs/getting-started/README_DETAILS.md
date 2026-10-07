@@ -1313,6 +1313,7 @@ node dist/server.js
 | `ALLOWED_ORIGINS` | `ALLOWED_ORIGINS` | `"*"` |
 | `DEV_MODE` | `DEV_MODE` | unset |
 | `ALLOWED_HOSTS` | `ALLOWED_HOSTS` | `"127.0.0.1,localhost"` |
+| `ENABLE_DYNAMIC_ROUTING` | `ENABLE_DYNAMIC_ROUTING` | `"false"` |
 | `IMAGE_BLOCK_DATA_MAX_SIZE` | `IMAGE_BLOCK_DATA_MAX_SIZE` | `"10485760"` |
 | `LOG_LEVEL` | `LOG_LEVEL` | `"info"` |
 | `GEMINI_API_VERSION` | — (hardcoded) | `"v1beta"` |

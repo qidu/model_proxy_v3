@@ -15,6 +15,10 @@ then walks the remaining segments to find the boundary between the upstream API 
 optional model id, and the trailing Claude-style endpoint (`v1/messages`, `v1/models`,
 `v1/messages/count_tokens`, etc.).
 
+- **Opt-in.** Dynamic routing is **disabled by default**. Unless `ENABLE_DYNAMIC_ROUTING` is set to
+  `true` (or `1`), a `/{protocol}/{host}/...` path is rejected with `403 "Dynamic routing is
+  disabled."` rather than being reinterpreted as a fixed route. This gate is evaluated before the
+  SSRF check, so a disabled proxy rejects every dynamic route regardless of the target host.
 - **No body conversion.** Dynamic routes are passthrough: the body is forwarded to the resolved
   upstream URL verbatim, and auth headers (`Authorization` / `x-api-key` / `x-goog-api-key`) are
   forwarded as-is from the caller. The proxy does **not** perform a local credential check.

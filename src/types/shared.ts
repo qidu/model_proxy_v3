@@ -49,6 +49,13 @@ export interface Env {
     ALLOWED_HOSTS?: string;
 
     /**
+     * Enable dynamic per-request upstream routing (`/{protocol}/{host}/...`).
+     * Set to "true" or "1" to enable.
+     * Default: disabled (`/{protocol}/{host}/...` paths are rejected with 403).
+     */
+    ENABLE_DYNAMIC_ROUTING?: string;
+
+    /**
      * Maximum size for image block base64 data in bytes.
      * Defaults to 10485760 (10MB).
      * Example: "10485760" for 10MB

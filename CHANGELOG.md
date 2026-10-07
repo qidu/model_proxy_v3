@@ -5,6 +5,21 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(routing): add ENABLE_DYNAMIC_ROUTING env var, disabled by default
+
+`src/types/shared.ts`, `src/index.ts`, `src/server.ts`, `wrangler.toml`, `tests/unit/dynamic-route-gate.test.ts` (new), `tests/run-integration-tests.js`, `README.md`, `docs/api/api-endpoints.md`, `docs/api/list_of_api_and_schema.md`, `docs/reference/configuration-reference.md`, `docs/getting-started/README_DETAILS.md` — gates per-request dynamic routing (`/{protocol}/{host}/...`) behind a new opt-in flag, **disabled by default**:
+
+- **New flag**: `ENABLE_DYNAMIC_ROUTING`, accepted as `true` or `1` (matching the existing boolean-env convention, e.g. `DEV_NO_KEY`). Declared in the `Env` interface, mapped in the Node adapter (`src/server.ts`, default `"false"`), and added to `wrangler.toml [vars]`.
+- **Gate**: a new `isDynamicRoutingEnabled(env)` predicate, checked at the top of the dynamic-route branch in `src/index.ts`. When the flag is off, a dynamic path returns `403 "Dynamic routing is disabled."`
+- **Rejected, not reinterpreted**: the gate deliberately returns an explicit error instead of falling through to `parseFixedRoute`. Otherwise a `/https/host/...` path would be silently handed to fixed routing and possibly served as a different endpoint — a silent failure rather than a loud one.
+- **Order**: the gate runs *before* the SSRF allowlist check, so a disabled proxy rejects every dynamic route regardless of target host.
+
+**Tests**: `tests/unit/dynamic-route-gate.test.ts` (new, 6 tests) pins unset → `403`; `"false"` → `403`; no upstream call made (proving no fall-through into fixed routing); `"true"` → gate opens and an unlisted host then hits the SSRF `403 "Target host not allowed."`; `"1"` behaves as `"true"`; and `"true"` + an allowlisted host is dispatched upstream.
+
+**Existing tests preserved**: because the flag defaults off, the four pre-existing SSRF integration tests (`tests/integration/16_security/ssrf_dynamic_route.test.js`, TC2001–TC2004) would otherwise fail with the "disabled" error instead of the SSRF error. `tests/run-integration-tests.js` now sets `ENABLE_DYNAMIC_ROUTING: 'true'` in the spawned proxy's env so that suite keeps exercising the SSRF guard.
+
+**Verified**: `npm run typecheck` and `npm run build` clean; `npm run test:unit` 1425/1425 pass; SSRF suite 4/4 pass against a proxy started with `ENABLE_DYNAMIC_ROUTING=true` (and confirmed to fail loudly, 3/4, with the flag unset); with the flag unset, a fixed route (`POST /v1/messages`) still routes normally (502 from an unresolvable test host, not the routing-gate 403).
+
 ### fix(deps): upgrade pi-tui and pi-agent-core to 0.99.2
 
 `package.json` — upgrades `@earendil-works/pi-tui` and `@earendil-works/pi-agent-core` from `^0.87.1` to `^0.99.2`. This is a minor version bump within the 0.x series that brings bug fixes and internal improvements to the TUI and agent core libraries. No API-breaking changes were observed in this codebase; the five `TuiMainScreen` construction sites and the agent session integration continue to work without modification. `npm run typecheck` and `npm run build` are clean after the upgrade.

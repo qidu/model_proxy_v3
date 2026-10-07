@@ -111,7 +111,10 @@ dashboard routes.
 
 In addition to the fixed endpoints above, the proxy accepts per-request dynamic
 routes of the form `/{protocol}/{host}/{path_prefix}/{model_id?}/{claude_endpoint}`,
-e.g. `/https/api.qnaigc.com/openai/v1/models/deepseek-v3.1/v1/messages`. These are
+e.g. `/https/api.qnaigc.com/openai/v1/models/deepseek-v3.1/v1/messages`. Dynamic
+routing is **disabled by default**: unless `ENABLE_DYNAMIC_ROUTING` is `true` (or
+`1`), these paths are rejected with `403 "Dynamic routing is disabled."` and are
+not reinterpreted as fixed routes. When enabled, they are
 **passthrough** — the body is forwarded verbatim and auth headers are forwarded
 as-is. Hosts are checked against `ALLOWED_HOSTS` (env, default
 `127.0.0.1,localhost`) plus any host derived from `[models.*]` / `[default_upstream]`

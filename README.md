@@ -418,7 +418,7 @@ Notes:
 
 Additional endpoint behavior is documented in [`docs/api/api-endpoints.md`](./docs/api/api-endpoints.md):
 
-- **Dynamic routing** — per-request upstream override routes `/{protocol}/{host}/...` with an SSRF allowlist (`ALLOWED_HOSTS`).
+- **Dynamic routing** — per-request upstream override routes `/{protocol}/{host}/...`, disabled by default (opt in with `ENABLE_DYNAMIC_ROUTING=true`) and guarded by an SSRF allowlist (`ALLOWED_HOSTS`).
 - **Image input/output across format boundaries** — wire shapes, source-shape handling, who fetches HTTP image URLs, and the model-generated-image limits.
 - **OpenAI prompt caching fields** — which of `prompt_cache_key` / `prompt_cache_options` / `prompt_cache_breakpoint` survive each cross-mode conversion.
 - **Dashboard API** — the `/dashboard/api/*` JSON routes, optional bearer token, and stats keying by resolved model id.

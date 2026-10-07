@@ -378,6 +378,14 @@ function isDynamicRoute(path: string): boolean {
 }
 
 /**
+ * Check if dynamic routing is enabled (opt-in via ENABLE_DYNAMIC_ROUTING).
+ * Disabled by default: a dynamic path is rejected rather than reinterpreted.
+ */
+function isDynamicRoutingEnabled(env: Env): boolean {
+  return env.ENABLE_DYNAMIC_ROUTING === 'true' || env.ENABLE_DYNAMIC_ROUTING === '1';
+}
+
+/**
  * Parse fixed route and return target configuration
  * Fixed route: /v1/messages -> /v1/chat/completions
  * Uses [models.default] and [default_upstream] from proxy_config.toml
@@ -1767,6 +1775,13 @@ export default {
         }
       } else if (isDynamicRoute(path)) {
         // Dynamic routing: /http/host/... or /https/host/...
+        // Opt-in: disabled unless ENABLE_DYNAMIC_ROUTING is set. Reject explicitly
+        // instead of falling through to fixed routing, which would silently
+        // reinterpret the path as a fixed route.
+        if (!isDynamicRoutingEnabled(env)) {
+          logger.warn(requestId, `Dynamic routing disabled (set ENABLE_DYNAMIC_ROUTING=true to enable): ${path}`);
+          return createErrorResponse(new Error('Dynamic routing is disabled.'), requestId, 403);
+        }
         // Validate parsed host against config-approved upstream hosts (SSRF protection).
         let parsedRoute;
         try {

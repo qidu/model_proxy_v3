@@ -459,6 +459,7 @@ entry can set `base_url = "sdk://chatjimmy.ai/api"` and keep the appropriate
 | `NAMESPACE_SEPARATOR` | `_Z_` | Separator joining namespace levels and the leaf tool name when flattening Responses API `namespace`-wrapped tools to Chat Completions tool names (`/v1/responses` + `openai-completions` upstream), e.g. `outer_Z_nested_Z_deep_fn`. Read once at module load; empty falls back to the default. Must match `/^[a-zA-Z0-9_-]+$/` so the flattened name stays valid for `function.name` — an out-of-charset value throws at startup. |
 | `IMAGE_BLOCK_DATA_MAX_SIZE` | `10485760` | Max inline image bytes accepted |
 | `ALLOWED_HOSTS` | `127.0.0.1,localhost` | SSRF allowlist for dynamic per-request upstream hosts |
+| `ENABLE_DYNAMIC_ROUTING` | `false` | `true` (or `1`) enables per-request dynamic upstream routes (`/{protocol}/{host}/...`). Disabled by default: a dynamic path is rejected with `403 "Dynamic routing is disabled."` rather than being reinterpreted as a fixed route. Checked before the SSRF allowlist. |
 
 ## Privacy-filter sidecar
 

@@ -258,6 +258,9 @@ if (await resolvePortConflict()) {
     PROXY_URL,
     API_KEY,
     TEST_TIMEOUT,
+    // 16_security/ssrf_dynamic_route.test.js exercises the dynamic-route SSRF
+    // guard, which is opt-in and off by default.
+    ENABLE_DYNAMIC_ROUTING: 'true',
   };
 
   proxy = spawn('node', ['dist/server.js'], {
