@@ -561,15 +561,15 @@ async function startPersistentTui(): Promise<void> {
   persistentTerminal = new ProcessTerminal();
   persistentTui = new TuiMainScreen(persistentTerminal);
 
-  // Status bar at top
-  statusBar = new Box(1, 0);
-
   // Conversation area (flex-grow)
   conversationArea = new Box(1, 1);
 
-  // Proxy log line: a single row between the conversation area and the '─' rule.
+  // Proxy log line: a single row between the conversation area and the status bar.
   // No padding at all, so it renders zero rows until the first log arrives.
   proxyLogLine = new Box(0, 0);
+
+  // Status bar at bottom (above the '─' rule) — shows tool calling status while agent runs
+  statusBar = new Box(1, 0);
 
   // Bottom input
   bottomInput = new Input();
@@ -581,11 +581,12 @@ async function startPersistentTui(): Promise<void> {
     }
   };
 
-  // Root container: statusBar | conversationArea | proxyLogLine | inputRow
+  // Root container: conversationArea | proxyLogLine | statusBar | inputRow
+  // statusBar sits just above the '─' rule (drawn by RuledInput wrapper)
   const root = new Box(0, 0);
-  root.addChild(statusBar);
   root.addChild(conversationArea);
   root.addChild(proxyLogLine);
+  root.addChild(statusBar);
   // `bottomInput` stays the bare Input (onSubmit/setValue call sites below are
   // unchanged); the wrapper exists only to draw the '─' rule above it, so it is
   // what gets mounted and focused.
@@ -595,7 +596,7 @@ async function startPersistentTui(): Promise<void> {
   persistentTui.addChild(root);
   persistentTui.setFocus(inputRow);
   persistentTui.start();
-  // Proxy log lines show in the single row directly above the '─' rule, newest
+  // Proxy log lines show in the single row directly above the status bar, newest
   // replacing the previous one (see captureConsoleOutput).
   captureConsoleOutput((line) => {
     setProxyLogRow(proxyLogLine, line);
@@ -715,11 +716,10 @@ function clearAgentTitle(): void {
   process.stdout.write('\x1b]0;\x07');
 }
 
-/** Which glyph the window title shows on a given spinner tick. Each glyph is
- *  held for two ticks (300ms), so the title reads π π * * … rather than
- *  flipping on every 150ms frame. Ticks start at 1 (see startTuiSpinner). */
+/** Which glyph the window title shows on a given spinner tick. Pattern: π for ~2s, * for ~1s.
+ *  At 150ms/tick: π for 13 ticks (1950ms), * for 7 ticks (1050ms). 20-tick cycle = 3s. Ticks start at 1. */
 export function agentTitleGlyph(tick: number): string {
-  return Math.floor((tick - 1) / 2) % 2 === 0 ? 'π' : '*';
+  return (tick - 1) % 20 < 13 ? 'π' : '*';
 }
 
 /** Start the TUI spinner interval when agent is running */
