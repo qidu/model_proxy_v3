@@ -723,6 +723,7 @@ PROXY_URL=http://localhost:8788 API_KEY=sk-test node tests/run-integration-tests
 The [`docs/`](./docs/) folder has deep-dives on specific topics:
 
 - **Sidecar status & config** — `docs/architecture/status_of_sidecars_of_proxy.md` (summary of all sidecars: remote auth, privacy filter, image fetch, tool judge, kompress, coordinator, fusion, composite, schedule, transforms)
+- **Tool-judge sidecar (Laya) context limit** — Laya runs with a per-checkpoint token budget (`max_len`: 512 for `convaiinnovations/laya`, 1,024 for multilingual/typed-decisions) shared by question prefix + state. The proxy uses character caps (2000/600/50) that don't map to tokens; exceeding the budget silently truncates the tool list — later tools vanish from the judge's view. See `docs/architecture/design_tool_judge_sidecar_protocol.md` and `submodules/laya-mlx/README.md`.
 - **Routing & aliases** — `docs/reference/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `docs/getting-started/proxy_config.example.toml`, `docs/architecture/routing_refactor.md`, `docs/architecture/routing_config_revision.md`
 - **API endpoint details** — `docs/api/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
 - **Configuration guide** — `docs/getting-started/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)

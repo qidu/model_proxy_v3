@@ -5,6 +5,17 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### docs(readme): document the Laya tool-judge token budget
+
+`README.md` — adds one bullet to the Documentation section recording the tool-judge sidecar's context limit, which was previously undocumented anywhere in this repo.
+
+- **The limit**: Laya is a bidirectional encoder with a per-checkpoint window (`max_len` in the checkpoint's `rl_agent_config.json`) — 512 tokens for `convaiinnovations/laya`, 1,024 for `laya-multilingual` / `laya-typed-decisions`. It is not a constant in code; the encoder config's `max_position_embeddings` is 8,192, and 512 is only the fallback when the checkpoint carries no `max_len`.
+- **Why it matters to the proxy**: the window is shared by the question prefix *and* the `state` text (tool schemas + prompt + recent context) — `submodules/laya-mlx/laya_mlx/common.py:build_sequence`. The proxy's caps in `src/utils/tool-judge-sidecar.ts` (`MAX_PROMPT_CHARS=2000`, `MAX_SCHEMA_CHARS=600` per tool, `max_batch_tools=50`) are *character* budgets, so they do not bound the token count.
+- **The failure is silent**: `build_sequence` right-truncates state with `st[:room]` and raises nothing — only the *option* side fails loud (`ValueError: … too many options for the token budget`). `serve_judge.py` therefore cannot report truncation, and `usage.input_tokens` reflects the already-truncated sequence. Over-budget tool lists lose their tail: the judge answers for tools it was never shown.
+- **Not reachable from this proxy's own usage**: `choice` mode always sends exactly two criteria (`keep`/`discard`, `buildChoiceRequest`), so the option-side `ValueError` cannot fire here; `noul` mode sends zero options. The repository's exposure is the state budget alone.
+
+**Verification status**: **not run.** This is a README-only change — no source, config, or test file was touched, so `npm run typecheck` / `npm run build` / `npm run test:unit` are unaffected and were not executed. The technical claims were read from source, not executed: `submodules/laya-mlx/laya_mlx/common.py` (`build_prefix`, `build_sequence`), `agent.py:120-123` (the `4 < head_max_len < max_len <= max_position_embeddings` guard) and `agent.py:182-186` (the marker-count guard), `prepared.py` (PrefixCache repeats the same semantics), `tokenizer.py` (`no_truncation()`), `serve_judge.py` (`judge`/`decision` handlers — no token accounting, `ValueError` → 400 only), and `src/utils/tool-judge-sidecar.ts` (`MAX_PROMPT_CHARS`/`MAX_SCHEMA_CHARS`/`max_batch_tools`, `buildChoiceRequest`). The 512-vs-1,024 split comes from the checkpoint table in `submodules/laya-mlx/README.md:83`. No tokenizer was run to confirm real token counts for the state text; the write-up does not depend on a specific count, only on the caps being characters rather than tokens.
+
 ### test(routing): cover `parseDynamicRoute`, `getHandlerType` and `buildTargetUrl` from the source
 
 `tests/unit/routing.test.ts` — adds three `describe` blocks (21 tests, 40 assertions) for the dynamic-route helpers, imported from `src/utils/routing.ts` (`parseDynamicRoute`, `getHandlerType`, `buildTargetUrl`). These three had **no** direct unit coverage before; their only exercise was in ad-hoc scripts that carry their own hand-copied reimplementations of the same logic.
