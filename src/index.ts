@@ -19,6 +19,7 @@ import { handleGeminiRequest, handleGeminiRequestForMessages } from './handlers/
 import { handleOpenAIRequest } from './handlers/openai.js';
 import { handleClaudeRequest } from './handlers/claude.js';
 import { handleEmbeddingsRequest } from './handlers/embeddings.js';
+import { handleDecisionRequest } from './handlers/decision.js';
 import { handleChatCompletionsPassthrough } from './handlers/chat-completions.js';
 import { handlePassthroughRequest, PASSTHROUGH_PREFIX } from './handlers/passthrough.js';
 import {
@@ -1271,6 +1272,34 @@ export default {
       // No response-side handling needed.
       const kompressConfig = getKompressConfig(env);
       const kompressActive = !!kompressConfig && shouldCompressPath(kompressConfig, path);
+
+      // Decision endpoint: POST /decision and POST /v1/decision proxy to a Clef-contract upstream
+      if (path === '/decision' || path === '/v1/decision') {
+        // The early gate above already ran unless auth is deferred
+        // (auth_with_model / auth_with_body). Those modes need the parsed body,
+        // and decision returns before the normal post-parse auth call — so
+        // run the deferred gate here, reusing the same doAuthRequest closure.
+        const decisionBodyText = await request.text();
+        if (authUrl && (authWithModel || authWithBody)) {
+          let decisionModel: string | undefined;
+          try {
+            const parsed = JSON.parse(decisionBodyText);
+            if (parsed && typeof parsed.model === 'string') decisionModel = parsed.model;
+          } catch {
+            // Invalid JSON is rejected by the handler with a 400.
+          }
+          const authError = await doAuthRequest(decisionModel, decisionBodyText);
+          if (authError) return authError;
+        }
+        const decisionResponse = await handleDecisionRequest(
+          decisionBodyText,
+          proxyConfig,
+          requestId,
+          logger,
+        );
+        recordRequestTiming(path, Date.now() - requestStartTime);
+        return decisionResponse;
+      }
 
       // Passthrough mode: /passthrough/v1/... -> verbatim upstream
       if (path.startsWith(`${PASSTHROUGH_PREFIX}/`)) {

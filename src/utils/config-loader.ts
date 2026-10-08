@@ -149,6 +149,31 @@ export interface ProxyConfig {
     /** Maximum number of tools to send in a single batch request (default: 50) */
     max_batch_tools?: number;
   };
+
+  /**
+   * `POST /decision` — the Clef API, as defined by the two schemas in
+   * `docs/api/decision/clef-schema-input.json` and `clef-schema-output.json`.
+   * The proxy POSTs the request body to `url` verbatim and returns the upstream
+   * body verbatim; it implements no transport of its own.
+   *
+   * `backend` picks which upstream serves that contract, and only affects one
+   * thing — whether `images` are allowed:
+   *   - "laya": the local `submodules/laya-mlx` sidecar. Its MLX encoder is
+   *     text-only, so a request carrying `images` is rejected with 400.
+   *   - "cloudflare": any endpoint serving the Clef schemas with `images`
+   *     support. The `images` array is forwarded untouched. "clef" is an
+   *     accepted equivalent spelling of this backend.
+   */
+  decision?: {
+    /** Which upstream serves the Clef contract: "laya" | "cloudflare" | "clef". Required to enable. */
+    backend?: 'laya' | 'cloudflare' | 'clef';
+    /** Full endpoint URL, POSTed verbatim (e.g. "http://localhost:8765/decision"). Required to enable. */
+    url?: string;
+    /** Optional API key, sent as `Authorization: Bearer <api_key>`. */
+    api_key?: string;
+    /** Timeout in milliseconds (default: 5000 for "laya", 30000 for "cloudflare") */
+    timeout_ms?: number;
+  };
 }
 
 /**
@@ -2866,6 +2891,10 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'tool_judge_sidecar';
         currentCategory = null;
         config.tool_judge_sidecar = {};
+      } else if (parts[0] === 'decision') {
+        currentSection = 'decision';
+        currentCategory = null;
+        config.decision = {};
       } else if (parts[0] === 'fetch') {
         currentSection = 'fetch';
         currentCategory = null;
@@ -2984,6 +3013,12 @@ export function parseSimpleToml(content: string): ProxyConfig {
         // are coerced in the unquoted branch below.
         if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
           (config.tool_judge_sidecar as any)[cleanKey] = value;
+        }
+      } else if (currentSection === 'decision' && config.decision) {
+        // backend, url and api_key are stored as strings; timeout_ms is coerced
+        // in the unquoted branch below.
+        if (cleanKey === 'backend' || cleanKey === 'url' || cleanKey === 'api_key') {
+          (config.decision as any)[cleanKey] = value;
         }
       } else if (currentSection === 'fetch' && config.fetch) {
         if (cleanKey === 'image_encode') {
@@ -3315,6 +3350,16 @@ export function parseSimpleToml(content: string): ProxyConfig {
         } else if (typeof cleanValueAny === 'string') {
           if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
             (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
+          }
+        }
+      } else if (currentSection === 'decision' && config.decision) {
+        if (typeof cleanValueAny === 'number') {
+          if (cleanKey === 'timeout_ms') {
+            (config.decision as any)[cleanKey] = cleanValueAny;
+          }
+        } else if (typeof cleanValueAny === 'string') {
+          if (cleanKey === 'backend' || cleanKey === 'url' || cleanKey === 'api_key') {
+            (config.decision as any)[cleanKey] = cleanValueAny;
           }
         }
       } else if (currentSection === 'fetch' && config.fetch) {

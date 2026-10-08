@@ -362,6 +362,7 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /config-reload` | Reload config from `PROXY_CONFIG_CONSUL` or `PROXY_CONFIG_APOLLO`. Only meaningful when a remote config source is set; returns `400`/`500` otherwise. Clears the config cache and re-fetches. |
 | `GET /health` (also `GET /`) | Health check. Probes the resolved default-category / `[default_upstream]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
+| `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar or Cloudflare Clef). See [Decision endpoint](#decision-endpoint-post-decision). |
 | `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
 | `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
 
@@ -422,6 +423,87 @@ Additional endpoint behavior is documented in [`docs/api/api-endpoints.md`](./do
 - **Image input/output across format boundaries** — wire shapes, source-shape handling, who fetches HTTP image URLs, and the model-generated-image limits.
 - **OpenAI prompt caching fields** — which of `prompt_cache_key` / `prompt_cache_options` / `prompt_cache_breakpoint` survive each cross-mode conversion.
 - **Dashboard API** — the `/dashboard/api/*` JSON routes, optional bearer token, and stats keying by resolved model id.
+
+### Decision endpoint (`POST /decision`)
+
+An endpoint for **typed decisions** rather than generation: the caller supplies some
+state and a map of questions, and gets back a probability per question. There is no
+prompt and no completion — questions are answered in a single forward pass.
+
+The wire contract is the **Clef API**, defined by
+[`docs/api/decision/clef-schema-input.json`](./docs/api/decision/clef-schema-input.json)
+and
+[`docs/api/decision/clef-schema-output.json`](./docs/api/decision/clef-schema-output.json).
+Those two files are authoritative; the summary below is a convenience.
+
+```jsonc
+// request — required: model, state, questions
+{
+  "model": "clef",                 // "clef" or "clef-flash"
+  "state": "…",                    // string, or structured data (object/array)
+  "questions": {                   // 1–64 questions, answers return under the same ids
+    "keep": { "type": "noul",   "instructions": "Is this file safe to edit?" },
+    "plan": { "type": "choice", "instructions": "Pick a plan", "criteria": ["free", "pro"] },
+    "risk": { "type": "score",  "instructions": "Rate the risk", "legend": ["none", "low", "high"] }
+  },
+  "images": [ … ]                  // optional
+}
+
+// response — required: model, answers, usage
+{
+  "model": "clef",
+  "answers": {
+    "keep": { "type": "noul",   "noul": 0.87 },
+    "plan": { "type": "choice", "choice": "pro", "probabilities": { "free": 0.2, "pro": 0.8 }, "confidence": 0.8 },
+    "risk": { "type": "score",  "score": 1.4, "legend": { "0": "none", "1": "low", "2": "high" },
+              "probabilities": { "0": 0.1, "1": 0.4, "2": 0.5 }, "confidence": 0.5 }
+  },
+  "usage": { "input_tokens": 412, "output_tokens": 0 }
+}
+```
+
+**Configuration** — `url` is a **full endpoint**, not a base URL (the proxy POSTs to
+it verbatim, so include the path). Setting both `backend` and `url` is what enables
+the route; without them `/decision` answers `503`.
+
+```toml
+[decision]
+backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed)
+url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim
+# api_key = "optional-bearer-token"         # sent as Authorization: Bearer
+# timeout_ms = 5000                         # default: 5000 for "laya", 30000 for "cloudflare"/"clef"
+```
+
+**Two backends, differing in exactly one thing — `images`:**
+
+- **`laya`** — the local sidecar [`submodules/laya-mlx/serve_judge.py`](./submodules/laya-mlx/serve_judge.py),
+  serving this contract from the Laya typed-decisions model. Its MLX encoder is
+  text-only, so a request carrying a non-empty `images` array is rejected with `400`
+  before any upstream call. It fails loud rather than dropping the images, so a caller
+  cannot mistake a text-only answer for one that saw the image. The same token-budget
+  caveat as the tool judge applies — see the Laya context-limit note under
+  [Documentation](#documentation).
+- **`cloudflare`** — any upstream serving the Clef schemas with image support (e.g.
+  Cloudflare's `@cf/cloudflare/clef`). The `images` array is forwarded untouched, and
+  the model id in the body selects the remote model. **`clef` is an accepted equivalent
+  spelling for this backend.**
+
+**Behaviour notes:**
+
+- **Verbatim forwarding** — the request body is forwarded byte-for-byte, and the
+  upstream response body is returned byte-for-byte. The proxy implements no transport
+  of its own beyond the POST, and does no model routing or alias resolution: the
+  `model` field in the body is the upstream's business.
+- **Envelope-only validation** — the proxy checks only the top-level required fields
+  (`model`/`state`/`questions` in, `model`/`answers`/`usage` out). Per-question shapes,
+  id charset, the 1–64 question bound, and the `model` pattern are the upstream's
+  validation, and its error is forwarded.
+- **Errors pass through** — a non-2xx upstream response is returned as-is (status, body,
+  and `x-request-id`). A 2xx whose body is not JSON, or is missing the response
+  envelope, is reported as `502 Invalid upstream response`.
+- **Auth & stats apply** — the caller's credential and `[remote] auth_server` gate run
+  as for other endpoints; requests are recorded to `record_server` and appear in the
+  dashboard under the `model` from the request body.
 
 ## Model Routing & Aliases
 
@@ -609,8 +691,8 @@ The full field-by-field reference lives in
 [`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md):
 
 - **TOML sections** — `[general]`, `[default_upstream]`, `[remote]`,
-  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[dashboard]`,
-  `[passthrough]`.
+  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[decision]`,
+  `[dashboard]`, `[passthrough]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
   config `api_key` into the OS keychain (accounts `<target_model_id>/<base_url>` under
   the `model_proxy_v3` service) and rewrites the config file to `STORE_KEY_IN_SYSTEM`

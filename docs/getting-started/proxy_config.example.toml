@@ -609,6 +609,40 @@ openai-responses   = ["max_tokens_rename"]
 # api_key = "optional-bearer-token"           # optional Authorization header
 
 # ---------------------------------------------------------------------------
+# Decision endpoint — POST /decision, the Clef API.
+# ---------------------------------------------------------------------------
+#
+# The proxy POSTs the request body to `url` verbatim and returns the upstream
+# body verbatim; it implements no transport of its own. The contract is the two
+# schemas in docs/api/decision/clef-schema-input.json and clef-schema-output.json:
+#
+#   request   {model, state, questions, images?}   required: model, state, questions
+#   response  {model, answers, usage}              answers keyed by question id
+#
+# `backend` picks which upstream serves that contract. It changes exactly one
+# thing — whether `images` is allowed:
+#   - "laya": the local sidecar submodules/laya-mlx/serve_judge.py. Its MLX
+#     encoder is text-only, so a request carrying `images` is rejected with 400
+#     rather than silently stripped.
+#   - "cloudflare": any endpoint serving the Clef schemas with image support.
+#     The `images` array is forwarded untouched.
+#
+# `url` is the FULL endpoint, not a base URL — it is POSTed verbatim, so include
+# any path (e.g. `/decision` for the Laya judge server).
+#
+# To enable: set both `backend` and `url`. The presence of the pair is what
+# activates the route (no separate `enabled` flag); without it, /decision
+# answers 503.
+#
+# Laya's reference server:
+#   python submodules/laya-mlx/serve_judge.py --model convaiinnovations/laya --port 8765
+[decision]
+# backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed); required to enable
+# url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim; required to enable
+# api_key = "optional-bearer-token"           # optional, sent as Authorization: Bearer
+# timeout_ms = 5000                           # default: 5000 for "laya", 30000 for "cloudflare"
+
+# ---------------------------------------------------------------------------
 # Passthrough mode — verbatim forwarding of /passthrough/v1/* to configured upstreams.
 # ---------------------------------------------------------------------------
 #
