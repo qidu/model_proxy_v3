@@ -129,7 +129,9 @@ export function createLogger(env: Env | Record<string, unknown>): Logger {
 
   function emit(level: string, requestId: string, message: string, args: unknown[]): void {
     if (AGENT_MODE && requestId === 'config') return; // startup-only diagnostics, not useful mid-session
-    const line = `[${shortRequestId(requestId)}] [${level}] ${message}`;
+    const line = AGENT_MODE
+      ? `[${level}] ${message}`
+      : `[${shortRequestId(requestId)}] [${level}] ${message}`;
     console.log(AGENT_MODE ? dim(line) : line, ...args);
   }
 

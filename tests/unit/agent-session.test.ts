@@ -11,6 +11,7 @@ import {
   diffWorkDirSnapshots,
   parseBudget,
   formatBudget,
+  formatUsage,
   DEFAULT_BUDGET,
   BUDGET_PROMPT_DEFAULT,
   buildModelPickerItems,
@@ -423,8 +424,8 @@ describe('parseBudget', () => {
 });
 
 describe('DEFAULT_BUDGET', () => {
-  it('is a combined 5,000,000-token / 100-turn budget', () => {
-    assert.deepEqual(DEFAULT_BUDGET, { tokens: 5_000_000, turns: 100 });
+  it('is a combined 50,000,000-token / 100-turn budget', () => {
+    assert.deepEqual(DEFAULT_BUDGET, { tokens: 50_000_000, turns: 100 });
   });
 
   // The prompt compares the submitted value against BUDGET_PROMPT_DEFAULT to
@@ -434,15 +435,16 @@ describe('DEFAULT_BUDGET', () => {
     assert.deepEqual(parseBudget(BUDGET_PROMPT_DEFAULT), { tokens: DEFAULT_BUDGET.tokens });
   });
 
-  // Turns must be a backstop, not the binding limit — at a realistic ~30k
-  // tokens/turn the token budget should run out first (see the comment on
-  // DEFAULT_BUDGET). Guards against reintroducing the old 10-turn cap, which
-  // made the 5m token limit unreachable in practice.
-  it('sizes turns so the token budget is the limit that normally trips first', () => {
+  // Turns is the limit that normally trips first: at a realistic ~30k
+  // tokens/turn the 100-turn cap (≈3m tokens) is reached well before the 50m
+  // token budget, so a typical run stops on turns. The token budget is the
+  // outer bound for runs with unusually large turns. Guards against a turn cap
+  // so high it can never bound a runaway loop within the token budget.
+  it('sizes turns so the turn cap is the limit that normally trips first', () => {
     const realisticTokensPerTurn = 30_000;
     assert.ok(
-      DEFAULT_BUDGET.turns! * realisticTokensPerTurn > DEFAULT_BUDGET.tokens! / 2,
-      `${DEFAULT_BUDGET.turns} turns caps a typical run well below the ${DEFAULT_BUDGET.tokens}-token budget`,
+      DEFAULT_BUDGET.turns! * realisticTokensPerTurn < DEFAULT_BUDGET.tokens!,
+      `${DEFAULT_BUDGET.turns} turns at ${realisticTokensPerTurn} tokens/turn exceeds the ${DEFAULT_BUDGET.tokens}-token budget`,
     );
   });
 });
@@ -457,7 +459,24 @@ describe('formatBudget', () => {
   });
 
   it('formats a combined budget as "tokens / turns"', () => {
-    assert.equal(formatBudget(DEFAULT_BUDGET), '5,000,000 tokens / 100 turns');
+    assert.equal(formatBudget(DEFAULT_BUDGET), '50m tokens / 100 turns');
+  });
+});
+
+describe('formatUsage', () => {
+  it('renders used/limit for both tokens and turns', () => {
+    assert.equal(
+      formatUsage(1276, 1, DEFAULT_BUDGET),
+      'usage: 1276 tokens / 50m limit and 1 / 100 turns',
+    );
+  });
+
+  it('omits the turn part when the budget has no turn limit', () => {
+    assert.equal(formatUsage(1276, 1, { tokens: 50_000 }), 'usage: 1276 tokens / 50,000 limit');
+  });
+
+  it('omits the token part when the budget has no token limit', () => {
+    assert.equal(formatUsage(1276, 1, { turns: 20 }), 'usage: 1 / 20 turns');
   });
 });
 
@@ -769,11 +788,11 @@ describe('SPINNER_CHARS', () => {
 });
 
 describe('agentTitleGlyph', () => {
-  it('starts on π and holds it for 13 ticks, then * for 7', () => {
+  it('starts on π and holds it for 14 ticks, then cycles o,u,n', () => {
     // Ticks are 1-based: startTuiSpinner increments spinnerTick before its first
     // glyph, so tick 0 never reaches this function.
     const seq = Array.from({ length: 20 }, (_, i) => agentTitleGlyph(i + 1));
-    assert.deepEqual(seq, [...Array(13).fill('π'), ...Array(7).fill('*')]);
+    assert.deepEqual(seq, [...Array(14).fill('π'), 'o', 'u', 'n', 'o', 'u', 'n']);
   });
 
   it('repeats that 20-tick cycle', () => {
@@ -784,10 +803,10 @@ describe('agentTitleGlyph', () => {
     }
   });
 
-  it('returns only π or *, for every tick', () => {
+  it('returns only π, o, u, or n, for every tick', () => {
     for (let tick = 1; tick <= 200; tick++) {
       assert.ok(
-        agentTitleGlyph(tick) === 'π' || agentTitleGlyph(tick) === '*',
+        ['π', 'o', 'u', 'n'].includes(agentTitleGlyph(tick)),
         `unexpected glyph at tick ${tick}`,
       );
     }

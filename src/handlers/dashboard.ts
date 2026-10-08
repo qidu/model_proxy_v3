@@ -2663,12 +2663,12 @@ export function handleDashboardPage(env: Env): Response {
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
         panel.className = 'testing';
 
-        // Timer to show elapsed seconds during testing
+        // Timer to show elapsed seconds during testing (0.1s resolution)
         const startTime = Date.now();
         const testResultTimer = setInterval(() => {
-          const elapsed = Math.floor((Date.now() - startTime) / 1000);
-          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(modelId) + ' takes ' + elapsed + 's …';
-        }, 1000);
+          const elapsedS = (Date.now() - startTime) / 1000;
+          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(modelId) + ' takes ' + elapsedS.toFixed(1) + 's …';
+        }, 100);
 
         panel.style.display = 'block';
 
