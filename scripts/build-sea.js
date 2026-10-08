@@ -44,7 +44,7 @@
  *     launcher; the fuse lives in the dylib, so injection cannot work.
  *
  * An official build (nodejs.org, nvm, actions/setup-node) satisfies both and is
- * ~150MB. `npx --yes --package=node@26 node scripts/build-sea.js` gets one
+ * ~150MB. `npx --yes --package=node@22 node scripts/build-sea.js` gets one
  * without changing the system Node.
  *
  * SENTINEL FUSE: --sentinel-fuse must be passed explicitly, read from the
@@ -232,7 +232,7 @@ function assertSeaCapableHost() {
       '\n\nThe output embeds a copy of the build Node, so only an official, self-contained\n' +
       'build (nodejs.org, nvm, actions/setup-node) can produce one. Without changing the\n' +
       'system Node:\n' +
-      '  npx --yes --package=node@26 node scripts/build-sea.js'
+      '  npx --yes --package=node@22 node scripts/build-sea.js'
   );
 }
 

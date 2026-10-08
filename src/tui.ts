@@ -1154,7 +1154,7 @@ class DashboardView implements Component {
     let inflightIndicator: string;
     if (activeRequests > 0) {
       // Cycle through braille spinner frames while requests are in flight.
-      const spinnerFrames = ['⠏', '⠹', '⠼', '⠧'];
+      const spinnerFrames = ['⠇', '⠏', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
       const frame = spinnerFrames[Math.floor(sec) % spinnerFrames.length];
       secondsTime = lightWhite(this.lastTime.slice(-2));
       inflightIndicator = ` ${green(frame)}`;

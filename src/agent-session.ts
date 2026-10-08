@@ -566,14 +566,14 @@ async function startPersistentTui(): Promise<void> {
   persistentTui = new TuiMainScreen(persistentTerminal);
 
   // Conversation area (flex-grow)
-  conversationArea = new Box(1, 1);
+  conversationArea = new Box(0, 1);
 
   // Proxy log line: a single row between the conversation area and the status bar.
   // No padding at all, so it renders zero rows until the first log arrives.
   proxyLogLine = new Box(0, 0);
 
   // Status bar at bottom (above the '─' rule) — shows tool calling status while agent runs
-  statusBar = new Box(1, 0);
+  statusBar = new Box(0, 0);
 
   // Bottom input
   bottomInput = new Input();
@@ -699,6 +699,13 @@ let spinnerTick = 0;
 // and the model-verification spinner (which writes straight to stdout).
 export const SPINNER_CHARS = ['·', '✢', '✶', '✳', '✻', '✽'];
 
+// Braille frames used for the input-area prompt while a task is running, so
+// the '>' becomes a visibly rotating indicator. Kept separate from
+// SPINNER_CHARS: the prompt is a plain string (not Markdown), so it can carry
+// these frames even though the others are chosen to avoid Markdown-significant
+// characters.
+export const PROMPT_SPINNER_CHARS = ['⠇', '⠏', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+
 // The terminal window title, set once at session start (see runAgentSession)
 // and animated while a task runs. Module-level rather than a local of
 // runAgentSession because runAgentTurn, which drives the spinner, is not
@@ -720,10 +727,25 @@ function clearAgentTitle(): void {
   process.stdout.write('\x1b]0;\x07');
 }
 
-/** Which glyph the window title shows on a given spinner tick. Pattern: π for ~2s, * for ~1s.
- *  At 150ms/tick: π for 13 ticks (1950ms), * for 7 ticks (1050ms). 20-tick cycle = 3s. Ticks start at 1. */
+/** Which glyph the window title shows on a given spinner tick.
+ *  π for 14 ticks, then cycles through o, u, n.
+ *  At 150ms/tick: π for ~2.1s, then o/u/n each for ~0.45s. 20-tick cycle = 3s. Ticks start at 1. */
 export function agentTitleGlyph(tick: number): string {
-  return (tick - 1) % 20 < 13 ? 'π' : '*';
+  const remainder = (tick - 1) % 20;
+  if (remainder < 14) return 'π';
+  const afterPi = remainder - 14;
+  const cycleGlyphs = ['o', 'u', 'n'];
+  return cycleGlyphs[afterPi % cycleGlyphs.length];
+}
+
+/** Set the prompt indicator shown before the input text. pi-tui's Input exposes
+ *  its prompt only at construction (`private readonly prompt`), but the running
+ *  indicator swaps it on every spinner tick, so the field is poked directly —
+ *  the one place that reaches past the type instead of a dozen call sites. */
+function setInputPrompt(prompt: string): void {
+  if (!bottomInput) return;
+  (bottomInput as unknown as { prompt: string }).prompt = prompt;
+  requestRender();
 }
 
 /** Start the TUI spinner interval when agent is running */
@@ -731,12 +753,15 @@ function startTuiSpinner(): void {
   if (tuiSpinnerInterval !== null) return;
   tuiSpinnerInterval = setInterval(() => {
     spinnerTick += 1;
+    const frame = SPINNER_CHARS[spinnerTick % SPINNER_CHARS.length];
     // The in-flight task's line animates its leading `>` through the spinner
     // frames, so the transcript itself shows which task is still running.
     if (currentTaskMessage) {
-      currentTaskMessage.setText(`${SPINNER_CHARS[spinnerTick % SPINNER_CHARS.length]} ${currentTaskText}`);
+      currentTaskMessage.setText(`${frame} ${currentTaskText}`);
       requestRender();
     }
+    // Also animate the input prompt to show agent is busy
+    setInputPrompt(`${PROMPT_SPINNER_CHARS[spinnerTick % PROMPT_SPINNER_CHARS.length]} `);
     // Also alternate the title's π with * so the window tab itself shows that
     // the agent is busy — the transcript may be scrolled off screen.
     writeAgentTitle(agentTitleGlyph(spinnerTick));
@@ -751,6 +776,7 @@ function stopTuiSpinner(clear = false): void {
     tuiSpinnerInterval = null;
   }
   spinnerTick = 0;
+  setInputPrompt('> ');
   if (clear) {
     clearAgentTitle();
   } else {
@@ -769,8 +795,8 @@ function updateStatusBar(): void {
   }
   const toolsList = ordered.length > 0 ? `(${ordered.join(',')})` : '';
   const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
-  const separator = toolsList ? ' | ' : ' ';
-  const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList}${separator}${toolsList} ${dots}`);
+  const suffix = skillsList || toolsList ? ` ${skillsList} | ${toolsList}` : '';
+  const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results)${suffix}${dots}`);
 
   // Create a temporary Markdown component for the status bar
   statusBar.clear();
@@ -811,7 +837,7 @@ function handleInputSubmit(value: string): void {
       timestamp: Date.now(),
     });
     // Visual feedback: add as user message immediately
-    const userMsg = new Markdown(`> ${value}`, 1, 1, currentTheme, dimStyle);
+    const userMsg = new Markdown(`> ${value}`, 0, 1, currentTheme, dimStyle);
     conversationArea.addChild(userMsg);
     requestRender();
   } else {
@@ -836,7 +862,7 @@ async function runAgentTurn(task: string, taskLabel: string = task): Promise<voi
   // Add the task to the conversation. Its leading `>` is replaced by the
   // spinner frames while the task runs, then restored once it settles.
   currentTaskText = taskLabel;
-  currentTaskMessage = new Markdown(`${SPINNER_CHARS[0]} ${taskLabel}`, 1, 1, currentTheme, dimStyle);
+  currentTaskMessage = new Markdown(`${SPINNER_CHARS[0]} ${taskLabel}`, 0, 1, currentTheme, dimStyle);
   conversationArea.addChild(currentTaskMessage);
   startTuiSpinner();
   updateStatusBar();
@@ -1088,15 +1114,15 @@ const TOKEN_MULTIPLIERS: Record<string, number> = {
 };
 
 // Applied when the budget prompt is left blank OR submitted with its prefill
-// unchanged (see startAgentSession). Turns is sized to be a runaway-loop
-// backstop rather than the binding limit: at a realistic ~30k tokens/turn,
-// 5m tokens is roughly 150 turns, so 100 turns keeps tokens as the constraint
-// that normally trips first while still bounding a loop that makes no progress.
-export const DEFAULT_BUDGET: Budget = { tokens: 5_000_000, turns: 100 };
+// unchanged (see startAgentSession). At a realistic ~30k tokens/turn the 100-
+// turn cap is the limit that normally trips first (≈3m tokens), well inside
+// the 50m token budget: the turn cap bounds a runaway loop, and the token
+// budget is the outer bound for runs with unusually large turns.
+export const DEFAULT_BUDGET: Budget = { tokens: 50_000_000, turns: 100 };
 
 // Prefilled into the budget prompt. Compared against the submitted value to
 // detect "took the default", so it must stay in sync with DEFAULT_BUDGET.tokens.
-export const BUDGET_PROMPT_DEFAULT = '5m';
+export const BUDGET_PROMPT_DEFAULT = '50m';
 
 /** Parse a single positive number (with optional k/m/b/t suffix) as a
  *  token limit. Returns null if the input isn't a positive number. */
@@ -1159,12 +1185,33 @@ export function parseBudget(raw: string): Budget | null {
   return { tokens, turns };
 }
 
-/** Human-readable form for logging, e.g. "10 turns", "5,000,000 tokens", or "5,000,000 tokens / 10 turns" when both are set. */
+/** Abbreviate a token budget the way the budget prompt accepts it: thousands-
+ *  separated below 1M ("500,000"), lowercase k/m/b/t suffix at or above
+ *  ("50m") — matching BUDGET_PROMPT_DEFAULT's lowercase form. Not
+ *  config-loader's formatTokenLimit, which abbreviates from 1K and uses
+ *  uppercase units (the dashboard/TUI display convention). */
+function formatTokenBudget(tokens: number): string {
+  if (tokens >= 1_000_000_000_000) return `${(tokens / 1_000_000_000_000).toFixed(0)}t`;
+  if (tokens >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(0)}b`;
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(0)}m`;
+  return tokens.toLocaleString();
+}
+
+/** Human-readable form for logging, e.g. "10 turns", "50m tokens", or "50m tokens / 10 turns" when both are set. */
 export function formatBudget(budget: Budget): string {
   const parts: string[] = [];
-  if (budget.tokens !== undefined) parts.push(`${budget.tokens.toLocaleString()} tokens`);
+  if (budget.tokens !== undefined) parts.push(`${formatTokenBudget(budget.tokens)} tokens`);
   if (budget.turns !== undefined) parts.push(`${budget.turns.toLocaleString()} turns`);
   return parts.join(' / ');
+}
+
+/** Per-task usage line, e.g. "usage: 1276 tokens / 50m limit and 1 / 100 turns".
+ *  A pair is omitted entirely when the budget leaves that dimension unbounded. */
+export function formatUsage(tokensUsed: number, turnsUsed: number, budget: Budget): string {
+  const parts: string[] = [];
+  if (budget.tokens !== undefined) parts.push(`${tokensUsed} tokens / ${formatTokenBudget(budget.tokens)} limit`);
+  if (budget.turns !== undefined) parts.push(`${turnsUsed} / ${budget.turns} turns`);
+  return `usage: ${parts.join(' and ')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,7 +1615,6 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     { value: 'openai-completions' as ProxyApiType, label: 'OpenAI Completions', description: '/v1/chat/completions (OpenAI chat format)' },
     { value: 'openai-responses' as ProxyApiType, label: 'OpenAI Responses', description: '/v1/responses (OpenAI Responses API)' },
     { value: 'google-generative-ai' as ProxyApiType, label: 'Google Generative AI', description: '/v1beta/models/{model}:generateContent (Gemini format)' },
-    { value: 'pi-messages' as ProxyApiType, label: 'Pi Messages', description: 'unsupported: posts /messages, which this proxy does not serve' },
   ];
   const apiChoice = await pickFromList(
     `\nSelect endpoint schema for ${selectedAlias} (default: Anthropic Messages):`,
@@ -1584,12 +1630,6 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // about where the version segment lives, so a bare origin made every api
   // but anthropic-messages request an unversioned path the proxy rejects.
   const baseUrl = proxyBaseUrlForApi(port, selectedApi);
-  if (selectedApi === 'pi-messages') {
-    console.warn(
-      `[proxy] warning: pi-messages posts the pi {model, context, options} body to ${baseUrl}/messages, ` +
-      'which this proxy does not serve — pick another endpoint schema for a working session.',
-    );
-  }
   const sessionModel = buildProxyPiModel(selectedAlias, baseUrl, selectedApi);
   models.setProvider(provider); // ensure provider is still registered
   const sessionModels = createModels();
@@ -1620,18 +1660,19 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   let budget: Budget | null = null;
   while (!budget) {
     const raw = await promptText(
-      '\n[π budget] Set task budget (e.g. 1000000 or 1m for tokens, e.g. 40 for turns), /quit or /exit to end.\nOr leave blank as DEFAULT budget (5m tokens && 100 turns):',
+      `\n[π budget] Set task budget (e.g. 1000000 or 1m for tokens, e.g. 40 for turns), /quit or /exit to end.\nOr leave blank as DEFAULT budget (${formatBudget(DEFAULT_BUDGET)}):`,
       BUDGET_PROMPT_DEFAULT,
     );
     if (raw === null || QUIT_COMMANDS.has(raw.trim().toLowerCase())) {
       console.log(dim('No budget entered — exiting agent session.\nbye!'));
       return;
     }
-    // Blank input and accepting the "5m" prefill unchanged both mean "the
+    // Blank input and accepting the prefill unchanged both mean "the
     // default" — so both yield the combined DEFAULT_BUDGET. Without this,
-    // submitting the prefill would run parseBudget('5m') = tokens-only and
-    // silently drop the turn cap, making the two ways of taking the default
-    // behave in opposite ways (one nearly unbounded, one capped).
+    // submitting the prefill would run parseBudget(BUDGET_PROMPT_DEFAULT)
+    // = tokens-only and silently drop the turn cap, making the two ways of
+    // taking the default behave in opposite ways (one nearly unbounded,
+    // one capped).
     if (!raw.trim() || raw.trim().toLowerCase() === BUDGET_PROMPT_DEFAULT) {
       budget = DEFAULT_BUDGET;
       break;
@@ -1743,7 +1784,8 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     // show a stable suffix so the line doesn't keep flickering for no
     // reason between the agent's text deltas.
     const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
-    const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results) ${skillsList} | ${toolsList} ${dots}`);
+    const suffix = skillsList || toolsList ? ` ${skillsList} | ${toolsList}` : '';
+    const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results)${suffix}${dots}`);
     if (isStderrTty) {
       process.stderr.write(`\r\x1b[K${line}`);
     } else {
@@ -1771,9 +1813,12 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
 
   const unsubscribeBudget = runningAgent.subscribe((event) => {
     if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
-      // First text delta after the process log: create/update the assistant message component
+      // First text delta after the process log: create/update the assistant message component.
+      // No defaultTextStyle: the model's reply is the one thing in the transcript
+      // that should read at normal brightness, so it stays in the terminal's
+      // default foreground rather than the faint dimStyle used for chrome.
       if (!committedForTurn) {
-        currentAssistantMessage = new Markdown('', 0, 0, currentTheme, dimStyle);
+        currentAssistantMessage = new Markdown('', 0, 0, currentTheme);
         conversationArea.addChild(currentAssistantMessage);
         currentAssistantMessageContent = '';
         committedForTurn = true;
@@ -1857,7 +1902,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         continue;
       }
       // Show shell command in conversation
-      const shellMsg = new Markdown(dim(`[π shell] running: ${cmd}`), 1, 1, currentTheme, dimStyle);
+      const shellMsg = new Markdown(dim(`[π shell] running: ${cmd}`), 0, 1, currentTheme, dimStyle);
       conversationArea.addChild(shellMsg);
       requestRender();
       try {
@@ -1866,10 +1911,10 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         // indented code block, so output that starts indented would otherwise
         // render inside ``` fences, and leading blank lines render as blank rows.
         const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
-        const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 1, 1, currentTheme, dimStyle);
+        const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 0, 1, currentTheme, dimStyle);
         conversationArea.addChild(exitMsg);
         if (output) {
-          const outMsg = new Markdown(output, 1, 1, currentTheme, dimStyle);
+          const outMsg = new Markdown(output, 0, 1, currentTheme, dimStyle);
           conversationArea.addChild(outMsg);
           shellOutputs.push(output);
         }
@@ -1879,7 +1924,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           nextTaskResolver = resolve;
         });
       } catch (err) {
-        const errMsg = new Markdown(dim(`[π shell] error: ${(err as Error).message}`), 1, 1, currentTheme, errorStyle);
+        const errMsg = new Markdown(dim(`[π shell] error: ${(err as Error).message}`), 0, 1, currentTheme, errorStyle);
         conversationArea.addChild(errMsg);
         requestRender();
         task = await new Promise<string | null>((resolve) => {
@@ -1921,9 +1966,9 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           ].filter(Boolean).join(' | ');
 
       const summaryMsg = new Markdown(
-        dim(`\n[π ${budgetHit ? 'Budget reached' : quitRequested ? 'quit requested' : 'task done'} (${tokensUsed} tokens, ${turnsUsed} turns used, budget limit: ${formatBudget(budget)})]\n`) +
+        dim(`\n[π ${budgetHit ? 'Budget reached' : quitRequested ? 'quit requested' : 'task done'} (${formatUsage(tokensUsed, turnsUsed, budget)})]\n`) +
         changeSummary,
-        1, 1, currentTheme, dimStyle
+        0, 1, currentTheme, dimStyle
       );
       conversationArea.addChild(summaryMsg);
       requestRender();
@@ -1971,7 +2016,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           });
           continue;
         }
-        const shellMsg = new Markdown(dim(`[π shell] running: ${cmd}`), 1, 1, currentTheme, dimStyle);
+        const shellMsg = new Markdown(dim(`[π shell] running: ${cmd}`), 0, 1, currentTheme, dimStyle);
         conversationArea.addChild(shellMsg);
         requestRender();
         try {
@@ -1979,10 +2024,10 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           // Trimmed once, at the source — see the matching comment in the first
           // shell loop above.
           const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
-          const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 1, 1, currentTheme, dimStyle);
+          const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 0, 1, currentTheme, dimStyle);
           conversationArea.addChild(exitMsg);
           if (output) {
-            const outMsg = new Markdown(output, 1, 1, currentTheme, dimStyle);
+            const outMsg = new Markdown(output, 0, 1, currentTheme, dimStyle);
             conversationArea.addChild(outMsg);
             shellOutputs.push(output);
           }
@@ -1991,7 +2036,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
             nextTaskResolver = resolve;
           });
         } catch (err) {
-          const errMsg = new Markdown(dim(`[π shell] error: ${(err as Error).message}`), 1, 1, currentTheme, errorStyle);
+          const errMsg = new Markdown(dim(`[π shell] error: ${(err as Error).message}`), 0, 1, currentTheme, errorStyle);
           conversationArea.addChild(errMsg);
           requestRender();
           task = await new Promise<string | null>((resolve) => {

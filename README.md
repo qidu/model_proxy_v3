@@ -840,7 +840,7 @@ with a warning. Either flag also enables `--dashboard` (token-stats persistence)
 already-installed `pi` skills (global `~/.pi/agent/skills` or project `.pi/skills`),
 plus skills installable on demand from other agents via the [`skills`](https://github.com/vercel-labs/skills)
 CLI → pick a model alias from `proxy_config.toml` → a verification message confirms it
-replies → set a budget (tokens and/or turns, default 5,000,000 tokens / 100 turns) →
+replies → set a budget (tokens and/or turns, default 50,000,000 tokens / 100 turns) →
 enter a free-text task. The agent runs with `read_file`/`write_file`/`bash` tools (plus
 `find_skill`/`add_skill` when the `skills` CLI is available, capped at 5 runtime
 installs/session) until the task completes or the budget is hit, then prompts for a

@@ -5,6 +5,23 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(agent-tui): restyle running indicators, trim leading whitespace, and retune the default budget
+
+`src/tui.ts`, `src/agent-session.ts`, `src/utils/logger.ts`, `src/handlers/dashboard.ts`, `tests/unit/agent-session.test.ts`, `README.md`, `docs/architecture/design_of_persistent_tui_of_agent_with_followup_for_task.md` — a pass over the interactive TUI's running indicators, message indentation, and budget display.
+
+- **Title-bar spinner** (`src/tui.ts`): the proxy dashboard's title-bar braille cycle is now the 10-frame `⠇ ⠏ ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧`, advancing once per second while a request is in flight.
+- **Agent tab title** (`src/agent-session.ts`): `agentTitleGlyph` now holds `π` for the first 14 ticks of each 20-tick cycle, then cycles `o, u, n` — replacing the old `π ↔ *` two-glyph alternation.
+- **Input prompt as spinner**: while a task runs, the bottom `Input`'s prompt becomes the same braille spinner (via a new `setInputPrompt` helper, needed because pi-tui's `Input.prompt` is `private readonly`), and reverts to `> ` when the run ends.
+- **Leading whitespace removed** from conversation rows, user-message echoes (`│ what to says`), task lines (`✻ what changes`), command/shell output, tool status, and the summary status line — the `Box`/`Markdown` `paddingX` args dropped from `1` to `0`, and the status template literal no longer emits stray spaces when there is no skills/tools suffix.
+- **Brightness**: assistant messages keep the terminal default foreground (the added `dimStyle` was removed), so they read brighter than the dim (`\x1b[2m`) status/summary lines.
+- **Proxy log noise**: under `AGENT=true` the shared logger drops the `[req_xxxxx]` prefix and the startup-only `config`-id diagnostics (see `src/utils/logger.ts`).
+- **Budget default retuned to 50m tokens / 100 turns** (`DEFAULT_BUDGET`, `BUDGET_PROMPT_DEFAULT = '50m'`). With a 50m token budget the 100-turn cap is now the limit that normally trips first (≈3m tokens at a realistic ~30k tokens/turn), so the `DEFAULT_BUDGET` comment and the guard test were rewritten to state that — the token budget is the outer bound for runs with unusually large turns.
+- **Progress + budget formatting**: `formatTokenBudget` abbreviates ≥1m tokens with a lowercase suffix (`50m`), matching the budget prompt's lowercase convention (deliberately *not* `config-loader`'s uppercase-from-1K `formatTokenLimit`). The per-task progress line is now `[π task done (usage: 1276 tokens / 50m limit and 1 / 100 turns)]` via a new `formatUsage(tokensUsed, turnsUsed, budget)`.
+- **Dashboard test timer** (`src/handlers/dashboard.ts`): the "Testing <model> takes Ns" counter now ticks at 100ms and shows one decimal (0.1s resolution).
+- **Removed** the unsupported "Pi Messages" choice from the agent's endpoint-schema picker.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1471 tests, 1471 pass, 0 fail, 278 suites** — executed on this tree. `tests/unit/agent-session.test.ts` was updated for the changed behaviour: the `agentTitleGlyph` cases now pin the `π`×14-then-`o,u,n` cycle (and that no tick yields anything outside π/o/u/n), the `DEFAULT_BUDGET` case asserts 50,000,000 tokens, the turn-backstop guard now asserts the turn cap trips first, and new `formatUsage` cases cover the both-limits / tokens-only / turns-only shapes. The design doc's test-coverage inventory was corrected to match (it still described the old `π π * *` sequence) and `formatUsage` added to the covered helpers. The dashboard timer is browser-only JavaScript inside the served HTML and has no unit coverage; the `src/tui.ts` title-bar frame change has no unit coverage either.
+
 ### feat(decision): accept `"clef"` as an equivalent spelling of the `cloudflare` backend
 
 `src/handlers/decision.ts`, `src/utils/config-loader.ts`, `tests/unit/decision.test.ts`, `README.md`, `docs/getting-started/proxy_config.example.toml` — `[decision] backend = "clef"` is now a recognised spelling of `backend = "cloudflare"`, documented and type-checked instead of arriving there by accident.
