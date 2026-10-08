@@ -15,7 +15,7 @@
     "typecheck": "tsc --noEmit",
     "build-chatjimmy": "cd submodules/chatjimmy && npm run build",
     "build": "tsc -p tsconfig.server.json",
-    "build:native": "node scripts/build-sea.js",
+    "build:native": "npx --yes --package=node@22 node scripts/build-sea.js",
     "start": "node dist/server.js",
     "server": "tsx src/server.ts",
     "test:unit": "node --experimental-global-webcrypto --import tsx --test tests/unit/**/*.test.ts",
