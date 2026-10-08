@@ -34,6 +34,3 @@ consul kv put model-proxy-v3/models/gemini/upstream_mode "gemini-generatecontent
 consul kv put model-proxy-v3/models/gemini/base_url "https://api.example.com"
 consul kv put model-proxy-v3/models/gemini/api_key "sk-***"
 consul kv put model-proxy-v3/models/gemini/gemini-3.0-flash-preview '["gemini-3-flash-preview", "", ""]'
-
-# models.default
-consul kv put model-proxy-v3/models/default/llama '["llama3.1-8B", "sdk://localhost", ""]'

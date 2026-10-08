@@ -60,7 +60,7 @@ Severities below are the **as-deployed-today** ratings (server on `0.0.0.0`, no 
 
 ### Medium
 
-- **M1 — Cross-upstream API-key forwarding.** `src/utils/sdk-handler.ts:229` **and** `:392` (two call sites) send the client's provider key to a hardcoded `https://chatjimmy.ai/api` for any `sdk://` route (key confusion / leakage to a fixed third party).
+- **M1 — Cross-upstream API-key forwarding.** ~~`src/utils/sdk-handler.ts:229` **and** `:392` (two call sites) send the client's provider key to a hardcoded `https://chatjimmy.ai/api` for any `sdk://` route (key confusion / leakage to a fixed third party).~~ **RESOLVED by removal (2026-10-08).** The chatjimmy-backed `sdk://` handler was deleted along with the submodule; the surviving `sdk-handler.ts` exports only stubs that throw `501 not_implemented` without building an upstream client or attaching any key. No key can leave the process via an `sdk://` route.
 - **M2 — Upstream error bodies returned/echoed verbatim.** `errors.ts:141-161` embeds the upstream URL + up to 500 chars of the request body into client-facing errors; `embeddings.ts:53-64` returns raw upstream `errorText`. Leaks internal URLs, prompt content, and potentially echoed auth headers.
 - **M3 — Partial API keys logged.** `routing.ts:267-281` logs the first 16 chars of the key; `openai.ts:116-118` logs key tails; `index.ts:822-828` logs partial key values.
 - **M4 — CORS reflects arbitrary Origin.** `index.ts:84-98` reflects the request Origin when `ALLOWED_ORIGINS` is unset; `server.ts:24` defaults `ALLOWED_ORIGINS='*'`. Combined with no auth, browsers can read proxied responses cross-origin.

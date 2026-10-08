@@ -13,7 +13,6 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "build-chatjimmy": "cd submodules/chatjimmy && npm run build",
     "build": "tsc -p tsconfig.server.json",
     "build:native": "npx --yes --package=node@22 node scripts/build-sea.js",
     "start": "node dist/server.js",

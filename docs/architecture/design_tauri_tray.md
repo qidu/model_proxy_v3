@@ -41,7 +41,7 @@ The webview is the frontend and the SEA binary is the backend, but they do not t
 
 **Option considered and rejected for now:** driving an already-running proxy over its existing `/dashboard/api/*` HTTP endpoints, with no child process. Less code, but it needs a port and a key, and the app cannot start or stop anything.
 
-**Repo topology.** The tray lives in a **separate repo** with `model_proxy_v3` as a git submodule; the RPC surface below is the only thing this repo owes it. Building the SEA binary needs no initialisation of proxy v3's *own* submodules — chatjimmy and keytar are esbuild externals (`scripts/build-sea.js:119`).
+**Repo topology.** The tray lives in a **separate repo** with `model_proxy_v3` as a git submodule; the RPC surface below is the only thing this repo owes it. Building the SEA binary needs no initialisation of proxy v3's *own* submodules — keytar is an esbuild external (`scripts/build-sea.js:101`).
 
 ## 3. JSON-RPC 2.0 protocol
 

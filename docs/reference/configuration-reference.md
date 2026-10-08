@@ -437,11 +437,6 @@ access_key_secret = "<plaintext HMAC-SHA1 key>"
 
 ## Token counting & upstream
 
-`sdk://...` model `base_url` values are handled by the local SDK adapter instead of
-HTTP fetch for supported Claude/OpenAI-shaped upstream calls. For example, a model
-entry can set `base_url = "sdk://chatjimmy.ai/api"` and keep the appropriate
-`upstream_mode` for the client/upstream protocol shape.
-
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOCAL_TIKTOKEN` | `false` | Count tokens locally instead of calling upstream. Local counts are best-effort estimates and include text, tool results, tool use, images, documents, thinking, and web-search result blocks. |

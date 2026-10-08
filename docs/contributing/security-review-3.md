@@ -28,7 +28,7 @@
 
 ### Medium
 
-- **M1 — Cross-upstream key forwarding to chatjimmy → STILL PRESENT.** `sdk-handler.ts:234-236` builds `{ baseURL: targetUrl.replace(/^sdk:\/\//, 'https://'), apiKey: apiKey || '' }` for any `sdk://` route; `targetUrl` is config-controlled so this is only "hardcoded third party" if the operator configured `sdk://chatjimmy.ai/api`. The real new issue is **N1** below — the same config object is logged verbatim at debug.
+- **M1 — Cross-upstream key forwarding to chatjimmy → RESOLVED by removal (2026-10-08).** The finding was that `sdk-handler.ts:234-236` built `{ baseURL: targetUrl.replace(/^sdk:\/\//, 'https://'), apiKey: apiKey || '' }` for any `sdk://` route (config-controlled `targetUrl`, so "hardcoded third party" only if the operator configured `sdk://chatjimmy.ai/api`). The chatjimmy submodule and the client-construction code are gone; the remaining `sdk://` stubs throw `501 not_implemented` before any upstream call, so there is no config object to build and no key to forward. N1 below goes with it.
 - **M2 — Upstream error bodies echoed → partially addressed.** `/config-reload` error path (`index.ts:521-531`) now returns a generic message. Other handlers were not re-audited this pass; review 2 noted `errors.ts` deliberately avoids echoing raw upstream bodies to clients.
 - **M3 — Partial API keys logged → STILL PRESENT (Low).** `index.ts:1221` logs `${value.substring(0,4)}...${value.substring(value.length-4)}`. Truncated prefix+suffix is acceptable hygiene; the prior `openai.ts` substring bug (logging the key *tail*) is confirmed fixed — `openai.ts` no longer logs `substring(64)`.
 - **M4 — CORS reflects arbitrary Origin → STILL PRESENT (Medium).** `getCorsOrigin` (`index.ts:129-177`) reflects `requestOrigin` whenever `ALLOWED_ORIGINS` is unset, and `server.ts:25` still defaults `ALLOWED_ORIGINS='*'`. With no auth on `/v1/*` (C3) this means any browser origin can read proxied responses cross-origin. Loopback gating of `/dashboard` limits the admin surface, but the data path is unaffected.
@@ -42,11 +42,7 @@
 
 ## 2. New findings (code changed since 2026-07-01)
 
-- **N1 — API key logged in plaintext at debug level (High).** `src/utils/sdk-handler.ts:242`:
-  ```ts
-  activeLogger.debug(requestId, `Using SDK client config: ${JSON.stringify(config)}`);
-  ```
-  `config` (line 234-240) includes `apiKey: apiKey || ''`. At `LOG_LEVEL=debug` this writes the **full upstream API key** to the structured logger — the same class of bug as the prior `openai.ts` substring issue (review 2 H1), but worse because it is the whole key, not a tail. The logger has no redaction layer (review 2 M1), so any future call site can leak secrets by construction. **Fix:** redact `apiKey` before stringifying, or drop it from the logged object.
+- **N1 — API key logged in plaintext at debug level (High) → RESOLVED by removal (2026-10-08).** The finding was the `activeLogger.debug(requestId, \`Using SDK client config: ${JSON.stringify(config)}\`)` call at `src/utils/sdk-handler.ts:242`, whose `config` object carried `apiKey: apiKey || ''` — the full upstream key written to the structured logger at `LOG_LEVEL=debug`. That call site no longer exists: the handler that built the config and logged it was deleted with the chatjimmy submodule. The stub handlers log nothing. The underlying concern — no redaction layer in the logger, so any future call site can leak secrets by construction — is unaffected by this removal and remains open as a general hygiene item.
 
 - **N2 — Schedule validation is robust (CHECKED, SAFE).** `config-loader.ts:1517-1568` validates schedule windows: `from`/`to` must be numbers in `[0,24]`, `from < to`, `days` must be `"weekday"`, `"weekend"`, or an array of valid 3-letter day names. `resolveScheduleTarget` (`config-loader.ts:542-569`) does a single-hop lookup (does not recurse into schedule-of-schedule), so no infinite recursion. No injection into timers/eval — schedule only selects which target alias to route to.
 

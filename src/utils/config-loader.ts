@@ -2286,8 +2286,10 @@ function validateBaseUrls(config: ProxyConfig, errors: ConfigValidationError[]):
     if (trimmed === '') return;
     try {
       const parsed = new URL(trimmed);
-      // sdk:// is a project-internal scheme rewritten to https:// at request
-      // time by the SDK handler (see src/utils/sdk-handler.ts).
+      // sdk:// is a project-internal scheme. It is still accepted here so
+      // existing configs keep loading, but nothing serves it: the chatjimmy
+      // SDK that backed these routes was removed, so requests to an sdk://
+      // target fail loud with 501 at request time (src/utils/sdk-handler.ts).
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'sdk:') {
         errors.push({ path, message: `base_url must use http, https, or sdk protocol, got: ${parsed.protocol}` });
       }

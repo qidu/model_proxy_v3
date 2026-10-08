@@ -206,14 +206,13 @@ test_TC12() {
     fi
 }
 
-# TC13: SDK集成测试（验证sdk://localhost处理）
+# TC13: 基础请求（原 SDK 集成测试；sdk:// 路由及其 SDK 已移除）
 test_TC13() {
-    log_info "=== TC13: SDK集成测试 ==="
+    log_info "=== TC13: 基础请求 ==="
 
     local data='{"model": "'"$MODEL"'", "messages": [{"role": "user", "content": "Hello, how are you?"}], "max_tokens": 512}'
 
-    log_info "验证SDK集成 (sdk://localhost)"
-    curl_post "$PROXY_ENDPOINT" "$data" "TC13 SDK集成"
+    curl_post "$PROXY_ENDPOINT" "$data" "TC13 基础请求"
 }
 
 # TC14: 并发请求测试

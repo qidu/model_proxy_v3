@@ -168,7 +168,7 @@ model_proxy_v3/
 | `stringify.ts` | core | JSON / safe-stable / fast-safe switch |
 | `token-counting.ts` | core | `js-tiktoken/lite` + rank tables; see Bundle Size decision |
 | `conversation-store.ts` | core | in-memory `Map`, env-gated (`CONVERSATION_STATE`) |
-| `sdk-handler.ts` | core | fetch-based chatjimmy/SDK URL handling |
+| `sdk-handler.ts` | core | `sdk://` route stubs — reject every request (501) |
 | `kompress.ts` | core | fetch-based |
 | `privacy-filter.ts` | core | fetch-based |
 | `image-fetch.ts` | core | fetch-based |

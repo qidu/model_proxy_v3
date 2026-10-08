@@ -1106,7 +1106,9 @@ describe('validateProxyConfig', () => {
     assert.ok(r.errors.some(e => e.path === 'default_upstream.default_base_url'));
   });
 
-  it('accepts sdk:// base_url (rewritten to https at request time)', () => {
+  // sdk:// is still accepted at load time (existing configs keep working) even
+  // though no SDK serves it any more — requests fail loud with 501 instead.
+  it('accepts sdk:// base_url at load time (no SDK behind it)', () => {
     const cfg: ProxyConfig = {
       models: { free: { base_url: 'https://x', llama3: ['llama3.1-8B', 'sdk://chatjimmy.ai/api', '-'] } as any },
     };

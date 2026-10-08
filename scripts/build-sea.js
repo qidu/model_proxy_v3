@@ -97,26 +97,8 @@ const BUILD = path.join(ROOT, '.sea-build');
  *   which stores the keys in the executable's own file body (plaintext; see
  *   that file's header). macOS and Linux keep keytar and the OS keychain;
  *   macOS/Linux SEA binaries keep the fatal KeyStoreError.
- *
- * chatjimmy — the sdk:// route's optional submodule
- *   (src/utils/sdk-handler.ts:62-75). It is loaded via a deliberately
- *   non-literal relative specifier ('../../submodules/chatjimmy/dist/index.js')
- *   so it is not a static build/typecheck dependency. Bundling it would mean
- *   making that import literal, which would turn an optional submodule into a
- *   hard build prerequisite for every native build. Excluded instead: the
- *   existing catch reports "ChatJimmy SDK not available" and only sdk:// URLs
- *   are affected.
- *
- * CAVEAT on the chatjimmy exclusion: that specifier is relative to the SOURCE
- * file's location, and in the binary there is no source tree for it to be
- * relative to — so the import fails regardless of what sits next to the
- * executable. sdk:// routes are unsupported in the native binary, full stop.
- * That is a real functional difference from `node dist/server.js`, which
- * resolves the submodule when it is present and built. It is called out in the
- * build banner below and should stay in the README alongside the
- * no-cross-compile note.
  */
-const EXTERNALS = ['@github/keytar', '../../submodules/chatjimmy/dist/index.js'];
+const EXTERNALS = ['@github/keytar'];
 
 /**
  * Output name in Rust target-triple form (`<name>-<host-tuple>`), the shape the
@@ -425,9 +407,8 @@ function main() {
       '            when unset: ./proxy_config.toml, then\n' +
       '            ~/.config/model-proxy-v3/proxy_config.toml) — it is not\n' +
       '            embedded in the binary.\n' +
-      '[build-sea] excluded from this binary: system keychain (@github/keytar) and\n' +
-      '            sdk:// routes (chatjimmy). sdk:// always fails loud, as in the\n' +
-      '            Docker image. keytar needs too many dependencies on Windows, so the\n' +
+      '[build-sea] excluded from this binary: system keychain (@github/keytar).\n' +
+      '            keytar needs too many dependencies on Windows, so the\n' +
       '            win32 build substitutes an in-binary body store for\n' +
       '            store_key_in_system (plaintext in the .exe, needs a writable\n' +
       '            directory); macOS/Linux SEA binaries keep the fatal KeyStoreError,\n' +

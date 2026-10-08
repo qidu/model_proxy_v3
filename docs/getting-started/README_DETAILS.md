@@ -372,49 +372,6 @@ cp proxy_config.example.toml proxy_config.toml
 PROXY_CONFIG_PATH=./proxy_config.toml npx tsx dist/server.js
 ```
 
-#### Optional: ChatJimmy SDK (`sdk://` models)
-
-The ChatJimmy SDK is an **optional** dependency, shipped as the git submodule
-`submodules/chatjimmy`. It is **only** needed if your config routes a model to an
-`sdk://` upstream (see [ChatJimmy SDK Integration](#chatjimmy-sdk-integration-2026-03-04)). The submodule is loaded
-lazily at runtime via a dynamic import, so:
-
-- **Not using `sdk://` models?** Skip it entirely. A plain `git clone` (without
-  `--recurse-submodules`) leaves the submodule absent, and `npm install`,
-  `npm run typecheck`, `npm run build`, and `npm run server` all work normally.
-  Only `sdk://` routes would return an `SDK_ERROR` at request time.
-- **Using `sdk://` models?** Fetch and build the submodule once:
-
-  ```bash
-  git submodule update --init --recursive
-  git submodule update --remote --merge
-  npm run build-chatjimmy        # builds submodules/chatjimmy/dist
-  ```
-
-  The SDK handler imports the built output from `submodules/chatjimmy/dist/`, so
-  re-run `npm run build-chatjimmy` after updating the submodule.
-
-#### Routing a model through the SDK
-
-Any model entry can be routed through the ChatJimmy SDK by setting its
-`base_url` slot to an `sdk://host/path` URL. The handler rewrites the scheme
-(`sdk://host/path` → `https://host/path`) when building the SDK client, so the
-third-party endpoint is fully configurable per model — no code change needed to
-point at a different host, path, or vendor.
-
-```toml
-[models.free]
-upstream_mode = "openai-completions"
-api_key = "WELCOME_TO_USE"
-
-# Chatjimmy (default example)
-llama3 = {target = "llama3.1-8B", base_url = "sdk://chatjimmy.ai/api", api_key = "-"}    # target != alias, overrides set → full form
-```
-
-Leave the `api_key` slot empty to use the per-request `Authorization` /
-`x-api-key` header from the caller; set it to a literal key (or
-`x-api-key: sk-...` form) to force a specific upstream credential.
-
 ### 3.1 Terminal Dashboard
 
 Run the server with `TUI=true` to open the terminal dashboard in the same process:
@@ -826,10 +783,6 @@ When both `reasoning_effort` and budget thresholds are present, effort takes pri
 **Gemini (`gemini-generatecontent` / `gemini-interactions`)**:
 - Claude `thinking` → Gemini `thinking_level: "medium"` + `max_output_tokens` budget
 - Gemini response `thought` blocks → Claude `thinking` content blocks with signature
-
-**SDK Handler (`sdk://`)**:
-- Same `thinking` → `reasoning_effort` mapping as `openai-completions`
-- Handles both Claude-format and OpenAI-format `thinking` objects
 
 ### Thinking Configuration Request Formats
 

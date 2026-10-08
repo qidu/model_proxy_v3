@@ -1,6 +1,3 @@
-[submodule "submodules/chatjimmy"]
-	path = submodules/chatjimmy
-	url = git@github.com:qidu/chatjimmy.git
 [submodule "submodules/privacy-filter"]
 	path = submodules/privacy-filter
 	url = git@github.com:qidu/privacy-filter.git

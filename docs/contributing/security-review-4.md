@@ -21,6 +21,7 @@
   activeLogger.debug(requestId, `Using SDK client config: ${JSON.stringify(config)}`);
   ```
   `config` (built at `sdk-handler.ts:230-240`) includes `apiKey: apiKey || ''`. At `LOG_LEVEL=debug` the **full upstream API key** goes to the console log. Line number shifted 242→243 by the `budgetToReasoningEffort` import; the finding is otherwise unchanged from review 3. The parallel Claude-SDK path (`sdk-handler.ts:400-406`) builds the same config object but does *not* log it — only the OpenAI path leaks. **Fix:** redact `apiKey` before stringifying, or drop it from the logged object.
+  **RESOLVED by removal (2026-10-08).** Both call sites are gone — the chatjimmy submodule and the whole `sdk://` client path were deleted. The remaining `sdk-handler.ts` stubs never build this config object and log nothing. Note the general point stands: the logger has no redaction layer (review 2 M1), so any *new* call site that stringifies a credential-bearing object would reintroduce this class of bug.
 
 - **H4 — Plaintext prompts/keys to predictable files → STILL PRESENT (High, still growing).**
   - `./model_proxy_tokens.jsonl` (`TOKEN_LOG_FILE`, `dashboard-stats.ts:304`, written at `dashboard-stats.ts:417,490`) is now **43.8 MB**, world-readable (`-rw-r--r--`), untracked, and **still not in `.gitignore`** (checked this pass: `.gitignore` lists only `.claude/`, `.wrangler/`, `node_modules/`, `dist/`, `docs/test_keys.md`, `.git_audit_before_commiting`, `.env`, `.kiro`, `tests/.fuse_*`).
@@ -35,7 +36,7 @@
 
 - **M5 — Missing Gemini timeouts → UNCHANGED.** `gemini.ts:138` and `gemini.ts:257` carry `createUpstreamAbortSignal(...)`; the three fetches at `gemini.ts:374, 555, 657` still have **no abort signal** (re-verified this pass). A hung upstream on the Gemini→OpenAI and native-Gemini paths still ties up the request indefinitely.
 
-- **M1 — `sdk://` key forwarding → UNCHANGED.** `sdk-handler.ts:401-402` still builds `baseURL` from the config-controlled `sdk://` target and attaches the caller's key. Operator-controlled config; residual risk unchanged. The exploitable half of this finding is N1 (the debug log), above.
+- **M1 — `sdk://` key forwarding → RESOLVED by removal (2026-10-08).** The finding was that `sdk-handler.ts:401-402` built `baseURL` from the config-controlled `sdk://` target and attached the caller's key. The chatjimmy submodule and the `sdk://` client implementation were deleted; the remaining stubs throw `501 not_implemented` before any upstream call, so neither the baseURL nor the key is used. N1 (the debug log), above, is resolved by the same removal.
 
 ### Low / informational
 

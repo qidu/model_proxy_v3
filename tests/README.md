@@ -55,7 +55,7 @@ npm run test:unit           # runs tsx --test tests/unit/**/*.test.ts
 | `utils/privacy-filter.ts` | `privacy-filter` (config precedence + sidecar URL/SSRF validation, local hash redaction with sentinel dedup, block-type skipping incl. Gemini `inlineData`, maxChars guard, fail-closed sidecar paths, `restoreText`, streaming split-sentinel restore) |
 | `utils/kompress.ts` | `kompress` (config defaults/validation, endpoint-path matching, CJK detection, selective fragment compression — user/tool text + tool descriptions only, minChars/maxChars guards, fail-open vs fail-closed, saved-chars accounting) |
 | `utils/tool-blocklist.ts` | `tests/infra/tool-blocklist.ts` (`eraseBlockedTools`) |
-| `utils/sdk-handler.ts` | via handler (integration testcases only) |
+| `utils/sdk-handler.ts` | `sdk-handler` (`isSdkUrl` scheme recognition only; the two `sdk://` stubs reject with `ClaudeProxyError` 501 `not_implemented`) |
 | `handlers/messages.ts`, `responses.ts`, `openai.ts` | via handler + `auth-with-model`, `responses-gemini-url`, `openai-gemini-role-default`, `think-tag-extraction` |
 | `handlers/gemini.ts`, `chat-completions.ts`, `claude.ts`, `models.ts`, `embeddings.ts`, `dashboard.ts`, `token-counting.ts` | integration only (`tests/integration/`) |
 | `index.ts` (handler entry) | `auth-with-model`, `routing`, `responses-gemini-url`, `think-tag-extraction`, `openai-gemini-role-default` |

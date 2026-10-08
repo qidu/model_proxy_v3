@@ -115,7 +115,7 @@ beyond a thin `select()` wrapper, and it is the main sidecar-side work item.
 3. It matches the established convention: inert unless its `*_URL` is set
    (`src/utils/kompress.ts:41`), so existing behavior is unchanged by default.
 
-Note: `submodules/{chatjimmy,kompress,privacy-filter}` are all currently **empty** on this checkout
+Note: `submodules/{kompress,privacy-filter}` are all currently **empty** on this checkout
 (submodules not initialized). Any build/verify step below assumes `git submodule update --init`.
 
 ---

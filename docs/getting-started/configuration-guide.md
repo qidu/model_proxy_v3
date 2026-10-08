@@ -93,9 +93,6 @@ Key ideas:
   `[models.default]`, etc.
 - **`upstream_mode`** picks the protocol: `anthropic-messages`, `gemini-generatecontent`,
   `gemini-interactions`, `openai-completions`, or `openai-responses`.
-- **`sdk://` target URLs** route supported Claude/OpenAI upstream calls through the
-  local SDK handler instead of plain HTTP fetch, while still using the configured
-  `upstream_mode` for request/response shape.
 - **Per-model overrides** use an inline table: `"my-model" = {target = "real-name", base_url = "...", api_key = "..."}`.
   Empty fields inherit from the category. Both the canonical keys (`upstream_mode`, `base_url`,
   `api_key`) and the short aliases (`mode`, `base`, `key`) are accepted; when both are present
@@ -118,7 +115,7 @@ Key ideas:
 > **Note — synthetic thinking-block signatures (Claude→OpenAI→Claude only):**
 > Anthropic's spec marks `signature` as REQUIRED on thinking content blocks, and clients such
 > as `@ai-sdk/anthropic` reject responses missing it. Upstreams reached via the conversion
-> paths (`openai-completions` / `openai-responses`, and the `sdk://` handler) emit reasoning
+> paths (`openai-completions` / `openai-responses`) emit reasoning
 > without a signature, so the proxy synthesizes a constant placeholder
 > (`SYNTHETIC_THINKING_SIGNATURE` = 'synthetic'). This **only** applies to the Claude→OpenAI→Claude
 > round-trip: the reverse converter round-trips reasoning via `reasoning_content` and drops the
