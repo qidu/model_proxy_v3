@@ -49,6 +49,13 @@ export interface Env {
     ALLOWED_HOSTS?: string;
 
     /**
+     * Enable dynamic per-request upstream routing (`/{protocol}/{host}/...`).
+     * Set to "true" or "1" to enable.
+     * Default: disabled (`/{protocol}/{host}/...` paths are rejected with 403).
+     */
+    ENABLE_DYNAMIC_ROUTING?: string;
+
+    /**
      * Maximum size for image block base64 data in bytes.
      * Defaults to 10485760 (10MB).
      * Example: "10485760" for 10MB
@@ -146,6 +153,21 @@ export interface Env {
      * Configured auth_server validation still applies.
      */
     DEV_NO_KEY?: string;
+
+    /**
+     * Client API key the AGENT=true interactive session (agent-session.ts)
+     * uses to authenticate its own loopback /v1/messages calls. Falls back to
+     * [default_upstream] default_api_key from proxy_config.toml, then to
+     * DEV_NO_KEY, if unset.
+     */
+    PROXY_CLIENT_API_KEY?: string;
+
+    /**
+     * Interactive agent mode (agent-session.ts). Set to "true" or "1" to launch
+     * an interactive pi-agent session using the proxy's own /v1/messages endpoint.
+     * When set, a default PROXY_CLIENT_API_KEY is supplied if not explicitly set.
+     */
+    AGENT?: string;
 
     /**
      * Base URL of the OPF privacy-filter sidecar, e.g. "http://127.0.0.1:8799".

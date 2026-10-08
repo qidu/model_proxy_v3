@@ -19,6 +19,7 @@ import { handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.js';
+import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 
@@ -106,7 +107,7 @@ export async function handleGeminiRequest(
     } else if (path.includes(':countTokens')) {
         activeLogger.debug(requestId, 'Routing to Gemini countTokens handler');
         return handleGeminiCountTokensRequest(
-            request, targetUrl, authHeaders, requestId, modelId, env, logger
+            request, targetUrl, authHeaders, requestId, modelId, env, logger, route
         );
     } else {
         activeLogger.debug(requestId, 'Routing to Gemini generateContent handler');
@@ -127,7 +128,8 @@ async function handleGeminiCountTokensRequest(
     requestId: string,
     modelId?: string,
     env?: Env,
-    logger?: Logger
+    logger?: Logger,
+    route?: ModelRouteConfig
 ): Promise<Response> {
     const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
     activeLogger.debug(requestId, `Gemini countTokens request to: ${targetUrl}`);
@@ -143,11 +145,12 @@ async function handleGeminiCountTokensRequest(
         method: 'POST',
         headers: geminiHeaders,
         body: request.body,
-        signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
     recordResponseStatusCodeFromUpstream(response.status);
+    recordUpstreamRateLimit(modelId, (name) => response.headers.get(name), targetUrl);
 
     if (!response.ok) {
         const errorText = await response.text();
@@ -280,7 +283,7 @@ async function handleGeminiInteractionsRequest(
         method: 'POST',
         headers: geminiHeaders,
         body: JSON.stringify(upstreamBodyGemini),
-        signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -294,6 +297,7 @@ async function handleGeminiInteractionsRequest(
     logPipelineHeaders(activeLogger, requestId, 'upstream-response', fullTargetUrl, response.headers);
     activeLogger.debug(requestId, `Response status: ${response.status}`);
     recordResponseStatusCodeFromUpstream(response.status);
+    recordUpstreamRateLimit((requestBody.model as string) || modelId, (name) => response.headers.get(name), fullTargetUrl);
 
     if (!response.ok) {
         const errorText = await response.text();
@@ -325,6 +329,7 @@ async function handleGeminiInteractionsRequest(
             total_input_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
             total_output_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0,
             total_tokens: geminiResponse.usageMetadata?.totalTokenCount || 0,
+            ...(geminiResponse.usageMetadata?.cachedContentTokenCount ? { total_cached_tokens: geminiResponse.usageMetadata.cachedContentTokenCount } : {}),
         }
     };
     
@@ -459,7 +464,7 @@ async function handleGeminiGenerateContentRequest(
             method: 'POST',
             headers: geminiHeaders,
             body: JSON.stringify(upstreamBodyGeminiGen),
-            signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+            signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
         });
 
         if (route) {
@@ -472,6 +477,7 @@ async function handleGeminiGenerateContentRequest(
 
         logPipelineHeaders(activeLogger, requestId, 'upstream-response', fullTargetUrl, response.headers);
         recordResponseStatusCodeFromUpstream(response.status);
+        recordUpstreamRateLimit(effectiveModelId || modelId, (name) => response.headers.get(name), fullTargetUrl);
 
         // Handle target API errors
         if (!response.ok) {

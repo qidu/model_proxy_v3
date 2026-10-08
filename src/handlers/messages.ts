@@ -5,6 +5,8 @@
  */
 
 import { Env } from '../types/shared.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { Logger, createLogger, logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
@@ -22,6 +24,7 @@ import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { countClaudeRequestTokens, getLocalTokenCountingConfig, TokenCountingOptions } from '../utils/token-counting.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
+import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { OpenAIResponsesResponse } from '../converters/completions-to-responses.js';
 
 /**
@@ -330,7 +333,7 @@ export async function handleMessagesRequest(
         method: 'POST',
         headers: responsesFetchHeaders1,
         body: JSON.stringify(responsesBody),
-        signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
       });
 
       if (route) {
@@ -344,6 +347,7 @@ export async function handleMessagesRequest(
       logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, responsesResponse.headers);
       recordResponseStatusCodeFromUpstream(responsesResponse.status);
       recordUpstreamResponseToolCount('openai-responses', 0);
+      recordUpstreamRateLimit(model, (name) => responsesResponse.headers.get(name), targetUrl);
 
       if (!responsesResponse.ok) {
         const upstreamResponseBody = await responsesResponse.text();
@@ -420,7 +424,7 @@ export async function handleMessagesRequest(
       method: 'POST',
       headers: openaiFetchHeaders,
       body: JSON.stringify(upstreamBodyOpenai),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -439,7 +443,7 @@ export async function handleMessagesRequest(
           const respClone = response.clone();
           const respBody = await respClone.text();
           const { appendFileSync } = await import('fs');
-          appendFileSync('/tmp/test_model.log',
+          appendFileSync(join(tmpdir(), 'test_model.log'),
             `[${new Date().toISOString()}] upstream response (openai-passthrough)\n` +
             `upstream url: ${targetUrl}\n` +
             `upstream status: ${response.status}\n` +
@@ -453,6 +457,7 @@ export async function handleMessagesRequest(
     logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
     recordResponseStatusCodeFromUpstream(response.status);
     recordUpstreamResponseToolCount('openai-completions', 0);
+    recordUpstreamRateLimit((requestBody.model as string) || modelId || model, (name) => response.headers.get(name), targetUrl);
 
     // Handle target API errors
     if (!response.ok) {
@@ -505,8 +510,13 @@ export async function handleMessagesRequest(
   // Check if streaming is requested
   const isStreaming = claudeRequest.stream === true;
 
-  // Log request info
-  activeLogger.info(requestId, `${userAgent} upstream (stream=${isStreaming}) thinking (${thinking?.type ?? 'none'}) to target ${targetModelId} [openai-completions]`);
+  // Log request info. Flags: 's' present when streaming, 't' when thinking is
+  // enabled (matching the thinkingType check above — a "disabled"/false thinking
+  // block counts as off, not on).
+  const flags = [isStreaming && 's', thinking && thinking.type !== 'disabled' && thinking.type !== false && 't']
+    .filter(Boolean)
+    .join(',');
+  activeLogger.info(requestId, `${targetModelId},(${flags}) [openai-completions] ${userAgent}`);
   activeLogger.debug(requestId, `Has auth headers: ${!!authHeaders['Authorization'] || !!authHeaders['x-api-key']}`);
   activeLogger.debug(requestId, `Is for SDK Model: ${isSdkUrl(targetUrl)} with upstreamMode: ${upstreamMode}`);
 
@@ -602,7 +612,7 @@ export async function handleMessagesRequest(
       method: 'POST',
       headers: responsesFetchHeaders2,
       body: JSON.stringify(responsesBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -616,6 +626,7 @@ export async function handleMessagesRequest(
     logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, responsesResponse.headers);
     recordResponseStatusCodeFromUpstream(responsesResponse.status);
     recordUpstreamResponseToolCount('openai-responses', 0);
+    recordUpstreamRateLimit(targetModelId, (name) => responsesResponse.headers.get(name), targetUrl);
 
     if (!responsesResponse.ok) {
       const upstreamResponseBody = await responsesResponse.text();
@@ -712,7 +723,7 @@ export async function handleMessagesRequest(
     method: 'POST',
     headers: claudeFetchHeaders,
     body: JSON.stringify(upstreamBodyClaude),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -730,7 +741,7 @@ export async function handleMessagesRequest(
         const respClone = response.clone();
         const respBody = await respClone.text();
         const { appendFileSync } = await import('fs');
-        appendFileSync('/tmp/test_model.log',
+        appendFileSync(join(tmpdir(), 'test_model.log'),
           `[${new Date().toISOString()}] upstream response (claude->openai)\n` +
           `upstream url: ${targetUrl}\n` +
           `upstream status: ${response.status}\n` +
@@ -744,6 +755,7 @@ export async function handleMessagesRequest(
   logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
   recordResponseStatusCodeFromUpstream(response.status);
   recordUpstreamResponseToolCount('openai-completions', 0);
+  recordUpstreamRateLimit(targetModelId, (name) => response.headers.get(name), targetUrl);
 
   // Handle target API errors
   if (!response.ok) {

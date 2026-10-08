@@ -1,0 +1,257 @@
+# Auth & Stats Service Protocol
+
+The proxy talks to two optional remote services over plain HTTP. This document
+records the exact wire-level contract for each, so an operator can implement
+a compatible auth/stats backend in any language. For the high-level overview and
+sequence diagram, see [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service)
+in the README.
+
+## Auth service — `[remote] auth_server`
+
+**When**: before routing (every non-exempt model-API request). Exempt paths:
+`/health`, `/`, `/dashboard`, `/v1/models`.
+
+**Timing**:
+- `auth_with_model = false` (default) → auth runs **before** the request body is
+  parsed.
+- `auth_with_model = true` → auth runs **after** body parsing, so the requested
+  model id is known and forwarded as `x-resource-for`. Deferring lets the auth
+  server key its decision to the requested model; it is **not** required for the
+  `targets[]` routing override, which is accepted whether auth runs early or
+  deferred.
+- `auth_with_body = true` → auth also runs **after** body parsing, and the entire
+  parsed request body is forwarded to the auth service as the `POST` body (raw
+  JSON, not base64). Either `auth_with_model` or `auth_with_body` defers auth
+  until the body is available. On endpoints where the proxy does not parse a
+  body (e.g. dynamic routes), `auth_with_body` has no body to send and degrades
+  to a bodyless call.
+
+**Request** (proxy → auth service):
+
+| Aspect | Value |
+|---|---|
+| Method | `GET` by default; switches to **`POST`** when `auth_with_body = true` and a parsed body is available |
+| URL | `auth_server` as configured |
+| Redirects | followed |
+
+Headers forwarded (each only if the client sent it):
+
+| Header | Source |
+|---|---|
+| `Authorization` | client's `Authorization` |
+| `x-api-key` | client's `x-api-key` |
+| `x-goog-api-key` | client's `x-goog-api-key` |
+| `user-agent` | client's `User-Agent` |
+| `request_id` | proxy-generated request id |
+| `endpoint` | inbound request path (e.g. `/v1/messages`) |
+| `x-resource-for` | requested model id — **only when `auth_with_model = true`** |
+| `x-forwarded-for` | resolved client IP (`cf-connecting-ip` → `x-forwarded-for`[0] → `x-real-ip`). Always sent when a client IP is detectable. |
+| `x-real-ip` | resolved client IP — **only when the caller did not already send `x-real-ip`** (an explicit outer-proxy value is preserved). |
+| `Content-Type` | `application/json` — **only on the `POST` form** (`auth_with_body = true` with a parsed body). Absent on the default `GET`. |
+
+When `auth_with_body = true`, the `POST` body is the **raw parsed request JSON**
+(post privacy-filter / kompress / tool-blocklist rewriting, so the auth sidecar
+never sees redacted PII). The body is not base64-encoded — it is sent as
+parseable JSON so the sidecar can inspect fields directly.
+
+**Response** (auth service → proxy):
+
+| Status | Proxy behavior |
+|---|---|
+| `200` | Auth passes; proceed to routing. |
+| any `4xx` / `5xx` | Proxy returns `401 Authentication failed.` to the client. |
+| network error | Proxy returns `503 Authentication service unavailable.` to the client. |
+
+On `200`, the proxy reads:
+
+- **Body field `version`** (**required**) — a non-empty string advertising which
+  era of this wire contract the auth service speaks (the bundled mock sidecar
+  sends `"v1"`). The proxy **requires** it: a `200` whose body is missing
+  `version`, is not a JSON object, or carries a blank/non-string value is
+  rejected with `401` before any routing, so a service that predates the
+  versioned contract fails loudly instead of being silently trusted. The check is
+  a *presence* check — any non-empty string passes (`"v1"` is the current era).
+- **Header `one_time_auth_code`** (OTAC, optional) — stored and re-sent as the
+  `one_time_auth_code` header on the later stats `POST record_server` call (see below).
+  A ladder descriptor's own `otac` field takes precedence over this header **for
+  that rung**: the rung sends its `otac` upstream and records that value, while
+  entries without an `otac` fall back to this response-header value.
+- **JSON body field `targets[]`** (optional) — the **auth `targets[]` failover
+  ladder**. See the table in
+  [Proxy ↔ remote auth & stats service](../README.md#proxy--remote-auth--stats-service).
+
+Example `200` body (auth service → proxy) — `version` is required, `targets[]`
+is optional:
+
+```json
+{
+  "version": "v1",
+  "targets": [
+    {
+      "target": "deepseek/deepseek-v4.1-flash",
+      "base": "https://api.example.com",
+      "mode": "openai-completions",
+      "key": "sk-upstream-key",
+      "transforms": "code_small_compat",
+      "timeout": 20000,
+      "retry": 1,
+      "retry_on": [429, 500, 502, 503, 504]
+    },
+    {
+      "target": "nvidia/nemotron-3.5-lightning:free",
+      "base": "https://openrouter.ai/api/v1",
+      "mode": "openai-completions"
+    }
+  ]
+}
+```
+
+The `one_time_auth_code` travel-header (above) is returned alongside this body.
+The first rung pins its own upstream `key`; the second omits `key`, so it
+forwards the caller's credential (passthrough).
+
+The response table above is therefore refined on `200`: a valid `version`-bearing
+body passes and proceeds to routing. A `200` body without a valid `version` is
+treated as a contract failure and returns `401` to the client (same as any `4xx`
+/ `5xx` auth response) — it does **not** fall back to config resolution.
+
+**Auth `targets[]` failover ladder.** When the auth response body carries a
+`targets` array, the proxy treats each entry as a **self-contained target
+descriptor** and resolves the route for **this request only**, in array order.
+The first entry is the initial rung; on a retryable upstream failure the proxy
+advances to the next entry (see *Two orthogonal retry axes* below). Descriptors
+carry no config inheritance:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `target` | **yes** | Upstream model id sent as `model` (the alias key is ignored). |
+| `base` | **yes** | Upstream base URL — the descriptor's `base_url`. |
+| `mode` | no | Upstream mode. Defaults to `[default_upstream].upstream_mode`, else `openai-completions`. |
+| `key` | no | Upstream API key. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (passthrough). |
+| `otac` | no | Per-rung replacement for the `one_time_auth_code` header sent upstream and on the stats record. |
+| `transforms` | no | `[transforms.*]` set names applied at the same five lifecycle hooks as config-attached sets. Resolved with no section layer. |
+| `timeout` | no | **Whole-request** upstream abort deadline (ms). Overrides `UPSTREAM_BODY_TIMEOUT_MS` for this rung. |
+| `retry_on` | no | Per-rung retry axis (see below): re-hit this same rung before advancing. |
+| `retry` | no | Max same-rung retries for **this rung** only, overriding `[remote] max_target_retries`; `retry_on` still gates the statuses, `0` disables. |
+
+**Why `target` and `base` are required.** A descriptor is self-sufficient. The
+config-resolution fallback for a missing target/base is `http://localhost` with
+no key — silently routing auth-directed traffic to a local address with no
+credential. Only `mode` has a safe default; the rest must be supplied or the
+entry is rejected.
+
+> **Notice — a rung's `key` replaces the caller's credential.** A descriptor
+> carrying a non-empty `key` sends **that** key upstream; the caller's credential
+> is not forwarded. The rung's key overwrites the mode's auth header
+> (`Authorization` for `openai-completions`, `x-api-key` for `anthropic-messages`,
+> `x-goog-api-key` for the Gemini modes) instead of being sent alongside it, and
+> no `auth_passthrough_with = "config_key"` opt-in is required. The rule is
+> **per-rung, not per-ladder** — an entry without a `key` still forwards the
+> caller's credential, so one ladder may mix server-pinned and caller-supplied
+> keys. A rung's `otac` overrides the response-header `one_time_auth_code` for
+> that rung only (see above).
+
+**Two orthogonal retry axes.**
+
+1. **Axis 1 — advance the ladder.** On any *retryable* upstream outcome the
+   proxy moves to the next entry. The set is fixed: HTTP `429`, any `5xx`,
+   transport failure (→ `502`), and abort/timeout (→ `504`). A *deterministic*
+   `4xx` (e.g. `400`/`401`/`422`) is terminal — the ladder stops and the client
+   sees that rung's status. The number of upstream attempts is bounded by
+   `[remote] max_targets` (default `16`).
+2. **Axis 2 — re-hit the same rung.** A descriptor's `retry_on` array lists the
+   upstream statuses that should re-hit **that same target** before the ladder
+   advances. The retry count is `[remote] max_target_retries` (default `1`; `0`
+   disables) unless the rung's own `retry` overrides it for that rung only.
+   Backoff is `250ms × 2^n`, capped at `2s`, honoring `Retry-After`.
+
+**Bounds and validation.** Entries are validated, deduplicated (key
+`target@base@key`), then capped at `max_targets`; the cap bounds *attempts*, not
+just array length. An invalid entry is dropped with an `ERROR` log and the
+ladder continues — including when the invalid entry is `targets[0]`. If the
+`version`-bearing body has no `targets` (or every entry is invalid), normal
+config resolution proceeds unchanged. A missing `version`, a body that is not a
+JSON object, or a non-`200` auth call is a contract failure and returns `401`
+(see the auth *Response* section) — it does **not** fall back to config
+resolution.
+
+The override is **never cached** and **never persisted** to `proxy_config.toml`
+— it is a single-use, per-request alias list. Each rung contributes at most one
+usage record to the stats service.
+
+## Stats service — `[remote] record_server`
+
+**When**: after the upstream response is received, once token usage is known.
+For streaming (`text/event-stream`) responses, usage is extracted from the SSE
+final event and the record is POSTed when the stream closes. For JSON
+responses, it is POSTed immediately after parsing. The POST is fire-and-forget
+(non-blocking); failures are logged at `WARN` and do not affect the client
+response.
+
+**When (with `record_response_body`)**: `[remote] record_response_body = true` (default `false`)
+adds the **entire constructed response body** to each usage record. For JSON
+responses this is the parsed response object; for streaming (`text/event-stream`)
+responses this is the accumulated raw SSE text (all events concatenated,
+captured as the stream flows through to the client, and POSTed once the stream
+closes). The body is sent raw (not base64) as a JSON value, so the collector
+can inspect it directly. When `record_response_body = false` (default), the field is
+omitted entirely.
+
+**Non-2xx responses are recorded too.** Every record carries a `response_status`
+field (the upstream HTTP status), reported **by default** whenever `record_server`
+is configured — no extra flag needed. When the upstream returns a non-2xx
+status, the proxy still POSTs a record — with all token counters at `0` (error
+bodies rarely carry usage) and `response_status` set to the real status. Only
+`response_body` is gated (by `record_response_body = true`); when that flag is on, the
+non-2xx constructed response body (the upstream's error JSON or text) is
+attached to `response_body` just like a success body. This lets the collector
+see failures and their statuses by default, and opt into error payloads via
+`record_response_body`.
+
+**Request** (proxy → stats service):
+
+| Aspect | Value |
+|---|---|
+| Method | `POST` |
+| URL | `record_server` as configured |
+| Content-Type | `application/json` |
+
+| Header | Value |
+|---|---|
+| `one_time_auth_code` | the one-time authorization code (OTAC) the auth service returned for this request, if any (absent otherwise) |
+| `x-forwarded-for` | resolved client IP, same value as sent to the auth service (when detectable) |
+| `x-real-ip` | resolved client IP — **only when the caller did not already send `x-real-ip`** |
+
+Body (`ModelUsageRecordPayload`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `request_id` | string | Same proxy-generated request id forwarded to auth. |
+| `timestamp` | string | ISO 8601 timestamp of the record. |
+| `endpoint` | string | Inbound request path (e.g. `/v1/messages`). |
+| `version` | string | Wire-contract era this record speaks. A fixed proxy constant (`"v1"`), sent on every record regardless of the auth response — the proxy does not echo the auth service's advertised `version`. |
+| `user_key` | string | Truncated caller auth key — first 16 characters followed by `****` (from `Authorization` / `x-api-key` / `x-goog-api-key`). The full key is never sent to the recording server. |
+| `model` | string | **Resolved** upstream model id actually sent upstream (the `target`, not the alias key). |
+| `response_status` | number | Upstream HTTP status. `0` means no response was obtained. Non-2xx statuses are recorded with all token counters at `0`. |
+| `input_tokens` | number | Input tokens reported by the upstream (or local tiktoken estimate when `LOCAL_TIKTOKEN=true`). For non-2xx, `0`. |
+| `cached_tokens` | number | Prompt-caching read tokens (Anthropic / OpenAI cache-read), if reported. |
+| `cache_written_tokens` | number | Prompt-caching write tokens, if reported. |
+| `output_tokens` | number | Output tokens reported by the upstream. |
+| `total_tokens` | number | Sum when reported by the upstream, else `input + output`. |
+| `response_body` | object \| string | **Only when `record_response_body = true`.** Parsed JSON object for non-streaming responses; accumulated raw SSE text for streaming responses. Absent otherwise. |
+
+**Response**: the proxy only checks `response.ok`; a non-2xx is logged at
+`WARN` with the status code. There is no retry. The stats POST is
+fire-and-forget — its response never gates the client — so the response body is
+ignored entirely: unlike the auth `200` (which must carry `version`), the stats
+response carries no `version` and the proxy does not read its body. The bundled
+sidecar answers `{ "ok": true }`.
+
+## Combining auth and stats in one service
+
+When `auth_server` and `record_server` point at the same backend, the
+`one_time_auth_code` (OTAC) header returned by the auth step is the linkage key:
+it travels on the auth response header, then on the stats request header,
+letting the backend tie the usage record back to the authenticated principal
+without re-validating the credential. If the two are separate services,
+`one_time_auth_code` is simply not sent on the stats call.

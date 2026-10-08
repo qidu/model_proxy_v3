@@ -20,7 +20,8 @@ usage stats and some configs modification.
                                ▼            privacy-filter
                         ┌─────────────┐     compression
      sidecar plugins <- │ Model Proxy │ ->  image-fetch & encoding
-                        └─────────────┘     auth & usage stats
+                        └─────────────┘     tool judge
+                                            auth & usage stats
                                │ 
         ┌──────────────┬───────┴───────┬──────────────┐
         ▼              ▼               ▼              ▼
@@ -32,8 +33,8 @@ usage stats and some configs modification.
 
 ### Proxy ↔ remote auth & stats service
 
-The two optional remote sidecars (`[remote.authentication] auth_server` and
-`[remote.recording] record_server`) can be the **same** service or two separate ones.
+The two optional remote sidecars (`[remote] auth_server` and
+`[remote] record_server`) can be the **same** service or two separate ones.
 `auth_server` gates admission; `record_server` collects per-request usage after the
 response. When they are the same service, the proxy can authenticate and
 report stats against one backend.
@@ -42,41 +43,93 @@ report stats against one backend.
 sequenceDiagram
     participant C as Client
     participant P as Model Proxy
-    participant A as Auth Service<br/>([remote.authentication] auth_server)
-    participant S as Stats Service<br/>([remote.recording] record_server)
+    participant A as Auth Service<br/>([remote] auth_server)
+    participant S as Stats Service<br/>([remote] record_server)
     participant U as Upstream Provider
 
     C->>P: POST /v1/messages<br/>(Authorization / x-api-key)
     Note over P: auth_with_model/auth_with_body = false → auth now (GET)<br/>either = true → defer until body parsed
     P->>A: auth_server<br/>GET (default) or POST (auth_with_body: whole request body)<br/>forward: Authorization, x-api-key, x-goog-api-key,<br/>user-agent, request_id, endpoint,<br/>[x-resource-for], [x-forwarded-for, x-real-ip]
-    A-->>P: 200 OK<br/>header: one_time_auth_code / OTAC (optional)<br/>body: dynamic routing override (optional)
-    Note over P: if body carries target/mode/base/key/transforms<br/>→ use as one-time dynamic route,<br/>skip config-file model resolution
+    A-->>P: 200 OK<br/>header: one_time_auth_code / OTAC (optional)<br/>body: {version (required), targets[] (optional)}
+    Note over P: if body carries targets[]<br/>→ walk rungs in order, fail over on retryable error,<br/>skip config-file model resolution
     P->>U: forwarded request (native or converted)
     U-->>P: response (streaming or JSON)
     P-->>C: response (converted back to client schema)
     P-)S: POST record_server<br/>{request_id, endpoint, user_key, model, response_status, token counters,<br/>[response_body if record_response_body=true]}<br/>header: one_time_auth_code, x-forwarded-for, [x-real-ip]
 ```
 
-**Auth dynamic-routing override (response body).** The auth service MAY respond
-with a JSON body that acts as a **one-time alias config entry** — the same shape
-as a `[models.*]` inline table. When present, the proxy uses it directly for
-this single request and skips resolving the model from `[models.*]` / `[composite]`
-/ `[schedule]` in the config file. All fields are optional; omitted fields fall
-back to the normal inheritance chain (`[default_upstream]` → section → entry):
+**Auth `targets[]` failover ladder (response body).** The auth service's `200`
+body **MUST** carry `version` (a non-empty string — `"v1"` is the current era).
+A `200` whose body is missing `version`, or is not an object, is rejected with
+`401` before any routing — a service that does not speak the versioned contract
+is never silently trusted. It **MAY** additionally carry `targets` — an ordered
+list of **self-contained target descriptors**. When present, the proxy uses them
+directly for this single request, starting on `targets[0]` and advancing to the
+next rung on a retryable upstream failure, and skips resolving the model from
+`[models.*]` / `[composite]` / `[schedule]` in the config file:
 
-| Body field | Type | Meaning |
+```json
+{ "version": "v1",
+  "targets": [
+    { "target": "claude-opus-4-6", "mode": "anthropic-messages",
+      "base": "https://api.anthropic.com", "key": "sk-…", "timeout": 30000 },
+    { "target": "gpt-5", "mode": "openai-completions",
+      "base": "https://api.openai.com/v1", "timeout": 10000, "retry_on": [503], "retry": 2 }
+] }
+```
+
+| Target field | Type | Meaning |
 |---|---|---|
-| `target` | string | Real upstream model id to send (like an alias `target`). |
-| `mode` / `upstream_mode` | string | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. |
-| `base` / `base_url` | string | Upstream base URL. |
-| `key` / `api_key` | string *(optional)* | Upstream API key for this request only. When omitted, the proxy uses the caller's key (subject to `auth_passthrough_with`) or the config-inherited key. |
-| `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached beyond what config resolution already yields. |
+| `target` | string **required** | Real upstream model id to send (like an alias `target`). |
+| `base` / `base_url` | string **required** | Upstream base URL. |
+| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[default_upstream].upstream_mode`, else `openai-completions`. |
+| `key` / `api_key` | string *(optional)* | Upstream API key for this rung only. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (subject to `auth_passthrough_with`). |
+| `otac` | string *(optional)* | Per-rung value replacing the `one_time_auth_code` header for the upstream call and the stats record. Overrides the auth response's OTAC header for this rung. |
+| `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached. |
+| `timeout` | number *(optional)* | **Whole-request** upstream abort deadline for **this rung**, in milliseconds. Overrides `UPSTREAM_BODY_TIMEOUT_MS`; on expiry the proxy aborts the attempt and fails over to the next entry. |
+| `retry_on` | number[] *(optional)* | Upstream statuses that re-hit **this same rung** before the ladder advances (axis 2). Bounded by `[remote] max_target_retries` (default `1`; `0` disables) unless this rung sets `retry`. |
+| `retry` | number *(optional)* | Max same-rung retries for **this rung** only, overriding `[remote] max_target_retries` (axis 2). `retry_on` still gates which statuses trigger it; `0` disables same-rung retry for the rung. |
 
-> The override is **per-request and ephemeral** — it is never cached, never
-> written to config, and does not persist across requests. If the auth response
-> body is empty or not JSON, the proxy falls back to normal config resolution.
-> Requires `auth_with_model = true` so the auth call runs after body parsing
-> (the proxy needs the requested model id and the override before routing).
+**Descriptors are self-contained — `target` and `base` are required.** A
+descriptor is not merged onto `[default_upstream]` / section / entry; the only
+inherited field is `mode`. A missing `target`/`base` would fall back to
+`http://localhost` with no key, so entries that omit them are rejected (dropped
+with an error) rather than silently mis-routed.
+
+> **Notice — a rung's `key` replaces the caller's credential.** When a descriptor
+> carries a non-empty `key`, the proxy sends **that** key upstream and does **not**
+> forward the caller's. The rung's key overwrites the mode's auth header
+> (`Authorization` for `openai-completions`, `x-api-key` for `anthropic-messages`,
+> `x-goog-api-key` for the Gemini modes) rather than being added alongside it.
+> This applies without `auth_passthrough_with = "config_key"` — that setting
+> governs config-resolved routes, not ladder rungs, so an auth service can pin
+> credentials per rung regardless of the client's passthrough setting. It is
+> **per-rung, not per-ladder**: an entry with no `key` still forwards the caller's
+> credential, so one ladder may mix server-pinned and caller-supplied keys. A
+> rung's `otac` likewise overrides the `one_time_auth_code` header for that rung
+> only.
+
+**Failover (axis 1).** The ladder advances on HTTP `429`, any `5xx`, a transport
+failure (→ `502`), or an abort/timeout (→ `504`). A deterministic `4xx`
+(`400`/`401`/`422`/…) is terminal — the ladder stops and the client sees that
+rung's status. Total attempts are bounded by `[remote] max_targets` (default `16`).
+
+**Bounds and validation.** Entries are validated, deduplicated
+(`target@base@key`), then capped at `max_targets`; an invalid entry is dropped
+with an error and the ladder continues — even when it is `targets[0]`. If the
+`version`-carrying body has no `targets` (or every entry is invalid), the proxy
+falls back to normal config resolution; a missing `version`, a non-`200` auth
+call, or an unparseable body is a contract failure (see the response table
+above). A rung's `base` host is **not** checked against the config host
+allowlist — the auth server is a trusted routing authority, so a descriptor may
+target any well-formed host (only `base` URL syntax is validated).
+
+> The ladder is **per-request and ephemeral** — never cached, never written to
+> config, and does not persist across requests. It requires a **parsed JSON
+> request body** (the proxy re-serializes it for each rung), so it applies to
+> body-carrying endpoints. The auth call may run early or deferred —
+> `auth_with_model` / `auth_with_body` are not required; the `targets[]` override
+> is captured on either path.
 
 See [Auth & Stats Service Protocol](#auth--stats-service-protocol) below for the
 full wire-level contract.
@@ -114,8 +167,9 @@ full wire-level contract.
   in a web dashboard or a live terminal UI.
 - **Token limits** — global and per-alias token caps over a configurable window (sliding `Nh`/`Nd` or calendar `1w`/`1m`). Returns HTTP 413 when exceeded.
 - **Sidecars** — optional privacy-filter (sidecar or local hash-only mode),
-  compression, and image-encode sidecars for redacting, shrinking, or fetching
-  request payloads before they reach the upstream.
+  compression, image-encode, and tool-judge sidecars: redact or shrink request
+  payloads, fetch images, or prune irrelevant tools before the request reaches
+  the upstream.
 - **Runs anywhere** — Node.js server or Docker.
 
 ## Quick Start
@@ -153,7 +207,7 @@ npm install
 Copy the example config and edit it:
 
 ```bash
-cp proxy_config.example.toml proxy_config.toml
+cp docs/getting-started/proxy_config.example.toml proxy_config.toml
 ```
 
 A minimal-config walkthrough (model categories, `upstream_mode`, per-model overrides,
@@ -161,9 +215,9 @@ wildcards) and the behavioral notes on extended thinking (inline `#` comment sup
 third-party `anthropic-messages` endpoints, synthetic thinking signatures,
 `budget_tokens` vs `max_tokens`, the `kimi-k2.7-code` `thinking_budget` collision,
 tag-based and `reasoning_content` extraction) live in
-[`docs/configuration-guide.md`](./docs/configuration-guide.md).
+[`docs/getting-started/configuration-guide.md`](./docs/getting-started/configuration-guide.md).
 
-See [`proxy_config.example.toml`](./proxy_config.example.toml) for a fully commented config
+See [`proxy_config.example.toml`](./docs/getting-started/proxy_config.example.toml) for a fully commented config
 covering every section and option.
 
 ### 3. Run
@@ -185,8 +239,10 @@ curl http://localhost:8788/v1/messages \
   }'
 ```
 
-The proxy reads `proxy_config.toml` from the working directory by default. Point it
-elsewhere with `PROXY_CONFIG_PATH=./other.toml npm run server`. Change the port with
+The proxy reads `proxy_config.toml` from the working directory by default; when
+that is absent it falls back to `~/.config/model-proxy-v3/proxy_config.toml`.
+Point it elsewhere with
+`PROXY_CONFIG_PATH=./other.toml npm run server`. Change the port with
 `PORT=7777`.
 
 ### 4. Watch live stats (optional)
@@ -194,15 +250,21 @@ elsewhere with `PROXY_CONFIG_PATH=./other.toml npm run server`. Change the port 
 Start with the terminal dashboard:
 
 ```bash
+npm run server -- --tui
+# equivalent:
 TUI=true npm run server
 ```
+
+`--dashboard` (or `DASHBOARD=true`) turns on token-stats persistence on its own — the
+JSONL dump and the startup restore below — without starting a UI; `--tui` and `--agent`
+imply it. It composes with every other mode (`--rpc --dashboard` is fine).
 
 You get a live view of configured models, token usage, response times, and tool stats;
 a web dashboard is also available at `GET /dashboard`. The `Q` key (documented in the
 `h` help panel) opens a model picker with a per-row usage suffix — `(58%)`,
 `(7472/20000, 63%)` (remaining/limit + used%), `(¥43.97)` — and shows the highlighted
 model's full quota on a status line at the bottom of the panel when moving through the
-list (minimax, deepseek, kimi, openrouter, zhipu coding plans — see
+list (minimax, deepseek, kimi, openrouter, zhipu, qnaigc coding plans — see
 `GET /dashboard/api/quota`); anthropic-routed models instead show the 5h-window left
 percent recorded from the `anthropic-ratelimit-unified-5h-utilization` response header
 on proxied traffic. In the
@@ -210,7 +272,77 @@ composite-aliases panel each target model shows its usage left after the timing 
 e.g. `[0.11/2.12/63.93s] (58% left)` or `(6930/12000, 42% left)` for count-based
 providers. The TUI key bindings, the
 `model_proxy_tokens.jsonl` usage-dump format, and the startup stats-restoration rules
-are documented in [`docs/live-stats.md`](./docs/live-stats.md).
+are documented in [`docs/guides/live-stats.md`](./docs/guides/live-stats.md).
+
+#### Mode-flag gating: what gets tracked
+
+The proxy only records detailed stats and enforces token limits when **at least one**
+of `--dashboard`, `--tui`, `--agent`, or `--rpc` is enabled. In "plain proxy" mode
+(no flags), memory usage is minimal:
+
+| Store | Flags set | No flags |
+|-------|-----------|----------|
+| `modelStats` (per-model totals) | ✅ | ✅ |
+| `dailyTokenStats` (daily rollup) | ✅ | ✅ |
+| `tokenHeatmapEvents` (sliding-window events) | ✅ | ❌ |
+| `compositeAliasStates.events` (alias limit windows) | ✅ | ❌ |
+| `agentStats` / `toolRequestChars` / `upstreamResponseToolStats` | ✅ | ❌ |
+| `requestEndpointStats` / timing / upstream / status codes | ✅ | ❌ |
+
+**Token limits enforced:** ✅ Global + Composite alias | ❌ **Both disabled**
+
+This means without any UI/runtime flag the proxy runs with minimal overhead —
+only cumulative per-model and daily totals are kept, no heatmap, no tool tracking,
+and no token-limit enforcement.
+
+#### Performance benchmarks (10,000 rpm ≈ 167 req/s)
+
+| Mode | Heap (stats) | Concurrency (30 s streams) | Total RSS | `tokenHeatmapEvents` shift CPU |
+|------|--------------|----------------------------|-----------|--------------------------------|
+| **Plain (no flags)** | ~50 KB | 5,000 × ~50 KB = **250 MB** | **~300–400 MB** | 0% (events disabled) |
+| **Flags + 1-day retention** | 14.4M events = **922 MB** | 250 MB | **~1.2 GB** | **~283%** (2.8× realtime) |
+
+*CPU figures measured on Node 22.23.2: `Array.prototype.shift()` on object arrays is O(n) memmove (no left-trim optimization). Benchmark: 100k→443 µs/op, 1M→2.7 ms/op, 10M→12 ms/op. At 167 ops/s, 1-day retention (14.4M array) saturates ~3 CPU cores on `shift()` alone.*
+
+**Takeaway:** plain mode scales to 10k+ rpm with flat ~350 MB. Enabling any dashboard flag (`--dashboard`, `--tui`, `--agent`, `--rpc`) at 10k rpm requires per-second event aggregation or a ring buffer — the current per-request array + `shift()` design caps at ~1–2k rpm with 1-day retention.
+
+## CLI Commands
+
+The server binary doubles as a config inspection tool. With no arguments it starts
+the HTTP server as before; with one of the commands below it runs, prints, and exits.
+
+```bash
+npm run server -- --list-models          # human-readable table
+npm run server -- --list-models --json   # machine-readable (dashboard config shape)
+npm run server -- --validate-config      # check the config file
+npm run server -- --export-pi-models     # pi models file + default provider/model
+npm run server -- --export-pi-models --default-model smart-coder   # pick the default model
+npm run server -- --export-openclaw-providers   # OpenClaw models.providers block
+npm run server -- --help                 # usage
+```
+
+(`npx model-proxy-v3 …` or `node dist/server.js …` once built.)
+
+| Command | Purpose |
+|---|---|
+| `--list-models [--json]` | List configured target models plus composite and schedule aliases. The default output is a grouped table — target models (`CATEGORY`/`ID`/`TARGET`/`BASE URL`/`MODE`, with category-level `base_url`/`upstream_mode` shown when an entry inherits them), composite aliases with their targets (one per line) and token limit, and schedule aliases with their timed windows (one per line). Headers are listed directly above the rows — no dash rule. `--json` emits the sanitized payload the dashboard config endpoint serves, with `api_key` values stripped. |
+| `--validate-config` | Parse and validate the config, printing the `[ERROR]`/`[WARN]` lines the parser finds plus a counts summary; exits `1` when there are errors. |
+| `--export-pi-models [--default-model <id>]` | Print what pi needs to route through this proxy: `defaultProvider`/`defaultModel` (for `~/.pi/agent/settings.json`) plus a `providers` block (for `~/.pi/agent/models.json`) — one provider (`model-proxy-v3`) holding a pi-ai `Model` object per configured target model and alias, each pointed at this proxy's own loopback origin (`http://127.0.0.1:$PORT`, default `8788`). `defaultModel` is the `--default-model` alias, or the first configured model when the flag is omitted; an unknown id is a usage error. `apiKey` is a dummy (`sk-hi`): the proxy's client auth is a presence check, and configured target `api_key` values are never emitted. |
+| `--export-openclaw-providers` | Print the `models.providers` block for `~/.openclaw/openclaw.json` — a single provider (`model-proxy-v3`) holding one entry per configured target model and alias, each pointed at this proxy's own loopback origin (`http://127.0.0.1:$PORT`, default `8788`). The provider carries `api: 'anthropic-messages'`, `auth: 'api-key'`, and the dummy `apiKey` (`sk-hi`); the surrounding `models.mode` is `merge`, so the block can be merged into an existing OpenClaw config without dropping its other providers. Configured target `api_key` values are never emitted. |
+| `--help`, `-h` | Print usage. |
+
+Commands read the **local TOML file only** (`$PROXY_CONFIG_PATH`); Consul/Apollo
+remote sources are not consulted. When `PROXY_CONFIG_PATH` is unset, the config
+path defaults to `./proxy_config.toml` if it exists, else
+`~/.config/model-proxy-v3/proxy_config.toml`. When neither exists the home path
+is returned anyway and its directory (`~/.config/model-proxy-v3`) is created, so
+a GUI-launched binary whose working directory is not the repo still finds its
+config in the home directory.
+
+Exit codes: `0` success (for `--validate-config`: no errors), `1` command failed
+(unreadable config, or a config with errors), `2` usage error (unknown argument,
+more than one command, `--json` without `--list-models`, or `--default-model`
+without `--export-pi-models` / without a model id / naming an unknown one).
 
 ## API Endpoints
 
@@ -226,11 +358,13 @@ are documented in [`docs/live-stats.md`](./docs/live-stats.md).
 | `POST /v1/embeddings` | Embeddings (proxied to an OpenAI-compatible upstream) |
 | `GET /v1/models` | List available models (no auth required) |
 | `GET /dashboard` | Web dashboard for config + stats |
-| `GET /dashboard/api/quota?model=<id>` | Remaining usage/credits for a model's route (minimax, deepseek, kimi, openrouter, zhipu coding plans; provider detected from the route host). `?base_url=<origin>` variant serves the web dashboard's per-URL "Usage Left" column, falling back to the recorded anthropic 5h percent. Dashboard `api_key` auth. |
+| `GET /dashboard/api/quota?model=<id>` | Remaining usage/credits for a model's route (minimax, deepseek, kimi, openrouter, zhipu, qnaigc coding plans; provider detected from the route host). `?base_url=<origin>` variant serves the web dashboard's per-URL "Usage Left" column, falling back to the recorded anthropic 5h percent. Dashboard `api_key` auth. |
 | `GET /config-reload` | Reload config from `PROXY_CONFIG_CONSUL` or `PROXY_CONFIG_APOLLO`. Only meaningful when a remote config source is set; returns `400`/`500` otherwise. Clears the config cache and re-fetches. |
 | `GET /health` (also `GET /`) | Health check. Probes the resolved default-category / `[default_upstream]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
-| `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api-endpoints.md#dynamic-routing). |
+| `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar or Cloudflare Clef). See [Decision endpoint](#decision-endpoint-post-decision). |
+| `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
+| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
 
 A Gemini `/v1/models/{model}:...` variant exists for each `/v1beta/models/{model}:...`
 endpoint. `:countTokens` is supported too: native Gemini routes forward to Gemini
@@ -247,7 +381,7 @@ The mode is selected by the route's `defaultMode` / model config:
 |---|---|---|---|---|---|
 | `POST /v1/messages` | **Native passthrough** to `/v1/messages`; request stays Claude Messages format end-to-end. | **Direct transform**: Claude Messages → Chat Completions → Claude Messages. If input is already OpenAI-shaped, it can pass through. | **Indirect transform via `openai-completions`**: Claude Messages → Chat Completions → Responses `input` → Claude Messages. Basic tools and streaming are supported; `max_tokens` is rewritten to `max_output_tokens`. | **Direct transform**: Claude Messages → Gemini generateContent → Claude Messages. | **Direct transform**: Claude Messages → Gemini Interactions/generateContent-compatible upstream → Claude Messages. |
 | `POST /v1/responses` | **Direct transform**: Responses `input`/`instructions` → Claude Messages → Responses. Text and tool-use are supported for non-streaming and streaming. | **Direct transform**: Responses → Chat Completions → Responses. For `api.qnaigc.com`, keeps legacy `max_tokens`; otherwise uses `max_completion_tokens`. | **Native passthrough** to `/v1/responses`. | **Direct transform via Claude Messages**: Responses → Claude Messages → Gemini generateContent → Claude Messages → Responses. | **Direct transform via Claude Messages**: Responses → Claude Messages → Gemini Interactions/generateContent → Claude Messages → Responses. |
-| `POST /v1/chat/completions` | **Convert passthrough**: Chat Completions body is converted to Claude Messages format and forwarded to `/v1/messages`; response (streaming and non-streaming) is converted back to OpenAI completions format. Tool schema types are lowercased; `content: ""` on assistant messages with `tool_calls` is normalized to `null`; consecutive tool messages are grouped into one user turn. | **Native passthrough**. Uses the resolved per-model route; composite aliases and `target`-mapped model ids are resolved and the `model` field in the forwarded body is rewritten to the target model id. | **Transform passthrough**: Chat Completions body is converted to Responses `input` and forwarded to `/v1/responses` using the resolved per-model route. | **Transform passthrough**: Chat Completions body (including `image_url` blocks) is converted to Gemini `generateContent` body (`inline_data` for data-URI images; http(s) image URLs are fetched server-side with an SSRF guard) and forwarded to `:generateContent` / `:streamGenerateContent?alt=sse`. Text deltas and `finishReason` round-trip; tool-call/thinking response parts and any model-generated image output are dropped (response schemas for Claude Messages and OpenAI Completions do not carry image output — see [image I/O notes](./docs/api-endpoints.md#image-inputoutput-across-format-boundaries)). | Same as `gemini-generatecontent`; not separately wired today. |
+| `POST /v1/chat/completions` | **Convert passthrough**: Chat Completions body is converted to Claude Messages format and forwarded to `/v1/messages`; response (streaming and non-streaming) is converted back to OpenAI completions format. Tool schema types are lowercased; `content: ""` on assistant messages with `tool_calls` is normalized to `null`; consecutive tool messages are grouped into one user turn. | **Native passthrough**. Uses the resolved per-model route; composite aliases and `target`-mapped model ids are resolved and the `model` field in the forwarded body is rewritten to the target model id. | **Transform passthrough**: Chat Completions body is converted to Responses `input` and forwarded to `/v1/responses` using the resolved per-model route. | **Transform passthrough**: Chat Completions body (including `image_url` blocks) is converted to Gemini `generateContent` body (`inline_data` for data-URI images; http(s) image URLs are fetched server-side with an SSRF guard) and forwarded to `:generateContent` / `:streamGenerateContent?alt=sse`. Text deltas and `finishReason` round-trip; tool-call/thinking response parts and any model-generated image output are dropped (response schemas for Claude Messages and OpenAI Completions do not carry image output — see [image I/O notes](./docs/api/api-endpoints.md#image-inputoutput-across-format-boundaries)). | Same as `gemini-generatecontent`; not separately wired today. |
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | **Indirect transform via `openai-completions`**: generateContent → Chat Completions → Claude Messages → generateContent. Forwards upstream to `/v1/messages`; text, tool calls, and streaming text deltas return as Gemini `candidates[].content.parts`; tool calls become `functionCall` parts. | **Direct transform**: generateContent → Chat Completions → generateContent. Forwards upstream to `/v1/chat/completions`. | **Indirect transform via `openai-completions`**: generateContent → Chat Completions → Responses `input` → generateContent. Forwards upstream to `/v1/responses`; `system`/`developer` messages become Responses `instructions`; content-part arrays are normalized to text. | **Native passthrough** to `:generateContent` / `:streamGenerateContent` using the configured Gemini API version. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint using Interactions-compatible mode. |
 | `POST /v1/interactions` | **Indirect transform via `openai-completions`**: Interactions → Chat Completions → Claude Messages → Interactions. Forwards upstream to `/v1/messages`; text, tool calls, and streaming text deltas return in Interactions shape. | **Direct transform**: Interactions → Chat Completions → Interactions. Forwards upstream to `/v1/chat/completions`. | **Indirect transform via `openai-completions`**: Interactions → Chat Completions → Responses `input` → Interactions. Forwards upstream to `/v1/responses`; `system`/`developer` messages become Responses `instructions`; content-part arrays are normalized to text. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint using Interactions-compatible mode. |
 | `GET /v1/models` | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. |
@@ -258,17 +392,118 @@ Notes:
 - **Direct transform** means the proxy converts directly between the client endpoint format and the selected upstream family, then converts the response directly back to the client endpoint shape.
 - **Direct transform via Claude Messages** means Responses uses Claude Messages as its internal bridge before calling Gemini; it does not go through `openai-completions`.
 - **Indirect transform via `openai-completions`** means the request body is routed through OpenAI Chat Completions as an intermediate shape before reaching the target upstream family. This covers two cases: (a) Gemini endpoint input becomes Chat Completions, then becomes Claude Messages or OpenAI Responses; (b) `/v1/messages` routed to an `openai-responses` upstream becomes Chat Completions, then Responses `input`. This reuses the Chat Completions middle mode for code reuse while preserving the original client endpoint response shape.
-- Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/routing-review.md) for tradeoffs and recommendations.
+- Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/architecture/routing-review.md) for tradeoffs and recommendations.
 
+
+### Token usage statistics columns
+
+The TUI "Top Models" panel and the stats sidecar record token usage per request
+from the upstream response (JSON body or final SSE usage event), via
+`extractUsageFromResponsePayload` / `createUsageTrackingTransformStream`
+(`src/utils/dashboard-stats.ts`). Column semantics per endpoint:
+
+| Endpoint | in | cached | wrote | out |
+|---|---|---|---|---|
+| `/v1/messages` | `input_tokens` (uncached input only) | `cache_read_input_tokens` | `cache_creation_input_tokens` | `output_tokens` |
+| `/v1/chat/completions` | `prompt_tokens` (**includes** cached) | `prompt_cache_hit_tokens` or `prompt_tokens_details.cached_tokens` | `prompt_cache_miss_tokens` (DeepSeek-style) | `completion_tokens` |
+| `/v1/responses` | `input_tokens` | `input_tokens_details.cached_tokens` | — (always 0) | `output_tokens` |
+| `/v1beta/models/{model}:generateContent` | `promptTokenCount` (**includes** cached) | `cachedContentTokenCount` | — (always 0) | `candidatesTokenCount` |
+| `/v1/interactions` | `input_tokens` ?? `total_input_tokens` | only if upstream sends `cache_read_input_tokens` | only if upstream sends `cache_creation_input_tokens` | `output_tokens` ?? `total_output_tokens` |
+
+Notes:
+- `total` is the upstream `total_tokens` when present, else computed as `in + cached + wrote + out`.
+- For streaming chat/completions, the proxy forces `stream_options.include_usage: true` (native passthrough and converted routes alike) so the upstream emits the final usage chunk; the extra chunk is forwarded to the client unchanged.
+- Anthropic's `input_tokens` excludes cached tokens, but OpenAI Chat Completions `prompt_tokens` and Gemini `promptTokenCount` include them — so for those endpoints the computed total counts cached tokens in both `in` and `cached`.
 
 ### Endpoint details
 
-Additional endpoint behavior is documented in [`docs/api-endpoints.md`](./docs/api-endpoints.md):
+Additional endpoint behavior is documented in [`docs/api/api-endpoints.md`](./docs/api/api-endpoints.md):
 
-- **Dynamic routing** — per-request upstream override routes `/{protocol}/{host}/...` with an SSRF allowlist (`ALLOWED_HOSTS`).
+- **Dynamic routing** — per-request upstream override routes `/{protocol}/{host}/...`, disabled by default (opt in with `ENABLE_DYNAMIC_ROUTING=true`) and guarded by an SSRF allowlist (`ALLOWED_HOSTS`).
 - **Image input/output across format boundaries** — wire shapes, source-shape handling, who fetches HTTP image URLs, and the model-generated-image limits.
 - **OpenAI prompt caching fields** — which of `prompt_cache_key` / `prompt_cache_options` / `prompt_cache_breakpoint` survive each cross-mode conversion.
 - **Dashboard API** — the `/dashboard/api/*` JSON routes, optional bearer token, and stats keying by resolved model id.
+
+### Decision endpoint (`POST /decision`)
+
+An endpoint for **typed decisions** rather than generation: the caller supplies some
+state and a map of questions, and gets back a probability per question. There is no
+prompt and no completion — questions are answered in a single forward pass.
+
+The wire contract is the **Clef API**, defined by
+[`docs/api/decision/clef-schema-input.json`](./docs/api/decision/clef-schema-input.json)
+and
+[`docs/api/decision/clef-schema-output.json`](./docs/api/decision/clef-schema-output.json).
+Those two files are authoritative; the summary below is a convenience.
+
+```jsonc
+// request — required: model, state, questions
+{
+  "model": "clef",                 // "clef" or "clef-flash"
+  "state": "…",                    // string, or structured data (object/array)
+  "questions": {                   // 1–64 questions, answers return under the same ids
+    "keep": { "type": "noul",   "instructions": "Is this file safe to edit?" },
+    "plan": { "type": "choice", "instructions": "Pick a plan", "criteria": ["free", "pro"] },
+    "risk": { "type": "score",  "instructions": "Rate the risk", "legend": ["none", "low", "high"] }
+  },
+  "images": [ … ]                  // optional
+}
+
+// response — required: model, answers, usage
+{
+  "model": "clef",
+  "answers": {
+    "keep": { "type": "noul",   "noul": 0.87 },
+    "plan": { "type": "choice", "choice": "pro", "probabilities": { "free": 0.2, "pro": 0.8 }, "confidence": 0.8 },
+    "risk": { "type": "score",  "score": 1.4, "legend": { "0": "none", "1": "low", "2": "high" },
+              "probabilities": { "0": 0.1, "1": 0.4, "2": 0.5 }, "confidence": 0.5 }
+  },
+  "usage": { "input_tokens": 412, "output_tokens": 0 }
+}
+```
+
+**Configuration** — `url` is a **full endpoint**, not a base URL (the proxy POSTs to
+it verbatim, so include the path). Setting both `backend` and `url` is what enables
+the route; without them `/decision` answers `503`.
+
+```toml
+[decision]
+backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed)
+url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim
+# api_key = "optional-bearer-token"         # sent as Authorization: Bearer
+# timeout_ms = 5000                         # default: 5000 for "laya", 30000 for "cloudflare"/"clef"
+```
+
+**Two backends, differing in exactly one thing — `images`:**
+
+- **`laya`** — the local sidecar [`submodules/laya-mlx/serve_judge.py`](./submodules/laya-mlx/serve_judge.py),
+  serving this contract from the Laya typed-decisions model. Its MLX encoder is
+  text-only, so a request carrying a non-empty `images` array is rejected with `400`
+  before any upstream call. It fails loud rather than dropping the images, so a caller
+  cannot mistake a text-only answer for one that saw the image. The same token-budget
+  caveat as the tool judge applies — see the Laya context-limit note under
+  [Documentation](#documentation).
+- **`cloudflare`** — any upstream serving the Clef schemas with image support (e.g.
+  Cloudflare's `@cf/cloudflare/clef`). The `images` array is forwarded untouched, and
+  the model id in the body selects the remote model. **`clef` is an accepted equivalent
+  spelling for this backend.**
+
+**Behaviour notes:**
+
+- **Verbatim forwarding** — the request body is forwarded byte-for-byte, and the
+  upstream response body is returned byte-for-byte. The proxy implements no transport
+  of its own beyond the POST, and does no model routing or alias resolution: the
+  `model` field in the body is the upstream's business.
+- **Envelope-only validation** — the proxy checks only the top-level required fields
+  (`model`/`state`/`questions` in, `model`/`answers`/`usage` out). Per-question shapes,
+  id charset, the 1–64 question bound, and the `model` pattern are the upstream's
+  validation, and its error is forwarded.
+- **Errors pass through** — a non-2xx upstream response is returned as-is (status, body,
+  and `x-request-id`). A 2xx whose body is not JSON, or is missing the response
+  envelope, is reported as `502 Invalid upstream response`.
+- **Auth & stats apply** — the caller's credential and `[remote] auth_server` gate run
+  as for other endpoints; requests are recorded to `record_server` and appear in the
+  dashboard under the `model` from the request body.
 
 ## Model Routing & Aliases
 
@@ -284,7 +519,7 @@ Incoming model names resolve through three stacked logic levels (see the
   the proxy never sets, modifies, or caps it. **Some upstreams require `max_tokens`**
   (e.g. DeepSeek's Anthropic-compatible API rejects requests without it) — configure
   `max_tokens` on those target entries, since the proxy no longer injects a default.
-  See [`docs/configuration-reference.md`](./docs/configuration-reference.md).
+  See [`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md).
   `[models.FREE]` and `[models.EMBEDDING]` are exact-only;
   in `[models.FREE]` the configured key always wins, elsewhere the caller's key wins
   by default (`auth_passthrough_with`).
@@ -307,12 +542,12 @@ Incoming model names resolve through three stacked logic levels (see the
 > upstream model returns, not the alias they requested. To echo the requested
 > alias back instead, attach the `restore_client_model_alias` transform
 > built-in to the route — see
-> [`docs/transforms-reference.md`](./docs/transforms-reference.md#restore_client_model_alias--echo-the-requested-alias-back-to-the-client).
+> [`docs/reference/transforms-reference.md`](./docs/reference/transforms-reference.md#restore_client_model_alias--echo-the-requested-alias-back-to-the-client).
 
 The full reference — category lookup priority tables, `base_url`/`api_key` override and
 "who wins" rules, every composite/fusion/coordinator/schedule option, the token-limit
 windowing engine, and worked examples — lives in
-[`docs/routing-and-aliases.md`](./docs/routing-and-aliases.md).
+[`docs/reference/routing-and-aliases.md`](./docs/reference/routing-and-aliases.md).
 
 ## Routing Hierarchy (Logic Levels)
 
@@ -342,14 +577,14 @@ level below* gets to serve this request:
 
 
 Level-by-level details and worked request-resolution examples are in
-[`docs/routing-and-aliases.md`](./docs/routing-and-aliases.md#routing-hierarchy-logic-levels--details).
+[`docs/reference/routing-and-aliases.md`](./docs/reference/routing-and-aliases.md#routing-hierarchy-logic-levels--details).
 
 ## Deployment
 
 **Docker**
 
 ```bash
-cp proxy_config.example.toml proxy_config.toml
+cp docs/getting-started/proxy_config.example.toml proxy_config.toml
 #COMMIT=$(git rev-parse --short HEAD)
 #docker build --network=host --build-arg VERSION=$COMMIT -t model-proxy-v3:$COMMIT -t model-proxy-v3:latest .
 docker build -t model-proxy-v3 .
@@ -357,7 +592,7 @@ docker run --network host -p 8788:8788 -v $(pwd)/proxy_config.toml:/app/proxy_co
 ```
 
 For higher throughput, run several containers behind an nginx reverse proxy that load-balances across them.
-Refer to docs/nginx_conf/ for nginx configuration examples.
+Refer to docs/reference/nginx_conf/ for nginx configuration examples.
 
 ### npm
 
@@ -391,9 +626,37 @@ npx model-proxy-v3                      # or: npm i -g model-proxy-v3 && model-p
 PORT=8788 model-proxy-v3                # default port is 8788
 ```
 
-> The server reads `proxy_config.toml` from the **current working directory**.
-> When running from elsewhere, point it at the config with
+> The server reads `proxy_config.toml` from the **current working directory**;
+> when that is absent it falls back to `~/.config/model-proxy-v3/proxy_config.toml`.
+> Point it elsewhere with
 > `PROXY_CONFIG_PATH=/path/to/proxy_config.toml npx model-proxy-v3`.
+
+### Native single-file binary
+
+```bash
+npm run build:native     # -> dist/model-proxy-v3-<host-triple>
+```
+
+The output is named `<name>-<host target triple>` (e.g.
+`model-proxy-v3-x86_64-apple-darwin`), the same name the Tauri tray's
+`externalBin` stages the sidecar under, so it can be copied across unchanged.
+A ready-to-use system tray for this proxy lives in
+`git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
+its sidecar and supervises it over the `--rpc` JSON-RPC control channel
+(design: [`docs/architecture/design_tauri_tray.md`](./docs/architecture/design_tauri_tray.md)).
+
+`scripts/build-sea.js` bundles the server into one Node SEA executable. The
+output *is* a copy of the Node that built it, so that Node must be an official,
+self-contained build (nodejs.org, nvm, `actions/setup-node`). Homebrew's is a
+thin launcher over a shared `libnode` with SEA compiled out and cannot host one;
+the script detects that up front and refuses rather than failing mid-build.
+
+If `npm run build:native` fails on that check, build with an official Node
+without touching the system install:
+
+```bash
+npx --yes --package=node@22 node scripts/build-sea.js
+```
 
 ### Node response compression headers
 
@@ -414,50 +677,110 @@ fail to read the response body.
 ## Auth & Stats Service Protocol
 
 The proxy talks to two optional remote services over plain HTTP: an auth service
-(`[remote.authentication] auth_server`) that gates admission before routing, and a stats
-service (`[remote.recording] record_server`) that collects per-request usage records after
+(`[remote] auth_server`) that gates admission before routing, and a stats
+service (`[remote] record_server`) that collects per-request usage records after
 the response. The exact wire-level contract — request/response shapes, forwarded headers,
 the `one_time_auth_code` (OTAC) linkage, `auth_with_model` / `auth_with_body` timing, the
-dynamic routing override, and how to combine both services in one backend — is documented
-in [`docs/auth-stats-protocol.md`](./docs/auth-stats-protocol.md).
+auth `targets[]` failover ladder, and how to combine both services in one backend — is
+documented in [`docs/architecture/auth-stats-protocol.md`](./docs/architecture/auth-stats-protocol.md).
 
 ## Configuration Reference
 
 Most users only need `proxy_config.toml`; optional environment variables tune behavior.
 The full field-by-field reference lives in
-[`docs/configuration-reference.md`](./docs/configuration-reference.md):
+[`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md):
 
-- **TOML sections** — `[general]`, `[default_upstream]`, `[remote.authentication]`,
-  `[remote.recording]`, `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`,
-  `[dashboard]`.
+- **TOML sections** — `[general]`, `[default_upstream]`, `[remote]`,
+  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[decision]`,
+  `[dashboard]`, `[passthrough]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
   config `api_key` into the OS keychain (accounts `<target_model_id>/<base_url>` under
   the `model_proxy_v3` service) and rewrites the config file to `STORE_KEY_IN_SYSTEM`
   sentinels; sentinels are resolved from the keychain on every later load, silently, as
   long as the same `node` binary/path keeps reading them — a Node upgrade or a different
   binary path can trigger a one-time OS keychain prompt or a fatal `KeyStoreError` if
-  access is denied. Scope:
-  configured api_keys of `[models.*]` targets in the local `proxy_config.toml` only —
-  ignored for Consul/Apollo sources, N/A for composite aliases, and caller/user keys
-  from request headers are never stored. Local/dev-host feature only — fails loud when
-  no OS keychain is available (Docker, Cloudflare Workers). Requires the `@github/keytar`
-  native addon — vendored as the `submodules/node-keytar` git submodule and declared an
-  `optionalDependency`, so `npm install` links it (and builds the native binding via
-  node-gyp) only when the submodule is checked out. Setup: `git submodule update --init
-  submodules/node-keytar && npm install`. If startup fails with `Cannot find package
-  '@github/keytar'`, first check `git diff package.json`: npm prune-style runs
-  (`--dry-run --omit=dev`, `--production` — see the warning in Quick Start) can strip
-  the `optionalDependencies` block, after which no `npm install` ever re-links the
-  addon; restore it with `git checkout -- package.json && npm install`. Band-aid when
-  the submodule is unavailable: `npm i @github/keytar --no-save` (registry copy with a
-  prebuilt binary; `--no-save` keeps the `file:submodules/node-keytar` pin in
-  `package.json`).
+  keychain *access* is denied. A single sentinel with no matching keychain entry is not
+  fatal: that slot is cleared (treated as unconfigured, so the normal api_key fallback
+  applies) and reported as a config error in the TUI/dashboard/console, letting the rest
+  of the models load and the proxy start. Scope:
+  configured api_keys of `[models.*]` targets, `default_upstream.default_api_key`,
+  and `[passthrough]` target `key`s
+  in the local `proxy_config.toml` only — ignored for Consul/Apollo sources, N/A for
+  composite aliases, and caller/user keys from request headers are never stored.
+  Local/dev-host feature only — fails loud when no OS keychain is available (Docker,
+  Cloudflare Workers). Backed by the `@github/keytar` native addon, pinned in
+  `optionalDependencies` as `github:github/node-keytar#v7.10.6`: `npm install` fetches
+  it from GitHub and its install script downloads a prebuilt NAPI binary — no compiler
+  or Python needed (see the toolchain note below). A source copy is kept at
+  `submodules/node-keytar` for local development; it is not used by `npm install`.
+  If startup fails with `Cannot find package '@github/keytar'`, first check
+  `git diff package.json`: npm prune-style runs (`--dry-run --omit=dev`,
+  `--production` — see the warning in Quick Start) can strip the
+  `optionalDependencies` block, after which no `npm install` ever re-fetches the
+  addon; restore it with `git checkout -- package.json && npm install`.
+  When a sentinel's exact `<target>/<base_url>` account isn't found, resolution
+  falls back to a best-effort search across every stored account for the service
+  (`keytar.findCredentials`) — on macOS this broader enumeration can trigger its
+  own Keychain Access permission prompt in a separate GUI window (not the
+  terminal); if startup appears to hang here, check for that dialog and click
+  "Always Allow". This fallback call is bounded to 60s — if it doesn't respond
+  in time (e.g. a stuck/dismissed dialog), it fails loud with a clear timeout
+  error instead of hanging the process indefinitely.
+- **`store_key_in_system` in the win32 single-executable build** — `@github/keytar`
+  needs too many dependencies on Windows (Visual Studio Build Tools with the "Desktop
+  development with C++" workload + Python 3, via node-gyp — see the toolchain table
+  below), so on **Windows only** the executable substitutes an in-binary store and
+  keeps the keys **in its own file body**
+  (`process.execPath`, using the record format from `store-in-body`): `setPassword`
+  appends a JSON record at EOF and lookups walk the record chain backwards. No OS
+  keychain is involved, and the `proxy_config.toml` behaviour is unchanged (keys are
+  still rewritten to sentinels and resolved on later loads). Three consequences:
+  **the keys are plaintext inside the `.exe`** — that is portability, not secrecy;
+  **appending rewrites the executable**, so its directory must be writable (an
+  in-place append at EOF is tried first; otherwise the whole file is copied and
+  swapped, and either way the directory must permit writes) and a full append is
+  O(file size); and **rebuilding wipes the stored keys**, since a fresh blob is
+  injected into a fresh copy of `node`. The fallback engages only for a real SEA
+  binary whose `process.execPath` basename is not `node`/`node.exe`, so it can never
+  target a Node install. macOS and Linux keep the OS keychain via `@github/keytar`;
+  the Docker image and macOS/Linux SEA binaries keep the fatal `KeyStoreError`.
+- **System & toolchain requirements for `store_key_in_system = true`** — the feature
+  needs an OS keychain backend at run time. On macOS/Linux the `@github/keytar` native
+  addon installs as a prebuilt NAPI binary (ABI 3 — works on any modern Node), so no
+  build toolchain is required; a native toolchain (Python 3 + a C++ compiler, via
+  node-gyp) is needed only when the prebuilt download fails (e.g. no network access to
+  GitHub releases) and npm falls back to compiling the addon from source. On Windows
+  the addon needs that toolchain in the normal case — Visual Studio Build Tools with
+  the "Desktop development with C++" workload + Python 3 — which is why the win32
+  **single-executable build** skips keytar entirely and stores the keys in the
+  executable's own file body instead (see the bullet above):
+
+  | Platform | Runtime requirement (OS keychain) | Node build toolchain (node-gyp) |
+  |---|---|---|
+  | macOS | Keychain Services (built in) | Xcode Command Line Tools (`xcode-select --install`) + Python 3 — only for the source-build fallback |
+  | Linux | a Secret Service provider — `gnome-keyring` (or KWallet) daemon running, with `libsecret-1` | `build-essential` (gcc/g++/make) + Python 3 + `libsecret-1-dev` headers — only for the source-build fallback |
+  | Windows — `node dist/server.js` | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 |
+  | Windows — single-executable build | **not used** — no OS keychain, keys go in the executable's own file body (see the bullet above) | **not needed** — keytar is not installed |
+
+  Headless Linux servers need a keyring daemon unlocked in the session (e.g.
+  `gnome-keyring-daemon --start --components=secrets` with `DBus` session) or keychain
+  access fails. Unsupported environments — Docker/distroless containers, Cloudflare
+  Workers — have no OS keychain; with the flag enabled the proxy refuses to start
+  (fatal `KeyStoreError`, no silent fallback). The Docker image installs with
+  `--omit=optional --ignore-scripts`, so the addon is absent there by design.
 - **Environment variables** — core/server (`PORT`, `LOG_LEVEL`, …), config source
   (`PROXY_CONFIG_PATH` / `PROXY_CONFIG_CONSUL` / `PROXY_CONFIG_APOLLO`), token counting &
   upstream, and the privacy-filter / compression / image-encode sidecars.
 
-Also see [`proxy_config.example.toml`](./proxy_config.example.toml) and
-[`docs/README_DETAILS.md`](./docs/README_DETAILS.md).
+Also see [`proxy_config.example.toml`](./docs/getting-started/proxy_config.example.toml) and
+[`docs/getting-started/README_DETAILS.md`](./docs/getting-started/README_DETAILS.md).
+
+**Config field aliases** — The proxy accepts both canonical and short field names
+in different config contexts (e.g., `base_url`/`base`, `upstream_mode`/`mode`,
+`api_key`/`key`). The rules differ between `[models.*]` inline tables,
+section-level defaults, and `[passthrough]` entries. See
+[**Config field aliases**](./docs/reference/configuration-reference.md#config-field-aliases)
+in the configuration reference for the full mapping tables.
 
 ## Testing
 
@@ -481,18 +804,69 @@ PROXY_URL=http://localhost:8788 API_KEY=sk-test node tests/run-integration-tests
 
 The [`docs/`](./docs/) folder has deep-dives on specific topics:
 
-- **Routing & aliases** — `docs/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `proxy_config.example.toml`, `docs/routing_refactor.md`, `docs/routing_config_revision.md`
-- **API endpoint details** — `docs/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
-- **Configuration guide** — `docs/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
-- **Configuration reference** — `docs/configuration-reference.md` (all TOML sections + environment variables)
-- **Auth & stats protocol** — `docs/auth-stats-protocol.md` (wire-level contract for the remote auth/stats sidecars)
-- **Config loading** — `docs/config_loader.md`
-- **Live stats** — `docs/live-stats.md` (TUI/web dashboard, JSONL usage-dump format, startup stats restoration)
-- **Thinking / reasoning** — `docs/claude-extended-thinking.md`, `docs/claude-adaptive-thinking.md`
-- **API formats** — `docs/claude-api-reference.md`, `docs/gemini-api-reference.md`, `docs/openai-api-reference.md`
-- **Fusion & composite design** — `docs/design_fusion_composite_alias.md`
-- **Request/response transform hooks** — `docs/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transform_defaults]` config) — plus `docs/design_request_transform_hooks.md` (original design) and `docs/implementation_of_request_transform_hooks.md` (implementation log)
-- **Agent harness integrations** — [`docs/agents/`](./docs/agents/) (per-agent guides; e.g. [using this proxy as an LLM provider for deepseek-harness](./docs/agents/proxy-as-provider-for-deepseek-harness.md))
+- **Sidecar status & config** — `docs/architecture/status_of_sidecars_of_proxy.md` (summary of all sidecars: remote auth, privacy filter, image fetch, tool judge, kompress, coordinator, fusion, composite, schedule, transforms)
+- **Tool-judge sidecar (Laya) context limit** — Laya runs with a per-checkpoint token budget (`max_len`: 512 for `convaiinnovations/laya`, 1,024 for multilingual/typed-decisions) shared by question prefix + state. The proxy uses character caps (2000/600/50) that don't map to tokens; exceeding the budget silently truncates the tool list — later tools vanish from the judge's view. See `docs/architecture/design_tool_judge_sidecar_protocol.md` and `submodules/laya-mlx/README.md`.
+- **Routing & aliases** — `docs/reference/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `docs/getting-started/proxy_config.example.toml`, `docs/architecture/routing_refactor.md`, `docs/architecture/routing_config_revision.md`
+- **API endpoint details** — `docs/api/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
+- **Configuration guide** — `docs/getting-started/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
+- **Configuration reference** — `docs/reference/configuration-reference.md` (all TOML sections + environment variables)
+- **Auth & stats protocol** — `docs/architecture/auth-stats-protocol.md` (wire-level contract for the remote auth/stats sidecars)
+- **Config loading** — `docs/reference/config_loader.md`
+- **Live stats** — `docs/guides/live-stats.md` (TUI/web dashboard, JSONL usage-dump format, startup stats restoration)
+- **Thinking / reasoning** — `docs/guides/claude-extended-thinking.md`, `docs/guides/claude-adaptive-thinking.md`
+- **API formats** — `docs/api/claude-api-reference.md`, `docs/api/gemini-api-reference.md`, `docs/api/openai-api-reference.md`
+- **Fusion & composite design** — `docs/architecture/design_fusion_composite_alias.md`
+- **Request/response transform hooks** — `docs/reference/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transform_defaults]` config) — plus `docs/architecture/design_request_transform_hooks.md` (original design) and `docs/contributing/implementation_of_request_transform_hooks.md` (implementation log)
+- **Agent harness integrations** — [`docs/guides/agents/`](./docs/guides/agents/) (per-agent guides; e.g. [using this proxy as an LLM provider for deepseek-harness](./docs/guides/agents/proxy-as-provider-for-deepseek-harness.md))
+
+## Interactive agent session (optional)
+
+Start an interactive [`pi-agent-core`](https://github.com/earendil-works/pi-agent-core)
+agent session that uses the proxy's own `/v1/messages` endpoint (loopback) as its LLM
+provider — useful for exercising the proxy's routing/quotas/transforms through a real
+agent loop without a separate client:
+
+```bash
+npm run server -- --agent
+# equivalent:
+AGENT=true npm run server
+```
+
+`--agent`/`AGENT` and `--tui`/`TUI` are mutually exclusive; if both are set, `AGENT` wins
+with a warning. Either flag also enables `--dashboard` (token-stats persistence).
+
+**Flow:** pick a working directory (tools are confined to it) → system prompt loads
+`AGENTS.md`/`CLAUDE.md` from that directory, with an optional multi-select for
+already-installed `pi` skills (global `~/.pi/agent/skills` or project `.pi/skills`),
+plus skills installable on demand from other agents via the [`skills`](https://github.com/vercel-labs/skills)
+CLI → pick a model alias from `proxy_config.toml` → a verification message confirms it
+replies → set a budget (tokens and/or turns, default 50,000,000 tokens / 100 turns) →
+enter a free-text task. The agent runs with `read_file`/`write_file`/`bash` tools (plus
+`find_skill`/`add_skill` when the `skills` CLI is available, capped at 5 runtime
+installs/session) until the task completes or the budget is hit, then prompts for a
+follow-up task in the same conversation. Set `TRAJ=true` to also log the full session
+transcript to a private (`0600`), per-session file under `os.tmpdir()`.
+
+**Logging:** proxy diagnostics (every `console` level, including WARN/ERROR) are shown on a
+single dedicated row above the `──` rule rather than written to the terminal directly — a raw
+stderr write lands on the row the TUI parked the cursor on, which is the `>` input row, and
+would smear across your prompt. Only the newest line is kept: each one replaces the previous,
+truncated to the terminal width so it never wraps, and the row takes no space at all until the
+first log arrives. Console output goes back to the real stderr when the session ends, so
+background/non-agent logging is unaffected.
+
+**Dependencies:** `pi-agent-core` (bundled), and optionally the `skills` CLI
+(`npm install skills`) for the dynamic skill-install tools — omitted with a notice if
+unavailable.
+
+**Risks/limits:** ⚠️ no OS-level sandbox — `bash` runs via a plain `/bin/sh -c` child
+process with the full privileges of the user running the server. Tool safety is limited
+to non-bypassable but simple raw string/regex checks (not a real shell parser): path
+confinement to the working directory + `/tmp`, and a denylist of destructive patterns
+(`rm -rf`, `kill -9`, `git push --force`, `chmod -R 777`, piping `curl`/`wget` into a
+shell). These stop obviously destructive self-inflicted commands, not an adversarial or
+sufficiently obfuscated one. Only run agent sessions against working directories and
+models you trust. See `src/agent-tools.ts` for the exact checks.
 
 ## 🤝 Contributing
 
@@ -503,22 +877,25 @@ The [`docs/`](./docs/) folder has deep-dives on specific topics:
 
 ## Models and Tools
 ### Models Involved
-1. `DeepSeek-R1`, `V3.2`, `V4-Flash`, `V4-Pro`
+1. `DeepSeek-R1`, `V3.2`, `V4-Flash`, `V4-Pro`, `V4.1-Flash`
 2. `Minimax-M2.6`, `M2.7-highspeed`, `M3`
-4. `Kimi-K2.6`, `K2.7-Code`
-5. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`
-6. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
-7. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`
-8. `Nemotron-3-Super-120b`, `gpt-oss-120b`
-9. `GLM-5.2`, `GLM-5.3`
+3. `Kimi-K2.6`, `K2.7-Code`, `K3`
+4. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`, `GPT-5.6`
+5. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
+6. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`
+7. `Nemotron-3-Super-120b`, `gpt-oss-120b`, `Nemotron-3-ultra-550b-a55b`
+8. `GLM-5.2`, `GLM-5.3`
+9. `Qwen3.8-Max`
+10. `Grok-4.6`
 
 ### Tools Involved
-1. `Claude Code`
+1. `Claude-Code`
 2. `Kiro`
 3. `Gemini-Cli`
-4. `Pi`
+4. `Pi-Coding-Agent`
 5. `Codex`
 6. `opencode`
+7. `model_proxy_v3` (For over 90% of its lifecycle, it functions as a local LLM gateway and continuously improves itself with CC and models.)
 
 ## License
 

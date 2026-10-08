@@ -228,6 +228,7 @@ export function convertGeminiGenerateContentToClaude(
         usage: {
             input_tokens: usageMetadata?.promptTokenCount || 0,
             output_tokens: usageMetadata?.candidatesTokenCount || 0,
+            ...(usageMetadata?.cachedContentTokenCount ? { cache_read_input_tokens: usageMetadata.cachedContentTokenCount } : {}),
         },
     };
 }

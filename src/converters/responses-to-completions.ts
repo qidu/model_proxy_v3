@@ -3,14 +3,131 @@
  */
 
 import { OpenAIRequest, OpenAIMessage, OpenAIToolCall, OpenAIContent, OpenAIContentPart } from '../types/openai.js';
+import { Logger } from '../utils/logger.js';
 import { stringify } from '../utils/stringify.js';
+import { ValidationError } from '../utils/errors.js';
+
+/**
+ * Reports input items this converter did not recognize. The Responses API item
+ * union keeps growing (e.g. `program` / `program_output` for programmatic tool
+ * calling, `mcp_approval_response`, `computer_call_output`), and an unhandled
+ * item would otherwise be dropped from the upstream conversation with no trace.
+ */
+export interface ConversionWarnings {
+  logger?: Logger;
+  requestId?: string;
+}
+
+function warnUnhandledItem(type: string, warn?: ConversionWarnings): void {
+  warn?.logger?.warn(
+    warn.requestId ?? '',
+    `[responses->completions] dropped unrecognized input item type: ${type || '(missing type)'}`
+  );
+}
+
+/**
+ * Key used to stash the namespace map on the returned `OpenAIRequest` as a
+ * non-enumerable property (invisible to JSON.stringify/hooks/existing tests
+ * that assert on the request shape, but readable by handlers that need it to
+ * reverse the flattening when converting the response back).
+ */
+export const NAMESPACE_MAP_KEY = '__namespaceMap';
+
+/**
+ * Separator joining namespace-path levels and the leaf tool name in a
+ * flattened tool name (`<namespace>_Z_<tool>`, e.g. `outer_Z_nested_Z_deep_fn`).
+ * Overridable via the `NAMESPACE_SEPARATOR` env var (read once at module load,
+ * empty values fall back to the default). Must stay within the
+ * `[a-zA-Z0-9_-]` charset that Chat Completions allows for `function.name` —
+ * an out-of-charset value is rejected at startup rather than silently
+ * producing tool names the upstream refuses.
+ */
+const DEFAULT_NAMESPACE_SEPARATOR = '_Z_';
+const NAMESPACE_SEPARATOR_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+const configuredNamespaceSeparator = process.env.NAMESPACE_SEPARATOR;
+if (configuredNamespaceSeparator && !NAMESPACE_SEPARATOR_PATTERN.test(configuredNamespaceSeparator)) {
+  throw new Error(
+    `Invalid NAMESPACE_SEPARATOR ${JSON.stringify(configuredNamespaceSeparator)}: must match ` +
+    `${NAMESPACE_SEPARATOR_PATTERN} (Chat Completions restricts function.name to a-zA-Z0-9_-).`
+  );
+}
+
+export const NAMESPACE_SEPARATOR = configuredNamespaceSeparator || DEFAULT_NAMESPACE_SEPARATOR;
+
+/**
+ * Chat Completions (and Anthropic/Gemini) restrict `function.name` to 64 chars
+ * in addition to the `[a-zA-Z0-9_-]` charset. A flattened name can exceed this
+ * when namespace + tool names are long, so over-long names are shortened (see
+ * {@link shortenFlatName}) and the map records the original split.
+ */
+const MAX_FUNCTION_NAME_LENGTH = 64;
+
+/**
+ * How to restore a flattened tool name back to the Responses API shape:
+ * the bare tool `name` and its optional dot-joined `namespace` path.
+ */
+export interface NamespaceMapEntry {
+  name: string;
+  namespace?: string;
+}
+
+export type NamespaceMap = Map<string, NamespaceMapEntry>;
+
+/**
+ * Shortens an over-long flattened tool name to fit `MAX_FUNCTION_NAME_LENGTH`
+ * while staying identifiable: a readable truncated head plus a per-request
+ * monotonic counter (`<head>_<counter>`), so distinct long names never collide.
+ */
+function shortenFlatName(flatName: string, counter: { value: number }): string {
+  counter.value += 1;
+  const suffix = `_${counter.value}`;
+  return `${flatName.slice(0, MAX_FUNCTION_NAME_LENGTH - suffix.length)}${suffix}`;
+}
+
+/**
+ * Recursively flattens `{ type: "namespace", name, tools: [...] }` entries
+ * (which group `function`/`custom` tools under a shared name) into a flat
+ * list of tools. Chat Completions has no namespace concept, so each leaf
+ * tool is renamed to `<namespace>_Z_<tool>` (nested namespaces join with
+ * `_Z_` at every level, e.g. `outer_Z_nested_Z_deep_fn`) to avoid name
+ * collisions between namespaces and to preserve enough information to
+ * restore the original `name`/`namespace` split when converting a tool call
+ * back to a Responses API `function_call` output item. Names longer than
+ * `MAX_FUNCTION_NAME_LENGTH` are shortened; `namespaceMap` records the
+ * original `{ name, namespace }` under the final flat name either way.
+ */
+function flattenNamespaces(
+  tools: Array<Record<string, unknown>>,
+  namespaceMap: NamespaceMap,
+  counter: { value: number },
+  prefix = ''
+): Array<Record<string, unknown>> {
+  const flat: Array<Record<string, unknown>> = [];
+  for (const t of tools) {
+    if (t.type === 'namespace' && Array.isArray(t.tools)) {
+      const nsName = t.name as string;
+      const nsPath = prefix ? `${prefix}.${nsName}` : nsName;
+      flat.push(...flattenNamespaces(t.tools as Array<Record<string, unknown>>, namespaceMap, counter, nsPath));
+    } else if (prefix && typeof t.name === 'string') {
+      const fullName = `${prefix.replace(/\./g, NAMESPACE_SEPARATOR)}${NAMESPACE_SEPARATOR}${t.name}`;
+      const flatName = fullName.length > MAX_FUNCTION_NAME_LENGTH ? shortenFlatName(fullName, counter) : fullName;
+      namespaceMap.set(flatName, { name: t.name, namespace: prefix });
+      flat.push({ ...t, name: flatName });
+    } else {
+      flat.push(t);
+    }
+  }
+  return flat;
+}
 
 /**
  * Convert OpenAI Responses API request to Chat Completions request
  */
 export function convertResponsesToChatCompletions(
   responsesRequest: Record<string, unknown>,
-  model: string
+  model: string,
+  warn?: ConversionWarnings
 ): OpenAIRequest {
   const messages: OpenAIMessage[] = [];
 
@@ -28,6 +145,7 @@ export function convertResponsesToChatCompletions(
 
   // Convert input items to messages
   const input = responsesRequest.input;
+  let additionalTools: Array<Record<string, unknown>> = [];
   if (input) {
     if (typeof input === 'string') {
       // Simple text input - treat as user message
@@ -37,7 +155,18 @@ export function convertResponsesToChatCompletions(
       });
     } else if (Array.isArray(input)) {
       // Array of input items — use the stateful converter to thread reasoning across turns
-      messages.push(...convertInputItemsToMessages(input as Array<Record<string, unknown>>));
+      const inputItems = input as Array<Record<string, unknown>>;
+      // `{ type: "additional_tools", role: "developer", tools: [...] }` items declare
+      // extra tools for this turn. Chat Completions has no per-item tool scoping —
+      // only one flat request-level `tools` array — so collect them here and merge
+      // into the top-level `tools` conversion below (same flat→nested handling,
+      // same function-tools-only filter as `responsesRequest.tools`).
+      for (const item of inputItems) {
+        if (item.type === 'additional_tools' && Array.isArray(item.tools)) {
+          additionalTools.push(...(item.tools as Array<Record<string, unknown>>));
+        }
+      }
+      messages.push(...convertInputItemsToMessages(inputItems, warn));
     } else {
       // Object input - treat as user message
       messages.push({
@@ -72,15 +201,43 @@ export function convertResponsesToChatCompletions(
   if (responsesRequest.response_format !== undefined) {
     completionsRequest.response_format = responsesRequest.response_format as { type: 'text' | 'json_object' };
   }
-  if (responsesRequest.tools !== undefined) {
+  // Combine top-level `tools` with any `additional_tools` input items (developer-
+  // supplied extra tools for this turn — see the `input` loop above). `namespace`
+  // tools group `function`/`custom` tools under a shared name — flatten them into
+  // the same flat list before conversion (Chat Completions has no namespace concept),
+  // renaming leaf tools to `<namespace>_Z_<tool>` and recording the mapping so the
+  // response conversion can restore the original `name`/`namespace` split.
+  const namespaceMap: NamespaceMap = new Map();
+  const allTools = flattenNamespaces([
+    ...(Array.isArray(responsesRequest.tools) ? (responsesRequest.tools as Array<Record<string, unknown>>) : []),
+    ...additionalTools,
+  ], namespaceMap, { value: 0 });
+  if (allTools.length > 0) {
     // Responses API function tools use a flat format:
     //   { type: "function", name: "fn", description?: "...", parameters: {...} }
     // Chat Completions uses a nested format:
     //   { type: "function", function: { name: "fn", description?: "...", parameters: {...} } }
-    // Non-function Responses API tools (web_search_preview, file_search, etc.) are dropped.
-    const converted = (responsesRequest.tools as Array<Record<string, unknown>>)
-      .filter(t => t.type === 'function')
+    // `custom` tools (unconstrained-text tools, no `parameters`) are best-effort
+    // converted to function tools with a permissive string-input schema, since
+    // Chat Completions has no equivalent tool type.
+    // Other non-function Responses API tools (web_search_preview, file_search, mcp, etc.) are dropped.
+    const converted = allTools
+      .filter(t => t.type === 'function' || t.type === 'custom')
       .map(t => {
+        if (t.type === 'custom') {
+          warn?.logger?.warn(
+            warn.requestId ?? '',
+            `[responses->completions] best-effort converting custom tool '${t.name as string}' to a function tool (unconstrained-text input has no Chat Completions equivalent)`
+          );
+          return {
+            type: 'function' as const,
+            function: {
+              name: t.name as string,
+              ...(t.description != null ? { description: t.description as string } : {}),
+              parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] },
+            },
+          };
+        }
         if (t.function != null) {
           // Already in Chat Completions nested format — pass through as-is
           return t as unknown as { type: 'function'; function: { name: string; description?: string; parameters: any } };
@@ -138,7 +295,26 @@ export function convertResponsesToChatCompletions(
     completionsRequest.prompt_cache_key = responsesRequest.prompt_cache_key as string;
   }
 
+  if (namespaceMap.size > 0) {
+    // Non-enumerable: invisible to JSON.stringify (upstream body), before_upstream
+    // hooks, and existing tests that assert on the request's own fields.
+    Object.defineProperty(completionsRequest, NAMESPACE_MAP_KEY, {
+      value: namespaceMap,
+      enumerable: false,
+    });
+  }
+
   return completionsRequest;
+}
+
+/**
+ * Reads back the `flatName -> { name, namespace }` map attached to a request
+ * returned by {@link convertResponsesToChatCompletions}, if any namespaced
+ * tools were flattened. Used by response conversion to restore the original
+ * `name`/`namespace` split on `function_call` output items.
+ */
+export function getNamespaceMap(completionsRequest: OpenAIRequest): NamespaceMap | undefined {
+  return (completionsRequest as unknown as Record<string, unknown>)[NAMESPACE_MAP_KEY] as NamespaceMap | undefined;
 }
 
 /**
@@ -154,12 +330,19 @@ export function convertResponsesToChatCompletions(
  * require a tool_use block's tool_result to immediately follow the single
  * message that emitted it.
  */
-export function convertInputItemsToMessages(items: Array<Record<string, unknown>>): OpenAIMessage[] {
+export function convertInputItemsToMessages(items: Array<Record<string, unknown>>, warn?: ConversionWarnings): OpenAIMessage[] {
   const allMessages: OpenAIMessage[] = [];
   let pendingReasoningContent: string | null = null;
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
+    // Spec: `type` on an input item is optional and defaults to "message"
+    // when the item carries `role`/`content` (see EasyInputMessage/Message
+    // in the Responses API schema). Normalize here so downstream checks
+    // don't drop these items as unrecognized.
+    if (item.type === undefined && item.role !== undefined && item.content !== undefined) {
+      item.type = 'message';
+    }
 
     if (item.type === 'reasoning') {
       pendingReasoningContent = extractReasoningText(item) ?? pendingReasoningContent;
@@ -229,7 +412,7 @@ export function convertInputItemsToMessages(items: Array<Record<string, unknown>
       continue;
     }
 
-    const msgs = convertInputItemToMessages(item, pendingReasoningContent);
+    const msgs = convertInputItemToMessages(item, pendingReasoningContent, warn);
     if (item.type === 'message') {
       pendingReasoningContent = null;
     }
@@ -276,10 +459,16 @@ function extractAssistantMessageParts(item: Record<string, unknown>): { text: st
 /**
  * Convert a single input item to one or more messages
  */
-function convertInputItemToMessages(item: Record<string, unknown>, pendingReasoningContent?: string | null): OpenAIMessage[] {
+function convertInputItemToMessages(item: Record<string, unknown>, pendingReasoningContent?: string | null, warn?: ConversionWarnings): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
   const role = item.role as string;
   const type = item.type as string;
+
+  if (type === 'additional_tools') {
+    // Developer-supplied extra tools for this turn — consumed by the tools
+    // merge in convertResponsesToChatCompletions above. Emit nothing here.
+    return messages;
+  }
 
   if (type === 'reasoning') {
     // Standalone reasoning output item — consumed by convertInputItemsToMessages above.
@@ -340,12 +529,30 @@ function convertInputItemToMessages(item: Record<string, unknown>, pendingReason
     }
     messages.push(assistantMsg);
   } else if (type === 'function_call_output') {
-    // Tool result — map to a tool message
+    // Tool result — map to a tool message. `output` can be a string or an
+    // array of input_text/input_image/input_file parts (same union as
+    // message content), so reuse the shared converter instead of assuming string.
     messages.push({
       role: 'tool',
-      content: item.output as string ?? '',
+      content: item.output != null ? convertResponsesContentToCompletions(item.output) : '',
       tool_call_id: item.call_id as string,
     });
+  } else if (type === 'program' || type === 'program_output') {
+    // Programmatic tool calling has no Chat Completions equivalent: `program`
+    // carries a flat JavaScript `code` string (not per-tool structured calls we
+    // could map onto `tool_calls`), and its `fingerprint` is an opaque replay
+    // token the spec says "must be round-tripped" — there is nowhere in a
+    // `messages` array to carry it. Flattening to text would yield a
+    // conversation that looks intact while silently breaking program replay
+    // upstream, so refuse the request instead of degrading it.
+    throw new ValidationError(
+      `Item type '${type}' (programmatic tool calling) cannot be converted to the Chat Completions API. ` +
+      `Use an 'openai-responses' upstream to pass these items through unmodified.`
+    );
+  } else {
+    // Unrecognized item type — emit nothing, but say so rather than dropping
+    // conversation content silently.
+    warnUnhandledItem(type, warn);
   }
 
   return messages;

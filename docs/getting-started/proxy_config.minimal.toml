@@ -1,0 +1,59 @@
+# Minimal proxy_config.toml — walkthrough in docs/configuration-guide.md.
+
+# Remote auth sidecar — validates proxy endpoint auth headers.
+# (auth_* / record_* / dispatch_* keys all live in one flat [remote] table.)
+# [remote]
+# auth_server = "https://auth.example.com/validate"
+# auth_with_model = false          # when true, defers auth until after body parsing
+                                   # and forwards requested model id as x-resource-for
+# auth_with_body = false           # when true, POSTs the parsed request body to auth_server
+# auth_passthrough_with = "user_key"   # controls which key is passed upstream:
+                                       # "user_key" (default) or "config_key"
+
+# Remote stats sidecar — POSTs per-request usage records to an HTTP collector.
+# Includes request_id, endpoint, raw user_key, model, response_status, and token counters.
+# Add to the same [remote] table above:
+# record_server = "http://127.0.0.1:8080/model-usage"
+# record_response_body = false     # when true, each record also includes the constructed response body
+
+# Global upstream defaults — applied ONLY to models that are NOT claimed by
+# any `[models.*]` category section below. A model name that falls through
+# every section's exact / wildcard / catch-all lookup gets routed here.
+[default_upstream]
+default_base_url = "https://api.your-provider.com"
+# default_api_key = "your-key"   # used in config_key mode or as fallback for [models.FREE]
+
+# Claude models, spoken to in native Anthropic format
+[models.claude]
+upstream_mode = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+api_key = "your-claude-key"
+"claude-sonnet-4-6" = {}                    # exact entry; inline table {target, base_url, api_key, mode} — empty fields inherit from section
+"claude-*" = {}                             # prefix wildcard — catch-all for every other claude-* model
+
+# Gemini models, spoken to in native Gemini format
+[models.gemini]
+upstream_mode = "gemini-generatecontent"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "your-gemini-key"
+"gemini-*" = {}
+
+# Everything else goes here (OpenAI-compatible). Empty entry fields inherit
+# from the section, then from `[default_upstream]` defaults.
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://api.your-provider.com"   # section base_url overrides [default_upstream].default_base_url
+"*" = {}                                     # final catch-all for this section
+"deepseek/deepseek-v3.2" = {}
+
+# /v1/embeddings — OpenAI-compatible. The proxy appends `v1/embeddings` to
+# `base_url`, so set the **API root** (e.g. `https://integrate.api.nvidia.com`,
+# NOT `…/v1`). When `api_key` is set, it always overrides any caller-supplied
+# header on `/v1/embeddings` — see the "Who wins" tables in
+# docs/routing-and-aliases.md. Model entries are exact-match only; bare model names without
+# the upstream's required prefix (e.g. `nvidia/`) will fail at the upstream.
+[models.EMBEDDING]
+upstream_mode = "openai-completions"   # value is informational — the proxy hardcodes this for /v1/embeddings
+base_url = "https://integrate.api.nvidia.com"
+api_key = "nvapi-..."
+"nvidia/nemotron-3-embed-1b" = {}

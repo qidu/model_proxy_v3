@@ -12,9 +12,12 @@ RUN apk add --no-cache make g++
 # Copy package files first for better caching
 COPY package*.json ./
 
-# Install dependencies
-# RUN npm ci --no-audit --no-fund
-RUN npm install
+# Install dependencies.
+# --omit=optional + --ignore-scripts: skip the @github/keytar optional dependency
+# (and its prebuild-install script) — the native addon targets an OS keychain,
+# which doesn't exist in this image. store_key_in_system stays unsupported in
+# Docker (fails loud at runtime). No prod dependency relies on install scripts.
+RUN npm install --omit=optional --ignore-scripts
 
 # Copy source and build
 COPY tsconfig.json ./

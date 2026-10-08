@@ -18,7 +18,7 @@ import {
   convertOpenAIToClaudeResponse,
   convertOpenAITokenCountingToClaude,
   convertOpenAIModelsToClaude,
-  mergeClaudeModelsResponse,
+  mergeOpenAIModelsResponse,
 } from '../../src/converters/openai-to-claude.js';
 import type { OpenAIResponse } from '../../src/types/openai.js';
 
@@ -210,14 +210,15 @@ describe('convertOpenAIModelsToClaude', () => {
   });
 });
 
-describe('mergeClaudeModelsResponse', () => {
-  it('dedupes existing ids and sets first/last id', () => {
-    const out = mergeClaudeModelsResponse(
-      { data: [{ id: 'a', type: 'model', created_at: 'now', display_name: 'a' }], first_id: 'a', has_more: false, last_id: 'a' },
-      ['a', 'z'],
-    );
+describe('mergeOpenAIModelsResponse', () => {
+  it('dedupes existing ids, passes them through unchanged, and adds the rest with defaults', () => {
+    const existing = { id: 'a', object: 'model', created: 5, owned_by: 'upstream' };
+    const out = mergeOpenAIModelsResponse({ object: 'list', data: [existing] } as any, ['a', 'z']);
+    assert.equal(out.object, 'list');
     assert.deepEqual(out.data.map(m => m.id), ['a', 'z']);
-    assert.equal(out.first_id, 'a');
-    assert.equal(out.last_id, 'z');
+    assert.equal(out.data[0], existing, 'an already-present model must be reused, not re-created');
+    assert.equal(out.data[1].owned_by, 'system');
+    assert.equal(out.data[1].context_length, 262144);
+    assert.equal(out.data[1].max_tokens, 65536);
   });
 });

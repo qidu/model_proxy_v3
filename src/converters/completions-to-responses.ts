@@ -3,6 +3,7 @@
  */
 
 import { OpenAIResponse } from '../types/openai.js';
+import { NamespaceMap } from './responses-to-completions.js';
 
 /**
  * OpenAI Responses API Response format
@@ -29,6 +30,7 @@ export interface OpenAIResponsesResponse {
     arguments?: string;
     call_id?: string;
     output?: string;
+    namespace?: string;
   }>;
   usage?: {
     input_tokens: number;
@@ -50,7 +52,8 @@ export interface OpenAIResponsesResponse {
  */
 export function convertCompletionsToResponses(
   completionsResponse: OpenAIResponse,
-  model: string
+  model: string,
+  namespaceMap?: NamespaceMap
 ): OpenAIResponsesResponse {
   const responseId = `resp_${completionsResponse.id || generateResponseId()}`;
   const created_at = completionsResponse.created || Math.floor(Date.now() / 1000);
@@ -160,13 +163,16 @@ export function convertCompletionsToResponses(
     // Handle tool calls
     if (message.tool_calls && message.tool_calls.length > 0) {
       for (const toolCall of message.tool_calls) {
+        const flatName = toolCall.function?.name || '';
+        const entry = namespaceMap?.get(flatName);
         outputItems.push({
           id: toolCall.id || `tool_${Date.now()}`,
           type: 'function_call',
           status: 'completed',
-          name: toolCall.function?.name || '',
+          name: entry ? entry.name : flatName,
           arguments: toolCall.function?.arguments || '',
           call_id: toolCall.id,
+          ...(entry?.namespace ? { namespace: entry.namespace } : {}),
         });
       }
     }
@@ -238,9 +244,10 @@ export interface CompactedResponse {
  */
 export function convertCompletionsToCompactedResponse(
   completionsResponse: OpenAIResponse,
-  model: string
+  model: string,
+  namespaceMap?: NamespaceMap
 ): CompactedResponse {
-  const base = convertCompletionsToResponses(completionsResponse, model);
+  const base = convertCompletionsToResponses(completionsResponse, model, namespaceMap);
   return {
     id: base.id,
     object: 'response.compaction',

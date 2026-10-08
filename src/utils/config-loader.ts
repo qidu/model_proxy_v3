@@ -14,7 +14,8 @@ import { buildConsulKvUrl, parseConsulConfig } from './consul-loader.js';
 import type { ConsulKvEntry } from './consul-loader.js';
 import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
 import { createLogger } from './logger.js';
-import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, STORE_KEY_IN_SYSTEM } from './key-store.js';
+import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
+import { UPSTREAM_MODES } from './upstream-modes.js';
 
 // Check if we're running in Node.js environment
 const isNodeEnvironment = (typeof process !== 'undefined' && process.versions?.node) ||
@@ -31,16 +32,21 @@ export interface ProxyConfig {
     store_key_in_system?: boolean;
   };
   remote?: {
-    authentication?: {
-      auth_server?: string;
-      auth_with_model?: boolean;
-      auth_with_body?: boolean;
-      auth_passthrough_with?: 'user_key' | 'config_key';
-    };
-    recording?: {
-      record_server?: string;
-      record_response_body?: boolean;
-    };
+    // auth role — pre-route gate, fail-CLOSED
+    auth_server?: string;
+    auth_with_model?: boolean;
+    auth_with_body?: boolean;
+    auth_passthrough_with?: 'user_key' | 'config_key';
+    max_targets?: number;
+    max_target_retries?: number;
+    // recording role — post-response, fire-and-forget
+    record_server?: string;
+    record_response_body?: boolean;
+    // dispatch role — on-failure retry, fail-OPEN
+    dispatch_server?: string;
+    max_dispatches?: number;
+    dispatch_timeout_ms?: number;
+    buffer_non_sse?: boolean;
   };
   default_upstream?: {
     upstream_mode?: string;
@@ -104,6 +110,94 @@ export interface ProxyConfig {
     image_encode?: string;
     timeout_ms?: number;
   };
+  /**
+   * Passthrough targets for verbatim upstream forwarding.
+   * Key = target name, value = target config with base URL, mode, share, etc.
+   */
+  passthrough?: Record<string, PassthroughTargetConfig>;
+
+  /**
+   * Tool Judge Sidecar configuration. When set, the proxy calls the sidecar
+   * to evaluate each tool's relevance against the user prompt before forwarding.
+   * The sidecar must respond within the timeout (default 50ms) with a relevance
+   * factor for each tool. Tools below the threshold are erased from the request.
+   * Fails OPEN — any sidecar error/timeout keeps all tools.
+   *
+   * The sidecar API:
+   *   POST {url}/judge
+   *   Request: { state: string, questions: { decision: { type: "choice", instructions: string, criteria: string[] } } }
+   *   Response: { answer: { decision: { type: "choice", decision: string, probabilities: { [key]: number } } } }
+   *   Or batch mode (noul):
+   *   Request: { state: string, questions: { keep: { type: "noul", instructions: string } } }
+   *   Response: { answer: { keep: { type: "noul", items: { [toolName]: number } } } }
+   *
+   * `mode`:
+   *   - "choice": per-tool decision (default, uses "decision" question with "keep"/"discard" criteria)
+   *   - "noul": batch scoring (uses "keep" question, returns score per tool)
+   */
+  tool_judge_sidecar?: {
+    /** Sidecar base URL (e.g., "http://localhost:8765"). Required to enable. */
+    judge_url?: string;
+    /** Timeout in milliseconds (default: 50) */
+    timeout_ms?: number;
+    /** Minimum relevance threshold 0.0-1.0 (default: 0.5). Tools below are erased. */
+    threshold?: number;
+    /** Judging mode: "choice" (per-tool) or "noul" (batch). Default: "choice". */
+    mode?: 'choice' | 'noul';
+    /** Optional API key for sidecar authentication */
+    api_key?: string;
+    /** Maximum number of tools to send in a single batch request (default: 50) */
+    max_batch_tools?: number;
+  };
+
+  /**
+   * `POST /decision` — the Clef API, as defined by the two schemas in
+   * `docs/api/decision/clef-schema-input.json` and `clef-schema-output.json`.
+   * The proxy POSTs the request body to `url` verbatim and returns the upstream
+   * body verbatim; it implements no transport of its own.
+   *
+   * `backend` picks which upstream serves that contract, and only affects one
+   * thing — whether `images` are allowed:
+   *   - "laya": the local `submodules/laya-mlx` sidecar. Its MLX encoder is
+   *     text-only, so a request carrying `images` is rejected with 400.
+   *   - "cloudflare": any endpoint serving the Clef schemas with `images`
+   *     support. The `images` array is forwarded untouched. "clef" is an
+   *     accepted equivalent spelling of this backend.
+   */
+  decision?: {
+    /** Which upstream serves the Clef contract: "laya" | "cloudflare" | "clef". Required to enable. */
+    backend?: 'laya' | 'cloudflare' | 'clef';
+    /** Full endpoint URL, POSTed verbatim (e.g. "http://localhost:8765/decision"). Required to enable. */
+    url?: string;
+    /** Optional API key, sent as `Authorization: Bearer <api_key>`. */
+    api_key?: string;
+    /** Timeout in milliseconds (default: 5000 for "laya", 30000 for "cloudflare") */
+    timeout_ms?: number;
+  };
+}
+
+/**
+ * Configuration for a single passthrough target, declared as an inline table
+ * under `[passthrough]`:
+ *
+ *   [passthrough]
+ *   openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
+ *
+ * Short names are canonical here (targets are terse); the long aliases
+ * `base_url`/`url`, `api_key`/`key` and `upstream_mode`/`mode` are accepted on
+ * parse. `[models.*]` sections use the long names instead.
+ */
+export interface PassthroughTargetConfig {
+  /** Base URL (bare origin + optional path prefix). Must NOT end with an endpoint path. */
+  base: string;
+  /** Upstream mode: one of 'openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent', 'gemini-interactions' */
+  mode: string;
+  /** Weight for weighted random selection (default: 1) */
+  share?: number;
+  /** Per-target timeout override in milliseconds */
+  timeout?: number;
+  /** Optional API key for config_key auth mode */
+  key?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +217,7 @@ export type TransformOp =
   | { op: 'remove';    path: string }
   | { op: 'map_value'; path: string; from: unknown; to: unknown; when_sibling?: string };
 
-export type BuiltinName = 'lowercase_tool_schema_types' | 'recover_tool_message_name' | 'inject_missing_tool_results' | 'strip_fresh_thinking' | 'filter_anthropic_beta' | 'ensure_tool_config_cache_ttl' | 'ensure_trailing_user_message' | 'assemble_sse_chunks' | 'restore_client_model_alias';
+export type BuiltinName = 'lowercase_tool_schema_types' | 'recover_tool_message_name' | 'inject_missing_tool_results' | 'strip_fresh_thinking' | 'filter_anthropic_beta' | 'ensure_tool_config_cache_ttl' | 'ensure_trailing_user_message' | 'assemble_sse_chunks' | 'restore_client_model_alias' | 'project_program_to_node_tool';
 
 /** A named transform set declared under [transforms.<name>] */
 export interface TransformSet {
@@ -184,7 +278,7 @@ const SCHEMA_PATHS: Record<TransformSchema, Set<string>> = {
   ]),
 };
 
-const BUILTIN_NAMES: Set<BuiltinName> = new Set(['lowercase_tool_schema_types', 'recover_tool_message_name', 'inject_missing_tool_results', 'strip_fresh_thinking', 'filter_anthropic_beta', 'ensure_tool_config_cache_ttl', 'ensure_trailing_user_message', 'assemble_sse_chunks', 'restore_client_model_alias']);
+const BUILTIN_NAMES: Set<BuiltinName> = new Set(['lowercase_tool_schema_types', 'recover_tool_message_name', 'inject_missing_tool_results', 'strip_fresh_thinking', 'filter_anthropic_beta', 'ensure_tool_config_cache_ttl', 'ensure_trailing_user_message', 'assemble_sse_chunks', 'restore_client_model_alias', 'project_program_to_node_tool']);
 
 /**
  * Backward-compatible hook name aliases.
@@ -510,8 +604,16 @@ export interface ModelRouteConfig {
   upstreamMode: string;
   modelAlias?: string;
   section?: string;
+  /**
+   * Set by auth-ladder descriptors whose `key` must be applied upstream
+   * verbatim, bypassing the client passthrough / `config_key` opt-in chain.
+   * Absent for config-derived routes (which use `section === 'free'` instead).
+   */
+  explicitApiKey?: boolean;
   transforms: TransformSet[];  // resolved & merged: mode-defaults → sector-defaults → entry
   maxTokens?: number;  // per-entry default max_tokens; falls back to DEFAULT_MAX_TOKENS when unset
+  /** Per-route abort deadline (ms). Overrides the env UPSTREAM_BODY_TIMEOUT_MS default. */
+  timeout?: number;
 }
 
 export interface CompositeRouteSelection {
@@ -538,7 +640,7 @@ interface CompositeResolvedTarget {
  * Order (design doc §3b / open-question #8): mode-defaults → sector-defaults → entry transforms.
  * Each level's names are looked up from proxyConfig.transforms.
  */
-function resolveTransforms(
+export function resolveTransforms(
   upstreamMode: string,
   categoryTransforms: string | undefined,
   entryTransforms: string | undefined,
@@ -1696,6 +1798,18 @@ function serializeScheduleConfig(config: ScheduleConfig): string {
   return `{${entries.join(', ')}}`;
 }
 
+/** Serialize a passthrough target as a TOML inline table (short field names). */
+function serializePassthroughTarget(target: PassthroughTargetConfig): string {
+  const fields: string[] = [
+    `base = ${JSON.stringify(target.base)}`,
+    `mode = ${JSON.stringify(target.mode)}`,
+  ];
+  if (target.key !== undefined) fields.push(`key = ${JSON.stringify(target.key)}`);
+  if (target.share !== undefined) fields.push(`share = ${target.share}`);
+  if (target.timeout !== undefined) fields.push(`timeout = ${target.timeout}`);
+  return `{${fields.join(', ')}}`;
+}
+
 /**
  * Config validation
  */
@@ -2111,6 +2225,48 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
   // the misconfiguration is visible in the dashboard status bar / TUI.
   validateBaseUrls(config, errors);
 
+  // Validate passthrough targets
+  if (config.passthrough) {
+    const validModes = new Set<string>(UPSTREAM_MODES);
+    for (const [name, target] of Object.entries(config.passthrough)) {
+      if (!target.base || typeof target.base !== 'string') {
+        errors.push({ path: `passthrough.${name}.base`, message: 'base is required and must be a string' });
+      } else {
+        try {
+          new URL(target.base);
+        } catch {
+          errors.push({ path: `passthrough.${name}.base`, message: 'base must be a valid URL' });
+        }
+        // Warn if base ends with a version segment or known endpoint path
+        const lowerBase = target.base.toLowerCase();
+        if (lowerBase.match(/\/v\d+[a-z]*\/?$/)) {
+          warnings.push({ path: `passthrough.${name}.base`, message: `base ends with a version segment (e.g. /v1, /v1beta); with plain join this will cause duplicate version in upstream URL` });
+        }
+        const knownEndpoints = ['/v1/messages', '/v1/chat/completions', '/v1/responses', '/v1/interactions', '/v1beta/models/', '/v1/models/'];
+        for (const ep of knownEndpoints) {
+          if (lowerBase.endsWith(ep) || lowerBase.includes(ep + '/')) {
+            warnings.push({ path: `passthrough.${name}.base`, message: `base appears to contain an endpoint path (${ep}); with plain join the client's version prefix will be appended, causing double path` });
+            break;
+          }
+        }
+      }
+      if (!target.mode || typeof target.mode !== 'string') {
+        errors.push({ path: `passthrough.${name}.mode`, message: 'mode is required and must be a string' });
+      } else if (!validModes.has(target.mode)) {
+        errors.push({ path: `passthrough.${name}.mode`, message: `mode must be one of: ${Array.from(validModes).join(', ')}` });
+      }
+      if (target.share !== undefined && (typeof target.share !== 'number' || target.share <= 0)) {
+        errors.push({ path: `passthrough.${name}.share`, message: 'share must be a positive number' });
+      }
+      if (target.timeout !== undefined && (typeof target.timeout !== 'number' || target.timeout <= 0)) {
+        errors.push({ path: `passthrough.${name}.timeout`, message: 'timeout must be a positive number (ms)' });
+      }
+      if (target.key !== undefined && typeof target.key !== 'string') {
+        errors.push({ path: `passthrough.${name}.key`, message: 'key must be a string' });
+      }
+    }
+  }
+
   return { errors, warnings, valid: errors.length === 0 };
 }
 
@@ -2130,8 +2286,10 @@ function validateBaseUrls(config: ProxyConfig, errors: ConfigValidationError[]):
     if (trimmed === '') return;
     try {
       const parsed = new URL(trimmed);
-      // sdk:// is a project-internal scheme rewritten to https:// at request
-      // time by the SDK handler (see src/utils/sdk-handler.ts).
+      // sdk:// is a project-internal scheme. It is still accepted here so
+      // existing configs keep loading, but nothing serves it: the chatjimmy
+      // SDK that backed these routes was removed, so requests to an sdk://
+      // target fail loud with 501 at request time (src/utils/sdk-handler.ts).
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'sdk:') {
         errors.push({ path, message: `base_url must use http, https, or sdk protocol, got: ${parsed.protocol}` });
       }
@@ -2157,6 +2315,14 @@ function validateBaseUrls(config: ProxyConfig, errors: ConfigValidationError[]):
         if (typeof value[1] === 'string') {
           check(value[1], `models.${categoryName}.${key}.base_url`);
         }
+      }
+    }
+  }
+
+  if (config.passthrough) {
+    for (const [name, target] of Object.entries(config.passthrough)) {
+      if (target.base) {
+        check(target.base, `passthrough.${name}.base`);
       }
     }
   }
@@ -2259,15 +2425,9 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
     lines.push('');
   }
 
-  if (config.remote?.authentication) {
-    lines.push('[remote.authentication]');
-    lines.push(...serializeTomlSection(config.remote.authentication as Record<string, unknown>));
-    lines.push('');
-  }
-
-  if (config.remote?.recording) {
-    lines.push('[remote.recording]');
-    lines.push(...serializeTomlSection(config.remote.recording as Record<string, unknown>));
+  if (config.remote) {
+    lines.push('[remote]');
+    lines.push(...serializeTomlSection(config.remote as Record<string, unknown>));
     lines.push('');
   }
 
@@ -2347,6 +2507,12 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
     lines.push('');
   }
 
+  if (config.passthrough) {
+    lines.push('[passthrough]');
+    lines.push(...Object.entries(config.passthrough).map(([name, target]) => `${tomlKey(name)} = ${serializePassthroughTarget(target)}`));
+    lines.push('');
+  }
+
   return lines.join('\n').replace(/\n$/, '');
 }
 
@@ -2416,6 +2582,15 @@ export function getAllowedHostsFromConfig(config: ProxyConfig): string[] {
         if (Array.isArray(value) && value.length >= 2 && typeof value[1] === 'string' && value[1]) {
           try { hosts.add(new URL(value[1]).host); } catch { /* ignore */ }
         }
+      }
+    }
+  }
+
+  // [passthrough] target base
+  if (config.passthrough) {
+    for (const target of Object.values(config.passthrough)) {
+      if (target.base) {
+        try { hosts.add(new URL(target.base).host); } catch { /* ignore */ }
       }
     }
   }
@@ -2523,10 +2698,20 @@ export async function loadProxyConfig(env: Env): Promise<ProxyConfig> {
     // and resolve existing sentinels back to real keys. LOCAL FILE SOURCE
     // ONLY (PROXY_CONFIG_PATH) — the feature is skipped for Consul/Apollo
     // configs, which cannot be rewritten and must not touch the keychain.
-    // Throws a fatal error when the keychain is unavailable or a sentinel
-    // cannot be resolved — no silent fallback.
+    // Throws a fatal error when the keychain itself is unavailable (affects
+    // every sentinel); an individual sentinel that can't be resolved is
+    // instead cleared to '' and reported below — one bad key must not block
+    // every other model from loading (Rule 8: fail loud, not fail everything).
     if (configPath && !configConsul && !configApollo) {
-      config = await applySystemKeyStore(config, { configPath });
+      const keyStoreResult = await applySystemKeyStore(config, { configPath });
+      config = keyStoreResult.config;
+      if (keyStoreResult.unresolved.length > 0) {
+        const meta = config as unknown as { _validationErrors?: ConfigValidationError[] };
+        meta._validationErrors = [
+          ...(meta._validationErrors ?? []),
+          ...keyStoreResult.unresolved.map((u) => ({ path: u.location, message: u.message })),
+        ];
+      }
     } else {
       if (config.general?.store_key_in_system === true) {
         console.warn('[key-store] store_key_in_system is only supported for local PROXY_CONFIG_PATH configs — ignoring it (Consul/Apollo source)');
@@ -2616,6 +2801,14 @@ export function parseSimpleToml(content: string): ProxyConfig {
   const seenSections = new Set<string>();
   // Track seen keys per section+category, e.g. "models.gemini/api_key"
   const seenKeys = new Set<string>();
+  // Field-name errors detected while parsing (a short alias used where only the
+  // long name is accepted, e.g. `mode` in a [models.*] section). Merged into
+  // validateProxyConfig's result below so they reach the TUI/dashboard.
+  const sectionFieldErrors: ConfigValidationError[] = [];
+  // Same idea for header-level problems that are not fatal (unknown section
+  // header, bare [transforms]). Kept separate from sectionFieldErrors so they
+  // surface as warnings rather than blocking startup.
+  const sectionFieldWarnings: ConfigValidationError[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
@@ -2682,32 +2875,73 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'dashboard';
         currentCategory = null;
         config.dashboard = {};
-      } else if (parts[0] === 'remote' && (parts[1] === 'authentication' || parts[1] === 'recording')) {
-        currentSection = 'remote';
-        currentCategory = parts[1];
-        if (!config.remote) config.remote = {};
-        if (currentCategory === 'authentication') {
-          config.remote.authentication = {};
+      } else if (parts[0] === 'remote') {
+        if (parts[1] === 'authentication' || parts[1] === 'recording') {
+          console.warn(`[config] [remote.${parts[1]}] is removed — use the flat [remote] table with prefixed keys (auth_* / record_* / dispatch_*) instead. Keys under this section are IGNORED.`);
+          currentSection = 'remote_deprecated';
+          currentCategory = null;
         } else {
-          config.remote.recording = {};
+          currentSection = 'remote';
+          currentCategory = null;
+          if (!config.remote) config.remote = {};
         }
       } else if (parts[0] === 'privacy_filter') {
         currentSection = 'privacy_filter';
         currentCategory = null;
         config.privacy_filter = {};
+      } else if (parts[0] === 'tool_judge_sidecar') {
+        currentSection = 'tool_judge_sidecar';
+        currentCategory = null;
+        config.tool_judge_sidecar = {};
+      } else if (parts[0] === 'decision') {
+        currentSection = 'decision';
+        currentCategory = null;
+        config.decision = {};
       } else if (parts[0] === 'fetch') {
         currentSection = 'fetch';
         currentCategory = null;
         config.fetch = {};
-      } else if (parts[0] === 'transforms' && parts[1]) {
-        currentSection = 'transforms';
-        currentCategory = parts[1];
-        if (!config.transforms) config.transforms = {};
-        config.transforms[currentCategory] = { name: currentCategory, schema: 'openai-completions' };
+      } else if (parts[0] === 'transforms') {
+        if (!parts[1]) {
+          // A bare [transforms] names no transform set, so it matches no branch
+          // below and its keys would be absorbed into whatever section preceded
+          // it. Report it and drop the keys instead.
+          sectionFieldWarnings.push({
+            path: 'transforms',
+            message: `[transforms] needs a name — use [transforms.<name>]; keys under [transforms] at line ${i + 1} are ignored`,
+          });
+          currentSection = null;
+          currentCategory = null;
+        } else {
+          currentSection = 'transforms';
+          currentCategory = parts[1];
+          if (!config.transforms) config.transforms = {};
+          config.transforms[currentCategory] = { name: currentCategory, schema: 'openai-completions' };
+        }
       } else if (parts[0] === 'transform_defaults') {
         currentSection = 'transform_defaults';
         currentCategory = null;
         if (!config.transform_defaults) config.transform_defaults = {};
+      } else if (parts[0] === 'passthrough') {
+        currentSection = 'passthrough';
+        currentCategory = null;
+        if (!config.passthrough) config.passthrough = {};
+        if (parts[1]) {
+          console.warn(`[config] [passthrough.${parts[1]}] sections are not supported at line ${i + 1} — declare targets as inline tables under [passthrough]: ${parts[1]} = {base = "...", mode = "..."}`);
+        }
+      } else {
+        // No branch claims this header. Leaving currentSection as it was would
+        // make every following key land in the PREVIOUS section instead of being
+        // dropped — that is how the missing [tool_judge_sidecar] branch once sent
+        // the sidecar's keys into [privacy_filter] with no message at all, which
+        // left `judgeTools` permanently disabled. Point currentSection at nothing
+        // so the keys are discarded, and say so.
+        sectionFieldWarnings.push({
+          path: section,
+          message: `unknown section header at line ${i + 1} — keys under it are ignored (check for a typo, or a section this version does not support)`,
+        });
+        currentSection = null;
+        currentCategory = null;
       }
       continue;
     }
@@ -2735,17 +2969,17 @@ export function parseSimpleToml(content: string): ProxyConfig {
         } else if (cleanKey === 'week_start_day') {
           (config.general as any)[cleanKey] = value === 'sunday' ? 'sunday' : 'monday';
         }
-      } else if (currentSection === 'remote' && currentCategory === 'authentication' && config.remote?.authentication) {
-        if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with') {
-          (config.remote.authentication as any)[cleanKey] = value;
-        } else if (cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body') {
-          (config.remote.authentication as any)[cleanKey] = value === 'true';
-        }
-      } else if (currentSection === 'remote' && currentCategory === 'recording' && config.remote?.recording) {
-        if (cleanKey === 'record_server') {
-          config.remote.recording.record_server = value;
-        } else if (cleanKey === 'record_response_body') {
-          config.remote.recording.record_response_body = value === 'true';
+      } else if (currentSection === 'remote' && config.remote) {
+        if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with'
+          || cleanKey === 'record_server' || cleanKey === 'dispatch_server') {
+          (config.remote as any)[cleanKey] = value;
+        } else if (cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body'
+          || cleanKey === 'record_response_body' || cleanKey === 'buffer_non_sse') {
+          (config.remote as any)[cleanKey] = value === 'true';
+        } else if (cleanKey === 'max_targets' || cleanKey === 'max_target_retries'
+          || cleanKey === 'max_dispatches' || cleanKey === 'dispatch_timeout_ms') {
+          const n = Number(value);
+          if (Number.isFinite(n) && n >= 0) (config.remote as any)[cleanKey] = n;
         }
       } else if (currentSection === 'default_upstream' && config.default_upstream) {
         (config.default_upstream as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, value);
@@ -2753,6 +2987,16 @@ export function parseSimpleToml(content: string): ProxyConfig {
         const category = config.models[currentCategory] as ModelCategoryConfig;
         if (cleanKey === 'upstream_mode' || cleanKey === 'base_url' || cleanKey === 'api_key') {
           category[cleanKey] = value;
+        } else if (cleanKey === 'mode' || cleanKey === 'url' || cleanKey === 'key') {
+          // A [models.*] section takes ONLY the long names; the short aliases
+          // belong to inline entries and [passthrough] targets. Silently
+          // dropping the key would lose base_url/mode/key with no message, so
+          // report it (surfaced in the TUI/dashboard status).
+          const longName = cleanKey === 'mode' ? 'upstream_mode' : cleanKey === 'url' ? 'base_url' : 'api_key';
+          sectionFieldErrors.push({
+            path: `models.${currentCategory}.${cleanKey}`,
+            message: `short field name is not accepted in a [models.*] section — use ${longName}`,
+          });
         }
       } else if (currentSection === 'composite' && config.composite) {
         config.composite[cleanKey] = parseCompositeModelConfig(value);
@@ -2765,6 +3009,18 @@ export function parseSimpleToml(content: string): ProxyConfig {
         // numeric thresholds are coerced in the unquoted branch below.
         if (cleanKey === 'filter_mode' || cleanKey === 'filter_url' || cleanKey === 'whitelist_file') {
           (config.privacy_filter as any)[cleanKey] = value;
+        }
+      } else if (currentSection === 'tool_judge_sidecar' && config.tool_judge_sidecar) {
+        // judge_url, mode and api_key are stored as strings; the numeric keys
+        // are coerced in the unquoted branch below.
+        if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
+          (config.tool_judge_sidecar as any)[cleanKey] = value;
+        }
+      } else if (currentSection === 'decision' && config.decision) {
+        // backend, url and api_key are stored as strings; timeout_ms is coerced
+        // in the unquoted branch below.
+        if (cleanKey === 'backend' || cleanKey === 'url' || cleanKey === 'api_key') {
+          (config.decision as any)[cleanKey] = value;
         }
       } else if (currentSection === 'fetch' && config.fetch) {
         if (cleanKey === 'image_encode') {
@@ -2815,11 +3071,11 @@ export function parseSimpleToml(content: string): ProxyConfig {
           if (kv) fields[kv[1]] = kv[2] !== undefined ? kv[2] : kv[3];
         }
         // Inline model tables accept both canonical and short aliases:
-        //   target; upstream_mode | mode; base_url | url; api_key | key.
+        //   target; upstream_mode | mode; base_url | base; api_key | key.
         // Canonical (upstream_mode/base_url/api_key) wins when both are present.
         const target = fields['target'] ?? cleanKey;
         const mode = fields['upstream_mode'] ?? fields['mode'] ?? '';
-        const baseUrl = fields['base_url'] ?? fields['url'] ?? '';
+        const baseUrl = fields['base_url'] ?? fields['base'] ?? '';
         const apiKey = fields['api_key'] ?? fields['key'] ?? '';
         const entry: string[] = [target, baseUrl, apiKey, mode];
         if (fields['transforms']) entry.push(fields['transforms']);
@@ -2830,6 +3086,54 @@ export function parseSimpleToml(content: string): ProxyConfig {
         }
         const category = config.models[currentCategory] as ModelCategoryConfig;
         category[cleanKey] = entry as [string, string, string, string, string];
+        continue;
+      }
+    }
+
+    // Handle passthrough inline-table entries:
+    //   openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
+    // Short names are canonical; the long aliases (base_url|url, api_key|key,
+    // upstream_mode|mode) are accepted for symmetry with [models.*] entries.
+    if (currentSection === 'passthrough' && config.passthrough) {
+      const ptTableMatch = trimmedNoComment.match(/^"?([^"=]+)"?\s*=\s*(\{[^{}]*\})$/);
+      if (ptTableMatch) {
+        const cleanKey = ptTableMatch[1].trim().replace(/^"|"$/g, '');
+        const seenKeyIdTable = `${currentSection}/${cleanKey}`;
+        if (seenKeys.has(seenKeyIdTable)) {
+          console.warn(`[config] duplicate key "${cleanKey}" in [passthrough] at line ${i + 1} — earlier value is overwritten`);
+        }
+        seenKeys.add(seenKeyIdTable);
+        const tableBody = ptTableMatch[2].slice(1, -1); // strip outer braces
+        const fields: Record<string, string> = {};
+        // Split on top-level commas only — must not split inside quoted values.
+        const fieldParts: string[] = [];
+        let buf = '';
+        let inQuote = false;
+        for (let ci = 0; ci < tableBody.length; ci++) {
+          const ch = tableBody[ci];
+          if (ch === '"') inQuote = !inQuote;
+          if (ch === ',' && !inQuote) {
+            fieldParts.push(buf);
+            buf = '';
+          } else {
+            buf += ch;
+          }
+        }
+        if (buf.trim()) fieldParts.push(buf);
+        for (const field of fieldParts) {
+          // Values are quoted strings, or bare numbers (share = 3, timeout = 600000).
+          const kv = field.trim().match(/^(\w+)\s*=\s*(?:"([^"]*)"|(\d+))$/);
+          if (kv) fields[kv[1]] = kv[2] !== undefined ? kv[2] : kv[3];
+        }
+        const target: PassthroughTargetConfig = {
+          base: fields['base'] ?? fields['base_url'] ?? fields['url'] ?? '',
+          mode: fields['mode'] ?? fields['upstream_mode'] ?? '',
+        };
+        const key = fields['key'] ?? fields['api_key'];
+        if (key !== undefined) target.key = key;
+        if (fields['share'] !== undefined) target.share = Number(fields['share']);
+        if (fields['timeout'] !== undefined) target.timeout = Number(fields['timeout']);
+        config.passthrough[cleanKey] = target;
         continue;
       }
     }
@@ -3040,23 +3344,42 @@ export function parseSimpleToml(content: string): ProxyConfig {
             (config.privacy_filter as any)[cleanKey] = cleanValueAny;
           }
         }
+      } else if (currentSection === 'tool_judge_sidecar' && config.tool_judge_sidecar) {
+        if (typeof cleanValueAny === 'number') {
+          if (cleanKey === 'timeout_ms' || cleanKey === 'threshold' || cleanKey === 'max_batch_tools') {
+            (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
+          }
+        } else if (typeof cleanValueAny === 'string') {
+          if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
+            (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
+          }
+        }
+      } else if (currentSection === 'decision' && config.decision) {
+        if (typeof cleanValueAny === 'number') {
+          if (cleanKey === 'timeout_ms') {
+            (config.decision as any)[cleanKey] = cleanValueAny;
+          }
+        } else if (typeof cleanValueAny === 'string') {
+          if (cleanKey === 'backend' || cleanKey === 'url' || cleanKey === 'api_key') {
+            (config.decision as any)[cleanKey] = cleanValueAny;
+          }
+        }
       } else if (currentSection === 'fetch' && config.fetch) {
         if (cleanKey === 'timeout_ms' && typeof cleanValueAny === 'number') {
           config.fetch.timeout_ms = cleanValueAny;
         } else if (cleanKey === 'image_encode' && typeof cleanValueAny === 'string') {
           config.fetch.image_encode = cleanValueAny;
         }
-      } else if (currentSection === 'remote' && currentCategory === 'recording' && config.remote?.recording) {
-        if (cleanKey === 'record_server' && typeof cleanValueAny === 'string') {
-          config.remote.recording.record_server = cleanValueAny;
-        } else if (cleanKey === 'record_response_body' && typeof cleanValueAny === 'boolean') {
-          config.remote.recording.record_response_body = cleanValueAny;
-        }
-      } else if (currentSection === 'remote' && currentCategory === 'authentication' && config.remote?.authentication) {
-        if ((cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body') && typeof cleanValueAny === 'boolean') {
-          (config.remote.authentication as any)[cleanKey] = cleanValueAny;
-        } else if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with') {
-          (config.remote.authentication as any)[cleanKey] = cleanValueAny;
+      } else if (currentSection === 'remote' && config.remote) {
+        if ((cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with'
+          || cleanKey === 'record_server' || cleanKey === 'dispatch_server') && typeof cleanValueAny === 'string') {
+          (config.remote as any)[cleanKey] = cleanValueAny;
+        } else if ((cleanKey === 'auth_with_model' || cleanKey === 'auth_with_body'
+          || cleanKey === 'record_response_body' || cleanKey === 'buffer_non_sse') && typeof cleanValueAny === 'boolean') {
+          (config.remote as any)[cleanKey] = cleanValueAny;
+        } else if ((cleanKey === 'max_targets' || cleanKey === 'max_target_retries'
+          || cleanKey === 'max_dispatches' || cleanKey === 'dispatch_timeout_ms') && typeof cleanValueAny === 'number') {
+          if (cleanValueAny >= 0) (config.remote as any)[cleanKey] = cleanValueAny;
         }
       }
       continue;
@@ -3065,6 +3388,8 @@ export function parseSimpleToml(content: string): ProxyConfig {
 
   // Validate config and log errors/warnings
   const validation = validateProxyConfig(config);
+  validation.errors.push(...sectionFieldErrors);
+  validation.warnings.push(...sectionFieldWarnings);
   for (const err of validation.errors) {
     const level = err.message.includes('Routing cycle detected') ? '[FATAL]' : '[ERROR]';
     console.error(`${level} ${err.path}: ${err.message}`);
@@ -3200,6 +3525,7 @@ export interface DashboardConfigPayload {
   global_token_limit?: string;
   remote_auth_active: boolean;
   remote_recording_active: boolean;
+  remote_dispatch_active: boolean;
   privacy_filter_active: boolean;
   /** True when every configured api_key in the local file is a STORE_KEY_IN_SYSTEM sentinel. */
   api_keys_in_system_store?: boolean;
@@ -3224,6 +3550,15 @@ function sanitizeDashboardCategoryConfig(categoryConfig: ModelCategoryConfig): D
       sanitized[key] = [value[0] || '', value[1] || '', value[3] || ''];
     } else if (typeof value === 'string') {
       sanitized[key] = value;
+    } else if (value && typeof value === 'object') {
+      // Inline-table entry (e.g. `bbb = {target = "...", base_url = "...", api_key = "...", mode = "..."}`).
+      // Same shape as the array case: [target, base_url, mode], api_key stripped.
+      const entry = value as Record<string, unknown>;
+      sanitized[key] = [
+        typeof entry.target === 'string' ? entry.target : '',
+        typeof entry.base_url === 'string' ? entry.base_url : '',
+        typeof entry.mode === 'string' ? entry.mode : '',
+      ];
     }
   }
 
@@ -3366,8 +3701,9 @@ export function toDashboardConfigPayload(config: ProxyConfig): DashboardConfigPa
     config_warnings: (config as unknown as { _validationWarnings?: ConfigValidationError[] })._validationWarnings ?? [],
     global_token_limit: config.general?.global_token_limit,
     api_keys_in_system_store: !!(config as ProxyConfig & { _api_keys_in_system_store?: boolean })._api_keys_in_system_store,
-    remote_auth_active: !!config.remote?.authentication?.auth_server,
-    remote_recording_active: !!config.remote?.recording?.record_server,
+    remote_auth_active: !!config.remote?.auth_server,
+    remote_recording_active: !!config.remote?.record_server,
+    remote_dispatch_active: !!config.remote?.dispatch_server,
     privacy_filter_active: !!config.privacy_filter?.filter_mode,
   };
 }
@@ -4029,6 +4365,91 @@ export function removeCompositeTarget(baseConfig: ProxyConfig, alias: string, ta
   return nextConfig;
 }
 
+export interface ModelTargetPatch {
+  target: string;
+  base_url: string;
+  api_key: string;
+  mode: string;
+}
+
+/**
+ * Add or update a `[models.<category>]` entry. `aliasKey` is the client-facing
+ * name the entry is keyed under; `patch.target` is the upstream model id
+ * (index 0 of the on-disk array). Internal entries are
+ * `[target, base_url, api_key, mode, transforms, max_tokens]` — this function
+ * only owns indices 0-3 and carries indices 4-5 over unchanged when editing.
+ */
+export function upsertModelTarget(
+  baseConfig: ProxyConfig,
+  category: string,
+  aliasKey: string,
+  patch: ModelTargetPatch,
+): ProxyConfig {
+  const categoryName = assertNonEmptyCompositeName('alias', category);
+  const key = assertNonEmptyCompositeName('target model', aliasKey);
+  const target = patch.target.trim();
+  if (!target) {
+    throw new Error('Target model id is required');
+  }
+  if (!(UPSTREAM_MODES as readonly string[]).includes(patch.mode)) {
+    throw new Error(`Invalid upstream mode: ${patch.mode} — must be one of ${UPSTREAM_MODES.join(', ')}`);
+  }
+
+  const nextModels: Record<string, ModelCategoryConfig | ModelArrayConfig> = { ...(baseConfig.models || {}) };
+  const existingCategory = nextModels[categoryName];
+  const nextCategory: ModelCategoryConfig = (existingCategory && !Array.isArray(existingCategory))
+    ? { ...existingCategory }
+    : {};
+
+  const existingEntry = nextCategory[key];
+  const [, , existingApiKey, , transforms, max_tokens] = Array.isArray(existingEntry) ? existingEntry : [];
+  // The sentinel is only ever safe when it already sat in this exact slot
+  // (edit, left untouched) — applySystemKeyStore backs it with a real
+  // keychain entry in that case. A hand-typed sentinel (add, or edit where
+  // it wasn't already that value) has no such entry and would resolve
+  // against whatever stale/unrelated keychain item happens to share the
+  // account (wrong key, no error) instead of failing loud. See CHANGELOG.
+  if (patch.api_key === STORE_KEY_IN_SYSTEM && existingApiKey !== STORE_KEY_IN_SYSTEM) {
+    throw new Error(
+      `api_key cannot be the literal "${STORE_KEY_IN_SYSTEM}" — that sentinel is only written by the system key store` +
+      ` after it stores a real key; type the actual key instead.`,
+    );
+  }
+  // Blank api_key: before falling through to empty (→ category api_key at
+  // resolve time), check sibling entries in this same category for one
+  // already backed by the system keychain (STORE_KEY_IN_SYSTEM) whose
+  // effective base_url (entry base_url, falling back to the category's)
+  // matches this entry's — same base_url-only scoring the keychain
+  // best-effort resolver uses, target name intentionally not considered.
+  // If found, adopt the sentinel so this entry resolves from the same
+  // keychain account instead of silently landing on category api_key.
+  let apiKey = patch.api_key;
+  if (!apiKey.trim()) {
+    const categoryBaseUrl = nextCategory.base_url ?? '';
+    const wantedBaseUrl = patch.base_url || categoryBaseUrl;
+    let bestScore = -1;
+    for (const [siblingKey, siblingEntry] of Object.entries(nextCategory)) {
+      if (siblingKey === key || !Array.isArray(siblingEntry) || siblingEntry.length < 3) continue;
+      if (siblingEntry[2] !== STORE_KEY_IN_SYSTEM) continue;
+      const siblingBaseUrl = (siblingEntry[1] as string) || categoryBaseUrl;
+      const score = scoreBaseUrlMatch(wantedBaseUrl, siblingBaseUrl);
+      if (score > bestScore) bestScore = score;
+    }
+    if (bestScore >= 0) {
+      apiKey = STORE_KEY_IN_SYSTEM;
+    }
+  }
+  const nextEntry: string[] = [target, patch.base_url, apiKey, patch.mode];
+  if (transforms !== undefined || max_tokens !== undefined) {
+    nextEntry.push(transforms ?? '', max_tokens ?? '');
+  }
+
+  nextCategory[key] = nextEntry;
+  nextModels[categoryName] = nextCategory;
+
+  return { ...baseConfig, models: nextModels };
+}
+
 function cloneScheduleConfig(schedule: ProxyConfig['schedule']): Record<string, ScheduleConfig> {
   const nextSchedule: Record<string, ScheduleConfig> = {};
 
@@ -4253,24 +4674,28 @@ export function loadProxyConfigFromPath(configPath: string): ProxyConfig {
 export interface OpenClawProviderModelConfig {
   id: string;
   name?: string;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   contextWindow?: number;
   maxTokens?: number;
-  reasoning?: boolean;
   [key: string]: unknown;
 }
 
 export interface OpenClawProviderConfig {
-  id: string;
   baseUrl?: string;
   apiKey?: string;
-  apiSchema?: 'anthropic-messages' | 'openai-completions';
+  auth?: string;
+  api?: 'anthropic-messages' | 'openai-completions';
   models?: OpenClawProviderModelConfig[];
   [key: string]: unknown;
 }
 
 export interface OpenClawConfig {
   models?: {
-    providers?: OpenClawProviderConfig[];
+    mode?: string;
+    /** Providers keyed by provider id (not an array). */
+    providers?: Record<string, OpenClawProviderConfig>;
     [key: string]: unknown;
   };
   agents?: {
@@ -4293,6 +4718,30 @@ export const DEFAULT_OPENCLAW_CONFIG_PATH = join(homedir(), '.openclaw', 'opencl
 export function resolveOpenClawConfigPath(configPath?: string | null): string {
   const trimmed = configPath?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_OPENCLAW_CONFIG_PATH;
+}
+
+const CWD_PROXY_CONFIG_PATH = './proxy_config.toml';
+export const HOME_PROXY_CONFIG_PATH = join(homedir(), '.config', 'model-proxy-v3', 'proxy_config.toml');
+
+/**
+ * Resolve the proxy config path when PROXY_CONFIG_PATH is unset: the working
+ * directory (a repo checkout in dev, where the historical './proxy_config.toml'
+ * default still applies), else ~/.config/model-proxy-v3/proxy_config.toml —
+ * returned even when it does not exist, with its directory created, so a
+ * missing config fails with a path the user (or the tray) can drop a file into
+ * rather than a bare relative name.
+ *
+ * Deliberately not derived from the executable's directory: under
+ * `node dist/server.js` that is the Node install, and the tray passes
+ * PROXY_CONFIG_PATH explicitly rather than relying on a path next to the SEA
+ * binary.
+ */
+export function resolveDefaultProxyConfigPath(): string {
+  if (existsSync(CWD_PROXY_CONFIG_PATH)) {
+    return CWD_PROXY_CONFIG_PATH;
+  }
+  mkdirSync(dirname(HOME_PROXY_CONFIG_PATH), { recursive: true });
+  return HOME_PROXY_CONFIG_PATH;
 }
 
 export function loadOpenClawConfigFromPath(configPath = DEFAULT_OPENCLAW_CONFIG_PATH): OpenClawConfig {

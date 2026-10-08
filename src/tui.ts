@@ -9,7 +9,7 @@ import {
   Input,
   ProcessTerminal,
   SelectList,
-  TUI,
+  TuiMainScreen,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -18,6 +18,7 @@ import {
   addCompositeAliasFromDashboard,
   addScheduleAliasFromDashboard,
   getDashboardSnapshot,
+  getModelTargetFromDashboard,
   removeCompositeAliasFromDashboard,
   removeCompositeTargetFromDashboard,
   removeScheduleAliasFromDashboard,
@@ -26,6 +27,7 @@ import {
   upsertCompositeTargetFromDashboard,
   upsertFusionOptionsFromDashboard,
   upsertGlobalTokenLimitFromDashboard,
+  upsertModelTargetFromDashboard,
   upsertScheduleTargetFromDashboard,
 } from './handlers/dashboard.js';
 import { getConfiguredModelIds, getCompositeAliasMode, type ScheduleWindow, type ScheduleDaysSpec } from './utils/config-loader.js';
@@ -33,12 +35,14 @@ import { buildHeatmap, renderHeatmapPanel, buildMonthlyHeatmap, renderMonthlyHea
 import { dumpTodayTokens, TOKEN_LOG_FILE, getActiveRequestCount, getTokensInWindowSince, getLiveTokens, blockTool, unblockTool, isToolBlocked, parseWindowSpec, getWindowCutoff } from './utils/dashboard-stats.js';
 import type { Env } from './types/shared.js';
 import type { ConfigValidationError } from './utils/config-loader.js';
-import type { ProxyConfig, FusionRole, FusionOptions } from './utils/config-loader.js';
+import type { ProxyConfig, FusionRole, FusionOptions, ModelTargetPatch } from './utils/config-loader.js';
 import { parseHumanTokenLimit, formatTokenLimit } from './utils/config-loader.js';
 import { formatApiKeyForUpstream } from './utils/routing.js';
 import { KEY_STORE_SERVICE, listSystemKeychainAccounts } from './utils/key-store.js';
 import { getModelRouteConfig } from './utils/config-loader.js';
 import { getModelQuota, formatQuota, formatQuotaLeft, getUpstreamRateLimitLeft, getUpstreamRateLimitLeftForUrl, type QuotaResult } from './utils/provider-quota.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const TEST_ENDPOINT = '/v1/messages';
 const TEST_TOOL_NAME = 'test_tool';
@@ -484,9 +488,9 @@ class PromptOverlay implements Component, Focusable {
   }
 }
 
-/** Strip the Ç/ƒ/Ö marker suffix used for duplicate disambiguation. */
+/** Strip the ᙅ/Ƒ/Ö marker suffix used for duplicate disambiguation. */
 function stripModelMarker(value: string): string {
-  return / [ÇƒÖ]$/.test(value) ? value.replace(/ [ÇƒÖ]$/, '').trim() : value;
+  return / [ᙅƑÖ]$/.test(value) ? value.replace(/ [ᙅƑÖ]$/, '').trim() : value;
 }
 
 /** Per-row quota data for the 'Model Quota' picker, keyed by choice value. */
@@ -752,10 +756,10 @@ class CompositeAliasesOverlay implements Component, Focusable {
       // request and would otherwise show a stale value right after an edit.
       const windowDuration = aliasLimit?.duration ?? '';
       const aliasSummary = aliasLimit !== undefined && aliasLimit.num > 0
-        ? ` ${dim(fmt(windowUsed))} ${dim('/')} ${dim('(')}${dim(fmt(aliasLimit.num) + '/' + windowDuration)}${dim(')')}${dim(bold('└'))}`
+        ? ` ${dim(fmt(windowUsed))} ${dim('/')} ${dim('(')}${dim(fmt(aliasLimit.num) + '/' + windowDuration)}${dim(')')}${dim(bold('𝕋'))}`
         : '';
       const aliasMode = snap.config ? getCompositeAliasMode(alias, snap.config) : undefined;
-      const aliasTag = aliasMode === 'fusion' ? dim(' ƒ') : aliasMode === 'coordinator' ? dim(' Ö') : dim(' Ç');
+      const aliasTag = aliasMode === 'fusion' ? dim(' Ƒ') : aliasMode === 'coordinator' ? dim(' Ö') : dim(' ᙅ');
       const hasError = compositeErrors.some((e) => e.path === `composite.${alias}`);
       const errorMark = hasError ? red(' x') : '';
       // Record this alias's line index for selections array
@@ -1117,6 +1121,10 @@ class DashboardView implements Component {
       void this.app.openSystemKeysOverlay();
       return;
     }
+    if (matchesKey(data, 'm') || matchesKey(data, 'shift+m')) {
+      this.app.openModelTargetPicker();
+      return;
+    }
     if (matchesKey(data, 'shift+u')) {
       this.heatmapView = this.heatmapView === 'weekly' ? 'monthly' : 'weekly';
       this.invalidate();
@@ -1145,12 +1153,11 @@ class DashboardView implements Component {
     let secondsTime: string;
     let inflightIndicator: string;
     if (activeRequests > 0) {
-      // Cycle through shading blocks (light -> solid) while requests are in
-      // flight, instead of the idle color-cycling seconds display.
-      const shadeFrames = ['░', '▒', '▓', '█'];
-      const shade = shadeFrames[Math.floor(sec) % shadeFrames.length];
+      // Cycle through braille spinner frames while requests are in flight.
+      const spinnerFrames = ['⠇', '⠏', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+      const frame = spinnerFrames[Math.floor(sec) % spinnerFrames.length];
       secondsTime = lightWhite(this.lastTime.slice(-2));
-      inflightIndicator = ` ${green(shade)}`;
+      inflightIndicator = ` ${green(frame)}`;
     } else {
       // Idle: seconds display resets to the normal (non-blinking) color.
       secondsTime = lightWhite(this.lastTime.slice(-2));
@@ -1160,11 +1167,14 @@ class DashboardView implements Component {
     // 🔒 — every api_key in the local config file is a STORE_KEY_IN_SYSTEM
     // sentinel (keys live in the OS keychain; see help markers).
     const lockSuffix = snap?.config.api_keys_in_system_store ? '🔒 ' : '';
-    lines.push(bold('Proxy TUI') + dim(`  ${hourminTime}`) + `${secondsTime}${inflightIndicator}` + ` ${lockSuffix}` + dim(`${this.app.getVersion()}`));
+    lines.push(bold('Proxy TUI') + dim(`  ${hourminTime}`) + `${secondsTime}${inflightIndicator}` + ` ${lockSuffix}` + dim(`(ver ${this.app.getVersion()})`));
     lines.push(dim('─'.repeat(Math.max(0, width))));
 
     if (!snap) {
       lines.push('Loading…');
+      if (this.message && this.message !== 'Ready') {
+        lines.push(yellow(this.message));
+      }
       return lines.map((line) => clip(line, width));
     }
 
@@ -1210,7 +1220,7 @@ class DashboardView implements Component {
         if (ratio >= 1) limitColor = red;
         else if (ratio >= 0.8) limitColor = yellow;
       }
-      globalLimitSuffix = ` ${limitColor('(')}${limitColor(globalLimitDisplay)}${limitColor(')')}${limitColor(bold('└'))}]`;
+      globalLimitSuffix = ` ${limitColor('(')}${limitColor(globalLimitDisplay)}${limitColor(')')}${limitColor(bold('𝕋'))}]`;
     }
     const configFlagParts: string[] = [];
     if (snap.config.remote_auth_active) configFlagParts.push(bold('Ä'));
@@ -1248,7 +1258,7 @@ class DashboardView implements Component {
       const shownModels = customModels.slice(0, maxCustomModelRows);
       const hiddenCount = customModels.length - shownModels.length;
       for (const row of shownModels) {
-        const tag = row.category === 'fusion' ? 'ƒ' : row.category === 'coordinator' ? 'Ö' : row.category === 'composite' ? 'Ç' : dim(titleCase(row.category));
+        const tag = row.category === 'fusion' ? 'Ƒ' : row.category === 'coordinator' ? 'Ö' : row.category === 'composite' ? 'ᙅ' : dim(titleCase(row.category));
         const extra = row.description ? ` ${dim(row.description)}` : '';
         const timing = modelTimingMap.get(row.routeModel ?? row.modelId);
         const timingStr = timing ? ` ${dim('[')}${dim(fmtSeconds(timing.min_time_ms))}${dim('/')}${dim(fmtSeconds(timing.avg_time_ms))}${dim('/')}${dim(fmtSeconds(timing.max_time_ms))}${dim('s]')}` : '';
@@ -1285,7 +1295,7 @@ class DashboardView implements Component {
     }
 
     lines.push('');
-    lines.push(`C ${dim('composite,fusion')}  S ${dim('schedule')}  T ${dim('models test')}  L ${dim('token limit')}  D ${dim('stats')}  P ${dim('tools list')}  h ${dim('help')}  ↑↓ ${dim('move')}`);
+    lines.push(`C ${dim('composite,fusion')}  S ${dim('schedule')}  T ${dim('models test')}  M ${dim('add target')}  L ${dim('token limit')}  D ${dim('stats')}  P ${dim('tools list')}  h ${dim('help')}  ↑↓ ${dim('move')}`);
     lines.push(this.message ? yellow(this.message) : dim('Ready'));
 
     return lines.map((line) => clip(line, width));
@@ -1336,7 +1346,7 @@ class DashboardView implements Component {
 
 class DashboardApp {
   private readonly terminal = new ProcessTerminal();
-  private readonly tui = new TUI(this.terminal);
+  private readonly tui = new TuiMainScreen(this.terminal);
   private readonly view = new DashboardView(this, () => this.scheduleRender());
   private overlay: OverlayHandle | null = null;
   private compositeOverlay: CompositeAliasesOverlay | null = null;
@@ -1346,6 +1356,21 @@ class DashboardApp {
   private modelTestTimer: ReturnType<typeof setInterval> | null = null;
   private modelTestTimerActive = false;
   private compositeQuotaRefreshing = false;
+  /** Live state of the open 'Model Quota' picker — set by openQuotaPicker,
+   *  cleared by closeOverlay/its close callbacks, and rebuilt from the
+   *  refresh() loop (refreshQuotaPicker) so open rows track new upstream
+   *  responses (e.g. the passively recorded anthropic 5h utilization). */
+  private quotaPickerState: {
+    overlay: ListOverlay;
+    choices: SelectItem[];
+    /** Base description (before the quota suffix) per choice value. */
+    baseDescription: Map<string, string>;
+    /** Latest quota entries, refreshed while the picker is open. */
+    data: Map<string, QuotaPickerEntry>;
+    /** Value of the currently highlighted row. */
+    highlighted: string | null;
+  } | null = null;
+  private quotaPickerRefreshing = false;
   private modelTestInProgress = false;
   // Set by togglePeriodicModelTest / stop() to abort an in-flight test-all
   // batch. The for-loop in runAllCustomModelTests checks it between models;
@@ -1472,6 +1497,7 @@ class DashboardApp {
       this.compositeOverlay?.setSnapshot(snapshot);
       this.scheduleOverlay?.setSnapshot(snapshot);
       void this.refreshCompositeQuota(proxyConfig);
+      void this.refreshQuotaPicker();
       if (fromMutation) this.view.setConfigStatus('saved');
       // When this refresh is triggered by a save action, don't override the
       // success message the save flow sets right after this returns. The
@@ -1532,8 +1558,8 @@ class DashboardApp {
 
   openModePicker(alias: string, onPicked: (mode: 'composite' | 'fusion' | 'coordinator' | null) => void): void {
     const choices: SelectItem[] = [
-      { value: 'composite', label: 'composite  Ç', description: 'share / primary / fallback routing' },
-      { value: 'fusion', label: 'fusion  ƒ', description: 'panel / judge / synth with fusion_options' },
+      { value: 'composite', label: 'composite  ᙅ', description: 'share / primary / fallback routing' },
+      { value: 'fusion', label: 'fusion  Ƒ', description: 'panel / judge / synth with fusion_options' },
       { value: 'coordinator', label: 'coordinator  Ö', description: 'planner / executor stages with coord weight' },
     ];
     this.hideOverlay();
@@ -1734,6 +1760,17 @@ class DashboardApp {
       return;
     }
 
+    // Build tool judge sidecar status string for display
+    let sidecarStatus = '';
+    const sidecar = (snap as any).toolJudgeSidecar;
+    if (sidecar && sidecar.enabled) {
+      const modeLabel = sidecar.mode === 'noul' ? 'Batch (noul)' : 'Single (choice)';
+      const thresholdPct = Math.round((sidecar.threshold ?? 0.5) * 100);
+      sidecarStatus = `Tool Judge Sidecar: Enabled | ${modeLabel} | Threshold: ${thresholdPct}% | Timeout: ${sidecar.timeout_ms ?? 50}ms | Max batch: ${sidecar.max_batch_tools ?? 50} | ${sidecar.url}`;
+    } else {
+      sidecarStatus = 'Tool Judge Sidecar: Not configured (add [tool_judge_sidecar] to config)';
+    }
+
     if (this.overlay) this.hideOverlay();
     const overlay = new ListOverlay(
       'Tools Statitic and tool blocklist',
@@ -1765,6 +1802,7 @@ class DashboardApp {
         return false;
       },
     );
+    overlay.setStatus(sidecarStatus);
     this.overlay = this.tui.showOverlay(overlay, { width: '90%', maxHeight: '70%', anchor: 'center' });
     this.overlay.focus();
   }
@@ -1818,11 +1856,11 @@ class DashboardApp {
 
   openHelpOverlay(): void {
     const items: SelectItem[] = [
-      { value: 'help\0c', label: `  ${bold('C(c)').padEnd(6)} ${dim('Manage composite')} ${bold('Ç')}${dim(' and fusion')} ${bold('ƒ')}${dim(' aliases')}` },
+      { value: 'help\0c', label: `  ${bold('C(c)').padEnd(6)} ${dim('Manage composite')} ${bold('ᙅ')}${dim(' and fusion')} ${bold('Ƒ')}${dim(' aliases')}` },
       { value: 'help\0s', label: `  ${bold('S(s)').padEnd(6)} ${dim('Manage schedule aliases')} ${bold('$')}` },
       { value: 'help\0t', label: `  ${bold('T(t)').padEnd(6)} ${dim('Test custom models')}` },
       { value: 'help\0q', label: `  ${bold('Q(q)').padEnd(6)} ${dim('Show model quota / usage left')}` },
-      { value: 'help\0l', label: `  ${bold('L(l)').padEnd(6)} ${dim('Edit global token limit')} ${bold('└')}` },
+      { value: 'help\0l', label: `  ${bold('L(l)').padEnd(6)} ${dim('Edit global token limit')} ${bold('𝕋')}` },
       { value: 'help\0d', label: `  ${bold('D(d)').padEnd(6)} ${dim('View detailed statistics')}` },
       { value: 'help\0p', label: `  ${bold('P(p)').padEnd(6)} ${dim('Tools list and blocking')}` },
       { value: 'help\0k', label: `  ${bold('K(k)').padEnd(6)} ${dim('List api keys stored in system keychain')} ${bold('🔒')}` },
@@ -1837,13 +1875,13 @@ class DashboardApp {
       { value: 'help\0m', label: `  ${bold('m').padEnd(6)} ${dim('Add target model to alias')}` },
       { value: 'help\0f', label: `  ${bold('f').padEnd(6)} ${dim('Edit fusion options for alias')}` },
       { value: 'help\0e', label: `  ${bold('e').padEnd(6)} ${dim('Edit composite target config')}` },
-      { value: 'help\0cl', label: `  ${bold('l').padEnd(6)} ${dim('Set token limit for alias')} ${bold('└')}` },
+      { value: 'help\0cl', label: `  ${bold('l').padEnd(6)} ${dim('Set token limit for alias')} ${bold('𝕋')}` },
       { value: 'help\0cd', label: `  ${bold('d').padEnd(6)} ${dim('Delete alias or target model')}` },
       { value: 'help\0sep2', label: dim('─'.repeat(50)) },
       { value: 'help\0hdr2', label: dim('Markers') },
-      { value: 'help\0mk_limit', label: `  ${bold('└')}${dim('     Token limit (global / alias)')}` },
-      { value: 'help\0mk_composite', label: `  ${bold('Ç')}${dim('     Composite alias')}` },
-      { value: 'help\0mk_fusion', label: `  ${bold('ƒ')}${dim('     Fusion alias')}` },
+      { value: 'help\0mk_limit', label: `  ${bold('𝕋')}${dim('     Token limit (global / alias)')}` },
+      { value: 'help\0mk_composite', label: `  ${bold('ᙅ')}${dim('     Composite alias')}` },
+      { value: 'help\0mk_fusion', label: `  ${bold('Ƒ')}${dim('     Fusion alias')}` },
       { value: 'help\0mk_coordinator', label: `  ${bold('Ö')}${dim('     Coordinator alias')}` },
       { value: 'help\0mk_auth', label: `  ${bold('Ä')}${dim('     Remote authentication active (auth_server)')}` },
       { value: 'help\0mk_recording', label: `  ${bold('®')}${dim('     Remote recording active (record_server)')}` },
@@ -2138,6 +2176,211 @@ class DashboardApp {
     this.overlay.focus();
   }
 
+  /** Lists every `[models.*]` target across all categories, plus a "new target" entry. */
+  openModelTargetPicker(): void {
+    const snap = this.viewSnapshot();
+    if (!snap) return;
+    const NEW_TARGET = ' new';
+    const choices: SelectItem[] = [
+      { value: NEW_TARGET, label: '+ _input new target_', description: 'add a new [models.*] entry' },
+    ];
+    for (const [category, categoryConfig] of Object.entries(snap.config.models)) {
+      for (const [aliasKey, value] of Object.entries(categoryConfig || {})) {
+        if (aliasKey === 'upstream_mode' || aliasKey === 'base_url') continue;
+        if (!Array.isArray(value)) continue;
+        const [target] = value;
+        choices.push({
+          value: `${category} ${aliasKey}`,
+          label: `${category}.${aliasKey}`,
+          description: target || aliasKey,
+        });
+      }
+    }
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Add target',
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        if (item.value === NEW_TARGET) {
+          this.openPrompt('New target', 'alias key (client-facing name)', '', async (aliasKey) => {
+            const trimmed = aliasKey.trim();
+            if (!trimmed) {
+              this.view.setMessage('Alias key is required');
+              await this.refresh();
+              this.requestRender();
+              return;
+            }
+            this.openModelTargetWizard(undefined, trimmed);
+          });
+          return;
+        }
+        const [category, aliasKey] = item.value.split(' ');
+        this.openModelTargetWizard(category, aliasKey);
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage('add target cancelled');
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '70%', maxHeight: '50%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  /**
+   * Category ([models.*] section) picker — the last step when adding a
+   * brand-new target (editing keeps its existing category and never reaches
+   * this). Offers every existing category plus a "+ _input new category_"
+   * entry that prompts for a new section name. Esc anywhere in this step
+   * cancels the whole wizard, matching every other step.
+   */
+  private openModelCategoryPicker(onPicked: (category: string) => void): void {
+    const snap = this.viewSnapshot();
+    if (!snap) return;
+    const NEW_CATEGORY = ' new-category';
+    const categories = Object.keys(snap.config.models);
+    const choices: SelectItem[] = [
+      ...categories.map((category) => ({ value: category, label: category })),
+      { value: NEW_CATEGORY, label: '+ _input new category_', description: 'create a new [models.*] section' },
+    ];
+    const cancel = () => {
+      this.hideOverlay();
+      this.view.setMessage('add target cancelled');
+      this.requestRender();
+    };
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      'New target — category',
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        if (item.value === NEW_CATEGORY) {
+          this.openPrompt('New target — new category', 'category name (e.g. claude, gemini, free)', '', async (categoryName) => {
+            const trimmed = categoryName.trim();
+            if (!trimmed) {
+              cancel();
+              return;
+            }
+            onPicked(trimmed);
+          });
+          return;
+        }
+        onPicked(item.value);
+      },
+      cancel,
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '40%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
+  /**
+   * Add/edit wizard for a `[models.<category>]` entry: target model id -> api
+   * key -> base url -> upstream mode -> (new targets only) category, then
+   * save. Esc at any step cancels the whole wizard (matches
+   * openCompositeRoutingPicker convention). When editing, `category` is
+   * already known and `getModelTargetFromDashboard` supplies the real
+   * (unsanitized) current values, including api_key — which may be the
+   * literal STORE_KEY_IN_SYSTEM sentinel; leaving it untouched keeps it
+   * as-is. When adding, `category` is undefined and the category picker
+   * (existing sections + "input new category") runs as the last step.
+   */
+  openModelTargetWizard(category: string | undefined, aliasKey: string): void {
+    const isEdit = category !== undefined;
+    const existing = isEdit ? getModelTargetFromDashboard(this.source.env, category, aliasKey) : undefined;
+    const current: ModelTargetPatch = existing ?? { target: aliasKey, base_url: '', api_key: '', mode: '' };
+    const label = isEdit ? `${category}.${aliasKey}` : aliasKey;
+
+    const save = (finalCategory: string, target: string, apiKeyValue: string, baseUrlValue: string, mode: string) => {
+      try {
+        upsertModelTargetFromDashboard(this.source.env, finalCategory, aliasKey, {
+          target,
+          api_key: apiKeyValue,
+          base_url: baseUrlValue.trim(),
+          mode,
+        });
+        this.view.setMessage(`${isEdit ? 'updated' : 'added'} ${finalCategory}.${aliasKey}`);
+        void this.refresh(true);
+        this.requestRender();
+      } catch (err) {
+        this.view.setMessage((err as Error).message, 2000);
+        void this.refresh();
+        this.requestRender();
+      }
+    };
+
+    this.openPrompt(
+      `${isEdit ? 'Edit' : 'Add'} ${bold(label)} — target model id`,
+      'upstream model id',
+      current.target,
+      async (targetValue) => {
+        const target = targetValue.trim();
+        if (!target) {
+          this.view.setMessage('Target model id is required');
+          await this.refresh();
+          this.requestRender();
+          return;
+        }
+        this.openPrompt(
+          `${isEdit ? 'Edit' : 'Add'} ${bold(label)} — api key`,
+          'api key (leave unchanged to keep current)',
+          current.api_key,
+          async (apiKeyValue) => {
+            this.openPrompt(
+              `${isEdit ? 'Edit' : 'Add'} ${bold(label)} — base url`,
+              'base url',
+              current.base_url,
+              async (baseUrlValue) => {
+                this.openModelModePicker(current.mode, (mode) => {
+                  if (category !== undefined) {
+                    save(category, target, apiKeyValue, baseUrlValue, mode);
+                    return;
+                  }
+                  this.openModelCategoryPicker((finalCategory) => {
+                    save(finalCategory, target, apiKeyValue, baseUrlValue, mode);
+                  });
+                });
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /** Upstream mode select for the model target wizard — the 4 closed TransformSchema values. */
+  private openModelModePicker(currentMode: string, onPicked: (mode: string) => void): void {
+    const choices: SelectItem[] = [
+      { value: 'openai-completions', label: 'openai-completions' },
+      { value: 'anthropic-messages', label: 'anthropic-messages' },
+      { value: 'openai-responses', label: 'openai-responses' },
+      { value: 'gemini-generatecontent', label: 'gemini-generatecontent' },
+    ];
+    if (currentMode) {
+      const idx = choices.findIndex((c) => c.value === currentMode);
+      if (idx > 0) choices.unshift(...choices.splice(idx, 1));
+    }
+    this.hideOverlay();
+    const overlay = new ListOverlay(
+      'Upstream mode',
+      `↑/↓ ${dim('move')}  Enter ${dim('select')}  Esc ${dim('cancel')}`,
+      choices,
+      (item) => {
+        this.hideOverlay();
+        onPicked(item.value);
+      },
+      () => {
+        this.hideOverlay();
+        this.view.setMessage('add target cancelled');
+        this.requestRender();
+      },
+    );
+    this.overlay = this.tui.showOverlay(overlay, { width: '60%', maxHeight: '30%', anchor: 'center' });
+    this.overlay.focus();
+  }
+
   openTestModelPicker(): void {
     const choices = this.modelChoices();
     // Always offer the manual-entry option so the user can test a model id
@@ -2150,7 +2393,7 @@ class DashboardApp {
         category: 'manual',
         modelId: '',
         value: OTHER_MODEL_ID,
-        label: dim('Other model id…'),
+        label: dim('_input other model id_'),
         description: dim(this.wildcardModelHint('test a wildcard route')),
       },
     ];
@@ -2208,7 +2451,7 @@ class DashboardApp {
   /**
    * Fetch quota data for every model in the picker (getModelQuota's 30s cache
    * keeps provider load bounded). Keyed by choice value — including the
-   * Ç/ƒ/Ö duplicate marker — so lookup from onSelectionChange is direct.
+   * ᙅ/Ƒ/Ö duplicate marker — so lookup from onSelectionChange is direct.
    */
   private async buildQuotaData(choices: { value: string }[]): Promise<Map<string, QuotaPickerEntry>> {
     const data = new Map<string, QuotaPickerEntry>();
@@ -2263,6 +2506,10 @@ class DashboardApp {
     this.requestRender();
     const quotaData = await this.buildQuotaData(choices);
     this.view.setMessage('');
+    // Base descriptions before the quota suffix is appended, so the live
+    // refresh (refreshQuotaPicker) can rebuild descriptions without
+    // duplicating the suffix.
+    const baseDescription = new Map(choices.map((c) => [c.value, c.description ?? ''] as const));
     for (const choice of choices) {
       choice.description += quotaListSuffix(quotaData.get(choice.value) ?? {});
     }
@@ -2271,10 +2518,12 @@ class DashboardApp {
       `↑/↓ ${dim('move')}  Esc ${dim('close')}`,
       choices,
       () => {
+        this.quotaPickerState = null;
         this.hideOverlay();
         this.requestRender();
       },
       () => {
+        this.quotaPickerState = null;
         this.hideOverlay();
         this.view.setMessage('quota cancelled');
         this.requestRender();
@@ -2284,14 +2533,45 @@ class DashboardApp {
       { minPrimaryColumnWidth: 25, maxPrimaryColumnWidth: 25 },
       undefined,
       (item) => {
-        overlay.setStatus(quotaStatusLine(quotaData.get(item.value) ?? {}));
+        const state = this.quotaPickerState;
+        if (!state) return;
+        state.highlighted = item.value;
+        overlay.setStatus(quotaStatusLine(state.data.get(item.value) ?? {}));
       },
     );
     // Show the initially highlighted row's quota without waiting for a move.
     const first = choices[0];
     if (first) overlay.setStatus(quotaStatusLine(quotaData.get(first.value) ?? {}));
+    this.quotaPickerState = { overlay, choices, baseDescription, data: quotaData, highlighted: first?.value ?? null };
     this.overlay = this.tui.showOverlay(overlay, { width: '70%', maxHeight: '50%', anchor: 'center' });
     this.overlay.focus();
+  }
+
+  /**
+   * Live-refresh the open 'Model Quota' picker from the 500ms refresh loop
+   * (same pattern as refreshCompositeQuota): rebuild the quota entries —
+   * getModelQuota's 30s cache keeps provider load bounded, and the
+   * anthropic-5h header lookups are plain map reads — so row suffixes and the
+   * highlighted row's status line track recordings from new upstream
+   * responses while the picker is open.
+   */
+  private async refreshQuotaPicker(): Promise<void> {
+    const state = this.quotaPickerState;
+    if (!state || this.quotaPickerRefreshing) return;
+    this.quotaPickerRefreshing = true;
+    try {
+      state.data = await this.buildQuotaData(state.choices);
+      for (const choice of state.choices) {
+        choice.description = (state.baseDescription.get(choice.value) ?? '') + quotaListSuffix(state.data.get(choice.value) ?? {});
+      }
+      if (state.highlighted !== null) {
+        state.overlay.setStatus(quotaStatusLine(state.data.get(state.highlighted) ?? {}));
+      }
+      state.overlay.invalidate();
+      this.requestRender();
+    } finally {
+      this.quotaPickerRefreshing = false;
+    }
   }
 
   /**
@@ -2372,9 +2652,9 @@ class DashboardApp {
   }
 
   async runModelTest(modelId: string): Promise<void> {
-    const displayId = / [ÇƒÖ]$/.test(modelId) ? modelId.replace(/ [ÇƒÖ]$/, '').trim() : modelId;
+    const displayId = / [ᙅƑÖ]$/.test(modelId) ? modelId.replace(/ [ᙅƑÖ]$/, '').trim() : modelId;
     const snap = this.viewSnapshot();
-    const cfg = snap ? resolveModelTestConfig(snap.config, displayId, snap.compositeResolved) : undefined;
+    const cfg = snap ? resolveModelTestConfig(snap.config, displayId, snap.compositeResolved, this.proxyConfig) : undefined;
     const target = cfg?.directModel && cfg.directModel !== displayId ? `(${cfg.directModel})` : '';
     const schema = cfg?.upstreamMode ?? '?';
     const baseUrl = cfg?.targetUrl ? stripHttps(cfg.targetUrl) : '?';
@@ -2383,9 +2663,10 @@ class DashboardApp {
     const result = await this.executeModelTest(modelId);
     if (!result) return;
     if (!result.ok) {
-      this.view.setMessage(`${red(`test failed ${result.modelId} (${result.status ?? '?'})`)} ${dim(result.detail)}`, 6000);
+      this.view.setMessage(`${red(`test failed ${result.modelId} (${result.status ?? '?'}, ${(result.elapsedMs / 1000).toFixed(1)}s)`)} ${dim(result.detail)}`, 6000);
     } else {
-      this.view.setMessage(`${green(`${result.modelId} OK (${result.status})`)} ${dim(`usage=${result.usage} ${result.detail}`)}`, 6000);
+      const elapsed = (result.elapsedMs / 1000).toFixed(1);
+      this.view.setMessage(`${green(`${result.modelId} (${result.status}, ${elapsed}s)`)} ${dim(`usage=${result.usage}`)}`, 6000);
     }
     this.requestRender();
   }
@@ -2398,9 +2679,10 @@ class DashboardApp {
     status?: number;
     usage: string;
     detail: string;
+    elapsedMs: number;
   } | null> {
-    // Strip Ç/ƒ/Ö marker suffix if present (used only for duplicate disambiguation in the picker)
-    const actualModelId = / [ÇƒÖ]$/.test(modelId) ? modelId.replace(/ [ÇƒÖ]$/, '').trim() : modelId;
+    // Strip ᙅ/Ƒ/Ö marker suffix if present (used only for duplicate disambiguation in the picker)
+    const actualModelId = / [ᙅƑÖ]$/.test(modelId) ? modelId.replace(/ [ᙅƑÖ]$/, '').trim() : modelId;
     const port = this.source.env.PORT || '8788';
     const endpoint = `http://127.0.0.1:${port}${TEST_ENDPOINT}`;
     const snapshot = this.viewSnapshot();
@@ -2408,7 +2690,7 @@ class DashboardApp {
     // Always pass compositeResolved so composite/fusion aliases resolve correctly
     // regardless of whether they share a name with a model entry.
     const modelConfig = snapshot
-      ? resolveModelTestConfig(snapshot.config, actualModelId, snapshot.compositeResolved)
+      ? resolveModelTestConfig(snapshot.config, actualModelId, snapshot.compositeResolved, this.proxyConfig)
       : undefined;
 
     // The TUI always POSTs to the local proxy's /v1/messages endpoint. When we
@@ -2449,7 +2731,7 @@ class DashboardApp {
     if (process.env.LOG_LEVEL === 'debug') {
       try {
         const fs = await import('fs');
-        fs.writeFileSync('/tmp/test_model.log',
+        fs.writeFileSync(join(tmpdir(), 'test_model.log'),
           `[${new Date().toISOString()}] test model request (tui)\n` +
           `target: ${endpoint}\n` +
           `upstreamMode: ${upstreamMode}\n` +
@@ -2460,6 +2742,7 @@ class DashboardApp {
     }
 
     this.modelTestAbortController = new AbortController();
+    const startTime = Date.now();
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -2476,7 +2759,7 @@ class DashboardApp {
         try {
           const fs = await import('fs');
           const responseText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody, null, 2);
-          fs.appendFileSync('/tmp/test_model.log',
+          fs.appendFileSync(join(tmpdir(), 'test_model.log'),
             `response status: ${response.status}\n` +
             `response body:\n${responseText}\n` +
             `---\n`,
@@ -2494,6 +2777,7 @@ class DashboardApp {
         status: response.status,
         usage,
         detail: detailText,
+        elapsedMs: Date.now() - startTime,
       };
     } catch (error) {
       return {
@@ -2501,6 +2785,7 @@ class DashboardApp {
         modelId: testLabel,
         usage: 'n/a',
         detail: (error as Error).message,
+        elapsedMs: Date.now() - startTime,
       };
     } finally {
       this.modelTestAbortController = null;
@@ -3170,6 +3455,7 @@ class DashboardApp {
     this.overlay = null;
     this.compositeOverlay = null;
     this.scheduleOverlay = null;
+    this.quotaPickerState = null;
     this.tui.setFocus(this.view);
   }
 
@@ -3309,14 +3595,14 @@ class DashboardApp {
       }
     }
 
-    // Add composite aliases — if same name as a model, add with a marker suffix (Ç/ƒ/Ö) to differentiate
+    // Add composite aliases — if same name as a model, add with a marker suffix (ᙅ/Ƒ/Ö) to differentiate
     if (snapshot.compositeResolved) {
       for (const alias of snapshot.compositeResolved) {
         if (alias.targets.length === 0) continue;
         const aliasMode = snapshot.config ? getCompositeAliasMode(alias.alias, snapshot.config) : undefined;
         const isFusion = aliasMode === 'fusion';
         const isCoordinator = aliasMode === 'coordinator';
-        const modeTag = isFusion ? 'ƒ' : isCoordinator ? 'Ö' : 'Ç';
+        const modeTag = isFusion ? 'Ƒ' : isCoordinator ? 'Ö' : 'ᙅ';
         const category = isCoordinator ? 'coordinator' : isFusion ? 'fusion' : 'composite';
         const isDuplicate = seenNames.has(alias.alias);
         const aliasConfig = snapshot.config.composite?.[alias.alias] as Record<string, unknown> | undefined;
@@ -3334,12 +3620,12 @@ class DashboardApp {
           : '';
         const description = `${avgPrefix}${targets}`;
         if (isDuplicate) {
-          // Same name already added as a model — add marker suffix (Ç/ƒ/Ö) to make value unique
+          // Same name already added as a model — add marker suffix (ᙅ/Ƒ/Ö) to make value unique
           choices.push({
             category,
             modelId: alias.alias,
             value: `${alias.alias} ${modeTag}`,
-            label: `${alias.alias} ${modeTag}`,
+            label: `${alias.alias} ${dim(modeTag)}`,
             description,
           });
         } else {
@@ -3348,7 +3634,7 @@ class DashboardApp {
             category,
             modelId: alias.alias,
             value: alias.alias,
-            label: `${alias.alias} ${modeTag}`,
+            label: `${alias.alias} ${dim(modeTag)}`,
             description,
           });
         }
@@ -3371,10 +3657,11 @@ class DashboardApp {
   }
 }
 
-function resolveModelTestConfig(
+export function resolveModelTestConfig(
   config: ProxyConfig,
   modelId: string,
   compositeResolved?: Array<{ alias: string; targets: Array<{ model: string; routeModel?: string; upstreamMode: string; targetUrl: string }> }>,
+  realConfig?: ProxyConfig | null,
 ): { upstreamMode: string; targetUrl: string; apiKey?: string; directModel?: string } | undefined {
   // Check composite aliases first
   if (compositeResolved) {
@@ -3415,6 +3702,17 @@ function resolveModelTestConfig(
       if (key === 'upstream_mode' || key === 'base_url' || key === 'api_key') continue;
       if (value === undefined) continue;
       if (key !== modelId) continue;
+      // The sanitized dashboard snapshot never carries a per-model api_key (it's
+      // stripped for display), so look it up from the real config via the same
+      // resolver the proxy/dashboard use, and use it as the fallback below —
+      // ahead of the proxy-wide default_upstream key, which belongs to a
+      // different model entirely and must not be sent as this model's key.
+      let realApiKey: string | undefined;
+      if (realConfig) {
+        try {
+          realApiKey = getModelRouteConfig(modelId, realConfig).apiKey;
+        } catch { /* fall through to other fallbacks below */ }
+      }
       // Check for per-model override in tuple [target, baseUrl, apiKey, mode]
       // (dashboard sanitizer strips 3rd element, so accept >= 2)
       if (Array.isArray(value) && value.length >= 2) {
@@ -3424,7 +3722,7 @@ function resolveModelTestConfig(
         return {
           upstreamMode: modelMode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
           targetUrl: modelBaseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
-          apiKey: categoryConfig.api_key || config.default_upstream?.default_api_key,
+          apiKey: realApiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
         };
       }
       // Inline-table form: e.g. "model" = {target = "...", base_url = "...", api_key = "...", mode = "..."}
@@ -3437,14 +3735,14 @@ function resolveModelTestConfig(
         return {
           upstreamMode: mode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
           targetUrl: baseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || 'http://localhost',
-          apiKey: apiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
+          apiKey: realApiKey || apiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
           directModel: target || undefined,
         };
       }
       return {
         upstreamMode: categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
         targetUrl: categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
-        apiKey: categoryConfig.api_key || config.default_upstream?.default_api_key,
+        apiKey: realApiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
       };
     }
   }

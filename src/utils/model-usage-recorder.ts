@@ -1,17 +1,27 @@
 import type { Logger } from '../types/shared.js';
 import type { UsageStats } from './dashboard-stats.js';
 
+/**
+ * Wire-contract era this proxy speaks, sent as `version` on every usage record.
+ * The stats service does not validate it (the record POST is fire-and-forget),
+ * but the field lets the collector tell which era of this contract produced the
+ * record. See docs/architecture/auth-stats-protocol.md.
+ */
+export const PROTOCOL_VERSION = 'v1';
+
 export interface ModelUsageRecordPayload {
   request_id: string;
   timestamp: string;
   endpoint: string;
+  /** Wire-contract era (see `PROTOCOL_VERSION`). */
+  version: string;
   user_key: string;
   model: string;
   /**
    * HTTP status of the upstream response. 0 means no response was obtained.
    * Non-2xx statuses are recorded with all token counters at 0 (the upstream
    * typically returns an error body rather than usage), plus the error body
-   * in `response_body` when `[remote.recording] record_response_body = true`.
+   * in `response_body` when `[remote] record_response_body = true`.
    */
   response_status: number;
   input_tokens: number;
@@ -20,7 +30,7 @@ export interface ModelUsageRecordPayload {
   output_tokens: number;
   total_tokens: number;
   /**
-   * Only present when `[remote.recording] record_response_body = true`. For JSON responses
+   * Only present when `[remote] record_response_body = true`. For JSON responses
    * this is the parsed response body object; for streaming (text/event-stream)
    * responses this is the accumulated raw SSE text (all events concatenated).
    * For non-2xx responses it carries the upstream's constructed error body.
@@ -45,7 +55,8 @@ export function buildModelUsageRecordPayload(
     request_id: requestId,
     timestamp: new Date().toISOString(),
     endpoint,
-    user_key: userKey,
+    version: PROTOCOL_VERSION,
+    user_key: userKey.slice(0, 16) + '****',
     model,
     response_status: responseStatus,
     input_tokens: toSafeNumber(usage.input_tokens),

@@ -180,6 +180,8 @@ export interface ClaudeModel {
     type: "model";
     created_at: string;  // RFC 3339 timestamp
     display_name: string;
+    context_length?: number;
+    max_tokens?: number;
 }
 
 // --- Streaming Types ---

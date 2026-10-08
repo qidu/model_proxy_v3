@@ -6,10 +6,12 @@
  */
 
 import { Env } from './types/shared.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
 import { createErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { createLogger, type Logger } from './utils/logger.js';
-import { handleModelsRequest, getModelCount } from './handlers/models.js';
+import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled } from './handlers/models.js';
 import { handleTokenCountingRequest } from './handlers/token-counting.js';
 import { handleMessagesRequest } from './handlers/messages.js';
 import { handleResponsesRequest, handleResponsesCompactRequest, handleResponsesInputTokensRequest, handleResponsesRetrievalRequest } from './handlers/responses.js';
@@ -17,7 +19,9 @@ import { handleGeminiRequest, handleGeminiRequestForMessages } from './handlers/
 import { handleOpenAIRequest } from './handlers/openai.js';
 import { handleClaudeRequest } from './handlers/claude.js';
 import { handleEmbeddingsRequest } from './handlers/embeddings.js';
+import { handleDecisionRequest } from './handlers/decision.js';
 import { handleChatCompletionsPassthrough } from './handlers/chat-completions.js';
+import { handlePassthroughRequest, PASSTHROUGH_PREFIX } from './handlers/passthrough.js';
 import {
   handleDashboardAgentStats,
   handleDashboardAddScheduleAlias,
@@ -33,9 +37,11 @@ import {
   handleDashboardTestModel,
   handleDashboardToggleToolBlock,
   handleDashboardToolBlocklist,
+  handleDashboardUpsertModelTarget,
   handleDashboardUpsertScheduleTarget,
 } from './handlers/dashboard.js';
 import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget } from './utils/config-loader.js';
+import { parseAuthTargets, hasRequiredProtocolVersion, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
 import { detectCoordinatorStage } from './utils/coordinator.js';
 import {
   extractToolNamesFromBody,
@@ -84,6 +90,7 @@ import {
 } from './utils/privacy-filter.js';
 import { getKompressConfig, shouldCompressPath, compressBody } from './utils/kompress.js';
 import { eraseBlockedTools } from './utils/tool-blocklist.js';
+import { judgeTools } from './utils/tool-judge-sidecar.js';
 import { buildModelUsageRecordPayload, recordModelUsageToRemote } from './utils/model-usage-recorder.js';
 import { runHook, applyWriteoutBody, pipeEventTransformer, formatTransformsDebug, type HookContext } from './utils/request-transform.js';
 
@@ -126,7 +133,7 @@ export function resetEffectiveCompositeSharesForTest(): void {
   compositeEffectiveShares.clear();
 }
 
-function selectWeightedCompositeCandidate<T>(candidates: T[], getWeight: (candidate: T) => number): T | undefined {
+export function selectWeightedCompositeCandidate<T>(candidates: T[], getWeight: (candidate: T) => number): T | undefined {
   const totalWeight = candidates.reduce((sum, candidate) => sum + Math.max(0, getWeight(candidate)), 0);
   if (totalWeight <= 0) return candidates[0];
 
@@ -372,9 +379,252 @@ function isDynamicRoute(path: string): boolean {
 }
 
 /**
+ * Check if dynamic routing is enabled (opt-in via ENABLE_DYNAMIC_ROUTING).
+ * Disabled by default: a dynamic path is rejected rather than reinterpreted.
+ */
+function isDynamicRoutingEnabled(env: Env): boolean {
+  return env.ENABLE_DYNAMIC_ROUTING === 'true' || env.ENABLE_DYNAMIC_ROUTING === '1';
+}
+
+/**
+ * Handler types the shared routing table can produce. Mirrors the union declared
+ * by `parseFixedRoute` and by `RouteAttempt['handlerType']`.
+ */
+type UpstreamHandlerType =
+  | 'messages' | 'interactions' | 'generateContent' | 'token-counting'
+  | 'responses' | 'responses-compact' | 'responses-input-tokens' | 'chat-completions';
+
+/** Endpoint family a resolved target belongs to. */
+type UpstreamTargetKind =
+  | 'messages' | 'interactions' | 'count-tokens' | 'generate-content'
+  | 'chat-completions' | 'responses' | 'responses-input-tokens' | 'responses-compact';
+
+/** `targetEndpoint` labels reported by `parseFixedRoute`, keyed by resolved kind. */
+const FIXED_ROUTE_ENDPOINTS: Record<UpstreamTargetKind, string> = {
+  messages: 'v1/messages',
+  interactions: 'v1/interactions',
+  'count-tokens': 'v1beta/models/countTokens',
+  'generate-content': 'v1beta/models/generateContent',
+  'chat-completions': 'v1/chat/completions',
+  responses: 'v1/responses',
+  'responses-input-tokens': 'v1/responses/input_tokens',
+  'responses-compact': 'v1/responses/compact',
+};
+
+/**
+ * Two routing dialects share the table below:
+ *
+ * - `fixed-route`: `[models.default]` / `[default_upstream]` routing (parseFixedRoute).
+ * - `model-route`: the per-model builders — composite candidates, fusion, the
+ *   remote auth-target ladder and the /v1/chat/completions model passthrough.
+ *
+ * They disagree on five paths, each marked "dialect difference" below:
+ * /v1/messages+gemini, /v1/interactions+gemini, the :countTokens handler type,
+ * /v1/chat/completions with a native mode, and whether the Gemini version prefix
+ * honours GEMINI_API_VERSION. This helper removes the duplicated dispatch; it
+ * deliberately does NOT reconcile those differences — every call site keeps the
+ * behaviour it had before.
+ */
+type RouteDialect = 'fixed-route' | 'model-route';
+
+interface ResolveUpstreamTargetInput {
+  path: string;
+  baseUrl: string;
+  upstreamMode: string;
+  dialect: RouteDialect;
+  /** Gemini version prefix, i.e. `env.GEMINI_API_VERSION || 'v1beta'`. */
+  geminiApiVersion: string;
+  /** Model id embedded in path-style Gemini URLs (fixed routes read it from the path, model routes pass the resolved alias). */
+  pathModel?: string;
+  /** `body.stream === true`. Model-route dialect only. */
+  bodyStream?: boolean;
+  /** Explicit streaming override. Model-route dialect only. */
+  forceStream?: boolean;
+}
+
+interface ResolvedUpstreamTarget {
+  kind: UpstreamTargetKind;
+  targetUrl: string;
+  handlerType: UpstreamHandlerType;
+  upstreamMode?: string;
+  forceStreaming?: boolean;
+}
+
+/**
+ * Resolve `(path, upstream_mode) → targetUrl / handlerType / upstreamMode / forceStreaming`.
+ * Returns `undefined` for paths whose target does not depend on the upstream mode
+ * (/v1/models, /v1/embeddings, /v1/messages/count_tokens) — callers keep those.
+ */
+function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstreamTarget | undefined {
+  const { path, baseUrl, upstreamMode, geminiApiVersion, dialect } = input;
+  const fixed = dialect === 'fixed-route';
+  const upstreamUrl = (suffix: string) => buildUpstreamUrl(baseUrl, suffix);
+  const isAnthropic = upstreamMode === 'anthropic-messages';
+  const isResponses = upstreamMode === 'openai-responses';
+  const isGemini = upstreamMode === 'gemini-generatecontent' || upstreamMode === 'gemini-interactions';
+  const isModelPath = path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/');
+  const isStreamEndpoint = path.includes(':streamGenerateContent');
+  const model = input.pathModel ? encodeURIComponent(input.pathModel) : '';
+
+  // Path-style Gemini model URL. The model-route dialect always addresses v1beta
+  // (the env override is not honoured there); the fixed-route dialect uses it
+  // except on /v1/messages — see the dialect differences below.
+  const geminiModelUrl = (action: string): string => {
+    if (!model) {
+      throw new Error(`Gemini routing for ${path} requires a model id`);
+    }
+    return upstreamUrl(`${fixed ? geminiApiVersion : 'v1beta'}/models/${model}:${action}`);
+  };
+  const geminiStreamingAction = input.bodyStream === true ? 'streamGenerateContent?alt=sse' : 'generateContent';
+
+  // 1. /v1/messages → multiple upstream modes
+  if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
+    if (isAnthropic) {
+      // Native Claude API
+      return { kind: 'messages', targetUrl: upstreamUrl('v1/messages'), handlerType: 'messages', upstreamMode: 'anthropic-messages' };
+    }
+    if (isGemini) {
+      // Native Gemini API - not typically used for /v1/messages but supported
+      // Dialect difference: a fixed route has no model id for this path and
+      // addresses the Gemini collection endpoint instead of a model.
+      return {
+        kind: 'messages',
+        targetUrl: fixed ? upstreamUrl('v1beta/models') : geminiModelUrl(geminiStreamingAction),
+        handlerType: 'messages',
+        upstreamMode,
+      };
+    }
+    if (isResponses) {
+      // OpenAI Responses API upstream
+      return { kind: 'messages', targetUrl: upstreamUrl('v1/responses'), handlerType: 'messages', upstreamMode: 'openai-responses' };
+    }
+    // OpenAI-compatible upstream
+    return { kind: 'messages', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'messages', upstreamMode: 'openai-completions' };
+  }
+
+  // 2. /v1/interactions → multiple upstream modes
+  if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
+    if (isGemini) {
+      // Native Gemini API
+      // Dialect difference: a fixed route forwards to the API version root.
+      return {
+        kind: 'interactions',
+        targetUrl: fixed ? upstreamUrl(geminiApiVersion) : geminiModelUrl(geminiStreamingAction),
+        handlerType: 'interactions',
+        upstreamMode,
+      };
+    }
+    if (isAnthropic) {
+      return { kind: 'interactions', targetUrl: upstreamUrl('v1/messages'), handlerType: 'interactions', upstreamMode: 'anthropic-messages' };
+    }
+    if (isResponses) {
+      return { kind: 'interactions', targetUrl: upstreamUrl('v1/responses'), handlerType: 'interactions', upstreamMode: 'openai-responses' };
+    }
+    // OpenAI-compatible upstream
+    return { kind: 'interactions', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'interactions', upstreamMode: 'openai-completions' };
+  }
+
+  // 3. /v1beta/models/{model}:countTokens → forward to Gemini upstream
+  if (isModelPath && path.includes(':countTokens')) {
+    if (isGemini) {
+      return { kind: 'count-tokens', targetUrl: geminiModelUrl('countTokens'), handlerType: 'generateContent', upstreamMode };
+    }
+    // countTokens has no OpenAI equivalent — proxy the request upstream as-is and return the raw JSON.
+    // Dialect difference: a fixed route reports the handler as token-counting.
+    return {
+      kind: 'count-tokens',
+      targetUrl: upstreamUrl('v1/messages/count_tokens'),
+      handlerType: fixed ? 'token-counting' : 'generateContent',
+      upstreamMode: 'openai-completions',
+    };
+  }
+
+  // 4. /v1beta/models/{model}:generateContent or :streamGenerateContent → multiple upstream modes
+  // Also support /v1/models/{model}:generateContent (some Gemini APIs use v1 instead of v1beta)
+  if (isModelPath && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
+    const streaming = input.forceStream ?? isStreamEndpoint;
+    if (isGemini) {
+      // Native Gemini - pass through the exact endpoint
+      const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
+      // Preserve query string if present, or add ?alt=sse for streamGenerateContent
+      let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
+      if (isStreamEndpoint && !queryString.includes('alt=sse')) {
+        queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse';
+      }
+      return { kind: 'generate-content', targetUrl: geminiModelUrl(`${endpoint}${queryString}`), handlerType: 'generateContent', upstreamMode };
+    }
+    // Through openai-completions transforming: the handler converts the
+    // generateContent body → openai-completions → the configured mode.
+    if (isAnthropic) {
+      return { kind: 'generate-content', targetUrl: upstreamUrl('v1/messages'), handlerType: 'generateContent', upstreamMode: 'anthropic-messages', forceStreaming: streaming };
+    }
+    if (isResponses) {
+      return { kind: 'generate-content', targetUrl: upstreamUrl('v1/responses'), handlerType: 'generateContent', upstreamMode: 'openai-responses', forceStreaming: streaming };
+    }
+    // OpenAI-compatible upstream
+    return { kind: 'generate-content', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'generateContent', upstreamMode: 'openai-completions', forceStreaming: streaming };
+  }
+
+  // 5. /v1/chat/completions
+  if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
+    if (isResponses) {
+      return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/responses'), handlerType: 'chat-completions', upstreamMode: 'openai-responses' };
+    }
+    // Dialect difference: a fixed route forwards anthropic/gemini modes to
+    // openai-completions instead of building a native target.
+    if (!fixed && isAnthropic) {
+      return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/messages'), handlerType: 'chat-completions', upstreamMode: 'anthropic-messages' };
+    }
+    if (!fixed && isGemini) {
+      // The chat-completions handler handles non-streaming (:generateContent);
+      // streaming lands in Phase 3.
+      return { kind: 'chat-completions', targetUrl: geminiModelUrl('generateContent'), handlerType: 'chat-completions', upstreamMode };
+    }
+    return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'chat-completions', upstreamMode: 'openai-completions' };
+  }
+
+  // 6. /v1/responses/input_tokens → count input tokens
+  if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
+    if (isResponses) {
+      return { kind: 'responses-input-tokens', targetUrl: upstreamUrl('v1/responses/input_tokens'), handlerType: 'responses-input-tokens', upstreamMode: 'openai-responses' };
+    }
+    return { kind: 'responses-input-tokens', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'responses-input-tokens', upstreamMode: 'openai-completions' };
+  }
+
+  // 7. /v1/responses/compact → compact a conversation
+  if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
+    if (isResponses) {
+      return { kind: 'responses-compact', targetUrl: upstreamUrl('v1/responses/compact'), handlerType: 'responses-compact', upstreamMode: 'openai-responses' };
+    }
+    return { kind: 'responses-compact', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'responses-compact', upstreamMode: 'openai-completions' };
+  }
+
+  // 8. /v1/responses → multiple upstream modes
+  if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
+    if (isResponses) {
+      // Pass through to OpenAI Responses API
+      return { kind: 'responses', targetUrl: upstreamUrl('v1/responses'), handlerType: 'responses', upstreamMode: 'openai-responses' };
+    }
+    if (isAnthropic) {
+      // Convert Responses API to Claude Messages and forward to native Anthropic upstream
+      return { kind: 'responses', targetUrl: upstreamUrl('v1/messages'), handlerType: 'responses', upstreamMode: 'anthropic-messages' };
+    }
+    if (isGemini) {
+      // Convert Responses API to Claude Messages and forward to Gemini upstream
+      return { kind: 'responses', targetUrl: upstreamUrl(geminiApiVersion), handlerType: 'responses', upstreamMode };
+    }
+    // Convert to OpenAI Chat Completions
+    return { kind: 'responses', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'responses', upstreamMode: 'openai-completions' };
+  }
+
+  return undefined;
+}
+
+/**
  * Parse fixed route and return target configuration
  * Fixed route: /v1/messages -> /v1/chat/completions
  * Uses [models.default] and [default_upstream] from proxy_config.toml
+ * The mode → target mapping is shared with model-specific routing (resolveUpstreamTarget).
  */
 function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   targetUrl: string;
@@ -393,266 +643,14 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   const defaultBaseUrl = defaultCategoryConfig?.base_url || 
                         proxyConfig.default_upstream?.default_base_url;
 
-  // 1. /v1/messages → multiple upstream modes
-  if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
-    if (defaultMode === 'anthropic-messages') {
-      // Native Claude API
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: 'anthropic-messages',
-      };
-    } else if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Native Gemini API - not typically used for /v1/messages but supported
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1beta/models'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: defaultMode,
-      };
-    } else if (defaultMode === 'openai-responses') {
-      // OpenAI Responses API upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      // OpenAI-compatible upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/messages',
-        handlerType: 'messages',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 2. /v1/interactions → multiple upstream modes
-  if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
-    if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Native Gemini API
-      const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', apiVersion),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: defaultMode,
-      };
-    } else if (defaultMode === 'anthropic-messages') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: 'anthropic-messages',
-      };
-    } else if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      // OpenAI-compatible upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/interactions',
-        handlerType: 'interactions',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 3a. /v1beta/models/{model}:countTokens → forward to Gemini upstream
-  if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && path.includes(':countTokens')) {
-    const modelMatch = path.match(/\/(v1beta|v1)\/models\/([^:?]+):countTokens/);
-    const modelId = modelMatch ? decodeURIComponent(modelMatch[2]) : 'gemini-no-id-at-proxy';
-    const safeModelId = encodeURIComponent(modelId);
-    const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-    if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', `${apiVersion}/models/${safeModelId}:countTokens`),
-        targetEndpoint: 'v1beta/models/countTokens',
-        handlerType: 'generateContent',
-        upstreamMode: defaultMode,
-        modelId,
-      };
-    } else {
-      // countTokens has no OpenAI equivalent — proxy the request upstream as-is and return the raw JSON.
-      // The handler will fall through to handleOpenAIRequest which passes the body through.
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages/count_tokens'),
-        targetEndpoint: 'v1beta/models/countTokens',
-        handlerType: 'token-counting',
-        upstreamMode: 'openai-completions',
-        modelId,
-      };
-    }
-  }
-
-  // 3. /v1beta/models/{model}:generateContent or :streamGenerateContent → multiple upstream modes
-  // Also support /v1/models/{model}:generateContent (some Gemini APIs use v1 instead of v1beta)
-  if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
-    const modelMatch = path.match(/\/(v1beta|v1)\/models\/([^:?]+):(stream)?[Gg]enerateContent/);
-    const modelId = modelMatch ? decodeURIComponent(modelMatch[2]) : 'gemini-no-id-at-proxy';
-    const safeModelId = encodeURIComponent(modelId);
-    const isStreamEndpoint = path.includes(':streamGenerateContent');
-    
-    if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Native Gemini - pass through the exact endpoint
-      const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-      const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
-      // Preserve query string if present, or add ?alt=sse for streamGenerateContent
-      let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
-      if (isStreamEndpoint && !queryString.includes('alt=sse')) {
-        queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse';
-      }
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', `${apiVersion}/models/${safeModelId}:${endpoint}${queryString}`),
-        targetEndpoint: `v1beta/models/${endpoint}`,
-        handlerType: 'generateContent',
-        upstreamMode: defaultMode,
-        modelId,
-      };
-    } else if (defaultMode === 'anthropic-messages') {
-      // Route through openai-completions transforming: handler converts
-      // generateContent body → openai-completions → anthropic-messages.
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1beta/models/generateContent',
-        handlerType: 'generateContent',
-        upstreamMode: 'anthropic-messages',
-        modelId,
-        forceStreaming: isStreamEndpoint,
-      };
-    } else if (defaultMode === 'openai-responses') {
-      // Route through openai-completions transforming: handler converts
-      // generateContent body → openai-completions → openai-responses.
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1beta/models/generateContent',
-        handlerType: 'generateContent',
-        upstreamMode: 'openai-responses',
-        modelId,
-        forceStreaming: isStreamEndpoint,
-      };
-    } else {
-      // OpenAI-compatible upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1beta/models/generateContent',
-        handlerType: 'generateContent',
-        upstreamMode: 'openai-completions',
-        modelId,
-        forceStreaming: isStreamEndpoint,
-      };
-    }
-  }
-
-  // 4. /v1/chat/completions — passthrough
-  if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
-    if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/chat/completions',
-        handlerType: 'chat-completions' as const,
-        upstreamMode: 'openai-responses',
-      };
-    }
-    return {
-      targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-      targetEndpoint: 'v1/chat/completions',
-      handlerType: 'chat-completions' as const,
-      upstreamMode: 'openai-completions',
-    };
-  }
-
-  // Token counting endpoint
+  // Endpoints whose target does not depend on the upstream mode keep their own
+  // branches; everything else goes through the shared (path × upstream_mode) table.
   if (path === '/v1/messages/count_tokens' || path.startsWith('/v1/messages/count_tokens?')) {
     return {
       targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages/count_tokens'),
       targetEndpoint: 'v1/messages/count_tokens',
       handlerType: 'token-counting',
     };
-  }
-
-  // 5. /v1/responses/input_tokens → count input tokens
-  if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
-    if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses/input_tokens'),
-        targetEndpoint: 'v1/responses/input_tokens',
-        handlerType: 'responses-input-tokens',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/responses/input_tokens',
-        handlerType: 'responses-input-tokens',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 6. /v1/responses/compact → compact a conversation
-  if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
-    if (defaultMode === 'openai-responses') {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses/compact'),
-        targetEndpoint: 'v1/responses/compact',
-        handlerType: 'responses-compact',
-        upstreamMode: 'openai-responses',
-      };
-    } else {
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/responses/compact',
-        handlerType: 'responses-compact',
-        upstreamMode: 'openai-completions',
-      };
-    }
-  }
-
-  // 6. /v1/responses → multiple upstream modes
-  if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
-    if (defaultMode === 'openai-responses') {
-      // Pass through to OpenAI Responses API
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/responses'),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: 'openai-responses',
-      };
-    } else if (defaultMode === 'anthropic-messages') {
-      // Convert Responses API to Claude Messages and forward to native Anthropic upstream
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/messages'),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: 'anthropic-messages',
-      };
-    } else if (defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions') {
-      // Convert Responses API to Claude Messages and forward to Gemini upstream
-      const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', apiVersion),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: defaultMode,
-      };
-    } else {
-      // Convert to OpenAI Chat Completions
-      return {
-        targetUrl: buildUpstreamUrl(defaultBaseUrl || '', 'v1/chat/completions'),
-        targetEndpoint: 'v1/responses',
-        handlerType: 'responses',
-        upstreamMode: 'openai-completions',
-      };
-    }
   }
 
   // Models endpoint
@@ -677,7 +675,41 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
     };
   }
 
-  throw new Error(`Unsupported fixed route: ${path}`);
+  // A fixed route has no route entry to take the Gemini model id from, so it comes
+  // from the path (the countTokens and generateContent guards both accept
+  // /v1beta/models/ and /v1/models/).
+  const isGeminiModelEndpoint = (path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) &&
+    (path.includes(':countTokens') || path.includes(':generateContent') || path.includes(':streamGenerateContent'));
+  const modelMatch = path.includes(':countTokens')
+    ? path.match(/\/(v1beta|v1)\/models\/([^:?]+):countTokens/)
+    : path.match(/\/(v1beta|v1)\/models\/([^:?]+):(stream)?[Gg]enerateContent/);
+  const modelId = modelMatch ? decodeURIComponent(modelMatch[2]) : 'gemini-no-id-at-proxy';
+
+  const resolved = resolveUpstreamTarget({
+    path,
+    baseUrl: defaultBaseUrl || '',
+    upstreamMode: defaultMode,
+    dialect: 'fixed-route',
+    geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+    pathModel: isGeminiModelEndpoint ? modelId : undefined,
+  });
+  if (!resolved) {
+    throw new Error(`Unsupported fixed route: ${path}`);
+  }
+
+  const isGeminiMode = defaultMode === 'gemini-generatecontent' || defaultMode === 'gemini-interactions';
+  const targetEndpoint = resolved.kind === 'generate-content' && isGeminiMode
+    ? `v1beta/models/${path.includes(':streamGenerateContent') ? 'streamGenerateContent' : 'generateContent'}`
+    : FIXED_ROUTE_ENDPOINTS[resolved.kind];
+
+  return {
+    targetUrl: resolved.targetUrl,
+    targetEndpoint,
+    handlerType: resolved.handlerType,
+    upstreamMode: resolved.upstreamMode,
+    modelId: isGeminiModelEndpoint ? modelId : undefined,
+    forceStreaming: resolved.forceStreaming,
+  };
 }
 
 /**
@@ -833,7 +865,7 @@ export default {
       }
 
       if (path === '/dashboard/api/stats/requests' && request.method === 'GET') {
-        return applyCorsHeaders(handleDashboardRequestStats(), request, env);
+        return applyCorsHeaders(handleDashboardRequestStats(proxyConfig), request, env);
       }
 
       if (path === '/dashboard/api/test-model' && request.method === 'POST') {
@@ -886,9 +918,29 @@ export default {
         }
       }
 
+      {
+        const modelTargetMatch = path.match(/^\/dashboard\/api\/models\/([^/]+)\/([^/]+)$/);
+        if (modelTargetMatch && request.method === 'POST') {
+          const category = decodeURIComponent(modelTargetMatch[1]);
+          const aliasKey = decodeURIComponent(modelTargetMatch[2]);
+          const response = await handleDashboardUpsertModelTarget(request, env, category, aliasKey);
+          return applyCorsHeaders(response, request, env);
+        }
+      }
+
       // Skip favicon requests
       if (path === '/favicon.ico') {
         return new Response(null, { status: 204 });
+      }
+
+      // Claude Code sends `HEAD /api/hello` at startup to warm the connection
+      // before its first real inference request. It is best-effort traffic the
+      // client ignores either way, but answering it locally keeps it off the
+      // upstream and off the auth path — Claude Code sends it with no
+      // credentials, so the presence check below would reject it with 401.
+      // Answered before the auth gate on purpose; no body, per HEAD semantics.
+      if (path === '/api/hello') {
+        return new Response(null, { status: 200 });
       }
 
       // Health check endpoint (also for root path)
@@ -951,10 +1003,15 @@ export default {
       // When auth_with_model is true, defer the auth call until after body parsing
       // so the requested model id can be forwarded as x-resource-for.
       // Skipped for /v1/models (exempt from auth entirely).
-      const authUrl = isModelsListPath ? '' : (proxyConfig.remote?.authentication?.auth_server?.trim() ?? '');
-      const authWithModel = proxyConfig.remote?.authentication?.auth_with_model === true;
-      const authWithBody = proxyConfig.remote?.authentication?.auth_with_body === true;
+      const authUrl = isModelsListPath ? '' : (proxyConfig.remote?.auth_server?.trim() ?? '');
+      const authWithModel = proxyConfig.remote?.auth_with_model === true;
+      const authWithBody = proxyConfig.remote?.auth_with_body === true;
       let modelUsageOneTimeAuthCode: string | undefined;
+      // Auth-response dynamic-routing override: when the auth server returns
+      // HTTP 200 with a `targets[]` array, these become a failover ladder for
+      // this request (see docs/architecture/auth-stats-protocol.md). Empty ⇒ normal config
+      // resolution. Populated in doAuthRequest once the body is read.
+      let authTargets: RemoteTargetDescriptor[] = [];
       // Client-IP forwarding headers for the auth_server / record_server sidecars.
       // Computed early so it is in scope for doAuthRequest (which may run now
       // when auth_with_model = false) and for the later stats record calls.
@@ -1018,6 +1075,38 @@ export default {
             : `Remote auth server rejected the request (HTTP ${authStatus}). This is a failure from the configured remote auth_server.`;
           return createErrorResponse(new Error(detail), requestId, 401);
         }
+
+        // Contract gate: a 200 response MUST advertise the wire-contract
+        // `version` field. A missing/blank/non-string version means the auth
+        // service does not speak the versioned contract we trust for routing, so
+        // reject (401) before parsing any `targets[]` (never silently fall back).
+        if (!hasRequiredProtocolVersion(authRespBodyText)) {
+          logger.warn(requestId, `Remote auth server (${authUrl}) returned 200 without a valid "version" field for ${path}; rejecting.`);
+          return createErrorResponse(
+            new Error('Remote auth server response is missing the required "version" field. This is a failure from the configured remote auth_server.'),
+            requestId,
+            401,
+          );
+        }
+
+        // Auth-response dynamic-routing override: parse the `targets[]` failover
+        // ladder. An absent/empty/malformed `targets` yields [] ⇒ normal config
+        // resolution. Invalid entries are dropped (loudly) and the ladder
+        // continues with the rest.
+        const rawTargets = parseAuthTargets(authRespBodyText);
+        if (rawTargets.length > 0) {
+          const { valid, dropped } = validateDescriptorEntries(rawTargets);
+          for (const d of dropped) {
+            logger.error(requestId, `Auth targets entry dropped: ${d.reason} (entry=${JSON.stringify(d.entry)})`);
+          }
+          const maxTargets = proxyConfig.remote?.max_targets ?? DEFAULT_MAX_TARGETS;
+          authTargets = dedupeAndCap(valid, maxTargets);
+          if (authTargets.length === 0) {
+            logger.error(requestId, `Auth server returned ${rawTargets.length} target(s) but all were invalid; falling back to normal config resolution.`);
+          } else {
+            logger.info(requestId, `Auth targets override accepted: ${authTargets.length} rung(s) (from ${rawTargets.length}, ${dropped.length} dropped).`);
+          }
+        }
         return null;
       };
 
@@ -1044,11 +1133,16 @@ export default {
         }
       }
 
-      const useConfigKey = proxyConfig.remote?.authentication?.auth_passthrough_with === 'config_key';
+      const useConfigKey = proxyConfig.remote?.auth_passthrough_with === 'config_key';
 
-      // Global token limit check: only applies to model API requests, not dashboard/health
+      // Global token limit check: only applies when mode flags are enabled (--dashboard/--tui/--agent/--rpc)
+      const modeFlagsEnabled =
+        process.env.DASHBOARD === 'true' ||
+        process.env.TUI === 'true' ||
+        process.env.AGENT === 'true' ||
+        process.env.RPC === 'true';
       const globalTokenLimitRaw = proxyConfig.general?.global_token_limit;
-      if (globalTokenLimitRaw) {
+      if (modeFlagsEnabled && globalTokenLimitRaw) {
         const parsedGlobal = parseHumanTokenLimit(globalTokenLimitRaw.trim());
         if (parsedGlobal && parsedGlobal.num > 0) {
           const cutoff = getWindowCutoff(parseWindowSpec(parsedGlobal.duration));
@@ -1116,6 +1210,14 @@ export default {
       // runAttempt so its request_ingress/response_egress transforms fire (this path
       // bypasses compositeAttempts/buildRouteAttempt which set route otherwise).
       let outerRoute: ModelRouteConfig | undefined;
+      // Remote target-retry ladder state. `routeBody` holds the parsed request
+      // body (same object mutated by privacy/kompress/erase below) so the ladder
+      // can rebuild a fresh Request per rung at dispatch — the body-parse `try`
+      // below closes before dispatch, so `body` itself is not in scope there.
+      // `useAuthLadder` is set when the auth server returned a `targets[]`
+      // override that owns routing for this request (see docs/architecture/auth-stats-protocol.md).
+      let routeBody: Record<string, unknown> | undefined;
+      let useAuthLadder = false;
       let isGeminiBypass = false;
       const userAgentPrefix = extractUserAgentPrefix(request.headers.get('user-agent'));
       // Structured agent identity — filled in once the request body is parsed
@@ -1163,16 +1265,83 @@ export default {
       const privacyActive = !!privacyConfig;
       let piiMapping: PiiMapping = {};
 
+      // Extract authentication headers early (needed for passthrough)
+      const authHeaders = extractAuthHeaders(request);
+
       // Kompress: lossy, one-directional compression of outbound request text.
       // No response-side handling needed.
       const kompressConfig = getKompressConfig(env);
       const kompressActive = !!kompressConfig && shouldCompressPath(kompressConfig, path);
 
-      // Extract authentication headers early
-      const authHeaders = extractAuthHeaders(request);
+      // Decision endpoint: POST /decision and POST /v1/decision proxy to a Clef-contract upstream
+      if (path === '/decision' || path === '/v1/decision') {
+        // The early gate above already ran unless auth is deferred
+        // (auth_with_model / auth_with_body). Those modes need the parsed body,
+        // and decision returns before the normal post-parse auth call — so
+        // run the deferred gate here, reusing the same doAuthRequest closure.
+        const decisionBodyText = await request.text();
+        if (authUrl && (authWithModel || authWithBody)) {
+          let decisionModel: string | undefined;
+          try {
+            const parsed = JSON.parse(decisionBodyText);
+            if (parsed && typeof parsed.model === 'string') decisionModel = parsed.model;
+          } catch {
+            // Invalid JSON is rejected by the handler with a 400.
+          }
+          const authError = await doAuthRequest(decisionModel, decisionBodyText);
+          if (authError) return authError;
+        }
+        const decisionResponse = await handleDecisionRequest(
+          decisionBodyText,
+          proxyConfig,
+          requestId,
+          logger,
+        );
+        recordRequestTiming(path, Date.now() - requestStartTime);
+        return decisionResponse;
+      }
+
+      // Passthrough mode: /passthrough/v1/... -> verbatim upstream
+      if (path.startsWith(`${PASSTHROUGH_PREFIX}/`)) {
+        // The early gate above already ran unless auth is deferred
+        // (auth_with_model / auth_with_body). Those modes need the parsed body,
+        // and passthrough returns before the normal post-parse auth call — so
+        // run the deferred gate here, reusing the same doAuthRequest closure.
+        const passthroughBodyText = await request.text();
+        if (authUrl && (authWithModel || authWithBody)) {
+          let passthroughModel: string | undefined;
+          try {
+            const parsed = JSON.parse(passthroughBodyText);
+            if (parsed && typeof parsed.model === 'string') passthroughModel = parsed.model;
+          } catch {
+            // Invalid JSON is rejected by the handler with a 400.
+          }
+          const authError = await doAuthRequest(passthroughModel, passthroughBodyText);
+          if (authError) return authError;
+        }
+        const passthroughResponse = await handlePassthroughRequest(
+          request,
+          path,
+          passthroughBodyText,
+          proxyConfig,
+          env,
+          logger,
+          requestId,
+          authHeaders,
+          getRawEndpointUserKey(authHeaders),
+          modelUsageOneTimeAuthCode,
+          sidecarForwardedHeaders,
+        );
+        // Same timing convention as the normal routes: recorded once the
+        // response is available (time-to-first-byte for SSE), keyed on the
+        // request path so /passthrough/v1/* shows real min/avg/max in the TUI
+        // and dashboard endpoint tables.
+        recordRequestTiming(path, Date.now() - requestStartTime);
+        return passthroughResponse;
+      }
       const endpointUserKey = getRawEndpointUserKey(authHeaders);
-      const modelUsageRecordUrl = proxyConfig.remote?.recording?.record_server?.trim();
-      const modelUsageRecordBody = proxyConfig.remote?.recording?.record_response_body === true;
+      const modelUsageRecordUrl = proxyConfig.remote?.record_server?.trim();
+      const modelUsageRecordBody = proxyConfig.remote?.record_response_body === true;
       let modelAuthHeaders = authHeaders;
 
       // For endpoints that need model-specific routing, extract model from request body
@@ -1186,6 +1355,10 @@ export default {
         try {
           let bodyText = await request.text();
           const body = JSON.parse(bodyText);
+          // Keep the parsed body visible at dispatch (the ladder rebuilds a
+          // fresh Request per rung from it). Same object reference — the
+          // in-place privacy/kompress/erase mutations below stay reflected.
+          routeBody = body;
 
           // Extract tool stats from the already-parsed body — avoids a second
           // clone()+parse that would otherwise happen before the routing block.
@@ -1225,11 +1398,23 @@ export default {
             }
           }
 
+          // Tool Judge Sidecar: evaluate tool relevance against user prompt before
+          // blocking. Runs after privacy/kompress so it sees the final request body.
+          // Fails OPEN — any error/timeout keeps all tools.
+          let sidecarEraseNames: string[] = [];
+          const judgeResult = await judgeTools(body, proxyConfig, requestId);
+          if (judgeResult.called) {
+            sidecarEraseNames = judgeResult.eraseNames;
+            if (judgeResult.error) {
+              logger.warn(requestId, `Tool judge sidecar: ${judgeResult.error}`);
+            }
+          }
+
           // Erase blocked tools from the request body before routing so every
           // downstream path (single/composite/fusion) operates on the filtered
           // body. Mirrors the privacy-filter pattern above — mutate `body`, then
           // reserialize `bodyText` so the passthrough reconstruction picks it up.
-          const eraseResult = eraseBlockedTools(body, logger, requestId);
+          const eraseResult = eraseBlockedTools(body, logger, requestId, sidecarEraseNames);
           if (eraseResult.erasedNames.length > 0 || eraseResult.toolChoiceReset) {
             bodyText = JSON.stringify(body);
           }
@@ -1265,10 +1450,14 @@ export default {
             if (authError) return authError;
           }
 
-          // Passthrough for /v1/chat/completions: use fixed routing but extract model name for stats.
-          // When passthrough is NOT enabled, skip routing vars entirely — the outer "else" block
-          // (fixed routing) calls parseFixedRoute() which throws the block error.
-          if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
+          // Remote target-retry ladder: when the auth server returned a `targets[]`
+          // override, it owns routing for this request. Skip all config-based
+          // resolution here — the ladder builds each rung from a self-contained
+          // descriptor at dispatch.
+          useAuthLadder = authTargets.length > 0 && !!routeBody && typeof routeBody === 'object';
+          if (useAuthLadder) {
+            // no-op: per-rung descriptor routing runs at dispatch (before composite dispatch)
+          } else if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
             // Prefer per-model route (e.g. gpt-5.5 in [models.free]) over the global default,
             // so the correct base_url, api_key, and upstream_mode are used.
             const modelRoute = modelName ? getModelRouteConfig(modelName, proxyConfig) : undefined;
@@ -1276,22 +1465,20 @@ export default {
             const fixedRoute = parseFixedRoute(path, proxyConfig, env);
 
             if (modelRoute && modelRoute.targetUrl) {
-              let upstreamPath: string;
-              if (modelRoute.upstreamMode === 'openai-responses') {
-                upstreamPath = 'v1/responses';
-              } else if (modelRoute.upstreamMode === 'anthropic-messages') {
-                upstreamPath = 'v1/messages';
-              } else if (modelRoute.upstreamMode === 'gemini-generatecontent'
-                  || modelRoute.upstreamMode === 'gemini-interactions') {
-                // Gemini generateContent URL embeds the target model id and the
-                // action. The chat-completions handler handles non-streaming
-                // (:generateContent); streaming lands in Phase 3.
-                const targetModel = modelRoute.modelAlias || modelName || 'gemini-no-id-at-proxy';
-                upstreamPath = `v1beta/models/${encodeURIComponent(targetModel)}:generateContent`;
-              } else {
-                upstreamPath = 'v1/chat/completions';
+              // Mode → target mapping shared with the other model-route builders.
+              const resolved = resolveUpstreamTarget({
+                path,
+                baseUrl: modelRoute.targetUrl,
+                upstreamMode: modelRoute.upstreamMode,
+                dialect: 'model-route',
+                geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+                pathModel: modelRoute.modelAlias || modelName || 'gemini-no-id-at-proxy',
+              });
+              // This branch only runs for /v1/chat/completions, which the table always maps.
+              if (!resolved) {
+                throw new Error(`Unsupported upstream target for ${path}`);
               }
-              targetUrl = buildUpstreamUrl(modelRoute.targetUrl, upstreamPath);
+              targetUrl = resolved.targetUrl;
               upstreamMode = modelRoute.upstreamMode || fixedRoute.upstreamMode;
             } else {
               targetUrl = fixedRoute.targetUrl;
@@ -1349,7 +1536,7 @@ export default {
               const fusionPlan = resolveFusionPlan(modelName, proxyConfig);
               if (fusionPlan) {
                 // token_limit check (covers all panel+judge+synth targets under the alias)
-                if (proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
+                if (modeFlagsEnabled && proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
                   const limitCfg = proxyConfig.composite[modelName].token_limit!;
                   const allTargets = [
                     ...fusionPlan.panel.map(p => p.route.modelAlias || p.modelName),
@@ -1379,7 +1566,7 @@ export default {
             compositeAliasName = (compositeCandidates.length > 0 || (request as any)._coordCandidate) ? modelName : undefined;
 
             // Token-limit enforcement: check tokens in the current duration window against the alias-level limit.
-            if (compositeCandidates.length > 0 && proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
+            if (modeFlagsEnabled && compositeCandidates.length > 0 && proxyConfig.composite?.[modelName]?.token_limit !== undefined) {
               const limitCfg = proxyConfig.composite[modelName].token_limit!;
               const targetModels = compositeCandidates.map((c) => c.route.modelAlias || c.modelName);
               const totalUsed = getCompositeAliasTokenUsage(modelName, targetModels);
@@ -1408,7 +1595,6 @@ export default {
               logger.debug(requestId, `Composite candidate ${modelName} -> ${candidateName} via ${route.targetUrl} (${route.upstreamMode}) [client ${clientAddress}:${clientPort}]`);
 
               const upstreamModelName = route.modelAlias || candidateName;
-              const safeModel = encodeURIComponent(upstreamModelName);
               const forwardedBodyText = JSON.stringify({
                 ...body,
                 model: upstreamModelName,
@@ -1432,138 +1618,20 @@ export default {
                 }
               }
 
-              const isNativeMode = route.upstreamMode === 'anthropic-messages' ||
-                                  route.upstreamMode === 'gemini-generatecontent' ||
-                                  route.upstreamMode === 'gemini-interactions' ||
-                                  route.upstreamMode === 'openai-responses';
+              const resolved = resolveUpstreamTarget({
+                path,
+                baseUrl: route.targetUrl,
+                upstreamMode: route.upstreamMode,
+                dialect: 'model-route',
+                geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+                pathModel: upstreamModelName,
+                bodyStream: body?.stream === true,
+              });
 
-              let candidateTargetUrl = '';
-              let candidateHandlerType: RouteAttempt['handlerType'] = 'messages';
-              let candidateUpstreamMode: string | undefined;
-              let candidateForceStreaming = false;
-
-              if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
-                candidateHandlerType = 'messages';
-                if (isNativeMode) {
-                  const requestBody = JSON.parse(forwardedBodyText) as Record<string, unknown>;
-                  const isStreaming = requestBody.stream === true;
-
-                  if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                    candidateTargetUrl = isStreaming
-                      ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-                      : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-                  } else if (route.upstreamMode === 'openai-responses') {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                  } else {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                  }
-                  candidateUpstreamMode = route.upstreamMode;
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
-                candidateHandlerType = 'interactions';
-                if (isNativeMode) {
-                  if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                    const requestBody = JSON.parse(forwardedBodyText) as Record<string, unknown>;
-                    const isStreaming = requestBody.stream === true;
-                    candidateTargetUrl = isStreaming
-                      ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-                      : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-                    candidateUpstreamMode = route.upstreamMode;
-                  } else if (route.upstreamMode === 'anthropic-messages') {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                    candidateUpstreamMode = 'anthropic-messages';
-                  } else if (route.upstreamMode === 'openai-responses') {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                    candidateUpstreamMode = 'openai-responses';
-                  } else {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                    candidateUpstreamMode = 'openai-completions';
-                  }
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && path.includes(':countTokens')) {
-                candidateHandlerType = 'generateContent';
-                if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:countTokens`);
-                  candidateUpstreamMode = route.upstreamMode;
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages/count_tokens');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
-                candidateHandlerType = 'generateContent';
-                const isStreamEndpoint = path.includes(':streamGenerateContent');
-                if (isNativeMode) {
-                  if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                    const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
-                    let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
-                    if (isStreamEndpoint && !queryString.includes('alt=sse')) {
-                      queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse';
-                    }
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:${endpoint}${queryString}`);
-                    candidateUpstreamMode = route.upstreamMode;
-                  } else if (route.upstreamMode === 'anthropic-messages') {
-                    // Through openai-completions transforming: handler converts
-                    // generateContent body → openai-completions → anthropic-messages.
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                    candidateUpstreamMode = 'anthropic-messages';
-                    candidateForceStreaming = isStreamEndpoint;
-                  } else if (route.upstreamMode === 'openai-responses') {
-                    // Through openai-completions transforming: handler converts
-                    // generateContent body → openai-completions → openai-responses.
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                    candidateUpstreamMode = 'openai-responses';
-                    candidateForceStreaming = isStreamEndpoint;
-                  } else {
-                    candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                    candidateUpstreamMode = 'openai-completions';
-                    candidateForceStreaming = isStreamEndpoint;
-                  }
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                  candidateForceStreaming = isStreamEndpoint;
-                }
-              } else if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
-                candidateHandlerType = 'responses';
-                if (route.upstreamMode === 'openai-responses') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-                  candidateUpstreamMode = 'openai-responses';
-                } else if (route.upstreamMode === 'anthropic-messages') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-                  candidateUpstreamMode = 'anthropic-messages';
-                } else if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-                  const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, apiVersion);
-                  candidateUpstreamMode = route.upstreamMode;
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
-                candidateHandlerType = 'responses-input-tokens';
-                if (route.upstreamMode === 'openai-responses') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/input_tokens');
-                  candidateUpstreamMode = 'openai-responses';
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              } else if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
-                candidateHandlerType = 'responses-compact';
-                if (route.upstreamMode === 'openai-responses') {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/compact');
-                  candidateUpstreamMode = 'openai-responses';
-                } else {
-                  candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-                  candidateUpstreamMode = 'openai-completions';
-                }
-              }
+              const candidateTargetUrl = resolved?.targetUrl ?? '';
+              const candidateHandlerType: RouteAttempt['handlerType'] = resolved?.handlerType ?? 'messages';
+              const candidateUpstreamMode = resolved?.upstreamMode;
+              const candidateForceStreaming = resolved?.forceStreaming ?? false;
 
               return {
                 request: candidateRequest,
@@ -1632,6 +1700,13 @@ export default {
         }
       } else if (isDynamicRoute(path)) {
         // Dynamic routing: /http/host/... or /https/host/...
+        // Opt-in: disabled unless ENABLE_DYNAMIC_ROUTING is set. Reject explicitly
+        // instead of falling through to fixed routing, which would silently
+        // reinterpret the path as a fixed route.
+        if (!isDynamicRoutingEnabled(env)) {
+          logger.warn(requestId, `Dynamic routing disabled (set ENABLE_DYNAMIC_ROUTING=true to enable): ${path}`);
+          return createErrorResponse(new Error('Dynamic routing is disabled.'), requestId, 403);
+        }
         // Validate parsed host against config-approved upstream hosts (SSRF protection).
         let parsedRoute;
         try {
@@ -1709,7 +1784,8 @@ export default {
       }
 
       // Build a RouteAttempt for a given {modelName, route} pair and a body object.
-      // Mirrors the inline logic in the compositeAttempts.map() block above.
+      // Shares the mode → target table with the compositeAttempts.map() block above
+      // (resolveUpstreamTarget).
       const buildRouteAttempt = (
         candidateName: string,
         route: ModelRouteConfig,
@@ -1717,7 +1793,6 @@ export default {
         forceStreamOverride?: boolean,
       ): RouteAttempt => {
         const upstreamModelName = route.modelAlias || candidateName;
-        const safeModel = encodeURIComponent(upstreamModelName);
         const forwardedBodyText = JSON.stringify({ ...bodyObj, model: upstreamModelName });
         const candidateRequest = new Request(request.url, {
           method: request.method,
@@ -1726,7 +1801,7 @@ export default {
         });
 
         let candidateAuthHeaders = transformAuthHeadersForUpstream(candidateRequest, route.upstreamMode, path, requestId, env as Record<string, unknown>);
-        if (route.apiKey && (route.section === 'free' || route.section === 'FREE' || useConfigKey)) {
+        if (route.apiKey && (route.section === 'free' || route.section === 'FREE' || route.explicitApiKey || useConfigKey)) {
           if (route.upstreamMode === 'openai-completions') {
             if (route.modelAlias) {
               candidateAuthHeaders = { ...candidateAuthHeaders, ...formatApiKeyForUpstream(route.apiKey, route.upstreamMode) };
@@ -1745,122 +1820,21 @@ export default {
           }
         }
 
-        const isNativeMode = route.upstreamMode === 'anthropic-messages' ||
-                             route.upstreamMode === 'gemini-generatecontent' ||
-                             route.upstreamMode === 'gemini-interactions' ||
-                             route.upstreamMode === 'openai-responses';
+        const resolved = resolveUpstreamTarget({
+          path,
+          baseUrl: route.targetUrl,
+          upstreamMode: route.upstreamMode,
+          dialect: 'model-route',
+          geminiApiVersion: env.GEMINI_API_VERSION || 'v1beta',
+          pathModel: upstreamModelName,
+          bodyStream: bodyObj.stream === true,
+          forceStream: forceStreamOverride,
+        });
 
-        let candidateTargetUrl = '';
-        let candidateHandlerType: RouteAttempt['handlerType'] = 'messages';
-        let candidateUpstreamMode: string | undefined;
-        let candidateForceStreaming = forceStreamOverride ?? false;
-
-        const bodyStream = (bodyObj.stream === true);
-
-        if (path === '/v1/messages' || path.startsWith('/v1/messages?')) {
-          candidateHandlerType = 'messages';
-          if (isNativeMode) {
-            if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-              candidateTargetUrl = bodyStream
-                ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-                : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-            } else if (route.upstreamMode === 'openai-responses') {
-              candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            } else {
-              candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            }
-            candidateUpstreamMode = route.upstreamMode;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
-          candidateHandlerType = 'interactions';
-          if (isNativeMode && (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions')) {
-            candidateTargetUrl = bodyStream
-              ? buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:streamGenerateContent?alt=sse`)
-              : buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:generateContent`);
-            candidateUpstreamMode = route.upstreamMode;
-          } else if (isNativeMode && route.upstreamMode === 'anthropic-messages') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            candidateUpstreamMode = 'anthropic-messages';
-          } else if (isNativeMode && route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            candidateUpstreamMode = 'openai-responses';
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && path.includes(':countTokens')) {
-          candidateHandlerType = 'generateContent';
-          if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:countTokens`);
-            candidateUpstreamMode = route.upstreamMode;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages/count_tokens');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && (path.includes(':generateContent') || path.includes(':streamGenerateContent'))) {
-          candidateHandlerType = 'generateContent';
-          const isStreamEndpoint = path.includes(':streamGenerateContent');
-          if (isNativeMode && (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions')) {
-            const endpoint = isStreamEndpoint ? 'streamGenerateContent' : 'generateContent';
-            let queryString = path.includes('?') ? path.substring(path.indexOf('?')) : '';
-            if (isStreamEndpoint && !queryString.includes('alt=sse')) { queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse'; }
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, `v1beta/models/${safeModel}:${endpoint}${queryString}`);
-            candidateUpstreamMode = route.upstreamMode;
-          } else if (isNativeMode && route.upstreamMode === 'anthropic-messages') {
-            // Through openai-completions transforming: handler converts
-            // generateContent body → openai-completions → anthropic-messages.
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            candidateUpstreamMode = 'anthropic-messages';
-            candidateForceStreaming = forceStreamOverride ?? isStreamEndpoint;
-          } else if (isNativeMode && route.upstreamMode === 'openai-responses') {
-            // Through openai-completions transforming: handler converts
-            // generateContent body → openai-completions → openai-responses.
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            candidateUpstreamMode = 'openai-responses';
-            candidateForceStreaming = forceStreamOverride ?? isStreamEndpoint;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-            candidateForceStreaming = forceStreamOverride ?? isStreamEndpoint;
-          }
-        } else if (path === '/v1/responses' || path.startsWith('/v1/responses?')) {
-          candidateHandlerType = 'responses';
-          if (route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses');
-            candidateUpstreamMode = 'openai-responses';
-          } else if (route.upstreamMode === 'anthropic-messages') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/messages');
-            candidateUpstreamMode = 'anthropic-messages';
-          } else if (route.upstreamMode === 'gemini-generatecontent' || route.upstreamMode === 'gemini-interactions') {
-            const apiVersion = env.GEMINI_API_VERSION || 'v1beta';
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, apiVersion);
-            candidateUpstreamMode = route.upstreamMode;
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if (path === '/v1/responses/input_tokens' || path.startsWith('/v1/responses/input_tokens?')) {
-          candidateHandlerType = 'responses-input-tokens';
-          if (route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/input_tokens');
-            candidateUpstreamMode = 'openai-responses';
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        } else if (path === '/v1/responses/compact' || path.startsWith('/v1/responses/compact?')) {
-          candidateHandlerType = 'responses-compact';
-          if (route.upstreamMode === 'openai-responses') {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/responses/compact');
-            candidateUpstreamMode = 'openai-responses';
-          } else {
-            candidateTargetUrl = buildUpstreamUrl(route.targetUrl, 'v1/chat/completions');
-            candidateUpstreamMode = 'openai-completions';
-          }
-        }
+        const candidateTargetUrl = resolved?.targetUrl ?? '';
+        const candidateHandlerType: RouteAttempt['handlerType'] = resolved?.handlerType ?? 'messages';
+        const candidateUpstreamMode = resolved?.upstreamMode;
+        const candidateForceStreaming = resolved?.forceStreaming ?? forceStreamOverride ?? false;
 
         return {
           request: candidateRequest,
@@ -2177,7 +2151,7 @@ export default {
             const clonedBody = attemptRequest.clone();
             const bodyText = await clonedBody.text();
             const { writeFileSync } = await import('fs');
-            writeFileSync('/tmp/test_model.log',
+            writeFileSync(join(tmpdir(), 'test_model.log'),
               `[${new Date().toISOString()}] proxy routing\n` +
               `path: ${path}\n` +
               `targetUrl: ${attemptTargetUrl}\n` +
@@ -2190,7 +2164,7 @@ export default {
           } catch (_e) {
             try {
               const { writeFileSync } = await import('fs');
-              writeFileSync('/tmp/test_model.log', `[${new Date().toISOString()}] proxy routing - failed to log request body: ${(_e as Error).message}\n`);
+              writeFileSync(join(tmpdir(), 'test_model.log'), `[${new Date().toISOString()}] proxy routing - failed to log request body: ${(_e as Error).message}\n`);
             } catch {}
           }
         }
@@ -2223,11 +2197,49 @@ export default {
 
         switch (attemptHandlerType) {
           case 'models':
-            response = await handleModelsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>, configuredModelIds);
+            // Check if Anthropic model discovery is enabled (gate)
+            if (isAnthropicModelDiscoveryEnabled(env as unknown as Record<string, unknown>)) {
+              // Use Anthropic model discovery handler: 3s timeout, redirect=error, filter, forward both auth headers
+              response = await handleAnthropicModelsDiscovery(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>);
+            } else {
+              response = await handleModelsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>, configuredModelIds);
+
+              // Check if User-Agent contains 'claude-cli' to return Anthropic model list format (legacy)
+              const userAgent = request.headers.get('user-agent') || '';
+              if (userAgent.includes('claude-cli')) {
+                try {
+                  const body: any = await response.json();
+                  // Transform OpenAI response to Anthropic format
+                  if (body.object === 'list' && Array.isArray(body.data)) {
+                    const anthropicModels = body.data.map((model: any) => ({
+                      id: model.id,
+                      type: 'model',
+                      created_at: new Date(model.created * 1000).toISOString(),
+                      display_name: model.id,
+                    }));
+                    const transformedResponse = {
+                      data: anthropicModels,
+                      first_id: anthropicModels[0]?.id || '',
+                      last_id: anthropicModels[anthropicModels.length - 1]?.id || '',
+                      has_more: false,
+                    };
+                    response = new Response(JSON.stringify(transformedResponse), {
+                      status: response.status,
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'x-request-id': requestId,
+                      },
+                    });
+                  }
+                } catch {
+                  // If transformation fails, return original response
+                }
+              }
+            }
             break;
 
           case 'token-counting':
-            response = await handleTokenCountingRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, env, logger);
+            response = await handleTokenCountingRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, env, logger, attemptRoute);
             break;
 
           case 'messages':
@@ -2442,6 +2454,94 @@ export default {
         return response;
       };
 
+      /** Parse a `Retry-After` header (delta-seconds or HTTP-date) into ms, or undefined. */
+      const parseRetryAfterMs = (response: Response | undefined): number | undefined => {
+        const raw = response?.headers.get('retry-after');
+        if (!raw) return undefined;
+        const seconds = Number(raw);
+        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+        const dateMs = Date.parse(raw);
+        return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : undefined;
+      };
+
+      // ---- Remote target-retry failover ladder (auth `targets[]` override) ----
+      // Each rung is a self-contained descriptor, so no config resolution is
+      // involved. Axis 1 advances to the next rung on a retryable outcome
+      // (429 / 5xx); axis 2 re-hits the SAME rung on an explicit `retry_on`
+      // status. An exhausted ladder surfaces the last failure in its original
+      // form — a returned Response (chat-completions/embeddings handlers have
+      // nothing to throw) is returned verbatim; a thrown error is rethrown so
+      // the outer catch applies the usual error path. See
+      // docs/plan-remote-target-retry-dispatch.md.
+      const runTargetLadder = async (
+        entries: RemoteTargetDescriptor[],
+        bodyObj: Record<string, unknown>,
+      ): Promise<Response> => {
+        // Auth-response one-time code is the base each rung's own otac overrides.
+        const baseOtac = modelUsageOneTimeAuthCode;
+        let lastOutcome: AttemptOutcome | undefined;
+
+        for (let i = 0; i < entries.length; i++) {
+          const entry = entries[i];
+          // A rung's own `retry` overrides the `[remote]` default for this rung only.
+          const maxTargetRetries = entry.retry ?? proxyConfig.remote?.max_target_retries ?? DEFAULT_MAX_TARGET_RETRIES;
+          const route = descriptorToRoute(entry, proxyConfig);
+          modelUsageOneTimeAuthCode = entry.otac ?? baseOtac;
+          let attempt = buildRouteAttempt(entry.target, route, bodyObj);
+          let outcome: AttemptOutcome | undefined;
+
+          // Axis 2: same-target retry (retry_on).
+          for (let n = 0; n <= maxTargetRetries; n++) {
+            if (attempt.modelId) failedModelId = attempt.modelId;
+            try {
+              outcome = outcomeFromResponse(await runAttempt(attempt));
+            } catch (error) {
+              outcome = outcomeFromError(error);
+              // runAttempt's stats block only fires for returned Responses;
+              // record the thrown case here so a dead rung is still counted
+              // (mirrors the composite loop's catch).
+              if (attempt.modelId) {
+                recordModelFailedRequest(attempt.modelId);
+                modelFailureRecorded = true;
+              }
+            }
+            logger.debug(requestId, `Target ladder: ${entry.target}@${entry.base} attempt ${n + 1}/${maxTargetRetries + 1} -> ${outcome.status}`);
+
+            if (outcome.ok) return outcome.response as Response;
+
+            if (n >= maxTargetRetries || !entry.retry_on?.includes(outcome.status)) break;
+
+            const retryAfterMs = parseRetryAfterMs(outcome.response);
+            const backoffMs = Math.min(250 * 2 ** n, 2000);
+            const waitMs = retryAfterMs !== undefined ? Math.min(retryAfterMs, 2000) : backoffMs;
+            if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+            attempt = buildRouteAttempt(entry.target, route, bodyObj); // Request bodies are single-use
+          }
+
+          lastOutcome = outcome;
+          // Axis 1: advance to the next rung only on a retryable status.
+          if (!outcome || !isRetryableOutcome(outcome)) break;
+          if (i < entries.length - 1) {
+            logger.warn(requestId, `Target ladder: ${entry.target}@${entry.base} returned ${outcome.status}; trying next target ${entries[i + 1].target}`);
+          }
+        }
+
+        if (lastOutcome?.response) return lastOutcome.response;
+        throw lastOutcome?.error ?? new ClaudeProxyError('All auth targets failed', 502, 'upstream_error');
+      };
+
+      // ---- Remote target-retry ladder dispatch ----
+      // The override owns routing for this request: no composite attempts were
+      // built (the routing block short-circuited), so the ladder runs here and
+      // applies the post-response pipeline itself — same three steps the two
+      // existing call sites apply, or override requests would silently lose
+      // PII restoration / CORS / timing.
+      if (useAuthLadder) {
+        const ladderResponse = await runTargetLadder(authTargets, routeBody as Record<string, unknown>);
+        recordRequestTiming(path, Date.now() - requestStartTime);
+        return applyCorsHeaders(await restorePrivacyResponse(ladderResponse, piiMapping, requestId, logger), request, env);
+      }
+
       // ---- Fusion dispatch ----
       const _fusionPlan = (request as any)._fusionPlan as FusionPlan | undefined;
       const _fusionBody = (request as any)._fusionBody as Record<string, unknown> | undefined;
@@ -2456,7 +2556,7 @@ export default {
         for (let i = 0; i < compositeAttempts.length; i++) {
           const attempt = compositeAttempts[i];
           try {
-            logger.info(requestId, `${new URL(attempt.request.url).pathname} for ${scheduleAliasName ?? compositeAliasName ?? attempt.modelId} to ${attempt.targetUrl} (${attempt.upstreamMode})`);
+            logger.info(requestId, `${new URL(attempt.request.url).pathname},${scheduleAliasName ?? compositeAliasName ?? attempt.modelId},${attempt.targetUrl}`);
             const response = await runAttempt(attempt);
             // Gradual share recovery: a successful primary or fallback attempt
             // doubles its effective share back toward the configured value

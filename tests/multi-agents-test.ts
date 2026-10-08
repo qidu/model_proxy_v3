@@ -67,6 +67,7 @@ const PROXY_BASE = process.env.PROXY_BASE || "http://127.0.0.1:7777";
 const WORK_DIR = "./tests/";
 
 const MODELS = [
+  "kimi-k3-qn",
   "deepseek-v4-comp",               // deepseek via openai-completions
   "deepseek-v4-anth",               // deepseek via anthropic-messages
   "max-m3-comp",                    // minimax via openai-completions
@@ -231,8 +232,27 @@ wire_api = "responses"
       model,
       modelReasoningEffort: "low",
     });
-    const result = await thread.run(prompt);
-    console.log("Codex result:", result.finalResponse ?? result);
+    // const result = await thread.run(prompt);
+    // console.log("Codex result:", result.finalResponse ?? result);
+
+    const { events } = await thread.runStreamed(prompt);
+    for await (const event of events) {
+      switch (event.type) {
+        case "item.started":
+          break;
+        case "item.completed":
+          if (event.item?.type === 'command_execution') {
+            console.log(`  ${event.item.command}`);
+            console.log(`  (aggregated_output length: ${event.item.aggregated_output.length})`);
+          }
+          break;
+        case "turn.completed":
+            console.log("Usage:", event.usage);
+            break;
+        default:
+            //console.log(event);
+      }
+    }
   } catch (error) {
     console.error("Codex failed:", error);
   }

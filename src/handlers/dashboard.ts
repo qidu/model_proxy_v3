@@ -1,4 +1,6 @@
 import { Env } from '../types/shared.js';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   ProxyConfig,
   CompositeTargetPatch,
@@ -14,6 +16,8 @@ import {
   toDashboardConfigPayload,
   upsertCompositeAliasLimit,
   upsertCompositeTarget,
+  upsertModelTarget,
+  ModelTargetPatch,
   upsertFusionOptions,
   FusionOptions,
   clearProxyConfigCache,
@@ -50,6 +54,7 @@ import {
   getPrivacyKeysDetected,
 } from '../utils/dashboard-stats.js';
 import { formatApiKeyForUpstream } from '../utils/routing.js';
+import { UPSTREAM_MODES } from '../utils/upstream-modes.js';
 import { getModelQuota, formatQuotaLeft, getUpstreamRateLimitLeft, getUpstreamRateLimitLeftForUrl, type QuotaResult } from '../utils/provider-quota.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -84,6 +89,14 @@ export interface DashboardSnapshot {
   toolStats: ReturnType<typeof getToolUsageStatsDesc>;
   agentToolStats: ReturnType<typeof getAgentToolPanelStats>;
   blockedTools: string[];
+  toolJudgeSidecar?: {
+    enabled: boolean;
+    judge_url?: string;
+    mode?: 'choice' | 'noul';
+    threshold?: number;
+    timeout_ms?: number;
+    max_batch_tools?: number;
+  };
   requestStats: {
     endpoints: ReturnType<typeof getRequestEndpointStatsDesc>;
     upstreams: ReturnType<typeof getRequestUpstreamStatsDesc>;
@@ -163,6 +176,14 @@ export function getDashboardSnapshot(proxyConfig: ProxyConfig, env: Env): Dashbo
     toolStats: getToolUsageStatsDesc(),
     agentToolStats: getAgentToolPanelStats(),
     blockedTools: [...getBlockedTools()],
+    toolJudgeSidecar: proxyConfig.tool_judge_sidecar?.judge_url ? {
+      enabled: true,
+      judge_url: proxyConfig.tool_judge_sidecar.judge_url,
+      mode: proxyConfig.tool_judge_sidecar.mode ?? 'choice',
+      threshold: proxyConfig.tool_judge_sidecar.threshold ?? 0.5,
+      timeout_ms: proxyConfig.tool_judge_sidecar.timeout_ms ?? 50,
+      max_batch_tools: proxyConfig.tool_judge_sidecar.max_batch_tools ?? 50,
+    } : { enabled: false },
     requestStats: {
       endpoints: getRequestEndpointStatsDesc(),
       upstreams: getRequestUpstreamStatsDesc(),
@@ -207,6 +228,41 @@ export function upsertCompositeTargetFromDashboard(
   return saveConfigMutation(env, (baseConfig) =>
     upsertCompositeTarget(baseConfig, alias, targetModel, patch, getConfiguredModelIds(baseConfig)),
   );
+}
+
+export function upsertModelTargetFromDashboard(
+  env: Env,
+  category: string,
+  aliasKey: string,
+  patch: ModelTargetPatch,
+): ReturnType<typeof toDashboardConfigPayload> {
+  return saveConfigMutation(env, (baseConfig) => upsertModelTarget(baseConfig, category, aliasKey, patch));
+}
+
+/**
+ * Read the real (unsanitized) `[models.<category>]` entry for `aliasKey` —
+ * unlike `toDashboardConfigPayload`, this includes `api_key`. Used to prefill
+ * the TUI's edit wizard. Returns undefined when the entry doesn't exist
+ * (adding a new target).
+ */
+export function getModelTargetFromDashboard(
+  env: Env,
+  category: string,
+  aliasKey: string,
+): ModelTargetPatch | undefined {
+  const configPath = getConfigPathForWrite(env);
+  const baseConfig = loadProxyConfigFromPath(configPath);
+  const categoryConfig = baseConfig.models?.[category];
+  if (!categoryConfig || Array.isArray(categoryConfig)) return undefined;
+  const entry = categoryConfig[aliasKey];
+  if (!Array.isArray(entry)) return undefined;
+  const [target, base_url, api_key, mode] = entry;
+  return {
+    target: target ?? aliasKey,
+    base_url: base_url ?? '',
+    api_key: api_key ?? '',
+    mode: mode || categoryConfig.upstream_mode || '',
+  };
 }
 
 export function upsertCompositeAliasLimitFromDashboard(
@@ -336,6 +392,32 @@ export function handleDashboardRemoveScheduleTarget(
   }
 }
 
+export async function handleDashboardUpsertModelTarget(
+  request: Request,
+  env: Env,
+  category: string,
+  aliasKey: string,
+): Promise<Response> {
+  try {
+    const body = await request.json() as Partial<ModelTargetPatch>;
+    if (typeof body.target !== 'string' || !body.target.trim()) {
+      return jsonResponse({ error: 'target is required' }, 400);
+    }
+    if (typeof body.mode !== 'string') {
+      return jsonResponse({ error: 'mode is required' }, 400);
+    }
+    const payload = upsertModelTargetFromDashboard(env, category, aliasKey, {
+      target: body.target,
+      api_key: typeof body.api_key === 'string' ? body.api_key : '',
+      base_url: typeof body.base_url === 'string' ? body.base_url : '',
+      mode: body.mode,
+    });
+    return jsonResponse(payload);
+  } catch (error) {
+    return jsonResponse({ error: (error as Error).message }, 400);
+  }
+}
+
 export function handleDashboardPage(env: Env): Response {
   const html = `<!doctype html>
 <html>
@@ -376,10 +458,14 @@ export function handleDashboardPage(env: Env): Response {
       .alias-message.success { color: #2e7d32; }
 
       .config-block { border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-top: 10px; }
+      .config-block h3 { position: relative; padding-right: 34px; }
+      .config-block-title { background: #fff; padding: 1px 8px; border-radius: 4px; }
+      .config-block.collapsed > *:not(h3) { display: none; }
+      .collapse-btn { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); width: 22px; height: 22px; padding: 0; font-size: 12px; line-height: 1; color: #555; background: #fff; border: 1px solid #bdbdbd; border-radius: 4px; cursor: pointer; }
+      .collapse-btn:hover { background: #f5f5f5; }
       .config-row { display: grid; grid-template-columns: 260px 1fr 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
       .config-row label { font-weight: 600; }
       input[type="text"], input[type="number"], select {
-        width: 100%;
         padding: 6px 10px;
         border: 1px solid #bdbdbd;
         border-radius: 6px;
@@ -401,12 +487,12 @@ export function handleDashboardPage(env: Env): Response {
       .sched-window-row select { width: auto; min-width: 110px; }
       .row-actions { display: flex; gap: 8px; align-items: center; }
       .mini-btn { padding: 4px 8px; font-size: 12px; justify-self: start; width: auto; }
-      .test-btn { padding: 4px 8px; font-size: 12px; background: #e8f5e9; border: 1px solid #a5d6a7; color: #2e7d32; }
+      .test-btn { padding: 4px 8px; font-size: 12px; background: #e8f5e9; border: 1px solid #a5d6a7; color: #2e7d32c7; }
       .test-btn:hover { background: #c8e6c9; }
       .test-btn.testing { background: #fff9c4; border-color: #fff176; color: #f57f17; }
       .test-btn.error-result { background: #ffebee; border-color: #ef9a9a; color: #c62828; }
       .test-btn.success-result { background: #e8f5e9; border-color: #a5d6a7; color: #2e7d32; }
-      .danger { background: #fff9c454; border: 1px solid #ffebee; }
+      .danger { background: ##fff9c350; border: 1px solid #fff176; }
       .section-actions { margin-top: 8px; }
       /* Tool blocklist */
       tr.tool-row.blocked { background: #fff1f1; }
@@ -468,7 +554,7 @@ export function handleDashboardPage(env: Env): Response {
       #testResultPanel.error { background: #ffebee; border: 1px solid #ef9a9a; color: #b71c1c; }
       #testResultPanel.testing { background: #fff9c4; border: 1px solid #fff176; color: #e65100; }
       .result-usage { font-size: 12px; opacity: 0.8; }
-      .result-clear { float: right; background: none; border: none; cursor: pointer; font-size: 13px; padding: 0; color: inherit; opacity: 0.7; }
+      .result-clear { float: right; background: white; border: 1px; cursor: pointer; font-size: 13px; padding: 2px; color: inherit; opacity: 0.7; }
       .result-clear:hover { opacity: 1; }
       .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: flex-start; justify-content: center; z-index: 2000; padding-top: 6vh; }
       .modal-overlay[hidden] { display: none; }
@@ -493,7 +579,7 @@ export function handleDashboardPage(env: Env): Response {
     </style>
   </head>
   <body>
-    <h1>Proxy Dashboard <span id="keyStoreLock" hidden title="All config api_keys are STORE_KEY_IN_SYSTEM (stored in the system keychain)" style="font-size:16px;">🔒</span> <span style="color:#9e9e9e;font-size:14px;font-weight:normal;">${env.VERSION || 'dev'}</span></h1>
+    <h1>Proxy Dashboard <span id="keyStoreLock" hidden title="All config api_keys are STORE_KEY_IN_SYSTEM (stored in the system keychain)" style="font-size:16px;">🔒</span> <span style="color:#9e9e9e;font-size:14px;font-weight:normal;">(ver ${env.VERSION || 'dev'})</span></h1>
 
     <div id="compositeAliasWizard" class="modal-overlay" hidden>
       <div class="modal" role="dialog" aria-labelledby="wizTitle" aria-modal="true">
@@ -505,8 +591,8 @@ export function handleDashboardPage(env: Env): Response {
           <input type="text" id="wiz-alias-name" placeholder="e.g. gpt-all" autocomplete="off" />
           <label>Mode</label>
           <div class="mode-options" id="wiz-mode-options">
-            <div class="mode-option selected" data-mode="composite" id="wiz-mode-composite"><b>Ç</b> composite<br /><span style="font-size:11px;color:#666;">share / primary / fallback</span></div>
-            <div class="mode-option" data-mode="fusion" id="wiz-mode-fusion"><b>ƒ</b> fusion<br /><span style="font-size:11px;color:#666;">panel / judge / synth</span></div>
+            <div class="mode-option selected" data-mode="composite" id="wiz-mode-composite"><b>ᙅ</b> composite<br /><span style="font-size:11px;color:#666;">share / primary / fallback</span></div>
+            <div class="mode-option" data-mode="fusion" id="wiz-mode-fusion"><b>Ƒ</b> fusion<br /><span style="font-size:11px;color:#666;">panel / judge / synth</span></div>
             <div class="mode-option" data-mode="coordinator" id="wiz-mode-coordinator"><b>Ö</b> coordinator<br /><span style="font-size:11px;color:#666;">planner / executor stages</span></div>
           </div>
         </div>
@@ -586,6 +672,21 @@ export function handleDashboardPage(env: Env): Response {
       </div>
     </div>
 
+    <div id="modelTargetWizard" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-labelledby="mtWizTitle" aria-modal="true">
+        <button type="button" class="modal-close-x" id="mt-wiz-close-x" aria-label="Close wizard" title="Close (Esc)">×</button>
+        <div class="wizard-steps" id="mt-wiz-steps">Step 1 of 6</div>
+        <h3 id="mtWizTitle">Add target model — Step 1: Alias key</h3>
+        <div id="mt-wiz-body"></div>
+        <div class="modal-status" id="mt-wiz-status"></div>
+        <div class="modal-actions">
+          <button type="button" class="mini-btn" id="mt-wiz-cancel">Cancel</button>
+          <button type="button" class="mini-btn" id="mt-wiz-back" hidden>Back</button>
+          <button type="button" class="mini-btn" id="mt-wiz-submit">Next</button>
+        </div>
+      </div>
+    </div>
+
     <div class="side-nav" id="sideNav">
       <a href="#section-config">Config</a>
       <a href="#section-model">Model</a>
@@ -599,7 +700,7 @@ export function handleDashboardPage(env: Env): Response {
       <div class="wildcard-test-row">
         <label for="wildcardModelInput">Wildcard model test:</label>
         <input type="text" id="wildcardModelInput" placeholder="model id matched by wildcard" autocomplete="off" />
-        <button id="testWildcardModel" type="button" class="test-btn mini-btn">test</button>
+        <button id="testWildcardModel" type="button" class="test-btn mini-btn">test it</button>
         <span id="wildcardRouteHint"></span>
         <span id="wildcardTestStatus"></span>
       </div>
@@ -644,6 +745,13 @@ export function handleDashboardPage(env: Env): Response {
           <thead><tr><th>Metric</th><th class="num">Count</th></tr></thead>
           <tbody><tr><td>filtered Keys (total)</td><td class="num" id="privacyKeysDetected">0</td></tr></tbody>
         </table>
+      </div>
+
+      <div class="request-submodule" id="section-tool-judge-sidecar">
+        <h3>Tool Judge Sidecar</h3>
+        <div id="toolJudgeSidecarStatus">
+          <p style="color:#666;">Loading…</p>
+        </div>
       </div>
 
       <div class="request-submodule">
@@ -861,8 +969,8 @@ export function handleDashboardPage(env: Env): Response {
             '<input type="text" id="wiz-alias-name" placeholder="e.g. gpt-all" autocomplete="off" />' +
             '<label>Mode</label>' +
             '<div class="mode-options" id="wiz-mode-options">' +
-              '<div class="mode-option" data-mode="composite"><b>Ç</b> composite<br /><span style="font-size:11px;color:#666;">share / primary / fallback</span></div>' +
-              '<div class="mode-option" data-mode="fusion"><b>ƒ</b> fusion<br /><span style="font-size:11px;color:#666;">panel / judge / synth</span></div>' +
+              '<div class="mode-option" data-mode="composite"><b>ᙅ</b> composite<br /><span style="font-size:11px;color:#666;">share / primary / fallback</span></div>' +
+              '<div class="mode-option" data-mode="fusion"><b>Ƒ</b> fusion<br /><span style="font-size:11px;color:#666;">panel / judge / synth</span></div>' +
               '<div class="mode-option" data-mode="coordinator"><b>Ö</b> coordinator<br /><span style="font-size:11px;color:#666;">planner / executor stages</span></div>' +
             '</div>';
           bodyEl.querySelectorAll('#wiz-mode-options .mode-option').forEach(function (el) {
@@ -1102,8 +1210,8 @@ export function handleDashboardPage(env: Env): Response {
           bodyEl.innerHTML =
             '<label>Mode</label>' +
             '<div class="mode-options" id="ctgt-mode-options">' +
-              '<div class="mode-option" data-mode="composite"><b>Ç</b> composite<br /><span style="font-size:11px;color:#666;">share / primary / fallback</span></div>' +
-              '<div class="mode-option" data-mode="fusion"><b>ƒ</b> fusion<br /><span style="font-size:11px;color:#666;">panel / judge / synth</span></div>' +
+              '<div class="mode-option" data-mode="composite"><b>ᙅ</b> composite<br /><span style="font-size:11px;color:#666;">share / primary / fallback</span></div>' +
+              '<div class="mode-option" data-mode="fusion"><b>Ƒ</b> fusion<br /><span style="font-size:11px;color:#666;">panel / judge / synth</span></div>' +
               '<div class="mode-option" data-mode="coordinator"><b>Ö</b> coordinator<br /><span style="font-size:11px;color:#666;">planner / executor stages</span></div>' +
             '</div>';
           bodyEl.querySelectorAll('#ctgt-mode-options .mode-option').forEach(function (el) {
@@ -1263,6 +1371,315 @@ export function handleDashboardPage(env: Env): Response {
 
         overlay.hidden = false;
         render();
+      }
+
+      // In-page wizard for adding a new [models.<category>] target model,
+      // styled and structured like openAddAliasWizard. Unlike
+      // openAddModelWizard (single-step, category fixed, no api_key/mode),
+      // this collects everything the config array can hold — alias key,
+      // target model id, api key, base url, upstream mode — and picks (or
+      // creates) the category as the final step. Saves through the
+      // dedicated POST /dashboard/api/models/:category/:aliasKey endpoint
+      // (backed by upsertModelTargetFromDashboard) rather than the generic
+      // whole-page PUT, so api_key round-trips correctly and any existing
+      // transforms/max_tokens on other entries are untouched.
+      function openAddModelTargetWizard() {
+        const overlay = document.getElementById('modelTargetWizard');
+        if (!overlay) return;
+
+        const stepsEl = document.getElementById('mt-wiz-steps');
+        const titleEl = document.getElementById('mtWizTitle');
+        const bodyEl = document.getElementById('mt-wiz-body');
+        const statusEl = document.getElementById('mt-wiz-status');
+        const cancelBtn = document.getElementById('mt-wiz-cancel');
+        const backBtn = document.getElementById('mt-wiz-back');
+        const submitBtn = document.getElementById('mt-wiz-submit');
+        const closeXBtn = document.getElementById('mt-wiz-close-x');
+        if (!stepsEl || !titleEl || !bodyEl || !statusEl || !cancelBtn || !backBtn || !submitBtn || !closeXBtn) return;
+
+        const TOTAL_STEPS = 6;
+        const MODES = ${JSON.stringify(UPSTREAM_MODES)};
+        const state = { step: 1, aliasKey: '', target: '', apiKey: '', baseUrl: '', mode: MODES[0], category: '' };
+
+        function setStatus(msg, kind) {
+          statusEl.textContent = msg || '';
+          statusEl.className = 'modal-status' + (kind ? ' ' + kind : '');
+        }
+
+        function modelNameConflicts(name) {
+          const reserved = { upstream_mode: 1, base_url: 1, api_key: 1 };
+          if (!currentConfig.models) return false;
+          for (const [category, catCfg] of Object.entries(currentConfig.models)) {
+            if (category === 'list' || Array.isArray(catCfg)) continue;
+            if (!catCfg || typeof catCfg !== 'object') continue;
+            for (const key of Object.keys(catCfg)) {
+              if (reserved[key]) continue;
+              if (key.startsWith('_')) continue;
+              if (key === name) return true;
+            }
+          }
+          return false;
+        }
+
+        function renderStep1() {
+          state.step = 1;
+          stepsEl.textContent = 'Step 1 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 1: Alias key';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-alias-key">Alias key</label>' +
+            '<input type="text" id="mt-wiz-alias-key" placeholder="e.g. gpt-5-mini" autocomplete="off" />' +
+            '<div class="helper-text">Client-facing name — the key clients request under [models.&lt;category&gt;].</div>';
+          const el = document.getElementById('mt-wiz-alias-key');
+          if (el) { el.value = state.aliasKey; el.focus(); }
+          backBtn.hidden = true;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep2() {
+          state.step = 2;
+          stepsEl.textContent = 'Step 2 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 2: Target model id';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-target">Target model id</label>' +
+            '<input type="text" id="mt-wiz-target" placeholder="e.g. gpt-5-mini-2025-08-07" autocomplete="off" />' +
+            '<div class="helper-text">Upstream model id to map ' + escapeHtml(state.aliasKey) + ' to.</div>';
+          const el = document.getElementById('mt-wiz-target');
+          if (el) { el.value = state.target; el.focus(); }
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep3() {
+          state.step = 3;
+          stepsEl.textContent = 'Step 3 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 3: API key';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-api-key">API key (optional)</label>' +
+            '<input type="text" id="mt-wiz-api-key" placeholder="leave blank to reuse a matching key or the category api_key" autocomplete="off" />' +
+            '<div class="helper-text">Leave blank to reuse another entry&#39;s system-stored key for the same base URL, else inherit the category&#39;s api_key.</div>';
+          const el = document.getElementById('mt-wiz-api-key');
+          if (el) { el.value = state.apiKey; el.focus(); }
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep4() {
+          state.step = 4;
+          stepsEl.textContent = 'Step 4 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 4: Base URL';
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-base-url">Base URL (optional)</label>' +
+            '<input type="text" id="mt-wiz-base-url" placeholder="leave blank to use the category base_url" autocomplete="off" />' +
+            '<div class="helper-text">Leave blank to inherit the category&#39;s base_url.</div>';
+          const el = document.getElementById('mt-wiz-base-url');
+          if (el) { el.value = state.baseUrl; el.focus(); }
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep5() {
+          state.step = 5;
+          stepsEl.textContent = 'Step 5 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 5: Upstream mode';
+          bodyEl.innerHTML =
+            '<label>Upstream mode</label>' +
+            '<div class="mode-options" id="mt-wiz-mode-options">' +
+              MODES.map((m) => '<div class="mode-option" data-mode="' + m + '">' + m + '</div>').join('') +
+            '</div>';
+          bodyEl.querySelectorAll('#mt-wiz-mode-options .mode-option').forEach((el) => {
+            el.addEventListener('click', () => {
+              state.mode = el.getAttribute('data-mode');
+              bodyEl.querySelectorAll('#mt-wiz-mode-options .mode-option').forEach((o) => {
+                o.classList.toggle('selected', o.getAttribute('data-mode') === state.mode);
+              });
+              setStatus('');
+            });
+          });
+          bodyEl.querySelectorAll('#mt-wiz-mode-options .mode-option').forEach((o) => {
+            o.classList.toggle('selected', o.getAttribute('data-mode') === state.mode);
+          });
+          backBtn.hidden = false;
+          submitBtn.textContent = 'Next';
+        }
+
+        function renderStep6() {
+          state.step = 6;
+          stepsEl.textContent = 'Step 6 of ' + TOTAL_STEPS;
+          titleEl.textContent = 'Add target model — Step 6: Category';
+          const categories = Object.keys(currentConfig.models || {});
+          const optionsHtml = categories.map((c) => '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>').join('');
+          bodyEl.innerHTML =
+            '<label for="mt-wiz-category">Category ([models.&lt;category&gt;] section)</label>' +
+            '<select id="mt-wiz-category">' + optionsHtml + '<option value="__new__">+ new category…</option></select>' +
+            '<div id="mt-wiz-new-category-row" hidden>' +
+              '<label for="mt-wiz-new-category">New category name</label>' +
+              '<input type="text" id="mt-wiz-new-category" placeholder="e.g. claude, gemini, free" autocomplete="off" />' +
+            '</div>';
+          const selectEl = document.getElementById('mt-wiz-category');
+          const newRowEl = document.getElementById('mt-wiz-new-category-row');
+          if (selectEl) {
+            selectEl.value = categories.includes(state.category) ? state.category : (categories[0] || '__new__');
+            newRowEl.hidden = selectEl.value !== '__new__';
+            selectEl.addEventListener('change', () => {
+              newRowEl.hidden = selectEl.value !== '__new__';
+              if (selectEl.value === '__new__') {
+                const newInput = document.getElementById('mt-wiz-new-category');
+                if (newInput) newInput.focus();
+              }
+              setStatus('');
+            });
+          }
+          backBtn.hidden = false;
+          var envLabel = ${JSON.stringify(env.VERSION || 'dev')} || 'dev';
+          submitBtn.textContent = 'Create target model (' + envLabel + ')';
+        }
+
+        function validateStep1() {
+          const el = document.getElementById('mt-wiz-alias-key');
+          if (!el) return null;
+          const aliasKey = (el.value || '').trim();
+          if (!aliasKey) {
+            setStatus('Alias key is required.', 'error');
+            el.focus();
+            return null;
+          }
+          if (modelNameConflicts(aliasKey)) {
+            setStatus('Alias key "' + aliasKey + '" already exists under [models.*].', 'error');
+            el.focus();
+            return null;
+          }
+          if (currentConfig.composite && currentConfig.composite[aliasKey]) {
+            setStatus('Alias key "' + aliasKey + '" conflicts with a composite alias — names must be unique.', 'error');
+            el.focus();
+            return null;
+          }
+          return aliasKey;
+        }
+
+        function validateStep2() {
+          const el = document.getElementById('mt-wiz-target');
+          if (!el) return null;
+          const target = (el.value || '').trim();
+          if (!target) {
+            setStatus('Target model id is required.', 'error');
+            el.focus();
+            return null;
+          }
+          return target;
+        }
+
+        function validateStep6() {
+          const selectEl = document.getElementById('mt-wiz-category');
+          if (!selectEl) return null;
+          if (selectEl.value !== '__new__') return selectEl.value;
+          const newInput = document.getElementById('mt-wiz-new-category');
+          const newCategory = newInput ? (newInput.value || '').trim() : '';
+          if (!newCategory) {
+            setStatus('New category name is required.', 'error');
+            if (newInput) newInput.focus();
+            return null;
+          }
+          return newCategory;
+        }
+
+        function close() {
+          if (overlay._mtWizKeydown) {
+            document.removeEventListener('keydown', overlay._mtWizKeydown);
+            overlay._mtWizKeydown = null;
+          }
+          overlay.hidden = true;
+          setStatus('');
+          configDirty = false;
+        }
+
+        function finalize() {
+          setStatus('Saving...');
+          submitBtn.disabled = true;
+          dashboardFetch('/dashboard/api/models/' + encodeURIComponent(state.category) + '/' + encodeURIComponent(state.aliasKey), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target: state.target, api_key: state.apiKey, base_url: state.baseUrl, mode: state.mode }),
+          }).then(async (res) => {
+            const result = await res.json();
+            submitBtn.disabled = false;
+            if (!res.ok) {
+              setStatus('Save failed: ' + (result.error || 'unknown error'), 'error');
+              return;
+            }
+            currentConfig.models = result.models || {};
+            currentConfig.composite = result.composite || {};
+            currentConfig.schedule = result.schedule || {};
+            renderConfigForm(currentConfig);
+            close();
+          }).catch((err) => {
+            submitBtn.disabled = false;
+            setStatus('Save failed: ' + (err && err.message ? err.message : err), 'error');
+          });
+        }
+
+        function onSubmit() {
+          setStatus('');
+          if (state.step === 1) {
+            const aliasKey = validateStep1();
+            if (!aliasKey) return;
+            state.aliasKey = aliasKey;
+            renderStep2();
+            return;
+          }
+          if (state.step === 2) {
+            const target = validateStep2();
+            if (!target) return;
+            state.target = target;
+            renderStep3();
+            return;
+          }
+          if (state.step === 3) {
+            const el = document.getElementById('mt-wiz-api-key');
+            state.apiKey = el ? (el.value || '').trim() : '';
+            renderStep4();
+            return;
+          }
+          if (state.step === 4) {
+            const el = document.getElementById('mt-wiz-base-url');
+            state.baseUrl = el ? (el.value || '').trim() : '';
+            renderStep5();
+            return;
+          }
+          if (state.step === 5) {
+            renderStep6();
+            return;
+          }
+          // step 6: finalize
+          const category = validateStep6();
+          if (!category) return;
+          state.category = category;
+          finalize();
+        }
+
+        function onBack() {
+          setStatus('');
+          if (state.step === 2) { renderStep1(); return; }
+          if (state.step === 3) { renderStep2(); return; }
+          if (state.step === 4) { renderStep3(); return; }
+          if (state.step === 5) { renderStep4(); return; }
+          if (state.step === 6) { renderStep5(); return; }
+        }
+
+        cancelBtn.onclick = function () { close(); };
+        backBtn.onclick = function () { onBack(); };
+        submitBtn.onclick = function () { onSubmit(); };
+        closeXBtn.onclick = function () { close(); };
+
+        overlay._mtWizKeydown = function (ev) {
+          if (ev.key === 'Escape' || ev.key === 'x' || ev.key === 'X') {
+            ev.preventDefault();
+            close();
+          }
+        };
+        document.addEventListener('keydown', overlay._mtWizKeydown);
+
+        overlay.hidden = false;
+        renderStep1();
       }
 
       // In-page wizard for adding a new model entry to a [models.<category>]
@@ -1657,6 +2074,11 @@ export function handleDashboardPage(env: Env): Response {
       // in-flight change. Cleared after the next successful loadConfig().
       let configDirty = false;
 
+      // Block ids (e.g. "models.claude", "composite.fast") the user has
+      // collapsed. Kept here so the periodic loadConfig() re-render preserves
+      // the collapsed state instead of popping every section back open.
+      const collapsedBlockIds = new Set();
+
       function getAliasUsed(aliasName) {
         const resolved = compositeResolved.find(r => r.alias === aliasName);
         if (!resolved) return 0;
@@ -1743,7 +2165,7 @@ export function handleDashboardPage(env: Env): Response {
 
       function upstreamModeSelect(categoryName, currentMode) {
         const disabledAttr = isReadOnly ? ' disabled' : '';
-        const options = ['anthropic-messages', 'openai-completions', 'openai-responses', 'gemini-generatecontent', 'gemini-interactions'];
+        const options = ${JSON.stringify(UPSTREAM_MODES)};
         const optionHtml = options.map((mode) => {
           const selected = mode === currentMode ? ' selected' : '';
           return '<option value="' + escapeHtml(mode) + '"' + selected + '>' + escapeHtml(mode) + '</option>';
@@ -1761,7 +2183,7 @@ export function handleDashboardPage(env: Env): Response {
       // drift from the category-level list.
       function perModelModeSelect(categoryName, modelKey, currentMode) {
         const disabledAttr = isReadOnly ? ' disabled' : '';
-        const options = ['', 'anthropic-messages', 'openai-completions', 'openai-responses', 'gemini-generatecontent', 'gemini-interactions'];
+        const options = ['', ...${JSON.stringify(UPSTREAM_MODES)}];
         const optionHtml = options.map((mode) => {
           const selected = mode === currentMode ? ' selected' : '';
           const label = mode === '' ? '(inherit)' : mode;
@@ -1986,6 +2408,10 @@ export function handleDashboardPage(env: Env): Response {
         }).join('');
       }
 
+      function collapseButtonHtml(collapsed) {
+        return '<button type="button" class="collapse-btn" data-action="toggle-collapse" title="Collapse / expand" aria-expanded="' + (collapsed ? 'false' : 'true') + '">' + (collapsed ? '▸' : '▾') + '</button>';
+      }
+
       function renderConfigForm(config) {
         const modelBlocks = Object.entries(config.models || {}).map(([categoryName, category]) => {
           const disabledAttr = isReadOnly ? ' disabled' : '';
@@ -2000,12 +2426,14 @@ export function handleDashboardPage(env: Env): Response {
 
           rows.push('<div class="section-actions"><button type="button" class="mini-btn" data-action="add-model" data-category="' + escapeHtml(categoryName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add model entry</button></div>');
 
-          return '<div class="config-block"><h3>models.' + escapeHtml(categoryName) + '</h3>' + rows.join('') + '</div>';
+          const blockId = 'models.' + categoryName;
+          const collapsed = collapsedBlockIds.has(blockId);
+          return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">models.' + escapeHtml(categoryName) + '</span>' + collapseButtonHtml(collapsed) + '</h3>' + rows.join('') + '</div>';
         }).join('');
 
         const compositeBlocks = Object.entries(config.composite || {}).map(([aliasName, targets]) => {
           const rows = compositeEntryRows(aliasName, targets, compositeLimitWindowsSnapshot[aliasName])
-            + '<div class="section-actions"><button type="button" class="test-btn mini-btn" data-action="test-composite" data-alias="' + escapeHtml(aliasName) + '">test model</button>'
+            + '<div class="section-actions"><button type="button" class="test-btn mini-btn" data-action="test-composite" data-alias="' + escapeHtml(aliasName) + '">test it</button>'
             + ' <button type="button" class="mini-btn" data-action="add-composite-target" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add target</button>'
             + ' <button type="button" class="mini-btn danger" data-action="remove-composite-alias" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Remove alias</button></div>';
           const hasError = configErrorsList.some((e) => e.path === 'composite.' + aliasName);
@@ -2013,15 +2441,19 @@ export function handleDashboardPage(env: Env): Response {
           const aliasKeys = Object.keys(targets || {}).filter((k) => k !== 'token_limit' && k !== 'fusion_options');
           const isCoordHead = aliasKeys.some((k) => { const c = (targets || {})[k] || {}; return typeof c.coord === 'number' && c.coord > 0; });
           const isFusionHead = !isCoordHead && !!targets.fusion_options;
-          const aliasTypeTag = isCoordHead ? ' <span style="font-size:11px;color:#555;"><b>Ö</b></span>' : isFusionHead ? ' <span style="font-size:11px;color:#555;"><b>ƒ</b></span>' : ' <span style="font-size:11px;color:#555;"><b>Ç</b></span>';
-          return '<div class="config-block"><h3>composite.' + escapeHtml(aliasName) + aliasTypeTag + errorMark + '</h3>' + rows + '</div>';
+          const aliasTypeTag = isCoordHead ? ' <span style="font-size:13px;color:#555;"><b>Ö</b></span>' : isFusionHead ? ' <span style="font-size:13px;color:#555;"><b>Ƒ</b></span>' : ' <span style="font-size:13px;color:#555;"><b>ᙅ</b></span>';
+          const blockId = 'composite.' + aliasName;
+          const collapsed = collapsedBlockIds.has(blockId);
+          return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">composite.' + escapeHtml(aliasName) + '</span>' + aliasTypeTag + errorMark + collapseButtonHtml(collapsed) + '</h3>' + rows + '</div>';
         }).join('');
 
         const compositeGlobalActions = '<div class="section-actions"><button type="button" class="mini-btn" data-action="add-composite-alias"' + (isReadOnly ? ' disabled' : '') + '>Add composite alias</button></div>';
 
         const scheduleBlocks = Object.entries(config.schedule || {}).map(([aliasName, targets]) => {
           const rows = scheduleAliasRows(aliasName, targets);
-          return '<div class="config-block"><h3>schedule.' + escapeHtml(aliasName) + '</h3>' + rows
+          const blockId = 'schedule.' + aliasName;
+          const collapsed = collapsedBlockIds.has(blockId);
+          return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">schedule.' + escapeHtml(aliasName) + '</span>' + collapseButtonHtml(collapsed) + '</h3>' + rows
             + '<div class="section-actions">'
             + '<button type="button" class="mini-btn" data-action="add-schedule-target" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add target</button>'
             + ' <button type="button" class="mini-btn danger" data-action="remove-schedule-alias" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Remove alias</button>'
@@ -2030,7 +2462,9 @@ export function handleDashboardPage(env: Env): Response {
 
         const scheduleGlobalActions = '<div class="section-actions"><button type="button" class="mini-btn" data-action="add-schedule-alias"' + (isReadOnly ? ' disabled' : '') + '>Add schedule alias</button></div>';
 
-        configForm.innerHTML = modelBlocks
+        const modelTargetGlobalActions = '<div class="section-actions"><button type="button" class="mini-btn" data-action="add-model-target"' + (isReadOnly ? ' disabled' : '') + '>Add target model</button></div>';
+
+        configForm.innerHTML = modelTargetGlobalActions + modelBlocks
           + '<div class="config-divider"></div>' + compositeBlocks + compositeGlobalActions
           + '<div class="config-divider"></div>' + scheduleBlocks + scheduleGlobalActions;
       }
@@ -2187,21 +2621,22 @@ export function handleDashboardPage(env: Env): Response {
 
       let testResultClearTimer = null;
 
-      function showTestResult(success, modelId, status, detail, usage) {
+      function showTestResult(success, modelId, status, detail, usage, elapsedMs) {
         const panel = document.getElementById('testResultPanel');
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
+        const elapsedStr = elapsedMs ? ' (' + status + ', ' + (elapsedMs / 1000).toFixed(1) + 's)' : ' (' + status + ')';
         if (success) {
           panel.className = 'success';
-          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">✗</button>'
+          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button>'
             + '<span class="result-model">✓ ' + escapeHtml(modelId) + '</span> '
-            + '<span style="opacity:0.7">(' + status + ')</span>'
+            + '<span style="opacity:0.7">' + elapsedStr + '</span>'
             + (usage ? ' <span class="result-usage">usage=' + escapeHtml(usage) + '</span>' : '')
             + (detail ? ' <span style="opacity:0.8">' + escapeHtml(detail) + '</span>' : '');
         } else {
           panel.className = 'error';
-          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">✗</button>'
-            + '<span class="result-model">✗ ' + escapeHtml(modelId) + '</span> '
-            + '<span style="opacity:0.7">(' + (status || '?') + ')</span>'
+          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button>'
+            + '<span class="result-model">x ' + escapeHtml(modelId) + '</span> '
+            + '<span style="opacity:0.7">' + elapsedStr + '</span>'
             + (detail ? ' — ' + escapeHtml(detail) : '');
         }
         panel.style.display = 'block';
@@ -2227,7 +2662,14 @@ export function handleDashboardPage(env: Env): Response {
         const panel = document.getElementById('testResultPanel');
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
         panel.className = 'testing';
-        panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">✗</button> Testing ' + escapeHtml(modelId) + '…';
+
+        // Timer to show elapsed seconds during testing (0.1s resolution)
+        const startTime = Date.now();
+        const testResultTimer = setInterval(() => {
+          const elapsedS = (Date.now() - startTime) / 1000;
+          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(modelId) + ' takes ' + elapsedS.toFixed(1) + 's …';
+        }, 100);
+
         panel.style.display = 'block';
 
         try {
@@ -2237,10 +2679,13 @@ export function handleDashboardPage(env: Env): Response {
             body: JSON.stringify({ modelId }),
           });
           const result = await res.json();
-          showTestResult(result.success, result.modelId, result.status, result.detail, result.usage);
+          const elapsedMs = Date.now() - startTime;
+          showTestResult(result.success, result.modelId, result.status, result.detail, result.usage, elapsedMs);
         } catch (err) {
-          showTestResult(false, modelId, null, err.message, null);
+          const elapsedMs = Date.now() - startTime;
+          showTestResult(false, modelId, null, err.message, null, elapsedMs);
         } finally {
+          clearInterval(testResultTimer);
           if (btn) {
             btn.disabled = false;
             btn.className = 'test-btn mini-btn';
@@ -2274,6 +2719,19 @@ export function handleDashboardPage(env: Env): Response {
           return;
         }
 
+        // Collapse/expand a config block. Handled before the read-only guard
+        // because it is a pure view toggle (no config mutation).
+        if (target.dataset.action === 'toggle-collapse') {
+          const block = target.closest('.config-block');
+          if (!block || !block.dataset.blockId) return;
+          const collapsed = block.classList.toggle('collapsed');
+          if (collapsed) collapsedBlockIds.add(block.dataset.blockId);
+          else collapsedBlockIds.delete(block.dataset.blockId);
+          target.textContent = collapsed ? '▸' : '▾';
+          target.setAttribute('aria-expanded', String(!collapsed));
+          return;
+        }
+
         if (isReadOnly) {
           return;
         }
@@ -2296,6 +2754,14 @@ export function handleDashboardPage(env: Env): Response {
           // paused while the user fills the modal.
           configDirty = true;
           openAddModelWizard(category);
+          return;
+        }
+
+        if (action === 'add-model-target') {
+          // Mark dirty before opening the wizard so stats auto-reload is
+          // paused while the user fills the modal.
+          configDirty = true;
+          openAddModelTargetWizard();
           return;
         }
 
@@ -2592,7 +3058,7 @@ export function handleDashboardPage(env: Env): Response {
         const blockedSet = new Set(blocked || []);
         tbody.innerHTML = rows.map((row) => {
           const isBlocked = blockedSet.has(row.tool_name);
-          const status = isBlocked ? '✗' : '·';
+          const status = isBlocked ? 'x' : '·';
           const statusCls = isBlocked ? 'status-blocked' : '';
           const rowCls = isBlocked ? 'tool-row blocked' : 'tool-row';
           const actionLabel = isBlocked ? 'Unblock' : 'Block';
@@ -2676,12 +3142,39 @@ export function handleDashboardPage(env: Env): Response {
         URL.revokeObjectURL(url);
       });
 
+      function renderToolJudgeSidecar(sidecar) {
+        const container = document.getElementById('toolJudgeSidecarStatus');
+        if (!container) return;
+
+        if (!sidecar || !sidecar.enabled) {
+          container.innerHTML =
+            '<p style="color:#666;">Not configured</p>' +
+            '<p style="font-size:12px;color:#888;">Add <code>[tool_judge_sidecar]</code> section to config to enable</p>';
+          return;
+        }
+
+        const modeLabel = sidecar.mode === 'noul' ? 'Batch (noul)' : 'Single (choice)';
+        const thresholdPct = Math.round((sidecar.threshold || 0.5) * 100);
+
+        container.innerHTML =
+          '<table style="width:100%;border-collapse:collapse;">' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Status</td><td><span style="color:#2e7d32;font-weight:600;">Enabled</span></td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">URL</td><td><code style="font-size:12px;">' + escapeHtml(sidecar.judge_url) + '</code></td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Mode</td><td>' + escapeHtml(modeLabel) + '</td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Threshold</td><td>' + thresholdPct + '% (score >= ' + (sidecar.threshold || 0.5).toFixed(2) + ' → keep)</td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Timeout</td><td>' + (sidecar.timeout_ms || 50) + ' ms per tool (a batch of N tools gets N × this, capped at 2000 ms)</td></tr>' +
+          '<tr><td style="padding:4px 12px 4px 0;font-weight:600;">Max batch tools</td><td>' + (sidecar.max_batch_tools || 50) + '</td></tr>' +
+          '</table>';
+      }
+
       async function loadRequestStats() {
         const res = await dashboardFetch('/dashboard/api/stats/requests');
         const json = await res.json();
 
         const privacyEl = document.getElementById('privacyKeysDetected');
         if (privacyEl) privacyEl.textContent = fmtStat(json.privacy_keys_detected || 0);
+
+        renderToolJudgeSidecar(json.toolJudgeSidecar);
 
         renderRows('#requestUpstreamStats', json.upstreams || [], (row) =>
           '<tr><td>' + row.upstream_base_url + '</td><td class="num quota-cell" data-base="' + encodeURIComponent(row.upstream_base_url) + '">…</td><td class="num">' + row.responses + '</td></tr>'
@@ -2880,7 +3373,23 @@ export async function handleDashboardToggleToolBlock(request: Request): Promise<
   }
 }
 
-export function handleDashboardRequestStats(): Response {
+export function handleDashboardRequestStats(proxyConfig: ProxyConfig): Response {
+  // Build tool judge sidecar status for the dashboard
+  const sidecarConfig = proxyConfig.tool_judge_sidecar;
+  let toolJudgeSidecar = null;
+  if (sidecarConfig && sidecarConfig.judge_url) {
+    toolJudgeSidecar = {
+      enabled: true,
+      judge_url: sidecarConfig.judge_url,
+      mode: sidecarConfig.mode || 'choice',
+      threshold: sidecarConfig.threshold ?? 0.5,
+      timeout_ms: sidecarConfig.timeout_ms ?? 50,
+      max_batch_tools: sidecarConfig.max_batch_tools ?? 50,
+    };
+  } else {
+    toolJudgeSidecar = { enabled: false };
+  }
+
   return jsonResponse({
     endpoints: getRequestEndpointStatsDesc(),
     upstreams: getRequestUpstreamStatsDesc(),
@@ -2890,6 +3399,7 @@ export function handleDashboardRequestStats(): Response {
     endpoint_timings: getRequestEndpointTimingStatsDesc(),
     model_timings: getRequestModelTimingStatsDesc(),
     privacy_keys_detected: getPrivacyKeysDetected(),
+    toolJudgeSidecar,
   });
 }
 
@@ -3168,7 +3678,7 @@ export async function handleDashboardTestModel(
     if (env.LOG_LEVEL === 'debug') {
       try {
         const fs = await import('fs');
-        fs.writeFileSync('/tmp/test_model.log',
+        fs.writeFileSync(join(tmpdir(), 'test_model.log'),
           `[${new Date().toISOString()}] test model request\n` +
           `target: ${endpoint}\n` +
           `upstreamMode: ${upstreamMode}\n` +
@@ -3194,7 +3704,7 @@ export async function handleDashboardTestModel(
       try {
         const fs = await import('fs');
         const responseText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody, null, 2);
-        fs.appendFileSync('/tmp/test_model.log',
+        fs.appendFileSync(join(tmpdir(), 'test_model.log'),
           `response status: ${testResponse.status}\n` +
           `response body:\n${responseText}\n` +
           `---\n`,

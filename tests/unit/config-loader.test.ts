@@ -7,13 +7,16 @@
  * validateProxyConfig, validateTransformSet, getModelNamesInConfig,
  * findAliasNameConflicts, stripConflictingAliases,
  * findSelfReferencingCompositeTargets, getConfiguredModelIds,
- * getAllowedHostsFromConfig.
+ * getAllowedHostsFromConfig, resolveDefaultProxyConfigPath.
  *
  * Run with: npx tsx --test tests/unit/config-loader.test.ts
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 import {
   parseHumanTokenLimit,
@@ -38,9 +41,13 @@ import {
   isScheduleAlias,
   applyDashboardConfigUpdate,
   toDashboardConfigPayload,
+  upsertModelTarget,
+  resolveDefaultProxyConfigPath,
+  HOME_PROXY_CONFIG_PATH,
   type ProxyConfig,
   type TransformSet,
 } from '../../src/utils/config-loader.js';
+import { UPSTREAM_MODES } from '../../src/utils/upstream-modes.js';
 
 // ---------------------------------------------------------------------------
 // parseHumanTokenLimit
@@ -175,14 +182,14 @@ describe('normalizeHookAlias', () => {
 // ---------------------------------------------------------------------------
 
 describe('parseSimpleToml', () => {
-  it('parses [remote.authentication] section with string and boolean values', () => {
+  it('parses [remote] section with string and boolean values', () => {
     const cfg = parseSimpleToml(`
-      [remote.authentication]
+      [remote]
       auth_server = "https://auth.example.com"
       auth_with_model = "true"
     `);
-    assert.equal(cfg.remote?.authentication?.auth_server, 'https://auth.example.com');
-    assert.equal(cfg.remote?.authentication?.auth_with_model, true);
+    assert.equal(cfg.remote?.auth_server, 'https://auth.example.com');
+    assert.equal(cfg.remote?.auth_with_model, true);
   });
 
   it('parses [general] section (global_token_limit)', () => {
@@ -279,13 +286,13 @@ describe('parseSimpleToml', () => {
     assert.equal(entry[5], '4096');
   });
 
-  it('accepts upstream_mode / url / key aliases in inline-table entries', () => {
+  it('accepts upstream_mode / base / key aliases in inline-table entries', () => {
     const cfg = parseSimpleToml(`
       [models.free]
       upstream_mode = "openai-completions"
       base_url = "https://default.example"
       api_key = "default-key"
-      "glm-5.2-a" = {target = "glm-5.2", upstream_mode = "anthropic-messages", url = "https://open.bigmodel.cn/api/anthropic", key = "bigmodel-key"}
+      "glm-5.2-a" = {target = "glm-5.2", upstream_mode = "anthropic-messages", base = "https://open.bigmodel.cn/api/anthropic", key = "bigmodel-key"}
     `);
     const entry = (cfg.models?.free as Record<string, unknown>)['glm-5.2-a'] as string[];
     assert.deepEqual(entry, ['glm-5.2', 'https://open.bigmodel.cn/api/anthropic', 'bigmodel-key', 'anthropic-messages']);
@@ -294,7 +301,7 @@ describe('parseSimpleToml', () => {
   it('canonical upstream_mode/base_url/api_key win over short aliases when both present', () => {
     const cfg = parseSimpleToml(`
       [models.free]
-      "m" = {upstream_mode = "anthropic-messages", mode = "openai-completions", base_url = "https://canonical", url = "https://short", api_key = "ck", key = "sk"}
+      "m" = {upstream_mode = "anthropic-messages", mode = "openai-completions", base_url = "https://canonical", base = "https://short", api_key = "ck", key = "sk"}
     `);
     const entry = (cfg.models?.free as Record<string, unknown>)['m'] as string[];
     assert.equal(entry[1], 'https://canonical');
@@ -389,11 +396,11 @@ describe('parseSimpleToml', () => {
     const cfg = parseSimpleToml(`
       # a comment
 
-      [remote.authentication]
+      [remote]
       # inline-ish
       auth_server = "https://x"  # trailing comment
     `);
-    assert.equal(cfg.remote?.authentication?.auth_server, 'https://x');
+    assert.equal(cfg.remote?.auth_server, 'https://x');
   });
 
   it('handles inline comment after value containing # (no preceding space is preserved)', () => {
@@ -427,18 +434,126 @@ describe('parseSimpleToml', () => {
     assert.deepEqual(cfg.privacy_filter?.whitelist_add, ['deadbeef', 'cafef00d']);
   });
 
-  it('parses [dashboard] and [remote.recording] sections', () => {
+  // Without a dispatch branch for this section the parser silently dropped it,
+  // so `judgeTools` always took its `!sidecarConfig?.judge_url` early return and
+  // the sidecar could not be enabled from a config file at all.
+  it('parses [tool_judge_sidecar] numeric and string fields', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      timeout_ms = 2000
+      threshold = 0.65
+      mode = "noul"
+      max_batch_tools = 8
+      api_key = "judge-secret"
+    `);
+    assert.deepEqual(cfg.tool_judge_sidecar, {
+      judge_url: 'http://127.0.0.1:8081',
+      timeout_ms: 2000,
+      threshold: 0.65,
+      mode: 'noul',
+      max_batch_tools: 8,
+      api_key: 'judge-secret',
+    });
+  });
+
+  it('parses unquoted [tool_judge_sidecar] string values', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = http://127.0.0.1:8081
+      mode = choice
+    `);
+    assert.equal(cfg.tool_judge_sidecar?.judge_url, 'http://127.0.0.1:8081');
+    assert.equal(cfg.tool_judge_sidecar?.mode, 'choice');
+  });
+
+  it('drops unknown keys and wrong-typed values in [tool_judge_sidecar]', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      enabled = true
+      threshold = "high"
+      timeout_ms = "2000"
+    `);
+    // Only allowlisted keys with the right type land; the rest are ignored
+    // rather than coerced, so `enabled` never becomes a second activation path.
+    assert.deepEqual(cfg.tool_judge_sidecar, { judge_url: 'http://127.0.0.1:8081' });
+  });
+
+  // A section header with no dispatch branch used to leave currentSection
+  // pointing at the previous section, so an unknown section's keys were
+  // silently absorbed by whatever came before it — that is how a missing
+  // [tool_judge_sidecar] branch once sent the sidecar's keys into
+  // [privacy_filter], leaving `judgeTools` permanently disabled with no message.
+  // The keys must be dropped, and the drop must be loud.
+  it('drops keys under an unknown section instead of leaking them into the previous one', () => {
+    const cfg = parseSimpleToml(`
+      [defaults]
+      max_tokens = "100"
+
+      [tool_judge_sidecar_typo]
+      judge_url = "http://127.0.0.1:8081"
+      mode = "noul"
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.deepEqual(
+      cfg.defaults,
+      { max_tokens: '100' },
+      'keys under the unknown section must not be absorbed by the preceding section'
+    );
+    assert.equal(cfg.tool_judge_sidecar, undefined);
+    // Parsing continues cleanly: a known section after the unknown one still lands.
+    assert.equal(cfg.general?.global_token_limit, 1234);
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'tool_judge_sidecar_typo'),
+      `expected a warning naming the unknown section, got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('accepts an unknown section as the very first header without crashing', () => {
+    const cfg = parseSimpleToml(`
+      [nonsense]
+      a = "b"
+    `) as any;
+    assert.deepEqual(
+      Object.keys(cfg).filter(k => !k.startsWith('_')),
+      [],
+      'an unknown first section contributes no config keys'
+    );
+  });
+
+  it('rejects a bare [transforms] header (it needs a name) and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [defaults]
+      max_tokens = "100"
+
+      [transforms]
+      schema = "anthropic-messages"
+    `) as any;
+    assert.deepEqual(cfg.defaults, { max_tokens: '100' });
+    assert.equal(cfg.transforms, undefined);
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'transforms'),
+      `expected a warning for the bare [transforms] header, got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses [dashboard] and [remote] sections', () => {
     const cfg = parseSimpleToml(`
       [dashboard]
       api_key = "dash-key"
 
-      [remote.recording]
+      [remote]
       record_server = "https://record.example.com"
       record_response_body = true
     `);
     assert.equal(cfg.dashboard?.api_key, 'dash-key');
-    assert.equal(cfg.remote?.recording?.record_server, 'https://record.example.com');
-    assert.equal(cfg.remote?.recording?.record_response_body, true);
+    assert.equal(cfg.remote?.record_server, 'https://record.example.com');
+    assert.equal(cfg.remote?.record_response_body, true);
   });
 
   it('folds multi-line array values into one logical line', () => {
@@ -465,6 +580,47 @@ describe('parseSimpleToml', () => {
   it('attaches _validationErrors on the returned config', () => {
     const cfg = parseSimpleToml(`[general]`) as any;
     assert.ok(Array.isArray(cfg._validationErrors));
+  });
+
+  it('accepts the long field names in a [models.*] section', () => {
+    const cfg = parseSimpleToml(`
+      [models.x]
+      upstream_mode = "openai-completions"
+      base_url = "https://a.dev"
+      api_key = "sk-a"
+    `) as any;
+    assert.equal(cfg.models.x.upstream_mode, 'openai-completions');
+    assert.equal(cfg.models.x.base_url, 'https://a.dev');
+    assert.equal(cfg.models.x.api_key, 'sk-a');
+    assert.deepEqual(cfg._validationErrors, []);
+  });
+
+  it('reports an error (not a silent drop) for short field names in a [models.*] section', () => {
+    const cfg = parseSimpleToml(`
+      [models.x]
+      mode = "openai-completions"
+      url = "https://a.dev"
+      key = "sk-a"
+    `) as any;
+    assert.deepEqual(cfg.models.x, {}, 'short-name keys are not applied to the section');
+    assert.deepEqual(
+      cfg._validationErrors.map((e: { path: string; message: string }) => `${e.path}: ${e.message}`),
+      [
+        'models.x.mode: short field name is not accepted in a [models.*] section — use upstream_mode',
+        'models.x.url: short field name is not accepted in a [models.*] section — use base_url',
+        'models.x.key: short field name is not accepted in a [models.*] section — use api_key',
+      ],
+    );
+  });
+
+  it('still accepts short aliases inside a [models.*] inline entry', () => {
+    const cfg = parseSimpleToml(`
+      [models.x]
+      upstream_mode = "anthropic-messages"
+      "m1" = {target = "t1", base = "https://b.dev", key = "sk-b", mode = "openai-completions"}
+    `) as any;
+    assert.deepEqual(cfg.models.x.m1, ['t1', 'https://b.dev', 'sk-b', 'openai-completions']);
+    assert.deepEqual(cfg._validationErrors, []);
   });
 
   it('returns empty config for empty input (with validation metadata attached)', () => {
@@ -950,7 +1106,9 @@ describe('validateProxyConfig', () => {
     assert.ok(r.errors.some(e => e.path === 'default_upstream.default_base_url'));
   });
 
-  it('accepts sdk:// base_url (rewritten to https at request time)', () => {
+  // sdk:// is still accepted at load time (existing configs keep working) even
+  // though no SDK serves it any more — requests fail loud with 501 instead.
+  it('accepts sdk:// base_url at load time (no SDK behind it)', () => {
     const cfg: ProxyConfig = {
       models: { free: { base_url: 'https://x', llama3: ['llama3.1-8B', 'sdk://chatjimmy.ai/api', '-'] } as any },
     };
@@ -1352,6 +1510,31 @@ describe('applyDashboardConfigUpdate per-model mode', () => {
     const entry = (payload.models.free as Record<string, unknown>)['glm-5.2-a'] as string[];
     assert.deepEqual(entry, ['glm-5.2', 'https://override.example', 'anthropic-messages']);
   });
+
+  it('toDashboardConfigPayload sanitizes an inline-table model entry into the same 3-element shape as an array entry', () => {
+    // Regression: entries written as an inline table (e.g. via the TUI/dashboard
+    // "Add target model" wizard — `bbb = {target=..., base_url=..., api_key=..., mode=...}`)
+    // were previously dropped entirely by sanitizeDashboardCategoryConfig, so the
+    // TUI's snapshot-based model test picker couldn't resolve their mode/base_url
+    // and silently fell back to wrong defaults (test failed there while the
+    // dashboard's own test, which reads the unsanitized config, succeeded).
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          bbb: {
+            target: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+            base_url: 'https://openrouter.ai/api/v1',
+            api_key: 'STORE_KEY_IN_SYSTEM',
+            mode: 'openai-responses',
+          },
+        },
+      },
+    };
+    const payload = toDashboardConfigPayload(cfg);
+    const entry = (payload.models.free as Record<string, unknown>).bbb as string[];
+    assert.deepEqual(entry, ['nvidia/nemotron-3-ultra-550b-a55b:free', 'https://openrouter.ai/api/v1', 'openai-responses']);
+    assert.ok(!JSON.stringify(entry).includes('STORE_KEY_IN_SYSTEM'), 'api_key must not leak into the sanitized payload');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1454,7 +1637,7 @@ before_upstream.headers.remove = ["x-stainless-os", "x-stainless-arch"]
     assert.doesNotMatch(toml, /value = "false"/);
   });
 
-  it('preserves [general] + [remote.*] across parse→serialize→parse', () => {
+  it('preserves [general] + [remote] across parse→serialize→parse', () => {
     const original = `
 [general]
 budget_to_effort_low = 32768
@@ -1462,12 +1645,10 @@ budget_to_effort_medium = 65536
 budget_to_effort_high = 128000
 global_token_limit = "700M 1w"
 
-[remote.authentication]
+[remote]
 auth_server = "https://auth.example.com/validate"
 auth_with_model = true
 auth_passthrough_with = "user_key"
-
-[remote.recording]
 record_server = "http://127.0.0.1:8080/model-usage"
 record_response_body = true
 `;
@@ -1476,11 +1657,11 @@ record_response_body = true
     assert.equal(parsed.general?.budget_to_effort_medium, 65536);
     assert.equal(parsed.general?.budget_to_effort_high, 128000);
     assert.equal(parsed.general?.global_token_limit, '700M 1w');
-    assert.equal(parsed.remote?.authentication?.auth_server, 'https://auth.example.com/validate');
-    assert.equal(parsed.remote?.authentication?.auth_with_model, true);
-    assert.equal(parsed.remote?.authentication?.auth_passthrough_with, 'user_key');
-    assert.equal(parsed.remote?.recording?.record_server, 'http://127.0.0.1:8080/model-usage');
-    assert.equal(parsed.remote?.recording?.record_response_body, true);
+    assert.equal(parsed.remote?.auth_server, 'https://auth.example.com/validate');
+    assert.equal(parsed.remote?.auth_with_model, true);
+    assert.equal(parsed.remote?.auth_passthrough_with, 'user_key');
+    assert.equal(parsed.remote?.record_server, 'http://127.0.0.1:8080/model-usage');
+    assert.equal(parsed.remote?.record_response_body, true);
 
     const roundTripped = parseSimpleToml(serializeProxyConfigToml(parsed));
     assert.deepEqual(roundTripped.general, {
@@ -1489,12 +1670,10 @@ record_response_body = true
       budget_to_effort_high: 128000,
       global_token_limit: '700M 1w',
     });
-    assert.deepEqual(roundTripped.remote?.authentication, {
+    assert.deepEqual(roundTripped.remote, {
       auth_server: 'https://auth.example.com/validate',
       auth_with_model: true,
       auth_passthrough_with: 'user_key',
-    });
-    assert.deepEqual(roundTripped.remote?.recording, {
       record_server: 'http://127.0.0.1:8080/model-usage',
       record_response_body: true,
     });
@@ -1537,5 +1716,403 @@ budget_to_effort_high = 20000
     assert.equal((cat['m1'] as string[])[5], '16384');
     assert.equal((cat['m2'] as string[])[5], '4096');
     assert.equal((cat['m2'] as string[])[4], 't1', 'transforms slot preserved alongside max_tokens');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// upsertModelTarget — TUI "Add target" wizard persistence
+// ---------------------------------------------------------------------------
+// Locks in behavior for the 4-step wizard (target model id → api key → base url → upstream mode)
+// Pre-fills from existing entry; new entries get a category picker first.
+// Index 4 (transforms) and index 5 (max_tokens) must be preserved when editing.
+
+describe('upsertModelTarget', () => {
+  const baseConfig: ProxyConfig = {
+    models: {
+      free: {
+        base_url: 'https://default.example',
+        upstream_mode: 'openai-completions',
+        api_key: 'default-key',
+        'existing-model': [
+          'existing-target',  // index 0: target
+          'https://override.example',  // index 1: base_url
+          'override-key',  // index 2: api_key
+          'anthropic-messages',  // index 3: mode
+          'my-transforms',  // index 4: transforms
+          '16384',  // index 5: max_tokens
+        ],
+        'minimal-model': [
+          'minimal-target',
+          '',
+          '',
+          'openai-completions',
+        ],
+      } as any,
+      claude: {
+        base_url: 'https://api.anthropic.com',
+        'claude-model': [
+          'claude-target',
+          '',
+          'claude-key',
+          'anthropic-messages',
+        ],
+      } as any,
+    },
+  };
+
+  it('preserves index 4 (transforms) and index 5 (max_tokens) when editing an entry', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'existing-model', {
+      target: 'existing-target',
+      base_url: 'https://new-override.example',
+      api_key: 'new-key',
+      mode: 'gemini-generatecontent',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    assert.equal(entry[0], 'existing-target');
+    assert.equal(entry[1], 'https://new-override.example');
+    assert.equal(entry[2], 'new-key');
+    assert.equal(entry[3], 'gemini-generatecontent');
+    assert.equal(entry[4], 'my-transforms', 'transforms (index 4) must be preserved');
+    assert.equal(entry[5], '16384', 'max_tokens (index 5) must be preserved');
+  });
+
+  it('preserves index 4 and adds empty index 5 when max_tokens not set on existing entry', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://x',
+          'm1': ['t1', 'https://x', 'k', 'anthropic-messages', 'transforms-only'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'm1', {
+      target: 't1',
+      base_url: 'https://y',
+      api_key: 'k2',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
+    assert.equal(entry[4], 'transforms-only');
+    assert.equal(entry[5], '', 'index 5 becomes empty string when transforms exists but max_tokens does not');
+  });
+
+  it('preserves only index 5 when transforms is not set on existing entry', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://x',
+          'm1': ['t1', 'https://x', 'k', 'anthropic-messages', '', '8192'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'm1', {
+      target: 't1',
+      base_url: 'https://y',
+      api_key: 'k2',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
+    assert.equal(entry[4], '', 'empty string preserved when transforms was empty string');
+    assert.equal(entry[5], '8192', 'max_tokens (index 5) must be preserved');
+  });
+
+  it('creates new entry with 4 elements when no existing entry (no transforms/max_tokens)', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'new-model', {
+      target: 'new-target',
+      base_url: 'https://new.example',
+      api_key: 'new-key',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
+    assert.deepEqual(entry, ['new-target', 'https://new.example', 'new-key', 'anthropic-messages']);
+    assert.equal(entry.length, 4, 'new entry should have exactly 4 elements');
+  });
+
+  it('throws on invalid upstream mode', () => {
+    assert.throws(
+      () =>
+        upsertModelTarget(baseConfig, 'free', 'new-model', {
+          target: 't',
+          base_url: 'https://x',
+          api_key: 'k',
+          mode: 'invalid-mode',
+        }),
+      /Invalid upstream mode/,
+    );
+  });
+
+  it('accepts all five valid upstream modes', () => {
+    for (const mode of UPSTREAM_MODES) {
+      const next = upsertModelTarget(baseConfig, 'free', `model-${mode}`, {
+        target: 't',
+        base_url: 'https://x',
+        api_key: 'k',
+        mode,
+      });
+      const entry = (next.models!.free as Record<string, unknown>)[`model-${mode}`] as string[];
+      assert.equal(entry[3], mode);
+    }
+  });
+
+  it('throws when target model id is empty', () => {
+    assert.throws(
+      () =>
+        upsertModelTarget(baseConfig, 'free', 'new-model', {
+          target: '',
+          base_url: 'https://x',
+          api_key: 'k',
+          mode: 'openai-completions',
+        }),
+      /Target model id is required/,
+    );
+  });
+
+  it('throws when api_key is a hand-typed STORE_KEY_IN_SYSTEM sentinel (add)', () => {
+    assert.throws(
+      () =>
+        upsertModelTarget(baseConfig, 'free', 'new-model', {
+          target: 't',
+          base_url: 'https://x',
+          api_key: 'STORE_KEY_IN_SYSTEM',
+          mode: 'anthropic-messages',
+        }),
+      /STORE_KEY_IN_SYSTEM/,
+    );
+  });
+
+  it('throws when api_key is a hand-typed STORE_KEY_IN_SYSTEM sentinel (edit, entry was not already the sentinel)', () => {
+    assert.throws(
+      () =>
+        upsertModelTarget(baseConfig, 'free', 'existing-model', {
+          target: 'existing-target',
+          base_url: 'https://override.example',
+          api_key: 'STORE_KEY_IN_SYSTEM',
+          mode: 'anthropic-messages',
+        }),
+      /STORE_KEY_IN_SYSTEM/,
+    );
+  });
+
+  it('allows STORE_KEY_IN_SYSTEM when left unchanged from the existing entry (edit, already stored)', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://x',
+          'm1': ['t1', 'https://x', 'STORE_KEY_IN_SYSTEM', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'm1', {
+      target: 't1',
+      base_url: 'https://y',
+      api_key: 'STORE_KEY_IN_SYSTEM',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
+    assert.equal(entry[2], 'STORE_KEY_IN_SYSTEM');
+  });
+
+  it('adopts STORE_KEY_IN_SYSTEM from a sibling entry with the same base_url when api_key is left blank', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://default.example',
+          'existing': ['existing-target', 'https://shared.example', 'STORE_KEY_IN_SYSTEM', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'new-model', {
+      target: 'new-target',
+      base_url: 'https://shared.example',
+      api_key: '',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
+    assert.equal(entry[2], 'STORE_KEY_IN_SYSTEM');
+  });
+
+  it('adopts STORE_KEY_IN_SYSTEM from a sibling entry falling back to category base_url when both blank', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://category.example',
+          'existing': ['existing-target', '', 'STORE_KEY_IN_SYSTEM', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'new-model', {
+      target: 'new-target',
+      base_url: '',
+      api_key: '',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
+    assert.equal(entry[2], 'STORE_KEY_IN_SYSTEM');
+  });
+
+  it('leaves api_key blank when no sibling entry shares the base_url (falls through to category api_key at resolve time)', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://default.example',
+          'existing': ['existing-target', 'https://unrelated.example', 'STORE_KEY_IN_SYSTEM', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'new-model', {
+      target: 'new-target',
+      base_url: 'https://shared.example',
+      api_key: '',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
+    assert.equal(entry[2], '');
+  });
+
+  it('ignores STORE_KEY_IN_SYSTEM matches in other categories', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://default.example',
+        } as any,
+        claude: {
+          base_url: 'https://default.example',
+          'existing': ['existing-target', 'https://shared.example', 'STORE_KEY_IN_SYSTEM', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'new-model', {
+      target: 'new-target',
+      base_url: 'https://shared.example',
+      api_key: '',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
+    assert.equal(entry[2], '');
+  });
+
+  it('does not adopt the sentinel from itself when editing (blank api_key clears a previously plaintext key)', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://default.example',
+          'm1': ['t1', 'https://shared.example', 'plaintext-key', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'm1', {
+      target: 't1',
+      base_url: 'https://shared.example',
+      api_key: '',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
+    assert.equal(entry[2], '');
+  });
+
+  it('creates category if it does not exist', () => {
+    const cfg: ProxyConfig = { models: {} };
+    const next = upsertModelTarget(cfg, 'newcat', 'm1', {
+      target: 't1',
+      base_url: 'https://x',
+      api_key: 'k',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.newcat as Record<string, unknown>)['m1'] as string[];
+    assert.deepEqual(entry, ['t1', 'https://x', 'k', 'anthropic-messages']);
+  });
+
+  it('does not mutate base config (immutability)', () => {
+    const originalEntry = (baseConfig.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    const originalBaseUrl = originalEntry[1];
+    upsertModelTarget(baseConfig, 'free', 'existing-model', {
+      target: 'existing-target',
+      base_url: 'https://changed.example',
+      api_key: 'changed',
+      mode: 'anthropic-messages',
+    });
+    const unchanged = (baseConfig.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    assert.equal(unchanged[1], originalBaseUrl, 'base config must not be mutated');
+  });
+
+  it('serializes and re-parses to identical entry (round-trip)', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'existing-model', {
+      target: 'updated-target',
+      base_url: 'https://updated.example',
+      api_key: 'updated-key',
+      mode: 'gemini-generatecontent',
+    });
+    const toml = serializeProxyConfigToml(next);
+    const reparsed = parseSimpleToml(toml);
+    const entry = (reparsed.models!.free as Record<string, unknown>)['existing-model'] as string[];
+    assert.equal(entry[0], 'updated-target');
+    assert.equal(entry[1], 'https://updated.example');
+    assert.equal(entry[2], 'updated-key');
+    assert.equal(entry[3], 'gemini-generatecontent');
+    assert.equal(entry[4], 'my-transforms', 'transforms preserved through round-trip');
+    assert.equal(entry[5], '16384', 'max_tokens preserved through round-trip');
+  });
+
+  it('serializes and re-parses new 4-element entry correctly (round-trip)', () => {
+    const next = upsertModelTarget(baseConfig, 'free', 'brand-new', {
+      target: 'brand-new-target',
+      base_url: 'https://brand-new.example',
+      api_key: 'brand-new-key',
+      mode: 'openai-responses',
+    });
+    const toml = serializeProxyConfigToml(next);
+    const reparsed = parseSimpleToml(toml);
+    const entry = (reparsed.models!.free as Record<string, unknown>)['brand-new'] as string[];
+    assert.deepEqual(entry, ['brand-new-target', 'https://brand-new.example', 'brand-new-key', 'openai-responses']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveDefaultProxyConfigPath
+// ---------------------------------------------------------------------------
+
+describe('resolveDefaultProxyConfigPath', () => {
+  it('prefers ./proxy_config.toml in the working directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mpv3-cfgpath-'));
+    writeFileSync(join(dir, 'proxy_config.toml'), '');
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(dir);
+      assert.equal(
+        resolveDefaultProxyConfigPath(),
+        './proxy_config.toml',
+        'a repo checkout must keep resolving the working-directory config',
+      );
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the home path, creating its directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mpv3-cfgpath-'));
+    const homeConfigDir = dirname(HOME_PROXY_CONFIG_PATH);
+    const homeConfigRoot = dirname(homeConfigDir);
+    const homeConfigDirExisted = existsSync(homeConfigDir);
+    const homeConfigRootExisted = existsSync(homeConfigRoot);
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(dir);
+      assert.equal(
+        resolveDefaultProxyConfigPath(),
+        HOME_PROXY_CONFIG_PATH,
+        'with no working-directory config the home path is the default',
+      );
+      assert.ok(
+        existsSync(homeConfigDir),
+        'the home config directory must be created when it is the fallback',
+      );
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(dir, { recursive: true, force: true });
+      // Undo only what this test created; never touch a pre-existing config dir.
+      if (!homeConfigDirExisted) rmSync(homeConfigDir, { recursive: true, force: true });
+      if (!homeConfigRootExisted) rmSync(homeConfigRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -335,11 +335,15 @@ describe('GET /v1/responses/{id} routing', () => {
     upstreamResponseBody = CHAT_COMPLETION('pong');
   });
 
-  const stateEnv = { PROXY_CONFIG_PATH: configPath, CONVERSATION_STATE: 'true', LOG_LEVEL: 'error' };
+  // Resolved per call: the describe body runs at collection time, before the
+  // `before()` hook assigns configPath, so a captured object would freeze
+  // PROXY_CONFIG_PATH as undefined and route every request to the default
+  // (base_url-less) route.
+  const stateEnv = () => ({ PROXY_CONFIG_PATH: configPath, CONVERSATION_STATE: 'true', LOG_LEVEL: 'error' });
 
   it('serves a stored response through the full routing + auth path', async () => {
     // Seed a stored entry via a real POST through the index handler.
-    const post = await handler.fetch(responsesRequest({ model: 'gpt', input: 'route-q' }), stateEnv as any);
+    const post = await handler.fetch(responsesRequest({ model: 'gpt', input: 'route-q' }), stateEnv() as any);
     assert.equal(post.status, 200);
     const { id } = await post.json();
     assert.ok(getConversation(id), 'POST must have stored the conversation entry');
@@ -347,18 +351,18 @@ describe('GET /v1/responses/{id} routing', () => {
     const get = await handler.fetch(new Request(`http://proxy/v1/responses/${id}`, {
       method: 'GET',
       headers: { 'x-api-key': 'test-key' },
-    }), stateEnv as any);
+    }), stateEnv() as any);
     assert.equal(get.status, 200);
     assert.equal((await get.json()).id, id);
   });
 
   it('serves input_items through the full routing path', async () => {
-    const post = await handler.fetch(responsesRequest({ model: 'gpt', input: 'route-q2' }), stateEnv as any);
+    const post = await handler.fetch(responsesRequest({ model: 'gpt', input: 'route-q2' }), stateEnv() as any);
     const { id } = await post.json();
     const get = await handler.fetch(new Request(`http://proxy/v1/responses/${id}/input_items`, {
       method: 'GET',
       headers: { 'x-api-key': 'test-key' },
-    }), stateEnv as any);
+    }), stateEnv() as any);
     assert.equal(get.status, 200);
     const body = await get.json();
     assert.equal(body.object, 'response.input_items.list');
@@ -366,9 +370,9 @@ describe('GET /v1/responses/{id} routing', () => {
   });
 
   it('requires auth headers on retrieval', async () => {
-    const post = await handler.fetch(responsesRequest({ model: 'gpt', input: 'auth-q' }), stateEnv as any);
+    const post = await handler.fetch(responsesRequest({ model: 'gpt', input: 'auth-q' }), stateEnv() as any);
     const { id } = await post.json();
-    const get = await handler.fetch(new Request(`http://proxy/v1/responses/${id}`, { method: 'GET' }), stateEnv as any);
+    const get = await handler.fetch(new Request(`http://proxy/v1/responses/${id}`, { method: 'GET' }), stateEnv() as any);
     assert.equal(get.status, 401);
   });
 
@@ -376,7 +380,7 @@ describe('GET /v1/responses/{id} routing', () => {
     const get = await handler.fetch(new Request('http://proxy/v1/responses/resp_route_missing', {
       method: 'GET',
       headers: { 'x-api-key': 'test-key' },
-    }), stateEnv as any);
+    }), stateEnv() as any);
     assert.equal(get.status, 404);
   });
 });

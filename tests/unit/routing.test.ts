@@ -7,7 +7,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildUpstreamUrl } from '../../src/utils/routing.js';
+import { buildTargetUrl, buildUpstreamUrl, getHandlerType, parseDynamicRoute } from '../../src/utils/routing.js';
 import { decayEffectiveCompositeShare, getEffectiveCompositeShare, recoverEffectiveCompositeShare, resetEffectiveCompositeSharesForTest } from '../../src/index.js';
 
 describe('composite primary effective share decay', () => {
@@ -352,5 +352,195 @@ describe('buildUpstreamUrl', () => {
       buildUpstreamUrl('https://api.example.com/v1/models', 'v1/models'),
       'https://api.example.com/v1/models'
     );
+  });
+});
+
+describe('parseDynamicRoute', () => {
+  it('splits a bare host and endpoint into an empty prefix and no model id', () => {
+    const route = parseDynamicRoute('/https/api.qnaigc.com/v1/messages');
+
+    assert.equal(route.targetConfig.targetUrl, 'https://api.qnaigc.com');
+    assert.equal(route.targetConfig.targetPathPrefix, '');
+    assert.equal(route.modelId, undefined);
+    assert.equal(route.claudeEndpoint, 'v1/messages');
+  });
+
+  it('takes the scheme from the route instead of assuming https', () => {
+    const route = parseDynamicRoute('/http/localhost:8788/v1/messages');
+
+    assert.equal(route.targetConfig.targetUrl, 'http://localhost:8788');
+    assert.equal(route.claudeEndpoint, 'v1/messages');
+  });
+
+  it('reads the segment before the endpoint as the model id', () => {
+    const route = parseDynamicRoute('/https/api.qnaigc.com/abc/v1/messages');
+
+    assert.equal(route.targetConfig.targetPathPrefix, '');
+    assert.equal(route.modelId, 'abc');
+    assert.equal(route.claudeEndpoint, 'v1/messages');
+  });
+
+  it('keeps the path prefix when a model id follows it', () => {
+    const route = parseDynamicRoute('/https/api.qnaigc.com/openai/v1/abc/v1/messages');
+
+    assert.equal(route.targetConfig.targetPathPrefix, '/openai/v1');
+    assert.equal(route.modelId, 'abc');
+    assert.equal(route.claudeEndpoint, 'v1/messages');
+  });
+
+  it('does not mistake a version segment inside the prefix for a model id', () => {
+    const route = parseDynamicRoute('/https/api.qnaigc.com/openai/v1/v1/messages');
+
+    assert.equal(route.targetConfig.targetPathPrefix, '/openai/v1');
+    assert.equal(route.modelId, undefined);
+    assert.equal(route.claudeEndpoint, 'v1/messages');
+  });
+
+  it('collapses a doubled slash to an empty prefix rather than a slash', () => {
+    const route = parseDynamicRoute('/https/api.qnaigc.com//abc/v1/messages');
+
+    assert.equal(route.targetConfig.targetPathPrefix, '');
+    assert.equal(route.modelId, 'abc');
+    assert.equal(route.claudeEndpoint, 'v1/messages');
+  });
+
+  it('locates a v1beta Gemini endpoint and leaves the model inside the endpoint', () => {
+    const route = parseDynamicRoute(
+      '/https/generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent'
+    );
+
+    assert.equal(route.targetConfig.targetUrl, 'https://generativelanguage.googleapis.com');
+    assert.equal(route.targetConfig.targetPathPrefix, '');
+    assert.equal(route.modelId, undefined);
+    assert.equal(route.claudeEndpoint, 'v1beta/models/gemini-2.5-pro:generateContent');
+  });
+
+  it('locates the interactions and count_tokens endpoints', () => {
+    assert.equal(
+      parseDynamicRoute('/https/api.qnaigc.com/v1/interactions').claudeEndpoint,
+      'v1/interactions'
+    );
+    assert.equal(
+      parseDynamicRoute('/https/api.qnaigc.com/v1/messages/count_tokens').claudeEndpoint,
+      'v1/messages/count_tokens'
+    );
+  });
+
+  it('rejects a url with too few segments', () => {
+    assert.throws(() => parseDynamicRoute('/v1/messages'), /Invalid URL format/);
+  });
+
+  it('rejects a protocol other than http or https', () => {
+    assert.throws(
+      () => parseDynamicRoute('/ftp/api.example.com/v1/messages'),
+      /Invalid protocol: ftp/
+    );
+  });
+
+  it('rejects an endpoint it does not recognise instead of guessing', () => {
+    // chat/completions is served by the fixed-route and model-route dialects;
+    // dynamic routing only locates models, messages and interactions.
+    assert.throws(
+      () => parseDynamicRoute('/https/api.openai.com/v1/chat/completions'),
+      /Could not locate Claude endpoint/
+    );
+  });
+});
+
+describe('getHandlerType', () => {
+  it('maps each supported endpoint to its handler', () => {
+    assert.equal(getHandlerType('v1/models'), 'models');
+    assert.equal(getHandlerType('v1/messages'), 'messages');
+    assert.equal(getHandlerType('v1/interactions'), 'interactions');
+    assert.equal(getHandlerType('v1beta/interactions'), 'interactions');
+  });
+
+  it('classifies count_tokens as token-counting rather than messages', () => {
+    assert.equal(getHandlerType('v1/messages/count_tokens'), 'token-counting');
+  });
+
+  it('accepts a generateContent endpoint under either api version', () => {
+    assert.equal(getHandlerType('v1beta/models/gemini-pro:generateContent'), 'generateContent');
+    assert.equal(getHandlerType('v1/models/gemini-pro:generateContent'), 'generateContent');
+  });
+
+  it('throws for a models endpoint that carries no generative action', () => {
+    // parseDynamicRoute can emit this endpoint, so it reaches getHandlerType in
+    // production and currently surfaces as an error rather than a handler.
+    assert.throws(() => getHandlerType('v1/models/gemini-2.5-pro'), /Unknown Claude endpoint/);
+  });
+});
+
+describe('buildTargetUrl', () => {
+  it('inserts the model id between the prefix and the endpoint', () => {
+    assert.equal(
+      buildTargetUrl(
+        { targetUrl: 'https://api.qnaigc.com', targetPathPrefix: '' },
+        'v1/messages',
+        'abc'
+      ),
+      'https://api.qnaigc.com/abc/v1/messages'
+    );
+  });
+
+  it('omits the model segment when no model id is given', () => {
+    assert.equal(
+      buildTargetUrl(
+        { targetUrl: 'https://api.qnaigc.com', targetPathPrefix: '' },
+        'v1/messages',
+        undefined
+      ),
+      'https://api.qnaigc.com/v1/messages'
+    );
+  });
+
+  it('omits the model segment for an empty model id', () => {
+    assert.equal(
+      buildTargetUrl(
+        { targetUrl: 'https://api.qnaigc.com', targetPathPrefix: '' },
+        'v1/messages',
+        ''
+      ),
+      'https://api.qnaigc.com/v1/messages'
+    );
+  });
+
+  it('keeps the path prefix ahead of the model id', () => {
+    assert.equal(
+      buildTargetUrl(
+        { targetUrl: 'https://api.qnaigc.com', targetPathPrefix: '/openai/v1' },
+        'v1/messages',
+        'abc'
+      ),
+      'https://api.qnaigc.com/openai/v1/abc/v1/messages'
+    );
+  });
+
+  it('round-trips parsed routes back to their absolute url', () => {
+    const cases: Array<[string, string]> = [
+      ['/https/api.qnaigc.com/abc/v1/messages', 'https://api.qnaigc.com/abc/v1/messages'],
+      ['/https/api.qnaigc.com//abc/v1/messages', 'https://api.qnaigc.com/abc/v1/messages'],
+      [
+        '/https/api.qnaigc.com/openai/v1/abc/v1/messages',
+        'https://api.qnaigc.com/openai/v1/abc/v1/messages',
+      ],
+      [
+        '/https/api.qnaigc.com/openai/v1/v1/messages',
+        'https://api.qnaigc.com/openai/v1/v1/messages',
+      ],
+      [
+        '/https/generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent',
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent',
+      ],
+    ];
+
+    for (const [route, expected] of cases) {
+      const parsed = parseDynamicRoute(route);
+      assert.equal(
+        buildTargetUrl(parsed.targetConfig, parsed.claudeEndpoint, parsed.modelId),
+        expected,
+        `round-trip failed for ${route}`
+      );
+    }
   });
 });

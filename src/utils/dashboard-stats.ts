@@ -4,6 +4,7 @@ import { dirname } from 'path';
 import { stringify } from './stringify.js';
 import type { TokenLimitDuration } from './config-loader.js';
 import { isSlidingDuration } from './config-loader.js';
+import { extractToolRecords, toolNameOf } from './tool-shapes.js';
 
 export type UsageStats = {
   input_tokens?: number;
@@ -13,7 +14,7 @@ export type UsageStats = {
   total_tokens?: number;
 };
 
-type ModelStatsEntry = {
+export type ModelStatsEntry = {
   model: string;
   requests: number;
   failed_requests: number;
@@ -106,7 +107,20 @@ function getOrAssignModelId(model: string): string {
 }
 
 const TOKEN_HEATMAP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;   // heatmap rendering: 7 days
-const TOKEN_RETENTION_WINDOW_MS = 31 * 24 * 60 * 60 * 1000; // event retention for enforcement: 31d (covers max calendar month)
+let TOKEN_RETENTION_WINDOW_MS = 31 * 24 * 60 * 60 * 1000; // event retention for enforcement: 31d (covers max calendar month)
+
+/**
+ * Configure the retention window for token heatmap events.
+ * Call this early (before any request processing) to adjust the in-memory
+ * retention. When persistence is enabled (via --dashboard/--tui/--agent/--rpc
+ * or DUMP=true), the default is 31 days to cover calendar-month token limits.
+ * When persistence is disabled (plain proxy mode), a 1-day cap saves memory
+ * at the cost of under-counting 1w/1m global token limits and composite alias
+ * windows — those limits will only see the last day of history.
+ */
+export function setTokenRetentionWindow(days: number): void {
+  TOKEN_RETENTION_WINDOW_MS = days * 24 * 60 * 60 * 1000;
+}
 
 // Tools in this set are blocked: future stat recording is skipped for them.
 // Existing (pre-block) counts are preserved but stop growing.
@@ -140,6 +154,20 @@ const upstreamResponseToolStats = new Map<string, UpstreamResponseToolStatsEntry
 const requestEndpointTimingStats = new Map<string, RequestEndpointTimingStatsEntry>();
 const requestModelTimingStats = new Map<string, RequestEndpointTimingStatsEntry>();
 const tokenHeatmapEvents: TokenHeatmapEvent[] = [];
+
+/**
+ * Returns true when any mode flag is enabled (--dashboard, --tui, --agent, --rpc).
+ * When false, heatmap events, composite alias windows, agent stats, and tool stats
+ * are not recorded, and global/alias token limits are not enforced.
+ */
+function areModeFlagsEnabled(): boolean {
+  return (
+    process.env.DASHBOARD === 'true' ||
+    process.env.TUI === 'true' ||
+    process.env.AGENT === 'true' ||
+    process.env.RPC === 'true'
+  );
+}
 // Tracks the in-memory event timestamp when last heatmap delta was written.
 // Used to write only new events since last dump (delta-only).
 let lastHeatmapDumpTs = 0;
@@ -310,6 +338,7 @@ function sumCompositeEventsSince(state: CompositeAliasState, cutoff: number): nu
  * Also updates windows for all aliases that include the same model.
  */
 export function recordCompositeTokenUsage(alias: string, _targetModel: string, tokenCount: number): void {
+  if (!areModeFlagsEnabled()) return;
   const state = compositeAliasStates.get(alias);
   if (!state) return;
   const now = Date.now();
@@ -614,10 +643,11 @@ type PersistedLimitWindowLegacy = {
 };
 
 // Stats persistence (dump to JSONL + restore from JSONL) is opt-in:
-// the Node entry point calls `setStatsPersistenceEnabled(true)` when either
-// TUI=1 or DUMP=1 is set. With persistence disabled, stats live only in
-// memory (capped at the 30d retention window by recordTokenHeatmapEvent)
-// and no file I/O happens on the hot path or at day rollover.
+// the Node entry point calls `setStatsPersistenceEnabled(true)` when
+// TUI=1, DASHBOARD=1 or DUMP=1 is set (the --tui/--agent flags set
+// DASHBOARD). With persistence disabled, stats live only in memory (capped at
+// the 30d retention window by recordTokenHeatmapEvent) and no file I/O happens
+// on the hot path or at day rollover.
 let persistenceEnabled = false;
 
 export function setStatsPersistenceEnabled(enabled: boolean): void {
@@ -886,33 +916,11 @@ export function extractUserAgentPrefix(userAgent: string | null): string {
 }
 
 export function extractToolNamesFromBody(body: Record<string, unknown> | undefined): string[] {
-  if (!body) {
-    return ['none'];
-  }
-
-  const tools = body.tools;
-  if (!Array.isArray(tools) || tools.length === 0) {
-    return ['none'];
-  }
-
   const names = new Set<string>();
-  for (const tool of tools) {
-    if (!tool || typeof tool !== 'object') {
-      continue;
-    }
-
-    const claudeToolName = (tool as Record<string, unknown>).name;
-    if (typeof claudeToolName === 'string' && claudeToolName.trim()) {
-      names.add(claudeToolName.trim());
-      continue;
-    }
-
-    const openAiFunction = (tool as Record<string, unknown>).function;
-    if (openAiFunction && typeof openAiFunction === 'object') {
-      const openAiName = (openAiFunction as Record<string, unknown>).name;
-      if (typeof openAiName === 'string' && openAiName.trim()) {
-        names.add(openAiName.trim());
-      }
+  for (const tool of extractToolRecords(body)) {
+    const name = tool.name.trim();
+    if (name) {
+      names.add(name);
     }
   }
 
@@ -1075,16 +1083,7 @@ export function extractToolRequestCharLengthsFromBody(body: Record<string, unkno
     }
 
     const record = tool as Record<string, unknown>;
-    const claudeToolName = typeof record.name === 'string' && record.name.trim()
-      ? record.name.trim()
-      : undefined;
-    const openAiFunction = record.function && typeof record.function === 'object'
-      ? (record.function as Record<string, unknown>)
-      : undefined;
-    const openAiName = typeof openAiFunction?.name === 'string' && openAiFunction.name.trim()
-      ? openAiFunction.name.trim()
-      : undefined;
-    const toolName = claudeToolName || openAiName;
+    const toolName = toolNameOf(record)?.trim();
     if (!toolName) {
       continue;
     }
@@ -1299,16 +1298,18 @@ export function extractUsageFromResponsePayload(payload: unknown): UsageStats | 
   if (usageMetadata && typeof usageMetadata === 'object') {
     const metadata = usageMetadata as Record<string, unknown>;
     const input_tokens = toSafeNumber(metadata.promptTokenCount);
+    // Gemini's promptTokenCount INCLUDES the cached portion; cachedContentTokenCount is a subset of it.
+    const cached_tokens = toSafeNumber(metadata.cachedContentTokenCount);
     const output_tokens = toSafeNumber(metadata.candidatesTokenCount ?? metadata.responseTokenCount);
     const total_tokens = toSafeNumber(metadata.totalTokenCount ?? (input_tokens + output_tokens));
 
-    if (input_tokens === 0 && output_tokens === 0 && total_tokens === 0) {
+    if (input_tokens === 0 && cached_tokens === 0 && output_tokens === 0 && total_tokens === 0) {
       return undefined;
     }
 
     return {
       input_tokens,
-      cached_tokens: 0,
+      cached_tokens,
       cache_written_tokens: 0,
       output_tokens,
       total_tokens,
@@ -1376,6 +1377,7 @@ export function recordModelStat(model: string | undefined, usage?: UsageStats): 
 }
 
 function recordTokenHeatmapEvent(values: number, timestamp = Date.now(), model?: string): void {
+  if (!areModeFlagsEnabled()) return;
   if (!Number.isFinite(values) || values <= 0) {
     return;
   }
@@ -1408,6 +1410,7 @@ export function recordModelUsage(model: string | undefined, usage?: UsageStats):
 }
 
 export function recordAgentStat(agent: ResolvedAgent | string, toolNames: string[]): void {
+  if (!areModeFlagsEnabled()) return;
   const { prefix, ua } = normaliseAgent(agent);
   const effectiveTools = toolNames.length > 0 ? toolNames : ['none'];
 
@@ -1425,6 +1428,7 @@ export function recordToolRequestChars(
   toolChars: Array<{ tool_name: string; request_chars: number }>,
   agent: ResolvedAgent | string = { prefix: '', ua: '' },
 ): void {
+  if (!areModeFlagsEnabled()) return;
   if (!Array.isArray(toolChars) || toolChars.length === 0) {
     return;
   }
@@ -1578,7 +1582,22 @@ export function createUsageTrackingTransformStream(
               continue;
             }
             const data = JSON.parse(dataText);
-            if (data.usage) {
+            if (data.usageMetadata) {
+              // Gemini :streamGenerateContent?alt=sse chunks — usage lives in
+              // usageMetadata (running totals; the final chunk is authoritative).
+              const metadata = data.usageMetadata as Record<string, unknown>;
+              const pt = toSafeNumber(metadata.promptTokenCount);
+              const ct = toSafeNumber(metadata.candidatesTokenCount);
+              if (pt > 0 || ct > 0) {
+                inputTokens = pt;
+                outputTokens = ct;
+                totalTokens = toSafeNumber(metadata.totalTokenCount);
+                const cached = toSafeNumber(metadata.cachedContentTokenCount);
+                if (cached > 0) cachedTokens = cached;
+                foundUsage = true;
+                setLiveTokens(inputTokens, outputTokens);
+              }
+            } else if (data.usage) {
               const usage = data.usage as Record<string, unknown>;
               const pt = toSafeNumber(usage.prompt_tokens);
               const ct = toSafeNumber(usage.completion_tokens);
@@ -1633,6 +1652,7 @@ export function createUsageTrackingTransformStream(
 }
 
 export function recordRequestEndpoint(endpoint: string): void {
+  if (!areModeFlagsEnabled()) return;
   if (!endpoint) {
     return;
   }
@@ -1643,6 +1663,7 @@ export function recordRequestEndpoint(endpoint: string): void {
 }
 
 export function recordRequestTiming(endpoint: string, elapsedMs: number): void {
+  if (!areModeFlagsEnabled()) return;
   if (!endpoint || typeof elapsedMs !== 'number' || elapsedMs < 0) {
     return;
   }
@@ -1672,6 +1693,7 @@ export function getRequestEndpointTimingStatsDesc(): (RequestEndpointTimingStats
 }
 
 export function recordModelTiming(model: string | undefined, elapsedMs: number): void {
+  if (!areModeFlagsEnabled()) return;
   if (!model || typeof elapsedMs !== 'number' || elapsedMs < 0) {
     return;
   }
@@ -1822,6 +1844,7 @@ function normalizeUpstreamBaseUrl(urlLike: string): string {
 }
 
 export function recordResponseUpstream(upstreamBaseUrl: string): void {
+  if (!areModeFlagsEnabled()) return;
   if (!upstreamBaseUrl) {
     return;
   }
@@ -1833,6 +1856,7 @@ export function recordResponseUpstream(upstreamBaseUrl: string): void {
 }
 
 export function recordResponseStatusCodeToEndpoint(statusCode: number): void {
+  if (!areModeFlagsEnabled()) return;
   if (!Number.isInteger(statusCode)) {
     return;
   }
@@ -1843,6 +1867,7 @@ export function recordResponseStatusCodeToEndpoint(statusCode: number): void {
 }
 
 export function recordResponseStatusCodeFromUpstream(statusCode: number): void {
+  if (!areModeFlagsEnabled()) return;
   if (!Number.isInteger(statusCode)) {
     return;
   }
@@ -1856,6 +1881,7 @@ export function recordUpstreamResponseToolNames(
   toolNames: string[],
   agent: ResolvedAgent | string = { prefix: 'unknown', ua: 'unknown' },
 ): void {
+  if (!areModeFlagsEnabled()) return;
   if (!Array.isArray(toolNames) || toolNames.length === 0) {
     return;
   }
@@ -2283,11 +2309,17 @@ export function createResponseToolTrackingTransformStream(
 // (server.ts) after the proxy config is loaded, with a retention window
 // derived from the configured token-limit durations.
 
-// Periodic delta dump every 30 min — only runs when DUMP=1 (non-TUI mode).
-// (TUI=1 mode uses the TUI's own timer instead.)
+// Periodic delta dump every 30 min — for the modes that have no dump timer of
+// their own: DUMP=1 (standalone) and --dashboard / DASHBOARD=true. TUI=1 mode
+// uses the TUI's own timer instead, so it is excluded even though --tui implies
+// DASHBOARD: two timers sharing the lastHeatmapDumpTs cursor would only split
+// the same delta stream across more lines. --agent has no timer of its own and
+// so is covered here.
 try {
   void (() => {
-    if (!process.env.DUMP) return;
+    const tuiOwnsDumpTimer = process.env.TUI === 'true' || process.env.TUI === '1';
+    const dashboardTimer = !tuiOwnsDumpTimer && (process.env.DASHBOARD === 'true' || process.env.DASHBOARD === '1');
+    if (!process.env.DUMP && !dashboardTimer) return;
     let lastDumpTokenCount = 0;
     setInterval(() => {
       const totalTokens = [...dailyTokenStats.values()].reduce((sum, m) => sum + m.total_tokens, 0);

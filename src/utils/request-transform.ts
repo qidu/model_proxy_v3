@@ -126,6 +126,76 @@ function applyBuiltin(
     return;
   }
 
+  if (name === 'project_program_to_node_tool') {
+    // EXPERIMENTAL / OPT-IN. Projects Responses `program` / `program_output`
+    // items (programmatic tool calling) onto an ordinary `node` function call,
+    // so an `openai-completions` upstream can carry them instead of the request
+    // being rejected. Runs at `before_conversion`, rewriting items into types
+    // convertResponsesToChatCompletions already handles; without this builtin
+    // those items are refused with a 400 (see responses-to-completions.ts).
+    //
+    // This is a LOSSY projection, enabled only for testing against upstreams
+    // whose behaviour you have verified. Two known hazards:
+    //
+    //  1. `fingerprint` is documented as an opaque replay token that "must be
+    //     round-tripped". Here it becomes a `node` argument, which means the
+    //     UPSTREAM model authors its value on the next turn — it will copy a
+    //     stale one, invent one, or omit it. Whether the Responses platform
+    //     tolerates that is not documented; assume replay is unreliable.
+    //  2. It declares a `node` tool the client never asked for. Strict
+    //     upstreams may reject an assistant turn calling an undeclared tool,
+    //     and lenient ones may start calling `node` on their own — with no
+    //     executor behind it. We therefore only project when the request
+    //     already declares a `node` tool, and leave items untouched otherwise
+    //     (the converter then rejects them, which is the safe default).
+    if (!Array.isArray(body.input)) return;
+    const items = body.input as Record<string, unknown>[];
+    if (!items.some(it => it?.type === 'program' || it?.type === 'program_output')) return;
+
+    const hasNodeTool = Array.isArray(body.tools) && (body.tools as Record<string, unknown>[]).some(t => {
+      if (t?.name === 'node') return true;                       // responses-style tool
+      const fn = t?.function as Record<string, unknown> | undefined;
+      return fn?.name === 'node';                                 // completions-style tool
+    });
+    if (!hasNodeTool) {
+      trace?.logger.warn(
+        trace.requestId,
+        '[project_program_to_node_tool] request contains program items but declares no `node` tool — leaving them unprojected (the converter will reject them). Declare a `node` tool to enable the projection.',
+      );
+      return;
+    }
+
+    body.input = items.map(item => {
+      if (item?.type === 'program') {
+        return {
+          type: 'function_call',
+          call_id: item.call_id,
+          name: 'node',
+          arguments: JSON.stringify({
+            code: item.code ?? '',
+            fingerprint: item.fingerprint ?? '',
+            type: 'program',
+          }),
+          ...(item.id !== undefined ? { id: item.id } : {}),
+        };
+      }
+      if (item?.type === 'program_output') {
+        return {
+          type: 'function_call_output',
+          call_id: item.call_id,
+          output: JSON.stringify({
+            result: item.result ?? '',
+            status: item.status ?? 'completed',
+            type: 'program_output',
+          }),
+          ...(item.id !== undefined ? { id: item.id } : {}),
+        };
+      }
+      return item;
+    });
+    return;
+  }
+
   if (name === 'inject_missing_tool_results') {
     // Anthropic-format invariant: every tool_use.id in an assistant message
     // must be matched by a tool_result.tool_use_id in the immediately

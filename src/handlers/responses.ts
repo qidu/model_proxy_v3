@@ -13,10 +13,11 @@ import { addForwardedHeaders, normalizeOpenAIAuthHeaders } from '../utils/routin
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
-import { convertResponsesToChatCompletions } from '../converters/responses-to-completions.js';
+import { convertResponsesToChatCompletions, getNamespaceMap, NamespaceMap } from '../converters/responses-to-completions.js';
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../converters/completions-to-responses.js';
 import { getConversation, saveConversation, normalizeInputToItems, getConversationThreadItems, appendConversationThreadItems } from '../utils/conversation-store.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
+import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { handleGeminiRequestForMessages } from './gemini.js';
 import { completionsToClaudeBody } from './openai.js';
 
@@ -530,7 +531,7 @@ async function handleAsAnthropicMessages(
   route?: ModelRouteConfig,
   upstreamMode?: string,
 ): Promise<Response> {
-  const completionsRequest = convertResponsesToChatCompletions(requestBody, model);
+  const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger, requestId });
   let claudeBody: Record<string, unknown> = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
 
   // before_upstream: apply declared transforms to the upstream-format body.
@@ -564,12 +565,13 @@ async function handleAsAnthropicMessages(
     method: 'POST',
     headers: anthropicFetchHeaders,
     body: JSON.stringify(claudeBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
   recordResponseStatusCodeFromUpstream(response.status);
   recordUpstreamResponseToolCount('anthropic-messages', 0);
+  recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
     const upstreamBody = await response.text();
@@ -609,7 +611,7 @@ async function handleAsGemini(
   env?: Env,
   upstreamMode?: string
 ): Promise<Response> {
-  const completionsRequest = convertResponsesToChatCompletions(requestBody, model);
+  const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger, requestId });
   const claudeBody = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
 
   logger.debug(requestId, `Responses->${upstreamMode}: ${JSON.stringify(claudeBody).substring(0, 500)}`);
@@ -729,7 +731,8 @@ async function handleAsCompletions(
   }
 
   // Convert Responses API request to Chat Completions format
-  const completionsRequest = convertResponsesToChatCompletions(effectiveBody, model);
+  const completionsRequest = convertResponsesToChatCompletions(effectiveBody, model, { logger, requestId });
+  const namespaceMap = getNamespaceMap(completionsRequest);
 
   // Inject stored reasoning_content onto any assistant messages that have tool_calls
   // whose IDs were recorded from a prior thinking-mode response (DeepSeek requires
@@ -778,7 +781,7 @@ async function handleAsCompletions(
     method: 'POST',
     headers: completionsFetchHeaders,
     body: JSON.stringify(upstreamBodyResponses),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -791,6 +794,7 @@ async function handleAsCompletions(
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
   recordResponseStatusCodeFromUpstream(response.status);
   recordUpstreamResponseToolCount('openai-completions', 0);
+  recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
     const bodyPreview = JSON.stringify(completionsRequest);
@@ -810,7 +814,7 @@ async function handleAsCompletions(
           logger.debug(requestId, `[conversation] saved responseId=${responseId} (${mergedInput.length} input + ${outputItems.length} output items)`);
         }
       : undefined;
-    return streamCompletionsAsResponses(response, model, requestId, logger, onComplete, conversationId);
+    return streamCompletionsAsResponses(response, model, requestId, logger, onComplete, conversationId, namespaceMap);
   }
 
   // Convert Chat Completions response back to Responses API format
@@ -818,7 +822,7 @@ async function handleAsCompletions(
   logger.debug(requestId, `Upstream completions response: ${responseText.substring(0, 1000)}`);
   logPipelineStage(logger, requestId, 'upstream-response', targetUrl, responseText);
   const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
-  const responsesResponse = convertCompletionsToResponses(completionsResponse, model);
+  const responsesResponse = convertCompletionsToResponses(completionsResponse, model, namespaceMap);
   if (conversationId) {
     (responsesResponse as unknown as Record<string, unknown>).conversation = conversationId;
   }
@@ -859,8 +863,16 @@ function streamCompletionsAsResponses(
   requestId: string,
   logger?: Logger,
   onComplete?: (responseId: string, outputItems: unknown[], completedResponse?: Record<string, unknown>) => void,
-  conversationId?: string
+  conversationId?: string,
+  namespaceMap?: NamespaceMap
 ): Response {
+  // Given a possibly-flattened tool name, restores the original `name`/`namespace`
+  // split recorded by convertResponsesToChatCompletions, if it was a namespaced tool.
+  const splitNamespace = (flatName: string): { name: string; namespace?: string } => {
+    const entry = namespaceMap?.get(flatName);
+    if (!entry) return { name: flatName };
+    return { name: entry.name, namespace: entry.namespace };
+  };
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
   const itemId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
   const created_at = Math.floor(Date.now() / 1000);
@@ -1037,6 +1049,7 @@ function streamCompletionsAsResponses(
                 const outputIndex = nextOutputIndex++;
                 toolCallOutputIndex.set(idx, outputIndex);
                 // Emit output_item.added for this function_call
+                const { name: addedName, namespace: addedNamespace } = splitNamespace(tc.function?.name ?? '');
                 await writer.write(encoder.encode(sseEvent('response.output_item.added', {
                   type: 'response.output_item.added',
                   sequence_number: nextSeq(),
@@ -1045,9 +1058,10 @@ function streamCompletionsAsResponses(
                     id: tcId,
                     type: 'function_call',
                     status: 'in_progress',
-                    name: tc.function?.name ?? '',
+                    name: addedName,
                     arguments: '',
                     call_id: tcId,
+                    ...(addedNamespace ? { namespace: addedNamespace } : {}),
                   },
                 })));
                 // If the first chunk already carries argument data, emit it as a delta now
@@ -1123,7 +1137,7 @@ function streamCompletionsAsResponses(
       }
 
       // --- close each tool call item ---
-      const completedToolCalls: Array<{ id: string; type: string; status: string; name: string; arguments: string; call_id: string }> = [];
+      const completedToolCalls: Array<{ id: string; type: string; status: string; name: string; arguments: string; call_id: string; namespace?: string }> = [];
       for (const [idx, accum] of toolCalls) {
         const outputIndex = toolCallOutputIndex.get(idx)!;
         await writer.write(encoder.encode(sseEvent('response.function_call_arguments.done', {
@@ -1133,6 +1147,7 @@ function streamCompletionsAsResponses(
           output_index: outputIndex,
           arguments: accum.arguments,
         })));
+        const { name: doneName, namespace: doneNamespace } = splitNamespace(accum.name);
         await writer.write(encoder.encode(sseEvent('response.output_item.done', {
           type: 'response.output_item.done',
           sequence_number: nextSeq(),
@@ -1141,12 +1156,17 @@ function streamCompletionsAsResponses(
             id: accum.id,
             type: 'function_call',
             status: 'completed',
-            name: accum.name,
+            name: doneName,
             arguments: accum.arguments,
             call_id: accum.id,
+            ...(doneNamespace ? { namespace: doneNamespace } : {}),
           },
         })));
-        completedToolCalls.push({ id: accum.id, type: 'function_call', status: 'completed', name: accum.name, arguments: accum.arguments, call_id: accum.id });
+        completedToolCalls.push({
+          id: accum.id, type: 'function_call', status: 'completed', name: doneName,
+          arguments: accum.arguments, call_id: accum.id,
+          ...(doneNamespace ? { namespace: doneNamespace } : {}),
+        });
       }
 
       // Build output array for response.completed
@@ -1281,7 +1301,7 @@ export async function handleResponsesInputTokensRequest(
 
   if (upstreamMode === 'openai-completions') {
     // Convert to completions format, call with max_tokens=1, extract prompt_tokens from usage
-    const completionsRequest = convertResponsesToChatCompletions(requestBody, model);
+    const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger: activeLogger, requestId });
     let countRequest: Record<string, unknown> = { ...completionsRequest, max_tokens: 1, stream: false };
 
     activeLogger.debug(requestId, `input_tokens -> completions count: ${JSON.stringify(countRequest).substring(0, 500)}`);
@@ -1304,7 +1324,7 @@ export async function handleResponsesInputTokensRequest(
       method: 'POST',
       headers: countFetchHeaders,
       body: JSON.stringify(countRequest),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -1317,6 +1337,7 @@ export async function handleResponsesInputTokensRequest(
     logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
     recordResponseStatusCodeFromUpstream(response.status);
     recordUpstreamResponseToolCount('openai-completions', 0);
+    recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
     if (!response.ok) {
       const upstreamErrorBody = await response.text();
@@ -1352,7 +1373,7 @@ export async function handleResponsesInputTokensRequest(
     method: 'POST',
     headers: passthroughInputTokensHeaders,
     body: JSON.stringify(passthroughBodyInputTokens),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1365,6 +1386,7 @@ export async function handleResponsesInputTokensRequest(
   logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, passthroughInputTokensResponse.headers);
   recordResponseStatusCodeFromUpstream(passthroughInputTokensResponse.status);
   recordUpstreamResponseToolCount('openai-completions', 0);
+  recordUpstreamRateLimit(model, (name) => passthroughInputTokensResponse.headers.get(name), targetUrl);
 
   if (!passthroughInputTokensResponse.ok) {
     const upstreamErrorBody = await passthroughInputTokensResponse.text();
@@ -1403,7 +1425,9 @@ export async function handleResponsesCompactRequest(
 
   if (upstreamMode === 'openai-completions') {
     // Convert to chat completions, call upstream, wrap as CompactedResponse
-    let completionsRequest: Record<string, unknown> = convertResponsesToChatCompletions(requestBody, model) as unknown as Record<string, unknown>;
+    const convertedRequest = convertResponsesToChatCompletions(requestBody, model, { logger: activeLogger, requestId });
+    const namespaceMap = getNamespaceMap(convertedRequest);
+    let completionsRequest: Record<string, unknown> = convertedRequest as unknown as Record<string, unknown>;
 
     activeLogger.debug(requestId, `Compact -> completions: ${JSON.stringify(completionsRequest).substring(0, 500)}`);
 
@@ -1425,7 +1449,7 @@ export async function handleResponsesCompactRequest(
       method: 'POST',
       headers: compactCompletionsHeaders,
       body: JSON.stringify(completionsRequest),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
     if (route) {
@@ -1438,6 +1462,7 @@ export async function handleResponsesCompactRequest(
     logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, compactCompletionsResponse.headers);
     recordResponseStatusCodeFromUpstream(compactCompletionsResponse.status);
     recordUpstreamResponseToolCount('openai-completions', 0);
+    recordUpstreamRateLimit(model, (name) => compactCompletionsResponse.headers.get(name), targetUrl);
 
     if (!compactCompletionsResponse.ok) {
       const upstreamErrorBody = await compactCompletionsResponse.text();
@@ -1447,7 +1472,7 @@ export async function handleResponsesCompactRequest(
 
     const responseText = await compactCompletionsResponse.text();
     const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
-    const compactedResponse = convertCompletionsToCompactedResponse(completionsResponse, model);
+    const compactedResponse = convertCompletionsToCompactedResponse(completionsResponse, model, namespaceMap);
 
     const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
     logPipelineHeaders(activeLogger, requestId, 'outbound', '/v1/responses/compact', outHeaders);
@@ -1473,7 +1498,7 @@ export async function handleResponsesCompactRequest(
     method: 'POST',
     headers: compactPassthroughHeaders,
     body: JSON.stringify(passthroughBodyCompact),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1486,6 +1511,7 @@ export async function handleResponsesCompactRequest(
   logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, compactPassthroughResponse.headers);
   recordResponseStatusCodeFromUpstream(compactPassthroughResponse.status);
   recordUpstreamResponseToolCount('openai-completions', 0);
+  recordUpstreamRateLimit(model, (name) => compactPassthroughResponse.headers.get(name), targetUrl);
 
   if (!compactPassthroughResponse.ok) {
     const upstreamErrorBody = await compactPassthroughResponse.text();
@@ -1533,7 +1559,7 @@ async function handleAsPassthrough(
     method: 'POST',
     headers: passthroughFetchHeaders,
     body: JSON.stringify(upstreamBodyPassthrough),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1547,6 +1573,7 @@ async function handleAsPassthrough(
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
   recordResponseStatusCodeFromUpstream(response.status);
   recordUpstreamResponseToolCount('openai-completions', 0);
+  recordUpstreamRateLimit((requestBody.model as string) || 'unknown', (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
     const bodyPreview = JSON.stringify(requestBody);

@@ -26,6 +26,7 @@ import {
 import { addForwardedHeaders } from '../utils/routing.js';
 import { validateBetaFeatures, hasBetaFeature } from '../utils/beta-features.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
+import type { ModelRouteConfig } from '../utils/config-loader.js';
 
 /**
  * Handle token counting API request
@@ -44,7 +45,8 @@ export async function handleTokenCountingRequest(
   authHeaders: Record<string, string>,
   requestId: string,
   env?: Env,
-  logger?: Logger
+  logger?: Logger,
+  route?: ModelRouteConfig
 ): Promise<Response> {
   const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
   // Parse request body
@@ -73,7 +75,7 @@ export async function handleTokenCountingRequest(
   }
 
   // Fall back to API-based token counting
-  return handleApiBasedTokenCounting(claudeRequest, targetUrl, authHeaders, requestId, request, activeLogger, env);
+  return handleApiBasedTokenCounting(claudeRequest, targetUrl, authHeaders, requestId, request, activeLogger, env, route);
 }
 
 /**
@@ -198,7 +200,8 @@ async function handleApiBasedTokenCounting(
   requestId: string,
   request: Request,
   logger: Logger,
-  env?: Env
+  env?: Env,
+  route?: ModelRouteConfig
 ): Promise<Response> {
   // Convert Claude request to OpenAI format
   const openaiRequest: OpenAITokenCountingRequest = convertClaudeTokenCountingToOpenAI(
@@ -226,7 +229,7 @@ async function handleApiBasedTokenCounting(
       ...addForwardedHeaders(authHeaders, request),
     },
     body: JSON.stringify(openaiRequest),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   // Handle target API errors (fallback to byte-based estimate for user text)

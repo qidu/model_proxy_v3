@@ -297,6 +297,7 @@ export function buildUpstreamUrl(baseUrl: string, suffix: string): string {
  * Supports both Authorization and X-Api-Key headers.
  * If X-Api-Key is provided but Authorization is missing,
  * converts X-Api-Key to Authorization: Bearer format.
+ * Also extracts Claude Code Gateway required headers for forwarding.
  */
 function extractAuthHeaders(request: Request): Record<string, string> {
   const headers: Record<string, string> = {};
@@ -325,7 +326,7 @@ function extractAuthHeaders(request: Request): Record<string, string> {
     headers['x-goog-api-key'] = googApiKeyHeader;
   }
 
-  // Forward beta feature headers
+  // Forward beta feature headers (verbatim, carries OAuth)
   const betaVersionHeader = request.headers.get('anthropic-beta');
   if (betaVersionHeader) {
     // Validate beta features
@@ -335,6 +336,26 @@ function extractAuthHeaders(request: Request): Record<string, string> {
     } else {
       // Forward as-is if validation fails (should still work)
       headers['anthropic-beta'] = betaVersionHeader.replace(/[\r\n\0]/g, '');
+    }
+  }
+
+  // Forward anthropic-version header (required by Claude Code Gateway)
+  const anthropicVersion = request.headers.get('anthropic-version');
+  if (anthropicVersion) {
+    headers['anthropic-version'] = anthropicVersion;
+  }
+
+  // Forward anthropic-workspace-id header (AWS Bedrock)
+  const workspaceId = request.headers.get('anthropic-workspace-id');
+  if (workspaceId) {
+    headers['anthropic-workspace-id'] = workspaceId;
+  }
+
+  // Forward x-claude-code-* hint headers (opt-in gateway hints)
+  // Per spec: request-class, agent-type, compaction, context-compacted, prev-tool-durations, prompt-id
+  for (const [key, value] of request.headers.entries()) {
+    if (key.startsWith('x-claude-code-')) {
+      headers[key] = value;
     }
   }
 
@@ -382,18 +403,24 @@ function transformAuthHeadersForUpstream(
   
   // Determine priority based on endpoint
   const isMessagesEndpoint = endpointPath?.startsWith('/v1/messages');
+  const isOpenAIEndpoint = upstreamMode === 'openai-completions' || upstreamMode === 'openai-responses';
   const isGeminiEndpoint = endpointPath?.startsWith('/v1/interactions') ||
                           endpointPath?.startsWith('/v1beta/models/') ||
                           endpointPath?.startsWith('/v1/models/');
-  
+
   if (isMessagesEndpoint) {
-    // /v1/messages prefers x-api-key
+    // /v1/messages: x-api-key > Authorization (no x-goog-api-key)
     if (xApiKey) {
       apiKey = xApiKey.startsWith('Bearer ') ? xApiKey.substring(7) : xApiKey;
-    } else if (googApiKey) {
-      apiKey = googApiKey.startsWith('Bearer ') ? googApiKey.substring(7) : googApiKey;
     } else if (authHeader) {
       apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
+    }
+  } else if (isOpenAIEndpoint) {
+    // OpenAI endpoints: Authorization > x-api-key (no x-goog-api-key)
+    if (authHeader) {
+      apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
+    } else if (xApiKey) {
+      apiKey = xApiKey.startsWith('Bearer ') ? xApiKey.substring(7) : xApiKey;
     }
   } else if (isGeminiEndpoint) {
     // Gemini endpoints prefer x-goog-api-key
@@ -405,13 +432,13 @@ function transformAuthHeadersForUpstream(
       apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
     }
   } else {
-    // Default priority: x-goog-api-key > x-api-key > Authorization
-    if (googApiKey) {
-      apiKey = googApiKey.startsWith('Bearer ') ? googApiKey.substring(7) : googApiKey;
+    // Default: Authorization > x-api-key > x-goog-api-key
+    if (authHeader) {
+      apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
     } else if (xApiKey) {
       apiKey = xApiKey.startsWith('Bearer ') ? xApiKey.substring(7) : xApiKey;
-    } else if (authHeader) {
-      apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
+    } else if (googApiKey) {
+      apiKey = googApiKey.startsWith('Bearer ') ? googApiKey.substring(7) : googApiKey;
     }
   }
   
@@ -455,7 +482,27 @@ function transformAuthHeadersForUpstream(
       }
     }
   }
-  
+
+  // Forward other Claude Code Gateway required headers (verbatim)
+  // These are extracted by extractAuthHeaders and passed via authHeaders,
+  // but we also forward them directly from request for any path using this function
+  const anthropicVersion = request.headers.get('anthropic-version');
+  if (anthropicVersion) {
+    headers['anthropic-version'] = anthropicVersion;
+  }
+
+  const workspaceId = request.headers.get('anthropic-workspace-id');
+  if (workspaceId) {
+    headers['anthropic-workspace-id'] = workspaceId;
+  }
+
+  // Forward x-claude-code-* hint headers (opt-in gateway hints)
+  for (const [key, value] of request.headers.entries()) {
+    if (key.startsWith('x-claude-code-')) {
+      headers[key] = value;
+    }
+  }
+
   return headers;
 }
 

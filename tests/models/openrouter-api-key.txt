@@ -1,0 +1,7 @@
+# this is safe key with budget limit for FREE models testing on openrouter.ai
+api_key = "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"
+base_url = "https://openrouter.ai/api/v1"
+upstream_mode = "openai-completions"
+model_list = "https://openrouter.ai/api/v1/models"
+parameters_filter = ["tools", "tool_choice", "reasoning"]
+context_filter = 264000

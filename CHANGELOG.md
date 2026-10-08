@@ -5,6 +5,1993 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refactor(sdk): drop the `chatjimmy` submodule and stub `sdk://` routes out of existence
+
+`src/utils/sdk-handler.ts`, `package.json`, `scripts/build-sea.js`, `scripts/init-proxy-config-in-consul-server.sh`, `src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `tests/unit/sdk-handler.test.ts` (new), `tests/README.md`, `tests/providers/llama/messages.sh`, `docs/getting-started/README_DETAILS.md`, `docs/getting-started/configuration-guide.md`, `docs/reference/configuration-reference.md`, `docs/architecture/design_tauri_tray.md`, `docs/architecture/plan-split-cloudflare-worker-vs-local.md`, `docs/architecture/plan-llm-as-a-verifier-plugin.md`, `docs/contributing/security-review.md`, `docs/contributing/security-review-3.md`, `docs/contributing/security-review-4.md`, `.gitmodules` — removes the `submodules/chatjimmy` git submodule and the SDK code path it backed. `sdk://` config values still load; every request to one now fails loud instead of silently routing.
+
+- **The scheme survives, the client does not.** `isSdkUrl()` and the `sdk://` acceptance in `validateBaseUrls` are kept, so existing configs keep loading and the route still parses. What is gone is the dynamic `import('../../submodules/chatjimmy/dist/index.js')`, the `parseSdkUrl` helper (dead code — defined, never called), the two request/response converters, and both SDK client bodies. `src/utils/sdk-handler.ts` went from 497 lines to 73: two exported stubs whose entire body is `throwSdkUnavailable(...)`.
+- **Fail loud, not silent (rule 8).** The stubs throw `new ClaudeProxyError(..., 501, 'not_implemented')` naming the model alias and request id. The old handler swallowed SDK failures into a generic `500 SDK_ERROR` body; the stub reports the real reason. The thrown error is an ordinary failed attempt outcome, so the rest of the pipeline behaves: `isRetryableOutcome` treats `status >= 500` as retryable, so a failover ladder skips the `sdk://` rung and moves to a healthy one, and if every rung fails the error propagates to `createErrorResponse` with its real status and message.
+- **`package.json`**: the `build-chatjimmy` script is deleted. That was the only reference to the submodule — `optionalDependencies` (`@github/keytar`) and every other script are untouched, and `package-lock.json` had no chatjimmy reference to begin with.
+- **`scripts/build-sea.js`**: `'../../submodules/chatjimmy/dist/index.js'` is dropped from `EXTERNALS`, which is now just `['@github/keytar']` (this moved the constant from line 119 to line 101, and `docs/architecture/design_tauri_tray.md` was updated to cite the new line). The build banner no longer claims `sdk://` is excluded from the binary.
+- **`tsconfig.json` / `tsconfig.server.json` need no change** — the chatjimmy-sdk path aliases were already removed on 2026-06-17, so nothing there ever resolved into the submodule.
+- **`src/utils/config-loader.ts`**: the `sdk:` protocol check in `validateBaseUrls` is unchanged (configs must still load). Only its now-false comment — which described a scheme rewrite at request time — was replaced with one pointing at the 501 stub.
+- **Consul seed script**: the two-line `[models.default]` section in `scripts/init-proxy-config-in-consul-server.sh` existed solely to seed the removed route (`["llama3.1-8B", "sdk://localhost", ""]`) and is deleted. `models.default` is an optional catch-all in `getModelConfig`, so its absence is not an error.
+- **Docs**: the two `README_DETAILS.md` sections (`Optional: ChatJimmy SDK`, `Routing a model through the SDK`) and the `SDK Handler (sdk://)` thinking-mapping block are removed; the `sdk://` bullets in `configuration-guide.md`, the `sdk://…` paragraph in `configuration-reference.md`, and the submodule lists in the two architecture notes are removed or corrected. The three security-review files keep their findings as history but each `sdk://` finding (M1 in reviews 1/3/4, N1 in reviews 3/4) now carries a dated **RESOLVED by removal** note — the key-forwarding and plaintext-key-log issues are fixed by deletion, not by a code fix.
+- **`tests/providers/llama/messages.sh`**: TC13 was labelled `SDK集成测试` while its body was an ordinary `curl_post`, so it now says what it does (`基础请求`). No assertion changed.
+- **Knowingly left alone (rule 8)**: `tests/api/sdk/integration.js` still exercises `sdk://` and will exit 1 if run. That is deliberate — the entry below (`fix(tests)` / SDK cleanup) records the earlier decision to leave the file untouched and defer its cleanup to a separate change, and it is wired into no npm script, so it cannot affect `npm run test:unit`. `tests/features/token-counting/results.json` also still names `src/utils/sdk-handler.ts`, and three files under `tests/logs/results/` (`test_llama3_sdk.md`, `test_of_sdk.md`, `test_result_of_deepseek_v4_flash_all_agents_all_tasks.md`) still describe the `sdk://` handler or quote upstream responses carrying a `chatjimmy-…` `system_fingerprint`. All four are generated artifacts recording runs that actually happened; they are left as-is rather than rewritten, since editing a historical log to remove what it observed would falsify the record.
+
+**Verification status: NOT VERIFIED — `npm run typecheck`, `npm run build`, and `npm run test:unit` were all rejected before they ran, and the git-plumbing half of this change is incomplete.** The tool calls for those three commands, for the `.gitmodules` edit, and for `git rm --cached submodules/chatjimmy` were each refused with `claude-sonnet-5 is temporarily unavailable, so auto mode cannot determine the safety of … right now.` (read-only commands were unaffected). Consequently: **`submodules/chatjimmy` is still declared in `.gitmodules` (lines 1-3) and still a gitlink in the index**, `.git/modules/submodules/chatjimmy` has not been deleted, and the now-empty `submodules/chatjimmy/` directory is still on disk. The file edits above are on disk and unrun. `tests/unit/sdk-handler.test.ts` contributes **5 tests in 2 suites** covering what the stub does: `isSdkUrl` recognising `sdk://` and only `sdk://` (including the empty string), both stubs rejecting with a `ClaudeProxyError` asserting `status === 501`, `type === 'not_implemented'`, and a message carrying the scheme, the model alias and the request id, the unknown-alias path reading `unknown` rather than an empty string, and `isRetryableOutcome({ok: false, status: 501}) === true` — the property that makes failover skip the dead rung. The `config-loader` test was retitled (`accepts sdk:// base_url at load time (no SDK behind it)`) with its assertion unchanged, since the scheme is still accepted. **Run `npm run typecheck && npm run build && npm run test:unit` and complete the four git steps before relying on any of this.**
+
+### feat(agent-tui): restyle running indicators, trim leading whitespace, and retune the default budget
+
+`src/tui.ts`, `src/agent-session.ts`, `src/utils/logger.ts`, `src/handlers/dashboard.ts`, `tests/unit/agent-session.test.ts`, `README.md`, `docs/architecture/design_of_persistent_tui_of_agent_with_followup_for_task.md` — a pass over the interactive TUI's running indicators, message indentation, and budget display.
+
+- **Title-bar spinner** (`src/tui.ts`): the proxy dashboard's title-bar braille cycle is now the 10-frame `⠇ ⠏ ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧`, advancing once per second while a request is in flight.
+- **Agent tab title** (`src/agent-session.ts`): `agentTitleGlyph` now holds `π` for the first 14 ticks of each 20-tick cycle, then cycles `o, u, n` — replacing the old `π ↔ *` two-glyph alternation.
+- **Input prompt as spinner**: while a task runs, the bottom `Input`'s prompt becomes the same braille spinner (via a new `setInputPrompt` helper, needed because pi-tui's `Input.prompt` is `private readonly`), and reverts to `> ` when the run ends.
+- **Leading whitespace removed** from conversation rows, user-message echoes (`│ what to says`), task lines (`✻ what changes`), command/shell output, tool status, and the summary status line — the `Box`/`Markdown` `paddingX` args dropped from `1` to `0`, and the status template literal no longer emits stray spaces when there is no skills/tools suffix.
+- **Brightness**: assistant messages keep the terminal default foreground (the added `dimStyle` was removed), so they read brighter than the dim (`\x1b[2m`) status/summary lines.
+- **Proxy log noise**: under `AGENT=true` the shared logger drops the `[req_xxxxx]` prefix and the startup-only `config`-id diagnostics (see `src/utils/logger.ts`).
+- **Budget default retuned to 50m tokens / 100 turns** (`DEFAULT_BUDGET`, `BUDGET_PROMPT_DEFAULT = '50m'`). With a 50m token budget the 100-turn cap is now the limit that normally trips first (≈3m tokens at a realistic ~30k tokens/turn), so the `DEFAULT_BUDGET` comment and the guard test were rewritten to state that — the token budget is the outer bound for runs with unusually large turns.
+- **Progress + budget formatting**: `formatTokenBudget` abbreviates ≥1m tokens with a lowercase suffix (`50m`), matching the budget prompt's lowercase convention (deliberately *not* `config-loader`'s uppercase-from-1K `formatTokenLimit`). The per-task progress line is now `[π task done (usage: 1276 tokens / 50m limit and 1 / 100 turns)]` via a new `formatUsage(tokensUsed, turnsUsed, budget)`.
+- **Dashboard test timer** (`src/handlers/dashboard.ts`): the "Testing <model> takes Ns" counter now ticks at 100ms and shows one decimal (0.1s resolution).
+- **Removed** the unsupported "Pi Messages" choice from the agent's endpoint-schema picker.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1471 tests, 1471 pass, 0 fail, 278 suites** — executed on this tree. `tests/unit/agent-session.test.ts` was updated for the changed behaviour: the `agentTitleGlyph` cases now pin the `π`×14-then-`o,u,n` cycle (and that no tick yields anything outside π/o/u/n), the `DEFAULT_BUDGET` case asserts 50,000,000 tokens, the turn-backstop guard now asserts the turn cap trips first, and new `formatUsage` cases cover the both-limits / tokens-only / turns-only shapes. The design doc's test-coverage inventory was corrected to match (it still described the old `π π * *` sequence) and `formatUsage` added to the covered helpers. The dashboard timer is browser-only JavaScript inside the served HTML and has no unit coverage; the `src/tui.ts` title-bar frame change has no unit coverage either.
+
+### feat(decision): accept `"clef"` as an equivalent spelling of the `cloudflare` backend
+
+`src/handlers/decision.ts`, `src/utils/config-loader.ts`, `tests/unit/decision.test.ts`, `README.md`, `docs/getting-started/proxy_config.example.toml` — `[decision] backend = "clef"` is now a recognised spelling of `backend = "cloudflare"`, documented and type-checked instead of arriving there by accident.
+
+- **The two names were already the same backend at runtime — by omission.** The images gate keys on `backend === 'laya'`, so *any* non-`laya` string, `"clef"` included, already fell through to the cloudflare path and got its 30000ms timeout. That equivalence was incidental: it existed only because of the no-runtime-validation gap recorded in the entry below (`config-loader.ts` stores `backend` as a raw string; the union is a type annotation). This change makes it deliberate — the union in `config-loader.ts` now reads `'laya' | 'cloudflare' | 'clef'`, and the handler normalises `'clef'` → `'cloudflare'` at one point so the images gate and the timeout default cannot drift apart on the three names.
+- **Why `clef` at all**: the Clef contract is served by Cloudflare's `@cf/cloudflare/clef`, so `clef` names the model and `cloudflare` names the vendor for the same upstream. Both were already in the config-facing conversation; the loader now admits both.
+- **Messages and docs name it.** The `503` for a missing `[decision]` section reads `backend ("laya" | "cloudflare" | "clef")`, and the README config block, the backend bullet and `docs/getting-started/proxy_config.example.toml` spell the equivalence out. The `400` for images on `laya` still points only at `"cloudflare"`, which is the canonical name for that backend.
+
+**Verification status**: `npm run typecheck` (pass), `npm run build` (pass, exit 0) and `npm run test:unit` — **1468 tests, 1467 pass, 1 skipped, 0 fail, 277 suites** — executed on this tree. `tests/unit/decision.test.ts` gains a `"clef" is an equivalent spelling of "cloudflare"` block (2 tests), asserting the two properties that would break if the normalisation were dropped: images on `backend = "clef"` are **forwarded** rather than rejected by the laya gate, and the timeout defaults to `30000` on `clef` rather than `5000`. The `spyAbortSignalTimeout` helper moved from the timeouts `describe` to module scope so the new block can use it — no assertion changed. `tests/manual/verify_decision_e2e.sh` was not extended for `clef`; the alias is covered at the handler level only.
+
+### feat(decision): serve the endpoint at `POST /v1/decision` as well as `POST /decision`
+
+`src/index.ts` — the decision route now matches `/decision` **and** `/v1/decision`, so callers that prefix every endpoint with the version segment reach it too. The handler, the config, and the behaviour are identical on both paths: same body consumption, same deferred-auth gate, same upstream, same `x-request-id`. `recordRequestTiming` is called with the path as received, so the two are distinguishable in the timing log.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` (pass) executed on this tree, plus a new section 8 in `tests/manual/verify_decision_e2e.sh` that drives the alias through a real proxy. Four checks: `/v1/decision` → `200`, its body carrying the Clef envelope, and — the check that actually distinguishes the alias from an unrelated route answering `200` — a request **with `images` on the `laya` proxy → `400` with the upstream call count unchanged**, proving the same handler runs on the second path. The unit tests still call `handleDecisionRequest` directly, so route matching for either path is exercised only by the manual harness.
+
+### feat(decision): add `POST /decision`, the Clef API endpoint
+
+`src/handlers/decision.ts` (new), `src/utils/config-loader.ts`, `src/index.ts`, `tests/unit/decision.test.ts` (new), `README.md`, `docs/getting-started/proxy_config.example.toml` — adds a route that answers **typed decisions** rather than generating text: the caller sends state plus a map of questions and gets a probability back per question. There is no prompt and no completion; the upstream answers in a single forward pass. It proxies to one of two upstreams that speak the same contract but differ in image support.
+
+- **The contract is the two schema files, not a transcription of them.** `docs/api/decision/clef-schema-input.json` and `clef-schema-output.json` are authoritative. Request envelope `{model, state, questions, images?}`, required `[model, state, questions]`, `questions` a 1–64 entry map of `noul` / `choice` / `score` questions keyed by id; response envelope `{model, answers, usage}` with answers under the request's ids, `usage` required `[input_tokens, output_tokens]`. The README section reproduces both with worked values, and defers to the schemas on any conflict.
+- **Two backends, differing in exactly one thing — `images`.** `backend = "laya"` is the local `submodules/laya-mlx/serve_judge.py` sidecar; its MLX encoder is text-only, so a request carrying a non-empty `images` array is rejected with `400` **before any upstream call**. That is deliberate: a silent strip would let a caller mistake a text-only answer for one that saw the image. `backend = "cloudflare"` is any endpoint serving the Clef schemas with image support (e.g. `@cf/cloudflare/clef`), and `images` is forwarded untouched. An empty `images: []` is accepted on both — it carries nothing, so it is not an error.
+- **Verbatim in, verbatim out.** The request body is POSTed byte-for-byte to `url` and the upstream response body returned byte-for-byte. There is no model routing, no alias resolution, and no `model`-field rewriting — the `model` in the body (`clef` / `clef-flash`) is the upstream's business. `url` is a **full endpoint**, not a base URL, because it is POSTed verbatim (include `/decision` for the Laya judge server, whose route is `/decision`, not the tool judge's `/judge`).
+- **Envelope-only validation, both directions.** The proxy checks the top-level required fields only; per-question shapes, the id charset, the 1–64 bound and the `model` pattern belong to the upstream, and its error is forwarded. A non-2xx upstream response passes through as-is (status, body, `x-request-id`); a 2xx whose body is not JSON, or is missing `model`/`answers`/`usage`, is reported as `502 Invalid upstream response` rather than returned as a malformed success.
+- **The config parser is four branches, because that is what the section needs.** `[decision]` is a scalar-only section like `[tool_judge_sidecar]` (no array keys, activation by presence, no `enabled` flag), so it is wired the same way: dispatch on `parts[0]`, plus the quoted-string site and the number/string site. The strings `backend` / `url` / `api_key` are accepted at **both** value sites — that repetition is the documented pattern in this parser (see the `[privacy_filter]` and `[tool_judge_sidecar]` branches) and is what the loader needs when a user quotes a key it expects unquoted. `timeout_ms` is coerced in the number branch only.
+- **Cost of getting that wrong is known and was avoided.** `fix(config): parse [tool_judge_sidecar], which the loader silently dropped` (below) records what a missing section branch does here: the header matches nothing, `currentSection` keeps its previous value, and the keys are **mis-attributed** into the preceding section rather than discarded — a fully-specified `[decision]` block would have landed in `[tool_judge_sidecar]` and left `config.decision` undefined with no diagnostic. Verified by parsing a config containing `[decision]` followed by a deliberately-unknown section: the section round-trips as `{backend, url, api_key, timeout_ms}` and the unknown header raises its warning.
+- **Auth and stats apply.** The route sits behind the same `[remote] auth_server` gate as other endpoints, including the deferred (`auth_with_model` / `auth_with_body`) modes, which it runs inline because it returns before the normal post-parse auth call — it reads the body first and pulls `model` out of it for the auth lookup. Requests reach `record_server` and the dashboard keyed by the request body's `model`.
+- **Not wired, and reported rather than hidden (rule 8)**: an unrecognised `backend` value is not rejected. `config-loader.ts` stores it as a raw string (the `'laya' | 'cloudflare'` union is a type annotation, not a runtime check), and the handler's image gate keys on `backend === 'laya'` — so a typo such as `backend = "cloudflair"` silently takes the **cloudflare** path: images are forwarded, and the timeout defaults to 30000ms. Unlike `[tool_judge_sidecar]`'s unvalidated `mode`, whose unknown value matches no branch and is therefore inert, an unknown `backend` is not inert — it grants image support. Left as-is to keep this change additive and to match the parser's existing no-runtime-validation convention; a one-line guard in the handler would turn it into a `503` naming the valid values, and is the natural follow-up. (The union now also admits `'clef'` — see the entry above — but the gap is unchanged: a typo still lands on the cloudflare path.)
+
+**Verification status**: **automated checks green; the route is now also exercised end-to-end through the real `src/index.ts` request path, but still against a stub upstream — the real Laya sidecar has not been reached.** `npm run typecheck` (pass), `npm run build` (pass), and `npm run test:unit` — **1466 tests, 1465 pass, 1 skipped, 276 suites** — were executed on this tree. The new file `tests/unit/decision.test.ts` contributes **21 tests in 6 suites**, all passing: unconfigured→`503` (section absent; `backend` without `url`); envelope rejection for malformed JSON, non-object bodies, and each of missing/empty/array `questions` and missing/non-string `model`; per-question shapes confirmed **not** validated by the proxy; the images gate in all three states (non-empty on `laya` → `400` with no upstream call, empty on `laya` → accepted, non-empty on `cloudflare` → forwarded untouched); byte-for-byte request forwarding, `Authorization: Bearer` sent only when `api_key` is set, upstream success and error bodies returned verbatim; `502` for a non-JSON body and for a body missing the envelope; and both timeout defaults (`5000` laya / `30000` cloudflare) with `timeout_ms` overriding them, asserting an abort signal reaches every call.
+
+**Manual end-to-end pass — `tests/manual/verify_decision_e2e.sh`, 21 checks, 0 failures.** Driven because the unit tests call `handleDecisionRequest` directly and therefore never exercise route matching, body consumption, or the deferred auth gate in `src/index.ts`. Three real proxy processes (`node --import tsx src/server.ts`) are started against a stub Clef upstream (`tests/manual/stub_clef_upstream.ts`), one per config. Confirmed through the live HTTP path: `noul` / `choice` / `score` → `200` with a well-formed `{model, answers, usage}` envelope and choice probabilities summing to 1; non-empty `images` on `laya` → `400` **with the upstream call count unchanged** (the gate fires before the fetch, not merely a `400`); the same body on `cloudflare` → `200` with `images` arriving at the upstream intact; missing `model`, malformed JSON, and empty `questions` → `400`; a config with no `[decision]` section → `503`; the request body arriving upstream byte-for-byte unchanged; `api_key = "sk-test-key-123"` producing `Authorization: Bearer sk-test-key-123` on the upstream request; **and the `/v1/decision` alias behaving identically to `/decision` on both the success path and the laya images gate**.
+
+**What neither pass covers, stated plainly (rule 8)**: every upstream in both is a stub — no real Cloudflare endpoint was called, and **no live `submodules/laya-mlx/serve_judge.py` has ever been reached**, because MLX is Apple-Silicon-only and this machine is win32/AMD64. The stub answers from the schema files, so what is verified is the proxy's handling of contract-shaped traffic, not agreement with the sidecar. The two schema files were also read rather than run through a JSON-schema validator. Run the sidecar and re-point `[decision] url` at it before relying on the Laya path in production; nothing here substitutes for that.
+
+**Harness note**: the script uses ports `18788`–`18791` and `19999`, deliberately away from the dev proxy's `8788`. It refuses to start if any of its ports is already listening — an earlier revision reused `8788` and silently asserted against whatever process was already bound there, which produced a run of misleading `401`s. `/tmp` is not used for IPC between Node and bash either (it resolves to different directories for Windows Node and git-bash); the stub exposes its recorded traffic over `GET /__count` and `GET /__requests` instead.
+
+### docs(readme): document the Laya tool-judge token budget
+
+`README.md` — adds one bullet to the Documentation section recording the tool-judge sidecar's context limit, which was previously undocumented anywhere in this repo.
+
+- **The limit**: Laya is a bidirectional encoder with a per-checkpoint window (`max_len` in the checkpoint's `rl_agent_config.json`) — 512 tokens for `convaiinnovations/laya`, 1,024 for `laya-multilingual` / `laya-typed-decisions`. It is not a constant in code; the encoder config's `max_position_embeddings` is 8,192, and 512 is only the fallback when the checkpoint carries no `max_len`.
+- **Why it matters to the proxy**: the window is shared by the question prefix *and* the `state` text (tool schemas + prompt + recent context) — `submodules/laya-mlx/laya_mlx/common.py:build_sequence`. The proxy's caps in `src/utils/tool-judge-sidecar.ts` (`MAX_PROMPT_CHARS=2000`, `MAX_SCHEMA_CHARS=600` per tool, `max_batch_tools=50`) are *character* budgets, so they do not bound the token count.
+- **The failure is silent**: `build_sequence` right-truncates state with `st[:room]` and raises nothing — only the *option* side fails loud (`ValueError: … too many options for the token budget`). `serve_judge.py` therefore cannot report truncation, and `usage.input_tokens` reflects the already-truncated sequence. Over-budget tool lists lose their tail: the judge answers for tools it was never shown.
+- **Not reachable from this proxy's own usage**: `choice` mode always sends exactly two criteria (`keep`/`discard`, `buildChoiceRequest`), so the option-side `ValueError` cannot fire here; `noul` mode sends zero options. The repository's exposure is the state budget alone.
+
+**Verification status**: **not run.** This is a README-only change — no source, config, or test file was touched, so `npm run typecheck` / `npm run build` / `npm run test:unit` are unaffected and were not executed. The technical claims were read from source, not executed: `submodules/laya-mlx/laya_mlx/common.py` (`build_prefix`, `build_sequence`), `agent.py:120-123` (the `4 < head_max_len < max_len <= max_position_embeddings` guard) and `agent.py:182-186` (the marker-count guard), `prepared.py` (PrefixCache repeats the same semantics), `tokenizer.py` (`no_truncation()`), `serve_judge.py` (`judge`/`decision` handlers — no token accounting, `ValueError` → 400 only), and `src/utils/tool-judge-sidecar.ts` (`MAX_PROMPT_CHARS`/`MAX_SCHEMA_CHARS`/`max_batch_tools`, `buildChoiceRequest`). The 512-vs-1,024 split comes from the checkpoint table in `submodules/laya-mlx/README.md:83`. No tokenizer was run to confirm real token counts for the state text; the write-up does not depend on a specific count, only on the caps being characters rather than tokens.
+
+### test(routing): cover `parseDynamicRoute`, `getHandlerType` and `buildTargetUrl` from the source
+
+`tests/unit/routing.test.ts` — adds three `describe` blocks (21 tests, 40 assertions) for the dynamic-route helpers, imported from `src/utils/routing.ts` (`parseDynamicRoute`, `getHandlerType`, `buildTargetUrl`). These three had **no** direct unit coverage before; their only exercise was in ad-hoc scripts that carry their own hand-copied reimplementations of the same logic.
+
+- **`parseDynamicRoute` (12 tests)**: pins the parse table — empty prefix with no model id; the scheme taken from the route (`/http/…` → `http://…`); a model id read from the segment before the endpoint; a path prefix kept ahead of the model id (`/openai/v1/abc/v1/messages` → prefix `/openai/v1`, modelId `abc`); a version segment inside the prefix *not* mistaken for a model id; a doubled slash collapsing to `''` rather than `'/'`; and a `v1beta/models/…:generateContent` Gemini endpoint located with the model left inside the endpoint. Error cases assert the three distinct `Error`s by message: `Invalid URL format` (fewer than 4 segments), `Invalid protocol: ftp` (non-`http`/`https`), and `Could not locate Claude endpoint` for `/v1/chat/completions`.
+- **`getHandlerType` (4 tests)**: pins every reachable mapping including the ordering that makes `v1/messages/count_tokens` resolve to `token-counting` and not `messages` (the exact-match check precedes the `startsWith('v1/messages')` check), `generateContent` under both `v1/models/` and `v1beta/models/`, and the `Unknown Claude endpoint` throw for a models URL carrying no generative action.
+- **`buildTargetUrl` (5 tests)**: model id placed between prefix and endpoint; omitted for both `undefined` and the empty string (the `if (modelId)` falsiness is pinned deliberately, since an empty id is silently dropped rather than producing a doubled slash); prefix ordering; and a round-trip property — `buildTargetUrl(parseDynamicRoute(url))` reconstructs the absolute URL for five route shapes.
+- **`/v1/chat/completions` is pinned as *rejected***, not as working. This is the case the copies in `tests/features/routing/fixed.js` list as valid; production does not serve it through dynamic routing.
+- **Deliberately not covered, reported instead of enshrined (rule 8)**: `parseDynamicRoute`'s `betweenParts.length > 1` branch and its `Unclear URL structure` error are unreachable — `targetPathEndIndex` is only ever set to `claudeEndpointStartIndex - 1`, so `betweenParts` is always empty. Likewise the second `if` at `src/utils/routing.ts:160` (`nextPart === 'messages' && twoPartsAhead === 'count_tokens'`) is dead: the preceding `nextPart === 'messages'` branch always matches first. No tests were written to lock in either dead path.
+- **Scope, as decided**: the two ad-hoc scripts are left **untouched** — `tests/features/routing/fixed.js` (one `parseDynamicRoute` copy) and `tests/api/sdk/integration.js` (three `parseDynamicRoute` copies, of which only the last is live, plus three `buildTargetUrl` copies). Neither is wired into any npm script and neither can fail: both print `✅`/`❌` and exit 0. Removing their copies is deferred to a separate change. Coverage for these helpers now lives where it actually runs — `npm run test:unit`.
+
+**Verification status**: **not run.** Shell execution was unavailable throughout this session (`claude-sonnet-5 is temporarily unavailable, so auto mode cannot determine the safety of Bash`), so `npm run typecheck` and `npm run test:unit` could not be executed and no pass count is claimed. Every expected value above was instead derived by hand-tracing `src/utils/routing.ts` (`parseDynamicRoute` at 121–222, `buildTargetUrl` at 227–236, `getHandlerType` at 514–538) against the new assertions, and the export list at `src/utils/routing.ts:16` was read to confirm the import specifiers resolve. Note that `npm run typecheck` uses the root `tsconfig.json`, whose `include` is `["src/**/*.ts"]` — it does **not** type-check this test file, so `test:unit` is the only gate that exercises it. Run both commands and replace this paragraph with their real results before relying on this change.
+
+### refactor(routing): collapse the four duplicated route→target tables into one helper
+
+`src/index.ts` — replaces four copies of the same `(path, upstream_mode) → {targetUrl, handlerType, upstreamMode, forceStreaming}` dispatch with a single `resolveUpstreamTarget()` helper (`src/index.ts:457`); the file goes from 2852 to 2645 lines. The four sites were `parseFixedRoute` (fixed routes), the `compositeAttempts.map()` candidate builder, `buildRouteAttempt` (fusion and retry rungs), and the `/v1/chat/completions` model-passthrough block. `safeModel` and `isNativeMode` were recomputed at three of them; both now exist once, inside the helper.
+
+- **Pure dedupe, not a reconciliation**: the four copies did not agree with each other. Every disagreement is kept, tagged "dialect difference" in place at the branch that owns it, so the drift is visible in one region instead of four. The dialect is an explicit helper input (`dialect: 'fixed-route' | 'model-route'`) precisely because the same `(path, upstream_mode)` pair has two answers.
+- **Divergence 1** — `/v1/messages` with a Gemini mode: a fixed route addresses the `v1beta/models` collection (that path carries no model id), while a model route addresses `v1beta/models/{model}:generateContent`, or `:streamGenerateContent?alt=sse` when the body sets `stream: true`.
+- **Divergence 2** — `/v1/interactions` with a Gemini mode: fixed forwards to the API-version root; model routes use the model URL.
+- **Divergence 3** — `:countTokens`: a fixed route reports `handlerType: 'token-counting'`, model routes report `'generateContent'`.
+- **Divergence 4** — `/v1/chat/completions` under `anthropic-messages` or a Gemini mode: model routes build a native target (`v1/messages`, `v1beta/models/{model}:generateContent`); a fixed route falls through to `openai-completions`.
+- **Divergence 5** — the Gemini version prefix: fixed routes honour `GEMINI_API_VERSION`, model-route path-style URLs hardcode `v1beta`, and `/v1/responses` honours the env var in both dialects.
+- **Latent gap carried over, then surfaced**: the `compositeAttempts.map()` copy had no `/v1/chat/completions` branch at all and left `candidateTargetUrl = ''` for that path. It is unreachable there (the path is dispatched earlier), so behaviour is unchanged; the call site now throws on an unmapped path instead of silently forwarding an empty target.
+- **New loud failure (rule 8)**: for a Gemini target the helper throws when the model id is empty, where the originals built a URL with an empty model segment. Reachable only when a candidate has neither an alias nor a name.
+
+**Verification status**: `npm run typecheck` is clean on the final state. `npm run build`, `npm run test:unit`, and a purpose-built differential test (old vs new route table over 28 paths × 7 upstream modes × 3 base URLs × 3 `GEMINI_API_VERSION` values × 4 config shapes) had **not been run** when this entry was written — shell execution was unavailable in that session. Equivalence was instead established by reading each of the four replaced regions against a pre-change copy of `src/index.ts`. Re-run those three commands and replace this paragraph with their results before relying on this change.
+
+### feat(routing): add ENABLE_DYNAMIC_ROUTING env var, disabled by default
+
+`src/types/shared.ts`, `src/index.ts`, `src/server.ts`, `wrangler.toml`, `tests/unit/dynamic-route-gate.test.ts` (new), `tests/run-integration-tests.js`, `README.md`, `docs/api/api-endpoints.md`, `docs/api/list_of_api_and_schema.md`, `docs/reference/configuration-reference.md`, `docs/getting-started/README_DETAILS.md` — gates per-request dynamic routing (`/{protocol}/{host}/...`) behind a new opt-in flag, **disabled by default**:
+
+- **New flag**: `ENABLE_DYNAMIC_ROUTING`, accepted as `true` or `1` (matching the existing boolean-env convention, e.g. `DEV_NO_KEY`). Declared in the `Env` interface, mapped in the Node adapter (`src/server.ts`, default `"false"`), and added to `wrangler.toml [vars]`.
+- **Gate**: a new `isDynamicRoutingEnabled(env)` predicate, checked at the top of the dynamic-route branch in `src/index.ts`. When the flag is off, a dynamic path returns `403 "Dynamic routing is disabled."`
+- **Rejected, not reinterpreted**: the gate deliberately returns an explicit error instead of falling through to `parseFixedRoute`. Otherwise a `/https/host/...` path would be silently handed to fixed routing and possibly served as a different endpoint — a silent failure rather than a loud one.
+- **Order**: the gate runs *before* the SSRF allowlist check, so a disabled proxy rejects every dynamic route regardless of target host.
+
+**Tests**: `tests/unit/dynamic-route-gate.test.ts` (new, 6 tests) pins unset → `403`; `"false"` → `403`; no upstream call made (proving no fall-through into fixed routing); `"true"` → gate opens and an unlisted host then hits the SSRF `403 "Target host not allowed."`; `"1"` behaves as `"true"`; and `"true"` + an allowlisted host is dispatched upstream.
+
+**Existing tests preserved**: because the flag defaults off, the four pre-existing SSRF integration tests (`tests/integration/16_security/ssrf_dynamic_route.test.js`, TC2001–TC2004) would otherwise fail with the "disabled" error instead of the SSRF error. `tests/run-integration-tests.js` now sets `ENABLE_DYNAMIC_ROUTING: 'true'` in the spawned proxy's env so that suite keeps exercising the SSRF guard.
+
+**Verified**: `npm run typecheck` and `npm run build` clean; `npm run test:unit` 1425/1425 pass; SSRF suite 4/4 pass against a proxy started with `ENABLE_DYNAMIC_ROUTING=true` (and confirmed to fail loudly, 3/4, with the flag unset); with the flag unset, a fixed route (`POST /v1/messages`) still routes normally (502 from an unresolvable test host, not the routing-gate 403).
+
+### fix(deps): upgrade pi-tui and pi-agent-core to 0.99.2
+
+`package.json` — upgrades `@earendil-works/pi-tui` and `@earendil-works/pi-agent-core` from `^0.87.1` to `^0.99.2`. This is a minor version bump within the 0.x series that brings bug fixes and internal improvements to the TUI and agent core libraries. No API-breaking changes were observed in this codebase; the five `TuiMainScreen` construction sites and the agent session integration continue to work without modification. `npm run typecheck` and `npm run build` are clean after the upgrade.
+
+### feat(agent-session): add command history with up/down arrow navigation
+
+`src/agent-session.ts` — adds in-memory input history (up to 100 entries) across all agent session prompts with up/down arrow key navigation:
+
+- **History storage**: New `inputHistory` array (max 100 entries) with `addToHistory()`, `historyPrev()`, `historyNext()`, `historyReset()` functions. This is an **in-memory store only** — it is not persisted to disk, so history is scoped to the lifetime of the agent session process and is lost on exit.
+- **Scope**: Applies to both initial setup prompts (`promptText` for model/provider/key) and the persistent TUI input (`RuledInput` / `PromptScreen`)
+- **Filtering**: Excludes empty strings, quit commands (`/q`, `/quit`, `/exit`, `/bye`), and command output lines (starting with `[` like `[π shell]`)
+- **Deduplication**: Consecutive duplicate inputs are not stored
+- **Navigation**: Up arrow (`\x1b[A` / `\x1bOA`) recalls older entries; down arrow (`\x1b[B` / `\x1bOB`) recalls newer entries; at end of history, down arrow clears input for new entry
+- **Cursor handling**: After recalling history entry, cursor moves to end of line (Ctrl+E / `\x05`) for immediate editing
+
+### feat(models): implement Anthropic model discovery per Gateway spec (partial)
+
+`src/handlers/models.ts`, `src/index.ts`, `tests/unit/api-hello.test.ts`, `docs/api/list_of_api_and_schema.md` — adds `handleAnthropicModelsDiscovery` to serve `GET /v1/models` with Anthropic-format model list when `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is set. The handler:
+- Forwards both `Authorization` and `x-api-key` headers from the incoming request to the upstream model discovery endpoint
+- Applies a 3-second timeout and treats redirects as failures (per spec)
+- Transforms upstream responses (OpenAI `{data:[]}`, direct array, or `{models:[]}` formats) to Anthropic shape `{object: 'list', data: AnthropicModel[]}`
+- Filters to models containing 'claude' or 'anthropic' in the id (case-insensitive)
+- Returns appropriate error responses for timeout (504), redirect (502), upstream errors (upstream status), and other failures (500)
+
+Gated by `isAnthropicModelDiscoveryEnabled(env)` so it only activates when explicitly enabled. The legacy `claude-cli` User-Agent transform for `/v1/models` remains as a fallback when the gate is off.
+
+**Covered by tests**: `tests/unit/api-hello.test.ts` (6 tests for `HEAD /api/hello` probe, which was added in the same commit) — the probe returns `200` with no auth header, makes no upstream call, returns empty body, is answered before the auth gate, and `GET /api/hello` also returns `200`. Anthropic model discovery handler tests are not yet added.
+
+**Known limitation**: the handler sits after `loadProxyConfig(env)`, so if the TOML config fails to load, the probe fails too. Matching `/config-reload` was the closer convention than the dashboard's `loadProxyConfig` bypass.
+
+### feat(route): add Claude Code Gateway header forwarding and error format with docs
+
+`src/utils/routing.ts`, `src/utils/errors.ts`, `src/index.ts`, `docs/api/llm-gateway-protocol-for-claude-code.md` (new), `docs/claude_code_gateway_compliance_review.md` (new) — implements header forwarding and error format required for Claude Code gateway compatibility:
+
+**Header forwarding** (`src/utils/routing.ts`): `getSidecarForwardedHeaders` now extracts and forwards `x-api-key`, `Authorization`, `anthropic-version`, `anthropic-beta`, and `anthropic-dangerous-direct-browser-access` headers from incoming requests to upstream calls. These headers are required by Anthropic's API and were previously dropped.
+
+**Error format** (`src/utils/errors.ts`): `createErrorResponse` now produces Anthropic-compatible error envelopes (`{error: {type, message}}`) with proper `x-request-id` header, replacing the previous generic format. `classifyTransportError` maps network errors to appropriate Anthropic error types (`overloaded`, `timeout`, `api_error`, etc.).
+
+**Documentation**: two new docs — `llm-gateway-protocol-for-claude-code.md` (338 lines) documents the endpoints, headers, and body fields Claude Code sends and what breaks when stripped; `claude_code_gateway_compliance_review.md` (331 lines) provides a compliance checklist against the protocol.
+
+### fix(agent-session): fix agent unit tests
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — fixes 9 failing tests in the agent session suite. The failures were caused by:
+- Test assertions that expected old spinner frame sets (5 frames) vs the current 6-frame set (`·✢✶✳✻✽`)
+- Test expectations for transcript trimming behavior that changed when `.trim()` was added to shell output handling
+- A test for the quit command path that relied on module-private internals
+
+All tests updated to match current behavior. `npm run test:unit` → 1407 pass / 0 fail.
+
+### fix(dashboard): minor UI fix
+
+`src/handlers/dashboard.ts` — fixes a dashboard UI issue where a button's text or layout was incorrect. The change adjusts 3 lines in the dashboard handler to correct the display.
+
+### fix(cli): add `dsh` command export for deepseek-harness integration
+
+`src/cli.ts` — adds a `dsh` command to the CLI that exports configuration and model data in a format compatible with deepseek-harness. The command outputs JSON suitable for consumption by the `llm-pi-ai` gateway integration. This enables using model_proxy_v3 as a model provider for deepseek-harness without a dedicated plugin (see `docs/guides/agents/proxy-as-provider-for-deepseek-harness.md` and `docs/plan-deepseek-harness-provider-plugin.md`).
+
+### docs: update estimated system resources in README
+
+`README.md` — updates the "Estimated System Resources" section with revised memory and CPU estimates based on current sidecar configurations (privacy filter, kompress, tool judge, etc.).
+
+### fix(config-loader): an unknown TOML section drops its keys and says so, instead of leaking them into the previous section
+
+`src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `docs/getting-started/validating_tool_judge_sidecar.md` — the entry `fix(config): parse [tool_judge_sidecar], which the loader silently dropped` named its own blind spot and left it open: *"the silent-drop behaviour that hid this bug is still there for any other unknown section — `continue`, no warning. Changing that is a parser-wide policy question, not part of this fix."* This closes it.
+
+**The old behaviour was worse than "dropped."** `parseSimpleToml` dispatched section headers on `parts[0]` through an `if / else if` chain with **no terminal `else`**. An unrecognised `[section]` matched nothing, so `currentSection` kept the value it already had and every following key-value line was assigned into the **preceding** section — mis-attributed, not discarded. That is precisely the mechanism by which a missing `[tool_judge_sidecar]` branch once sent the sidecar's six keys into `[privacy_filter]`, left `sidecarConfig` `undefined`, and made `judgeTools` take its `if (!sidecarConfig?.judge_url) return … {called: false}` early return with `_validationErrors` and `_validationWarnings` both empty. The keys did not disappear; they landed somewhere plausible, which is why the result looked like a config that simply had no sidecar block in it.
+
+**The fix is a terminal `else` at the end of the dispatch chain.** It pushes `{path: section, message: "unknown section header at line N — keys under it are ignored (check for a typo, or a section this version does not support)"}` onto a new `sectionFieldWarnings` array, then sets `currentSection = null; currentCategory = null` so the keys below it are discarded rather than absorbed. `currentSection` is declared `string | null` and already starts as `null` (`config-loader.ts:2772`), so the value-assign sites need no new guard: a key with no section now finds no home. A **bare `[transforms]`** header is folded into the same treatment and for the same reason: it names no transform set, so it matched no branch either.
+
+**Why the warning goes into `_validationWarnings` and not just `console.warn`.** The two other header-level problems in this file (`[remote.authentication]` / `[remote.recording]` deprecation, and `[passthrough.<x>]`) do log straight to `console.warn`, and copying that would have been the shorter change — but `src/cli.ts:431-437` counts the attached `_validationErrors` / `_validationWarnings` arrays for `proxy config validate`, so a bare `console.warn` would reach the log and nothing else. Recording it means the warning reaches both the log — the `[WARN] <path>: <message>` line still appears automatically, through the existing loop that prints every entry of `validation.warnings` — and the CLI's `Result: N errors, M warnings` count. (`src/cli.ts` does not re-print the arrays, precisely because the parser already wrote the lines; see the comment at `:427`.) The array is only consumed there — the dashboard's config-write path calls `validateProxyConfig` directly and never sees parser-level warnings, so it is not a third consumer. `sectionFieldWarnings` is kept separate from the sibling `sectionFieldErrors` so an unknown section warns rather than blocking startup.
+
+**Covered by tests**: three in `tests/unit/config-loader.test.ts` — an unknown section between two known ones (keys dropped, the *following* known section still parses, and a warning naming the unknown section is present); an unknown section as the very first header, which must not crash and must contribute no config keys; and a bare `[transforms]`, likewise dropped and warned. The leak witness is `[defaults]`, whose branch accepts arbitrary keys — a leak into `[privacy_filter]` is invisible to a test, because that section allowlists its keys, so the historical failure had to be reproduced against a section that would actually show it. **Mutation-checked**: stripping the two `currentSection = null` resets from the new branches makes two of the three fail with the leak visible in the diff (`judge_url` and `mode` present in `cfg.defaults`), which is what makes them regression tests rather than assertions of the obvious. `npx tsx --test tests/unit/config-loader.test.ts` → **166 pass / 0 fail**; `npm run test:unit` → **1419 pass / 0 fail** (1416 before, i.e. exactly the 3 new); `npx tsc --noEmit` clean.
+
+**No legitimate config trips the new warning.** All five TOMLs in the repo were parsed through `parseSimpleToml` and re-parsed through `serializeProxyConfigToml`'s output — the untracked local `proxy_config.toml`, `docs/getting-started/proxy_config.{example,minimal,transforms.example}.toml`, and `tests/models/proxy_config.or_free_model.toml` — and every one reports zero warnings on both paths, so the serializer does not emit anything its own parser rejects.
+
+**The runbook's §7 is updated with it**: `docs/getting-started/validating_tool_judge_sidecar.md` carried this as the one still-open item of five ("Parser-wide policy, not fixed here"), which was the exact statement this change falsifies. It now records the mechanism, the `_validationWarnings` routing, and the repo-wide sweep, and the section heading reads that all five are resolved.
+
+### fix(judge): `timeout_ms` is now a per-question budget with a 2000 ms cap per request, and the sidecar warms itself before it binds
+
+`src/utils/tool-judge-sidecar.ts`, `src/handlers/dashboard.ts`, `tests/unit/tool-judge-sidecar.test.ts`, `submodules/laya-mlx/serve_judge.py` — two independent ways the judge lost its race against its own timeout. The second is the one that mattered: the proxy's default budget is **50 ms**, measured against a sidecar whose first inference after a restart is the slowest it will ever be.
+
+**The client's budget was flat, and `noul` mode is where that bites.** `callJudgeSidecar` armed `setTimeout(…, config.timeoutMs)` regardless of how much work the request carried. That is fine for `choice`, which issues one request per tool, but `noul` packs *one question per tool into a single request* — so a 50-tool batch got the same 50 ms as a 1-tool batch and was 50× more likely to time out, failing the whole batch open and silently keeping every tool. The fix is `requestTimeoutMs(config, questionCount) = min(config.timeoutMs × max(1, questionCount), max(config.timeoutMs, 2000))`, with a named `MAX_REQUEST_TIMEOUT_MS = 2000` ceiling. Scaling by question count also puts the two modes on the same footing: N tools get at most N × `timeout_ms` either way, since `choice` already spends that as N sequential single-question requests (the per-iteration cost is unchanged — each of those calls still passes `questionCount === 1`). The cap deliberately bounds **the scaling, not the configuration**: `max(config.timeoutMs, 2000)` means a base budget already above 2000 ms is never shrunk to it, which is the otherwise-surprising case, and it is pinned by its own test. The proxy is blocked on this call, so the ceiling exists to stop a large batch stalling a user's request far past the point of usefulness.
+
+**The sidecar paid MLX's lazy setup on the first real request.** `serve_judge.py` loaded the checkpoint before binding — so a broken model failed loudly at startup instead of 500-ing every request — but MLX builds its Metal pipelines and allocates buffers on *first execution*, not at load. The first `POST /judge` after a restart therefore cost noticeably more than steady state, and against a 50 ms default that one-off can be the whole margin. `warmup(agent)` now runs **before the bind**, one throwaway inference per question type against shapes that mirror what the proxy actually sends (a `choice` request for single-tool mode, a two-question `noul` request for batch mode), so whichever mode the proxy is configured for meets a warm model on its first call. It reuses `do_POST`'s own answer-set check, so a model that cannot answer is caught before the port opens rather than by the first client — extending the load-before-bind contract rather than working around it. Failure is fatal (`return 1`), not a warning, for the same reason. Measured cost: **70.7 ms total** across both passes, buying back about 7 ms on the first real request. `--no-warmup` skips it for anyone who would rather pay the one-off on the first call. The wrapper's module docstring records the behaviour, so it is not a second, undocumented startup phase.
+
+**Observed in the dashboard too**: the sidecar panel's Timeout row had been rendering the bare number, `50 ms`, which now understates a batch's budget by a factor of N. It reads `50 ms per tool (a batch of N tools gets N × this, capped at 2000 ms)`.
+
+**Covered by tests**: six added to `tests/unit/tool-judge-sidecar.test.ts` — a `noul` batch gets one request whose budget covers every tool in it, a `choice` request stays on the single-question budget, and a `requestTimeoutMs` suite covering the scale-up, an empty request counting as one question, the 2000 ms cap, and the base-above-the-cap case that must not be shrunk. `serve_judge.py` has no tests of its own (unchanged from the entry that added it), so the warm-up figure is one hand measurement on one checkpoint, not a suite.
+
+**Docs corrected in the same pass** — the runbook `docs/getting-started/validating_tool_judge_sidecar.md` had carried the exact inverse of this behaviour ("`timeout_ms` IS PER HTTP REQUEST, NOT PER TOOL-SET"), which was true when it was written and is now backwards; `docs/getting-started/proxy_config.example.toml` had a stale `~50ms per request`; `docs/architecture/status_of_sidecars_of_proxy.md` §4 now states the per-question semantics and mentions the startup warm-up; `README.md` now lists the tool judge among the sidecars and shows it in the architecture diagram. The design doc's §8 schema block is a *design proposal*, not a description of shipped code, so it is left as written — with its status table already recording which of its keys are not implemented. Nothing in the older CHANGELOG entries was rewritten: `fix(config): parse [tool_judge_sidecar] …` describes the flat budget accurately as the behaviour of its time, and this entry supersedes it.
+
+### feat(converters): implement `mergeClaudeModelsResponse` for `/v1/models` fallback
+
+`src/converters/openai-to-claude.ts`, `tests/unit/openai-to-claude.test.ts` — The previously documented but unimplemented `mergeClaudeModelsResponse` function is now exported. It merges extra model IDs (from `extraModelIds` in the handler) into a `ClaudeModelsResponse`, deduplicating by `id` and setting `first_id`/`last_id` from the merged list. This enables the `/v1/models` fallback path when the upstream URL is invalid (see CHANGELOG entry "Fix: `/v1/models` falls back to local models when upstream URL is invalid"). Covered by `tests/unit/openai-to-claude.test.ts` (1 test in `mergeClaudeModelsResponse` suite).
+
+### fix(config-loader): align tests with documented `base` short alias for `base_url` in inline tables
+
+`tests/unit/config-loader.test.ts` — Two tests in the `parseSimpleToml` suite used `url = "..."` as the short alias for `base_url` in `[models.*]` inline-table entries. The documented and implemented short alias is `base` (matching the `mode`/`key`/`base` 4-letter pattern). Tests updated to use `base = "..."` instead of `url = "..."`, and test names updated from "url" to "base". The inline-table parser in `src/utils/config-loader.ts:3002` already expects `base`; the tests were out of sync since commit d99f62e ("fix(config) update for short alias consistant").
+
+### fix(tools): the judge saw a Gemini request's tools but not its prompt, so it ruled on schema alone
+
+`src/utils/tool-judge-sidecar.ts`, `tests/unit/tool-judge-sidecar.test.ts` — the earlier entry `fix(tools): the judge read Gemini's tool key wrong` stopped the judge from mis-reading Gemini's *tool* key. This fixes the other half of the same blindness: `buildStateText` read the conversation from `body.messages` only (`tool-judge-sidecar.ts:106`), and a Gemini native request has no `messages` at all — its turns are `body.contents[]`, its assistant turn is spelled `model`, and a turn's content sits in `parts[]`. So on `/v1beta/models/{model}:generateContent` (`src/index.ts:504`) the state the judge received said, verbatim, `User prompt: ""`, while `Tools to evaluate:` below it was fully populated. Tool extraction was never the problem here — `src/utils/tool-shapes.ts` already handles Gemini's camelCase `functionDeclarations` — which is exactly what made the failure quiet: the judge was handed a well-formed state naming every tool, and decided keep/discard with no idea what the user had asked for.
+
+**What the empty prompt costs.** The verdict is keep-or-discard on tools a real request is about to run with. With no prompt the judge has only each tool's name and schema, so a request that says *"trim the log"* is judged as though it said nothing — the tool it needs is as likely to be discarded for overlapping its own schema as kept for being needed. This was not failing open: falling open keeps the tools and says so. It was a confident answer built from half the input.
+
+**The fix** is three surgical edits and no new state shape. A new private `conversationTurns(body)` (`:162`) returns `body.messages` when that is a non-empty array and `body.contents` otherwise — `messages` wins when a body carries both, so a Gemini-shaped body that also carries `messages` keeps the richer form instead of being half-read. `buildStateText`'s turn loop (`:113–115`) then takes each turn's content as `m.parts ?? m.content` and maps the `model` role onto `assistant`, leaving `user`/`assistant` turns untouched. `messageToolCalls` (`:186`) gained a `content` parameter — the turn's block list, under whichever name it arrived — and a Gemini `functionCall` branch beside the existing Claude `tool_use` one. `messageText` needed **no** change, and that is worth stating plainly: its loop already reads a generic `block.text`, which is precisely what a Gemini `{text: "…"}` part is, so the prompt text was reachable all along once the turn was found. Only the turn lookup was wrong.
+
+**Probe, the same Gemini-native body through both revisions.** Before: `state contains prompt text?: false`, `User prompt: ""`. After: `true`, `User prompt: "What is the weather in Paris today?"`. The Claude-shaped control body printed identically in both runs, so this adds Gemini without disturbing what already worked.
+
+**Three tests**, in `tests/unit/tool-judge-sidecar.test.ts` (31 → 34; `npm run test:unit` 1410 tests / 265 suites / 0 fail, `npm run typecheck` exit 0). They pin the three things a one-line `messages` read gets wrong, and each asserts a value rather than that something was returned: `reads Gemini native contents, where the assistant turn is model and content is parts` asserts both the prompt *and* a `functionCall` rendered as `- Assistant called: clock({"tz":"UTC"})`; `keeps a trailing Gemini functionResponse turn from becoming the prompt` covers Gemini's habit of ending the array with the tool's own `functionResponse` — a naive "last user-role turn" read would have made the tool's result the prompt; and `prefers messages when a body carries both messages and contents` is the one that fails if `conversationTurns`' precedence is ever reversed.
+
+**Not addressed, and surfaced rather than fixed** — three findings from the same validation pass, none touched by this change. (a) **Unknown TOML sections are mis-attributed, not merely dropped**, and the validation doc understates the severity: `parseSimpleToml`'s section dispatch closes at `src/utils/config-loader.ts:2885` and the `continue;` at `:2886` has no terminal `else`, so an unrecognised `[section]` leaves `currentSection` holding its previous value and its keys land in the *preceding* section — `[passthrough]` followed by a stray section absorbs those keys as `passthrough` entries, with `console.warn` count 0. (b) The protocol doc's §2.2 state example (`design_tool_judge_sidecar_protocol.md:32`) still shows the single-tool form `Tool: file_write\nSchema: {…}`, while §4.1 (`:156–160`) shows the `Tools to evaluate:` numbered form the code actually emits. (c) `docs/getting-started/validating_tool_judge_sidecar.md` still carries the validation run taken before this fix and will keep reporting Q3 as open.
+
+### refactor(tui): drop `SPINNER_MD`, which had become the identity map of `SPINNER_CHARS`
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts`, `docs/architecture/design_of_persistent_tui_of_agent_with_followup_for_task.md` — `SPINNER_MD` was a Markdown-escaped copy of `SPINNER_CHARS`, built to stop the `+` and `-` frames rendering as list markers. Since the frames became `·✢✶✳✻✽` (`src/agent-session.ts:599`) none is Markdown-significant, so the map's `c === '+' || c === '-'` branch was unreachable and the constant was a pure identity — two names for one array, with the second existing only to hold a rule that no longer applied. The user's call: *"no needs 'SPINNER_MD'"*. It is removed; the two consumers (the in-flight task line at `:646`/`:745`, and `runAgentTurn`'s task line) now index `SPINNER_CHARS` directly, and the constant carries the note that the same frames serve both the Markdown and stdout spinners.
+
+**What is not lost.** The two regression tests that pin *why* the frames are what they are stay, re-pointed at `SPINNER_CHARS`: an unescaped `+` still renders as a `-` bullet, and unescaped list markers still wrap with a hanging indent. They are now guards against a future frame choice rather than documentation of a live escape map — the `renders every frame literally` test is what fails if a list-marker frame is ever added back, so the safety the deleted branch provided is still enforced, just from the test side.
+
+### test: clear the 14 unit failures — 12 stale expectations, and 2 assertions of a retired alias
+
+`tests/unit/agent-tools.test.ts`, `tests/unit/agent-session.test.ts`, `tests/unit/openai-to-claude.test.ts`, `tests/unit/config-loader.test.ts`, `CHANGELOG.md` — the suite the entry below recorded as **1391 tests / 1377 pass / 14 fail** is now **1407 / 1407 / 0**, with `npm run typecheck` exiting 0. Only one of the 14 was a defect in shipped code, and it was not the one it first appeared to be. No production file is changed by this entry.
+
+**10 of the 14 — `agent-tools` path confinement (`read_file` / `write_file` / `bash — Section 12 rm/mv`).** The tests asserted the literal string `/tmp/`; the guards interpolate `TMP_ROOT_RAW = tmpdir()` (`src/agent-tools.ts:55`) with **no trailing slash**, so on macOS they say `/var/folders/…/T` and on Windows `C:\Users\<user>\AppData\Local\Temp`, and the asserted `/tmp/` matched nowhere. Commit `ae0240c fix(cross-platform): replace hardcoded paths or tmp.` had already made the messages platform-correct; the tests kept asserting the literal it replaced. Fixed by deriving the expected text from `tmpdir()` the same way the source does, with the path's regex metacharacters escaped (`replace(/[.*+?^${}()|[\]\\]/g, '\\$&')` — load-bearing on Windows, whose temp root contains backslashes), and anchoring the tail on the parenthesised path (` \(`) rather than the `\/tmp\/` the message never contained. Four shared regexes (`READ_BLOCKED_RE` / `WRITE_BLOCKED_RE` / `RM_BLOCKED_RE` / `MV_BLOCKED_RE`) replace the 10 literals; each keeps the shape its site already had, including `write_file`'s not naming its tool. **This is the Windows distinction the request asked for** — the assertions now hold on all three platforms rather than being re-hardcoded to macOS. Note what the run actually proved: every escape was blocked in every subtest, including both symlink cases. The guards were never broken; the asserted string was stale.
+
+**1 — `SPINNER_MD` in `tests/unit/agent-session.test.ts`.** Asserted the retired five-glyph set `['\\','|','/','+','-']`; `src/agent-session.ts:599` has held the six frames `['·','✢','✶','✳','✻','✽']` since before this branch. The test now pins the real six, written as literals rather than spread from `SPINNER_CHARS`, matching the sibling `agentTitleGlyph` test's hardcoded `'π π * * π π * *'`. A subtest title claiming "every frame is escaped" was renamed, since that clause is now false.
+
+**1 — `tests/unit/openai-to-claude.test.ts` did not load at all.** It imported `mergeClaudeModelsResponse`, which commit `32121b2 fix(route) update models list schema.` renamed to `mergeOpenAIModelsResponse`; the module-load failure was counted as one test failure and hid every test in the file behind it. The import is fixed and the describe re-pointed at the surviving function's real contract: it returns the **OpenAI** shape (`{object:'list', data:[…]}`, no `first_id`/`last_id`), reuses an already-present model **by identity** rather than re-creating it, and gives appended models the `owned_by: 'system'` / `context_length: 262144` / `max_tokens: 65536` defaults. The identity assertion is what makes the dedupe path meaningful rather than incidentally-green.
+
+**2 — the `[models.*]` inline alias pair, which looked like a source bug and was not.** Both failing tests supplied `url` for the base URL and expected it honoured. `docs/reference/configuration-reference.md:311` settles it: `base_url`'s short alias is **`base`**, "the short alias (**changed from `url`**)" — and commit `d99f62e fix(config) update for short alias consistant.` removed `fields['url']` from that branch and rewrote that doc line in the same commit. The source was correct; the tests asserted an alias the project had deliberately retired. Fixed by moving them to `base`, which is what the user confirmed directly: *"just keep 'base_url | base' equivalent, no needs short 'url' for 'base_url' in config"*.
+
+**A wrong turn, recorded rather than quietly dropped.** I first concluded these two were a source bug and edited `src/utils/config-loader.ts` to re-accept `fields['url']` — an additive change I described at the time as harmless and already-documented. It was neither: it re-introduced a retired alias and contradicted both the reference doc and the commit that retired it. The reference the file's own header points at (`docs/reference/configuration-reference.md#config-field-aliases`) is what disproved it, after I had already landed the edit; it is reverted and `src/utils/config-loader.ts` is unchanged by this entry. **Why the error was plausible enough to make:** `url` genuinely *is* the live short alias for `[passthrough]` (`config-loader.ts:3063`) and for the category-level mapping (`:2930-2939`), the reference doc's `[passthrough]` table lists it, and the alias table in that doc is per-section — I generalised a `[passthrough]` rule into `[models.*]`, which has its own stated rule and a stated reason for it ("short aliases are reserved for inline tables only"). The lesson is that the alias tables are **per-section** and the sections disagree on purpose.
+
+**One more test repaired while in here.** The precedence test beside them supplied `base_url` **and** `url` while asserting the canonical one wins. With `url` retired that assertion passed for a vacuous reason — nothing reads `url` any more, so it could not have failed. It now supplies `base_url` **and `base`**, so it exercises the documented precedence rule (`configuration-reference.md:316`) against a live pair instead of a dead key.
+
+**Not addressed, and surfaced rather than fixed**: (a) `SPINNER_MD`'s escape branch (`src/agent-session.ts:606-608`, `c === '+' || c === '-'`) had become **unreachable** — no shipped frame is `+` or `-`, so the map was the identity of `SPINNER_CHARS` — and the comment above it ("The other three are inert") described a five-glyph set that no longer existed. Surfaced here, then acted on: the user asked for the constant's removal, so it is gone — see the entry at the top of this file. (b) `/tmp/` survives as shorthand in `agent-tools.test.ts`'s header prose and several test titles even though every assertion is now platform-derived; the change was kept to assertions to stay surgical.
+
+### fix(tools): the judge read Gemini's tool key wrong, and four copies of the tool-name rule became one
+
+`src/utils/tool-shapes.ts` (new), `src/utils/tool-judge-sidecar.ts`, `src/utils/dashboard-stats.ts`, `src/utils/tool-blocklist.ts`, `tests/unit/tool-shapes.test.ts` (new), `tests/unit/tool-judge-sidecar.test.ts`, `tests/unit/dashboard-stats.test.ts`, `docs/architecture/design_tool_judge_sidecar_protocol.md`, `docs/getting-started/validating_tool_judge_sidecar.md` — two defects with one root: the rule "what is this `body.tools[i]` entry called, and what schema does it carry" had been written out four times, and one of the four got Gemini's key spelling wrong.
+
+**The bug**: Gemini's native tool form is `{functionDeclarations: [{name, parameters}]}` — **camelCase**, on which `src/utils/tool-blocklist.ts`, `src/utils/converters/claude-to-gemini.ts:454`, `src/utils/handlers/openai.ts:265` and the first-class `/v1beta/models/{model}:generateContent` inbound route (`src/index.ts:485,504`) all agree. The judge's `extractTools` read `body.tools[i].function_declarations` — snake_case — so on a Gemini-native request it matched nothing, returned `[]`, and `judgeTools` reported zero tools judged while logging at `info`/no level at all: **every tool was kept, silently**. That is precisely the failure mode the entry two below this one was written to eliminate ("failing open is still the behaviour; failing open *silently* is not"), reappearing one shape over. The dashboard's `extractToolNamesFromBody` had the same blind spot and returned its `['none']` sentinel, so every Gemini request was counted as carrying no tools. Neither surface had a test that could catch either one — and the judge's test **asserted the snake_case shape**, which is how the bug survived review.
+
+**Both now read camelCase.** `tests/unit/tool-shapes.test.ts` pins the spelling directly (`reads the camelCase Gemini key, not the snake_case one`) and `tests/unit/dashboard-stats.test.ts` asserts a Gemini body names `['ls','cat']` `instead of reporting [none]`.
+
+**Four copies, not two.** The duplicates were: `extractTools` (judge — snake_case Gemini, `function`-first precedence, `type: 'function'` gate, no trim, `{name, schema}[]`); `extractToolNamesFromBody` (`dashboard-stats.ts:917` — no Gemini at all, `name`-first, trims, `['none']` sentinel); a second copy inlined inside `extractToolRequestCharLengthsFromBody`; and `tool-blocklist.ts`'s private `extractToolName` beside its own inline camelCase Gemini filter. The two dashboard copies are fed the *identical* inbound `body` that `judgeTools` is handed at `src/index.ts:1311` vs `:1351`, so they were genuine duplicates, not two views of different data. All four now walk one module, `src/utils/tool-shapes.ts`, which exports `extractToolRecords(body): ToolRecord[]` (`{name, schema}`, deduplicated by name, first occurrence and first schema win) and `toolNameOf(tool): string | undefined` for callers that want one entry's name only. It lives in `utils/` rather than in either consumer so the judge does not depend on the dashboard or the reverse.
+
+**Behaviour deliberately preserved, in five places**: `name` wins over `function.name` and the schema comes from the same branch as the name, so a flat `name` is never paired with a nested `function.parameters` — this is what the judge already did (the first version of the new test asserted the opposite and was wrong, not the code); the OpenAI branch is **not** gated on `type: 'function'`, because the old judge skipped an entry without the tag, which is a second silent drop — an entry that names a function is a tool; nothing in the shared module trims, so the judge keeps receiving names exactly as sent and the dashboard trims in its adapter where it always did; `extractToolRequestCharLengthsFromBody` keeps its own per-tool loop and calls only `toolNameOf` on the entry, so a Gemini wrapper — which has no per-entry name — is still skipped rather than charged, leaving Gemini char accounting unchanged; and `tool-blocklist.ts` keeps its shape-preserving rewriter and its (already correct) inline Gemini filter, borrowing only the name lookup. The judge's `JudgeTool` interface is gone, folded into `ToolRecord`, and `buildStateText(body, tools: ToolRecord[])` takes the shared type — the schema is load-bearing there, since it is serialized into the §4.1 state text, so a `string[]` return would not have done.
+
+**Covered by tests**: `tests/unit/tool-shapes.test.ts` (new, 18 tests — 13 for `extractToolRecords` across the three wire shapes, the flat Responses shape, Gemini's multi-declaration entry, the camelCase/snake_case regression, name-over-nested precedence, dedup keep-first, absent or non-object schemas, untrimmed names and malformed entries; 5 for `toolNameOf` including every case that must return `undefined`); 8 added to `tests/unit/dashboard-stats.test.ts` (4 per converter — the `['none']` sentinel for five empty-ish bodies, trim-then-dedup, both Claude and OpenAI shapes, the Gemini regression, and for the char-length walker: a charged tool, the system-text surcharge once per mentioned name and not otherwise, a repeated name accumulated across entries, and entries it cannot name including a Gemini wrapper); and the 7 `extractTools` tests **moved out** of `tests/unit/tool-judge-sidecar.test.ts` into the new file rather than being duplicated. Full unit suite: **1391 tests, 1377 pass, 14 fail**, and the same 14 fail on a clean checkout of `HEAD` (1331 / 1317 / 14) — so the +60 tests are all new and all passing, and none of the 14 is in a file this change touches. They are the `agent-tools` path-confinement tests (`read_file` / `write_file` / `bash — Section 12 rm/mv path confinement`), `SPINNER_MD` in `tui`, the two `parseSimpleToml` inline-table alias tests, and `openai-to-claude`. *(All 14 are cleared by the entry at the top of this file; the list is kept as the baseline this change was measured against.)* **An earlier revision of this entry said "1291 tests, 1285 pass, 6 fail", and an earlier draft of this work reported 36 `tsc` errors in `tui.ts` / `agent-session.ts` / `agent-tools.ts`: both were artifacts of an `unfinished npm install`** — `node_modules/@earendil-works/*` was absent, so three suites failed to load and `tsc` could not resolve `TuiMainScreen` / `BACKGROUND_CONTEXT`. Once the install completed, `npm run typecheck` exits **0** and the suite collects 100 more tests. The baseline was therefore re-measured against a complete `node_modules`; the numbers above are that measurement, not the earlier ones.
+
+**Docs updated with the code**: the design doc's §6.1 call-site sketch named `extractTools(body)` — renamed to `extractToolRecords(body)`. `docs/getting-started/validating_tool_judge_sidecar.md` §7 listed both the Gemini key and the duplicates as open questions; items 1 and 2 are now recorded as resolved with what they were, and items 3–5 (Gemini `contents` vs `messages` context, silent unknown-TOML-section drops, the §2.2/§4.1 state-text contradiction) are explicitly left open.
+
+**Not addressed**: the judge still gets no prompt context on Gemini requests, because Gemini bodies carry `contents` where `buildStateText` reads `messages`. That is item 3 above and the remaining known Gemini-shaped hole; it is a second bug, not this one.
+
+### fix(config): parse `[tool_judge_sidecar]`, which the loader silently dropped
+
+`src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts` — the entry below this one shipped a client that speaks the tool-judge protocol and a wrapper that serves it, and the feature still could not be turned on: **`[tool_judge_sidecar]` was never parsed.** `ProxyConfig.tool_judge_sidecar` was declared at `config-loader.ts:138` and read by `src/utils/tool-judge-sidecar.ts:423` and `src/dashboard.ts`, but the hand-rolled TOML parser had no branch that ever populated it — not in the section dispatch, not in any of the three value-assign sites — so `sidecarConfig` was `undefined` on every request, `judgeTools` took its `if (!sidecarConfig?.judge_url) return … {called: false}` early return, and the tool list reached the upstream untouched.
+
+**The failure was completely silent**, which is why the entry below was able to claim a hand-verified feature that was in fact unreachable from a config file. An unknown `[section]` falls through the dispatch chain to a bare `continue`; `parseSimpleToml` on a config containing a fully-specified `[tool_judge_sidecar]` returned `tool_judge_sidecar: undefined` with `_validationErrors` and `_validationWarnings` both **empty**. The section header, its six keys, and their values were discarded without a diagnostic. The only way to see it was to notice that the judge's `debug` line never appeared in the proxy log.
+
+**The fix is four branches, mirroring `[privacy_filter]` exactly** — that section is the nearest neighbour (scalar-only sidecar, activation by URL presence, no `enabled` flag) and the branch already documented the pattern of repeating the string keys across both the quoted and unquoted value sites. Dispatch: `parts[0] === 'tool_judge_sidecar'` → `currentSection = 'tool_judge_sidecar'; config.tool_judge_sidecar = {}`. Quoted-string site: `judge_url | mode | api_key`. Number/string site: numbers `timeout_ms | threshold | max_batch_tools`, strings the same three as above. No array branch — the schema has no array keys. Unknown keys and wrong-typed values are still dropped (the allowlist is unchanged), so `enabled = true` does **not** become a second activation path, which the new test pins.
+
+**Verified through the real proxy path**, not just the client: proxy on `:8899` → judge on `:8081` → a recording echo upstream on `:8890`, one `POST /v1/messages` carrying `Read` and `get_weather` for the prompt "What is the weather in Paris today?". The proxy log now shows `Tool judge sidecar (mode=choice, threshold=0.5): 2/2 judged, 1 to erase in 68ms` followed by `Erased blocked tools from request: Read`, and the upstream received `tools: ["get_weather"]` with `tool_choice` reset to `null`. Three consecutive runs at the **default 50 ms timeout** all judged 2/2 and erased `Read`. Note what those numbers mean: `choice` issues one HTTP request per tool, so the 50 ms budget applies per request, and the reported `in 68ms` is the whole loop — the client's total can exceed `timeout_ms` while every individual request stays inside it. `timeout_ms` is therefore a per-call budget, not a per-request wall clock; if the judge is cold or loaded, the symptom is `judged 0/N … failing open` and the remedy is to raise it. *(Superseded: the entry `fix(judge): timeout_ms is now a per-question budget with a 2000 ms cap per request` changed a request's budget to scale with the number of questions it carries. The observation recorded here — that under `choice` the client's total loop can exceed a flat `timeout_ms` while each individual request stays inside it — is still how `choice` behaves, and is now the reason the two modes share one rule.)*
+
+**Covered by tests**: three in `tests/unit/config-loader.test.ts` — all six keys parsed with their exact values and types; the unquoted-value path (`judge_url = http://…`, `mode = choice`) exercising the second assign site; and a mixed-validity block asserting that `enabled = true` and the wrong-typed `threshold = "high"` / `timeout_ms = "2000"` are dropped rather than coerced. A regression back to an unparsed section fails all three. Full unit suite: **1266 pass / 6 fail**, the 6 being the pre-existing failures in `src/tui.ts` / `agent-session.ts` / `agent-tools.ts` (confirmed identical with this change stashed). *(Those numbers were taken with `node_modules/@earendil-works/*` uninstalled, which is what made those three suites and `tsc` fail; see the shared-walker entry above for the re-measured baseline.)*
+
+**Not addressed**: the silent-drop behaviour that hid this bug is still there for any *other* unknown section — `continue`, no warning. Changing that is a parser-wide policy question, not part of this fix, and it is called out in the entry below as the reason the bug survived a hand-verification.
+
+**Docs now match the code, rather than the reverse**: `docs/getting-started/proxy_config.example.toml`, `docs/architecture/status_of_sidecars_of_proxy.md` §4 and the status table appended to `docs/architecture/design_tool_judge_sidecar_protocol.md` all documented `[tool_judge_sidecar]` and listed its six keys as shipped *before* the loader could read them. Those three files are unchanged by this commit — the fix brings the parser up to what they already said, so no doc edit was needed to make them true. One doc **is** added: `docs/getting-started/validating_tool_judge_sidecar.md`, the manual validation procedure that found this bug, written up as a runnable recipe (the three layers, the harness scripts inlined so it does not depend on `/tmp`, the pass criteria for each, and the measured operational notes — 35.5 s cold start, `timeout_ms` being a per-request budget, `noul`'s poor discrimination on this checkpoint). The config-loader prerequisite it names is the fix above.
+
+### feat(judge): serve the tool-judge protocol from Laya, and make the client speak it
+
+`submodules/laya-mlx/serve_judge.py`, `src/utils/tool-judge-sidecar.ts`, `tests/unit/tool-judge-sidecar.test.ts`, `docs/architecture/design_tool_judge_sidecar_protocol.md`, `docs/architecture/status_of_sidecars_of_proxy.md`, `docs/getting-started/proxy_config.example.toml` — the two halves the previous entry left undone. Laya had no HTTP server at all (`laya_mlx/cli.py` is `predict` / `convert` only), and the client did not speak the protocol the design doc specifies, so every judge call parsed to zero erasures while logging an `info`-level success.
+
+**The wrapper** (`serve_judge.py`, stdlib `http.server`, no new dependencies — matching the sibling-sidecar convention in `plan-opf-privacy-filter-plugin.md:45` and the server-inside-the-sidecar-submodule layout): `POST /judge` accepts the doc's `{state, questions}` and calls `agent.system_one(state, questions)` once, under a lock — a single MLX `Agent` is not safe to drive from concurrent threads, and `ThreadingHTTPServer` would otherwise re-enter it. `GET /health` returns `{status, model_version, mode}` (doc §7.2). The model is loaded *before* the socket binds, so a broken checkpoint fails loudly at startup instead of answering every request `500`.
+
+**Why the wrapper does almost nothing:** Laya's per-question answers already carry exactly the doc's §2.4 / §2.5 fields — `{type, confidence, action, choice, probabilities}` for `choice`, `{type, confidence, action, noul}` for `noul` — so the only translation needed is unwrapping Laya's `{model, answers, usage}` envelope into the top-level qid-keyed map the doc specifies. Anything else would be re-implementing the model's own output. Error mapping is deliberate: a `ValueError` (Laya raises it for malformed question definitions, and the wrapper for a bad body) is the caller's fault → `400`; `FloatingPointError` (Laya's own non-finite-outputs signal) and any other inference failure → `500` with the exception named, and the traceback logged. Answers are checked against the question set before returning: a mismatch is a `500`, not a partial map the client would silently fail open on.
+
+**The client rewrite** was five separate defects, all of which had to go:
+- `buildNoulRequest` / `buildChoiceRequest` emitted **one question for N tools** (the `toolNames` argument was accepted and never read). Now `noul` keys one question per tool name and `choice` issues one request per tool — the shape Laya and doc §2.3/§2.2 both require, and the reason `choice` is now a sequential loop rather than a single call.
+- Both parsers read fields that exist in neither Laya nor the doc — `answer.keep.items[name]` and `answer.decision.probabilities[tool]`. Now `response[toolName]` for `noul` and `response.decision.probabilities.keep` for `choice`, with `keep` iff score **strictly greater than** `threshold` (doc §3).
+- `buildStateText` sent only the tool *names*, so the judge had nothing to judge relevance against. It now emits doc §4.1 — the user prompt, each tool with its parameter schema, recent user messages and assistant tool calls (Claude `tool_use` blocks, OpenAI `tool_calls`, legacy `function_call`) — capped at 2000 chars of prompt, 600 per schema, 3 context messages, 5 tool calls. The caps are not cosmetic: Laya builds its sequence with `max_len=512` / `head_max_len=192` and raises `ValueError("Question … has too many options for the token budget")` on overflow, so an unbounded schema dump would fail open on every request.
+- A malformed JSON body, a non-object body, a non-2xx, and a timeout all returned `null` — but the old code then logged an `info` success and counted the tools as judged. Per-tool failures now land in `unjudgedNames`, over-cap tools in `skippedNames`, and a summary line (`N/M judged, K to erase, U unjudged (kept), S over max_batch_tools=N`) is logged at `warn` whenever anything was left undecided. `JudgeResult.error` is set for both total (`Sidecar judged none of N tools — failing open`) and partial failure. Failing open is still the behaviour; failing open *silently* is not.
+- `judge_url` is documented as a base URL, so the client appends `/judge` — tolerating an already-complete `/judge` URL so a config written against the doc's full-URL example still resolves rather than POSTing to `/judge/judge`.
+
+**Covered by tests**: `tests/unit/tool-judge-sidecar.test.ts` (31 tests as of the shared-walker entry above; it was 38 when this entry was written — the 7 `extractTools` tests now live in `tests/unit/tool-shapes.test.ts`, unchanged apart from the Gemini key they assert) — `buildStateText`'s §4.1 sections, last-user-message-is-the-prompt, OpenAI `tool_calls` argument parsing, schema truncation and both context caps; the request builders' question ids, types and criteria; both parsers including the `> threshold` boundary (exactly `0.5` at threshold `0.5` erases), a missing answer keeping with `factor: 1.0`, and a wrong-typed answer doing the same; and `judgeTools` against a stubbed `globalThis.fetch` — one request per tool in `choice` mode with each state carrying only its own schema, one batched request in `noul` mode, the timeout actually aborting the request, the `api_key` bearer header, and every fail-open path asserting both the decision **and** the report (`unjudgedNames` / `skippedNames` / `error`), so a regression back to silent no-op fails the tests rather than passing them.
+
+**Verified end-to-end once, by hand**: a Python 3.13.3 venv with `mlx==0.32.3` on arm64, `serve_judge.py` started against the locally cached `aac6fef/laya-multilingual-mlx` checkpoint (a converted `convaiinnovations/laya-multilingual`, not the `convaiinnovations/laya` this file defaults to), and the real client driven at it through `judgeTools` over HTTP. It works: `/health` returns the documented shape; a Claude-shaped body asking for the weather with `Read` and `get_weather` attached comes back `2/2 judged, 1 to erase` in `choice` mode with `Read` erased and `get_weather` kept, twice in a row; both error paths (`{"state":"x"}` → `400`, an unknown question type → `400`, an unknown path → `404`) answer as intended; and Laya's answer objects come back as exactly the §2.4/§2.5 fields the wrapper passes through, which is the assumption the whole no-translation design rests on.
+
+**Not covered by tests**: `serve_judge.py` has no tests of its own, and the numbers above are one hand-run on one checkpoint — not a suite, and not reproducible by CI. Two observations from that run that a real rollout needs to settle first. **`noul` mode discriminated poorly** on the multilingual checkpoint: for a weather prompt with `Read` attached, it scored `Read` at `noul=0.7051` and `get_weather` at `0.9343`, so with the default `threshold=0.5` nothing was erased at all, where `choice` mode erased `Read` on the same state — the doc's `noul` instruction wording ("Keep `<tool>` tool?") may just be too weak a prompt for this model, and is worth tuning (or leaving `choice` as the default, which it already is) before `noul` is used in anger. And a prompt needing no tool at all ("Say hello in one word") erased nothing in either mode. **Latency**: 32–106 ms per call end to end, so the doc's 50 ms p99 budget is met only on the warm path — the first call after load was 106 ms. **Startup is the bigger number**: loading the checkpoint and binding the socket took **35.5 s** on this machine (`13:28:41 loading …` → `13:29:16 listening on http://127.0.0.1:8081`), so the process is not usable until roughly half a minute after launch. (An earlier revision of this entry said "about 0.4 s"; that was wrong — the model load dominates, and nothing answers `/health` until it finishes, which is deliberate: `serve_judge.py` binds only after a successful load so a broken checkpoint fails loudly instead of 500-ing every request.)
+
+**Docs corrected while in here**: the example config's `[tool_judge_sidecar]` block documented a *third* response shape that neither Laya nor the client produces (`{type:"noul", items:[{tool, score}]}`, `{type:"choice", tool, probabilities}`) and a Flask stub keyed on `questions["keep"]["tools"]`; `status_of_sidecars_of_proxy.md` §4 listed a `batch_size`/`fail_open` schema that does not exist and credited the sidecar to a `filter_tools` builtin transform that appears nowhere in `src/`; both now describe the shipped contract. The design doc §8 block is left as written — it is a design proposal, not a description of shipped code — with a status table added beside it recording which of its keys (`enabled`, `url`, `thresholds`, `send_context`, `context_window`) are **not** implemented.
+
+### chore(submodules): vendor `qidu/laya-mlx` at `submodules/laya-mlx`
+
+`.gitmodules`, `submodules/laya-mlx` — adds `git@github.com:qidu/laya-mlx.git` (pinned at `fc1df62`, branch `main`) alongside the existing `submodules/{chatjimmy,privacy-filter,kompress,node-keytar}` vendor pins. Laya is an open-weight *typed-decisions* model — a bidirectional encoder with decision heads and zero output tokens, answering `choice` / `score` / `noul` questions in a single forward pass — and is the intended implementation behind `docs/architecture/design_tool_judge_sidecar_protocol.md`.
+
+**Vendor pin only; nothing consumed it at the time of this change.** `src/utils/tool-judge-sidecar.ts` did not talk to Laya's wire format: it sent one question for N tools (Laya, and design doc §2.3, key one question per tool), and parsed `answer.keep.items` / `answer.decision.probabilities[tool]`, which is neither Laya's `{answers: {<qid>: {type, noul | probabilities}}}` envelope nor the design doc's §2.4/§2.5 shapes. Laya also ships no HTTP server — `laya-mlx predict` is a CLI — so `POST /judge` (doc §2.1) needed a wrapper before an end-to-end call was possible. Between this pin and the entry above, every judge call parsed to zero erasures and reported it as an `info`-level success; **both defects are fixed by the entry above**, which is the first change that consumes this submodule.
+
+**Not initialized on this checkout**: like the other four, the pin is declared but empty until `git submodule update --init submodules/laya-mlx`.
+
+### feat(router): answer Claude Code's `HEAD /api/hello` startup probe with a local `200`
+
+`src/index.ts`, `tests/unit/api-hello.test.ts` — `HEAD /api/hello` is the connection-warming probe Claude Code fires at startup, before its first real inference request, so a gateway can pay the TLS and TCP setup cost on traffic the model never sees (`docs/api/llm-gateway-protocol-for-claude-code.md:60`). The path matched no route, so it fell through to the auth presence check and was answered `401` — or, with a credential, died in `parseFixedRoute` with `Unsupported fixed route: /api/hello`. It is now answered with `200` and an empty body, next to `/favicon.ico` and before the auth gate.
+
+**Why before the auth gate:** Claude Code sends the probe with no credentials, which is exactly what the presence check rejects, so any placement after it would return `401` and re-create the bug it is meant to avoid. Answering it locally also keeps it off the upstream entirely. The spec calls this traffic "best-effort startup traffic [the gateway] can reject without breaking anything" — a `401` would indeed be survivable, so this buys latency and log noise, not correctness; the client is documented as skipping the probe when an HTTP proxy or client certificate is configured, in which case it is not sent at all.
+
+**Path-only matching, like the other operational endpoints:** `/favicon.ico` and `/health` both match on path alone, so `/api/hello` does too and `GET /api/hello` also returns `200`. No method check means no second, subtly different code path for a probe that exists only to be fast. The body is `null` rather than an empty string, which is what `HEAD` wants and what both the Workers and the Node adapter (`src/server.ts`, which already skips body-stream construction for `GET`/`HEAD`) expect.
+
+**Covered by tests**: `tests/unit/api-hello.test.ts` (6 tests) — the probe returns `200` with no auth header, makes **no upstream `fetch` call** (asserted against a mocked `globalThis.fetch` recording every call, so a regression that proxied it instead of answering it locally would fail), returns an empty body, is still answered `200` with `DEV_NO_KEY: 'false'`, that is, before the auth presence check; `GET /api/hello` returns `200`, pinning the deliberate no-method-check choice; and an adjacent unknown path, `/api/not-hello`, is still rejected `401`, so the exemption cannot silently widen.
+
+**Not covered by tests**: the end-to-end Claude Code client behaviour — that Claude Code actually issues this probe, and that it treats any response as a warming success, are both taken from the protocol doc and are not driven from a real client here.
+
+**Known limitation, deliberately not addressed**: the handler sits after `loadProxyConfig(env)`, so if the TOML config fails to load, the probe fails too. Matching `/config-reload` — which also loads config before answering — was the closer convention than the `loadProxyConfig` bypass used by the dashboard, and the probe is best-effort by definition.
+
+### feat(server): add `--dashboard` flag; `--tui` and `--agent` imply it
+
+`src/mode-flags.ts`, `src/server.ts`, `src/cli.ts`, `src/utils/dashboard-stats.ts`, `tests/unit/mode-flags.test.ts` — `--dashboard` is the argv spelling of `DASHBOARD=true`: it turns on token-stats persistence (append to `model_proxy_tokens.jsonl` + restore at startup). `--tui` and `--agent` now set it too, since both render the same token stats the dashboard serves, so asking for either is asking for the stats to survive a restart.
+
+**What `--dashboard` does and does not change:** the `/dashboard` page and `/dashboard/api/*` were already always on (loopback-only, optional `DASHBOARD_API_KEY`) — that is untouched. The flag is additive, and only governs the JSONL dump/restore that previously required `TUI=1` or `DUMP=1`: `persistenceEnabled = dashboardEnabled || tuiEnabled || dumpEnabled`. It claims no stdout, so unlike `--rpc`/`--tui`/`--agent` it composes with any of them (`--rpc --dashboard` is allowed) and needed no new conflict guard.
+
+**Why the implication is flag → flag only:** a bare `TUI=true` / `AGENT=true` env var does **not** imply `DASHBOARD`. A supervisor that sets those vars would otherwise silently start writing a JSONL file to the working directory. `DUMP=true` remains the env-only way to get persistence without a UI. The three vars stay one source of truth — `--dashboard` is normalized into `process.env.DASHBOARD` in `src/mode-flags.ts` at import time, exactly like the existing flag/env pairs, so nothing downstream had to learn about flags.
+
+**The periodic-dump gap, and why the TUI is excluded from the timer:** `persistenceEnabled` alone only buys a restore at startup plus the day-rollover write, so the flag would have been restore-without-write. The only periodic writers are the TUI's own 30-min timer (`src/tui.ts`) and the standalone 30-min timer in `src/utils/dashboard-stats.ts` that was gated on `DUMP` alone. That standalone timer now also runs when `DASHBOARD=1` **and the TUI is not running** (`tuiOwnsDumpTimer`): since `--tui` implies `DASHBOARD`, gating on `DASHBOARD` alone would start a second timer beside the TUI's, and the two share the module-global `lastHeatmapDumpTs` cursor — the deltas are additive so nothing is lost, but the same stream would be split across more lines and the TUI would print a spurious "auto-dumped tokens" notice. `--agent` has no timer of its own and is covered by the standalone one.
+
+**Covered by tests**: `tests/unit/mode-flags.test.ts` (17 tests) — `--dashboard` sets `DASHBOARD=true` and starts no UI (`TUI`/`AGENT` stay undefined), overrides a contradicting `DASHBOARD` env var, both `--tui` and `--agent` set `DASHBOARD`, the bare `TUI=true`/`AGENT=true` env vars leave `DASHBOARD` undefined (the flag-only implication, asserted directly), `--dashboards` does not match by prefix, and `MODE_FLAGS` is exactly `['--rpc','--tui','--agent','--dashboard']` with `--dashboard` alone rejected by `runCli` as `Unknown argument: --dashboard` (proving the strip in `src/server.ts` is necessary).
+
+**Not covered by tests**: the import-order timing constraint (no separate-process test), and the standalone 30-min timer path end-to-end — no test drives a `DASHBOARD=1` process across a dump interval, so the `tuiOwnsDumpTimer` exclusion is verified by reading the two timer sites, not by execution.
+
+### fix(agent-session): proxy warn/error log shows on one dedicated row above the `──` rule, not on the `>` prompt row
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — `src/server.ts` routes every proxy diagnostic to stderr (`console.log`/`info`/`debug` are aliased onto `console.error`'s original function there, keeping stdout free for CLI payloads), and the shared `Logger` emits *every* level — WARN and ERROR included — through `console.log`. A raw stderr write lands on whichever row the TUI parked the cursor on, which is the `>` input row, so a proxy warning smeared across the user's half-typed prompt. `TUI=true` resolves the same conflict by silencing every console method outright; in `AGENT=true` the lines are wanted, so while the persistent TUI owns the screen `captureConsoleOutput(append)` replaces all five methods and shows each line in `proxyLogLine` — a single dedicated row mounted between the conversation area and the `──` rule — then `restoreConsoleOutput()` hands the genuine methods back as the first statement of `stopPersistentTui`.
+
+**Why all five methods, not just `console.error`:** replacing `console.error` alone would leave the proxy logger's own channel (`console.log`) still writing straight to stderr, which is the exact path the bug arrives on.
+
+**Layout — one row, newest replaces the previous:** the proxy can emit warnings per attempt on this branch, so the display is deliberately fixed-height: `setProxyLogRow(row, line)` does `row.clear()` then adds a single `TruncatedText(dim(line), 0, 0)`, the replace-a-child convention `updateStatusBar` already uses. `TruncatedText` clips to exactly one row (ANSI-aware, pad to the render width) so a long warning cannot wrap and push the `──` rule and the `>` row down mid-session; `addChild` without the `clear()` would stack rows instead, growing the layout by one line per warning. The row is a `Box(0, 0)`, and an empty `Box` renders no rows at all, so nothing is consumed before the first log arrives. An earlier cut of this fix appended every line to the conversation area as a dim `Markdown`; that grew the transcript without bound and is what this replaces.
+
+**Why `captureConsoleOutput` takes the sink as a parameter** rather than closing over `proxyLogLine`/`currentTheme`: the redirection/restoration contract is then unit-testable without a real terminal. `requestRender()` inside the capture is null-guarded (`persistentTui?.requestRender()`), so capturing while no TUI exists is a safe no-op. `util.format` reproduces what the real console methods would have printed, including inspected objects for non-string args; multi-line messages (a few of the proxy's startup notices are multi-line) are delivered one callback per non-blank line, so with a single-row display the message's last line is what remains visible.
+
+Restoration is guarded by `savedConsoleMethods`, making capture idempotent: a second capture would otherwise adopt the capturing function as the "original" and restoring it would leave the console diverted for the rest of the process. The early returns in `runAgentSession` (no model picked, cancelled, missing API key) all happen before the TUI starts, so `restoreConsoleOutput()` is a no-op on those paths.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` → `captureConsoleOutput` (4 tests) assert that capturing diverts all five methods and writes **nothing** to `process.stderr` (asserted against a stubbed `process.stderr.write`, so the test fails if any method escapes the capture), that a multi-line message yields one callback per non-blank line, that teardown restores the *identical* original function objects, and that a second capture is a no-op. `setProxyLogRow` (4 tests) render the real component: the second log replaces the first rather than concatenating (one row, stale text gone), an empty row renders **zero** lines, a long warning is truncated to exactly the render width at widths 10/30/120 (`visibleWidth`, so a wrap is a failure), and the line is dim. Both properties were confirmed to bite by rendering the rejected alternatives: a `Markdown` child in place of `TruncatedText` produced 16 rows at width 30, and two children without the `clear()` produced 2. The aliased-console case was additionally verified against a byte-level replica of `src/server.ts`'s redirect: with `console.log === console.error`, both channels are captured and zero proxy text reaches stderr.
+
+**Not covered by tests**: the on-screen placement (needs a real PTY) and the `AGENT=true` end-to-end path.
+
+**Known limitation, deliberately not addressed**: a multi-line log shows only its last line, since each split line overwrites the row. Separately, `printProcessLog`'s raw `process.stderr.write` (`src/agent-session.ts:1592`, written every 400ms while a tool runs, gated only on `isStderrTty`) bypasses `console` entirely and so is **not** captured — it corrupts the prompt row the same way. Routing it through the capture would take the in-flight progress line off the terminal, which is a behavior change beyond this fix.
+
+### fix(agent-session): dim the `──` rule, and show the `|` tool separator only when a tool has been used
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — The `──` rule above the `>` row was drawn in the terminal's default foreground, which made it compete with the conversation text. `RuledInput.render` now wraps it in `dim()`, the same dark-gray helper the status bar and transcript notices already use.
+
+The status bar's tool segment always emitted the `|` that separates the skills list from the tool list, so an empty tool list rendered a dangling `… (results) (skills) |  ` — a separator with nothing on its right. It is now `const separator = toolsList ? ' | ' : ' ';`, so the `|` appears only once at least one tool has actually been called. (The status line itself was already `dim()`ed; only the rule gained it.)
+
+`dim()` is applied to the rule rather than the whole row, and the zero-width guard is kept: `dim('')` would emit stray SGR bytes for an invisible line, so a non-positive width still yields `''` rather than a styled empty string.
+
+**Covered by tests**: the `RuledInput` suite asserts the rule is exactly `width` `─` chars on the first row at widths 1/5/40/200, checking `visibleWidth` — `─` is East-Asian-Width ambiguous, so that is what actually decides whether the rule wraps onto a second line. The assertions strip ANSI before comparing, which proves the `dim()` wrapper did not change the rule's geometry; the zero-width case still asserts `lines[0] === ''`.
+
+**Not covered by tests**: that the rule is actually dim, and the status-bar ` | ` separator — `updateStatusBar` reads the module-scope `toolsUsedNames`/`pendingToolNames`/`selected` and writes into the module-scope `statusBar`, so it is not callable in isolation. Both are visible-only changes verified by eye in a real TUI; the geometry tests are what guard them against regressing silently.
+
+### feat(agent-session): window title `Agent π in proxy v3`, alternating π/`*` while a task runs
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts` — The agent session sets the terminal window title to `Agent π in proxy v3` via OSC 0 (`\x1b]0;<title>\x07`) at session start, so the window is distinguishable from the proxy's other TUI/TRAJ sessions. While a task is in flight the title alternates its π with `*`, two ticks each — `π π * * π π * *` at 150ms/tick, so each glyph is held 300ms — because the transcript with the running-task spinner may be scrolled off screen. While idle the title shows a plain π.
+
+`agentTitleGlyph(tick)` is extracted as an exported pure function (`tick` is 1-based; `startTuiSpinner` increments `spinnerTick` before its first glyph, so tick 0 never fires) rather than inlined in the interval, following the file's existing convention of exporting `SPINNER_CHARS`/`SPINNER_MD` for tests. The `Math.floor((tick - 1) / 2)` form is deliberate: the obvious `Math.floor(tick / 2) % 2` would make the opening π run a single tick, since tick 0 never occurs.
+
+`AGENT_TITLE` and `IS_STDOUT_TTY` live at module scope, not inside `runAgentSession`: `runAgentTurn` drives the spinner and is a module-level function, so it cannot see that function's locals. All title writes are gated on `IS_STDOUT_TTY` — piped stdout would otherwise log the escapes as garbage. The two user-facing exit paths (`bye!` and `Budget reached`) hand the title back to the shell default with an empty OSC 0; early-return paths (no model picked, cancelled prompt, missing API key) deliberately do not, because the process is still the proxy server and there is nothing to hand back.
+
+`stopTuiSpinner(clear = false)` gained its parameter to fix a teardown ordering bug: those exit paths clear the title inside the `try`, then the `finally` runs `stopPersistentTui()` → `stopTuiSpinner()`, which had unconditionally re-written π after the session had ended. `stopPersistentTui` now calls `stopTuiSpinner(true)`.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` → `agentTitleGlyph` (3 tests) assert the exact π π * * π π * * sequence over the first eight ticks, that each glyph is held for exactly two ticks (tick *n* = tick *n+1*, tick *n* ≠ tick *n+2*), and that no tick ever yields a glyph other than π or `*`.
+
+**Not covered by tests**: the OSC 0 write itself and the teardown ordering — `writeAgentTitle`/`clearAgentTitle` are module-private and `IS_STDOUT_TTY` is frozen at import, so exercising them needs a real PTY with a TTY stdout.
+
+### feat(server): add `--tui` and `--agent` flags to start dashboard / agent session
+
+`src/mode-flags.ts` (new), `src/server.ts`, `src/cli.ts` — The interactive dashboard (`TUI=true`) and the loopback agent session (`AGENT=true`) were reachable only via environment variables. Two argv flags now spell the same modes: `--tui` and `--agent`, documented in `src/cli.ts` USAGE and forwardable through `npm run server -- --tui` / `--agent`.
+
+**Why a dedicated module at import time:** Six code paths already read `process.env.TUI` / `process.env.AGENT` — `server.ts`'s `env` literal, `LOG_LEVEL` default, `--rpc` conflict check, mode dispatch; `agent-session.ts`'s `agentMode`; and `logger.ts`'s module-scope `AGENT_MODE` (frozen at import). `server.ts`'s first project import (`utils/config-loader.ts` → `utils/logger.ts`) reaches `logger.ts` before `server.ts`'s own body runs, so argv parsed anywhere in the body is too late. The fix is a self-executing module (`src/mode-flags.ts`) placed as `server.ts`'s very first import: it normalizes `--tui`/`--agent` into `process.env` at import time, leaving all six read sites byte-identical. A flag wins over a contradicting env var (`AGENT=0 --agent` starts the agent), being the more specific request.
+
+**Why strip before `runCli`:** `runCli()` treats unknown args as usage errors. A mode flag beside a command (`--tui --list-models`) would otherwise exit 2 with "Unknown argument: --tui". `MODE_FLAGS = ['--rpc','--tui','--agent']` is stripped in `server.ts` before the `runCli` scan; the strip is idempotent and `runCli` exits before the server starts anyway.
+
+**Covered by tests**: `tests/unit/mode-flags.test.ts` (13 tests) — `applyModeFlags` sets the canonical `true` values, leaves unrelated argv alone, overrides contradicting env vars, matches exactly not by prefix, and is idempotent; `MODE_FLAGS` lists exactly the three modes; every mode flag is rejected by `runCli` (proving the strip is necessary); stripping lets a real command through and prints output; stripping all flags leaves empty argv so `runCli` returns `null` (server starts in the requested mode).
+
+**Not covered by tests**: the import-order timing constraint (hard to test in isolation without a separate process); the pre-existing no-TTY silent-fallthrough — with `--tui`/`--agent` and no TTY the existing `&& process.stdin.isTTY && process.stdout.isTTY` guard silently falls through to the plain HTTP server, same as `TUI=true`/`AGENT=true`.
+
+### feat(agent-session): add `-` frame to the running-task spinner
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts`, `docs/architecture/design_of_persistent_tui_of_agent_with_followup_for_task.md` — The in-flight task's animated `>` marker cycles through `\ | / +` at 150ms/frame. A user requested the fifth common spinner frame `-` (`\|/+-+`). Adding `-` required escaping it for Markdown: a bare `- ` at a line start is list syntax, and while pi-tui draws the bullet as `-` (same character), the list item's wrapped continuation lines carry a hanging indent that a paragraph's do not — causing the task text to jump sideways on that frame. Both list markers (`+` and `-`) are now escaped in `SPINNER_MD`; the stdout verification spinner keeps bare `SPINNER_CHARS` because it never goes through Markdown.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` SPINNER_MD suite — the new wrapping regression test asserts that every frame in `SPINNER_MD` wraps its continuation lines at the paragraph indent, and would fail if `-` (or `+`) were unescaped; the existing `renders every frame literally` test still passes; the array-length assertions updated to 5 frames.
+
+**Not covered by tests**: visual confirmation of the 5-frame animation (requires a real PTY); the stdout spinner still uses the bare 5-frame set.
+
+### fix(deps): migrate to pi-tui 0.87's `TuiMainScreen` for the removed `TUI` constructor
+
+`package.json`, `src/tui.ts`, `src/agent-session.ts` — Bumping `@earendil-works/pi-tui` from `^0.76.0` to `^0.87.1` aligns it with `@earendil-works/pi-agent-core`, already at `^0.87.1`, but breaks the build: in 0.87 `TUI` is exported as a **type only**, so the five `new TUI(terminal)` construction sites are no longer valid. The package now ships two implementations of that interface, both extending `abstract class TuiBase`: `TuiMainScreen` (`mode: "regular"`, renders into the main terminal buffer and preserves terminal scrollback) and `TuiAltScreen` (`mode: "fullscreen"`, a fixed-height application-owned viewport in the alternate buffer, with mouse capture, scrollbars and search).
+
+All five sites take `TuiMainScreen`, the behavior-preserving successor. Both the dashboard and the agent screens render inline into the main buffer and rely on the terminal's own scrollback, so `TuiAltScreen` would be a UX change nobody asked for — and would begin capturing mouse input. Its constructor also differs (`(terminal, showHardwareCursor?, logDirectory?, options?)`), so it is not a drop-in even ignoring that.
+
+The five constructor errors were `TS2693`; each degraded the enclosing field's inferred type to `any`, which in turn produced 28 further errors across `src/tui.ts` (`TS2531` on every `this.overlay`/`this.tui` member access, `TS18047` on the `persistentTui` calls, `TS7006` on a callback that lost parameter inference) — 33 in total, all from the one root cause. Fixing the five sites cleared all 33, and `npm run typecheck` and `npm run build` are both clean.
+
+Note that neither `tsconfig.json` nor `tsconfig.server.json` sets `noEmitOnError`, so `npm run build` had been writing a `dist/` that did not typecheck; a fresh `dist/` timestamp is not evidence of a clean build.
+
+`src/tui.ts` used `TUI` only as a value, so its import is replaced outright rather than kept as an unused `type TUI`. `src/agent-session.ts` also uses it in a type position (`let persistentTui: TUI | null`), so it keeps `type TUI` and adds `TuiMainScreen`.
+
+**Not covered by tests**: no test constructs a TUI — the five sites are inside module-private entry points that need a real PTY. Verification was `npm run typecheck` (0 errors), `npm run build`, and the existing unit suite, which imports `src/agent-session.ts` and so would fail at import time were the `TuiMainScreen` export missing. That suite reports 12 pre-existing failures unrelated to this change and unreachable from pi-tui: 10 in `tests/unit/agent-tools.test.ts`, whose path-confinement assertions hardcode POSIX `/tmp/` while `src/agent-tools.ts` deliberately reports the platform temp dir (`C:\Users\<user>\AppData\Local\Temp` on Windows), and 2 in `tests/unit/config-loader.test.ts`, where a `url` alias inside an inline-table `[models.*]` entry parses to `''` instead of the URL.
+
+### fix(agent-session): trim transcript text before it reaches `Markdown`
+
+`src/agent-session.ts` — Every transcript line is handed to pi-tui's `Markdown`, which parses 4+ leading spaces as an indented code block. Ordinary command output — an `ls` or tree listing, a padded one-liner — therefore rendered inside ``` fences with per-character syntax highlighting, and output or replies opening with blank lines rendered as blank rows pushing the transcript down.
+
+Both `!` shell loops now `.trim()` the combined stdout/stderr once, at the source, before constructing the `Markdown`. This also removes an inconsistency in the first loop, which already guarded with `if (output.trim())` and pushed `output.trim()` into `shellOutputs` while rendering the untrimmed `output` — the transcript and the task prompt could show the same output differently.
+
+The streamed agent reply uses `.trimStart()` on the display copy only (`currentAssistantMessage.setText(…)`), leaving the `currentAssistantMessageContent` accumulator holding raw deltas: trailing whitespace is provisional mid-stream, and stripping it on every delta would flicker Markdown's two-space soft break.
+
+Interior indentation is preserved — a nested listing keeps its own 4-space children, since only the leading edge of the whole string is removed — and a genuine indented code block still renders as one.
+
+**Covered by tests**: `tests/unit/agent-session.test.ts` → `output trimming before Markdown` (6 tests) pin the component's own one-row top margin as the baseline, assert that untrimmed 4-space output does fence (the regression), assert trimmed output reaches exactly that margin with no fence and no source indentation, and assert interior indentation and intended code blocks survive.
+
+### feat(agent-session): full-width `──` rule above the bottom input row
+
+`src/agent-session.ts:329–349` — `RuledInput` wraps the pinned bottom `Input` and prepends a `'─'.repeat(width)` row, so the input row reads as visually separate from the scrolling conversation above it. pi-tui ships no separator component, so this is a wrapper rather than a fork: it forwards `focused`, `handleInput` and `invalidate` to the inner `Input` and renders the rule on its own line, leaving the inner component the full terminal width for its own text and cursor. `Math.max(0, width)` guards `String.repeat`'s `RangeError` on a pathologically narrow or zero-width terminal.
+
+An earlier iteration put a `│ ` gutter in front of the prompt character instead; that was removed at request and the class renamed from `PrefixedInput`.
+
+**Covered by tests**: 6 tests in `tests/unit/agent-session.test.ts` → `RuledInput` assert the rule is exactly `width` chars on the first row, that the inner input still renders from row 1 at full width, that the cursor marker stays on the input line and never leaks onto the rule, and that `focused` reads and writes pass through.
+
+### feat(agent-session): live progress and elapsed time during model verification
+
+`src/agent-session.ts` — The `AGENT=true` model picker verifies the chosen model with a loopback `/v1/messages` call before starting the session, and that round-trip can sit for many seconds with no output at all, so a slow or hung proxy was indistinguishable from a working one. The verify loop now prints a live in-place progress line — `\ checking… 3.1s` — reusing the existing `SPINNER_CHARS` set and `dim()` helper rather than introducing a second progress mechanism, at the same 150ms cadence as the TUI's running-task spinner.
+
+The elapsed total is appended to the outcome line either way, so a redirected run still reports duration: `[proxy] replied ok (3.1s)`, or `[proxy] verifying failed: model returned an empty reply (3.1s).`
+
+The animation is gated on `process.stdout.isTTY` and stays silent when stdout is redirected — the verification output goes to stdout via `console.log` (unlike the status bar, which deliberately uses stderr), and a line every 150ms would flood a log file. `stopVerifyProgress()` is idempotent, erases the partial line, and is called before every `console.error` so error text is never appended to a half-written progress line; error output stays plain, per the convention at the top of the file. The timer is declared inside the `while` body and cleared in `finally`, so picking a different model cannot leak an interval.
+
+**Not covered by tests**: the verify loop is inside `runAgentSession`, which is module-private, so this has no unit test — exercising the real path needs a live proxy and model. Only the escape-sequence logic was checked, by a byte-stream replica.
+
+### feat(agent-session): `/q` `/quit` `/exit` `/bye` end the loop from the TUI input row
+
+`src/agent-session.ts` — The four quit commands already existed as `QUIT_COMMANDS` and were honored at the task prompt, but `handleInputSubmit` forwarded **every** mid-run submission to `agent.followUp()`, so typing `/q` while the agent was working sent the literal string `/q` to the model as a prompt instead of stopping it. Quit commands are now intercepted before the `followUp()` branch: they set a new module-scope `quitRequested` flag, print `[π quit] exiting agent loop`, then call `agent.abort()` if a turn is in flight or resolve the pending next-task wait with `null` if idle.
+
+`quitRequested` also stops the queued-follow-up drain in `runAgentTurn`, exits the task loop, and suppresses the `[error]` render for the abort's own rejection (a deliberate quit is not an error). The per-turn summary reads `[π quit requested …]` rather than `[π task done …]` so an aborted turn is not reported as completed. The quit check runs before the budget acknowledgment, so a user who already asked to stop is not asked to confirm it again.
+
+Also fixed: the budget acknowledgment prompt reads "press enter or type /q to exit", but its resolver only accepted `null` or a quit command — blank input did nothing. It now accepts blank input too, matching the top-level loop's existing treatment of blank as end-of-session.
+
+**Not covered by tests**: `handleInputSubmit` and the task loop are module-private and the module's export surface is only its pure helpers, so the quit path has no unit test. Adding one would mean exporting TUI internals or driving a real PTY — a design change, not a test.
+
+### feat(agent-session): persistent TUI with mid-run followUp input
+
+`src/agent-session.ts` — Replaced throwaway TUI screens with a single persistent TUI that stays alive for the entire session. The conversation area streams assistant replies (text deltas, tool calls, tool results) as Markdown components; a pinned input row at the bottom accepts new prompts at any time. While the agent is running, submitted input is queued via `agent.followUp()` (one message per `followUpMode: "one-at-a-time"` drain) and rendered immediately as a user message. Between tasks, input becomes the next task prompt. Status bar shows live counts of skills/tools/results and budget usage.
+
+The in-flight task's line now animates its leading `>` through a `\ | / +` spinner (150ms per frame) and reverts to a static `>` once the turn settles, so the transcript itself shows which task is still running. Also fixed: the first text delta of each turn called `conversationArea.clear()`, which discarded the task line and all prior history — the conversation area now accumulates across turns as designed.
+
+Because that task line is rendered as `Markdown`, the `+` frame needs escaping: `+ ` at a line start is list syntax, and pi-tui draws it as a `-` bullet rather than a plus. `SPINNER_MD` therefore holds the same frames with `+` written `\+`, while `SPINNER_CHARS` stays bare for the stdout verification spinner, which is not Markdown. `runAgentTurn` also takes a `taskLabel` parameter defaulting to `task`, splitting what is sent to the model (`task`, the full payload including accumulated shell output) from what is shown in the transcript (`taskLabel`, the line the user actually typed).
+
+**Covered by tests**: 3 tests in `tests/unit/agent-session.test.ts` → `SPINNER_MD` assert each frame's escaped form and that rendering a frame through `Markdown` yields the intended glyph rather than a list bullet. **Not covered**: that the 150ms interval advances `spinnerTick`, and the `taskLabel` split — both are module-private wiring.
+
+### feat(agent): cross-platform bash tool + shell prefix in task prompt
+
+**Agent bash tool** (`src/agent-tools.ts`) now uses `cmd.exe /c` on Windows and `sh -c` on Unix — no longer requires Git Bash / `sh` in PATH on Windows.
+
+**Agent session** (`src/agent-session.ts`): input starting with `!` runs as a shell command in the working directory and its output becomes the new task input (e.g., `!git status`, `!npm test`). Works at both initial and follow-up task prompts.
+
+### feat(agent-session): accumulate multiple `!` shell outputs before task
+
+`src/agent-session.ts:1199–1235,1273–1310` — entering multiple `!cmd` lines accumulates their outputs; only when the user enters a non-`!` prompt are all shell outputs concatenated with the user input as the agent task. Entering nothing after `!` commands skips the turn (agent does nothing).
+
+### feat(tui, dashboard): version display as "(ver <version>)"
+
+`src/tui.ts:1171` and `src/handlers/dashboard.ts:583` — version now shown as `(ver dev)` / `(ver <version>)` instead of bare version string.
+
+### fix(server): dashboard URL uses 127.0.0.1 instead of 0.0.0.0
+
+`src/server.ts:197` — startup log now shows `http://127.0.0.1:7777/dashboard` (correct for local access) while server still binds to `0.0.0.0`.
+
+### fix(dashboard): button text "test model" → "test it"
+
+`src/handlers/dashboard.ts:2437` — composite alias test button renamed for brevity.
+
+### feat(dashboard): elapsed timer during model/alias testing
+
+`src/handlers/dashboard.ts:2653–2693` — test panel shows `Testing <modelId> takes <n>s …` updating every second until completion.
+
+### fix(agent-session): pipe spacing in process log
+
+`src/agent-session.ts:1093` — `results) |(` → `results) | (` for readability.
+
+### feat(tool-judge): dynamic tool relevance filtering via sidecar
+
+Added a **Tool Judge Sidecar** system that evaluates each tool's relevance against the user prompt before forwarding to the upstream. The proxy calls a local HTTP sidecar (`POST {url}/judge`) with the request state and tool list; the sidecar returns a relevance score (0.0–1.0) per tool. Tools scoring below the configured threshold are erased from the request. Fails OPEN — any sidecar error, timeout, or malformed response keeps all tools and logs a warning.
+
+- **Config** — New `[tool_judge_sidecar]` section in `proxy_config.toml` with `url`, `timeout_ms` (default 50ms), `threshold` (default 0.5), `mode` ("choice" per-tool or "noul" batch), `api_key`, `max_batch_tools` (default 50).
+- **Integration** — Runs after privacy filter & kompress, before model routing and static blocklist (`src/index.ts:1329–1345`).
+- **Protocol** — HTTP/JSON with `state` + `questions` request; `choice` type returns per-tool `keep`/`discard` with probabilities; `noul` type returns batch scores per tool name.
+- **Dashboard** — Web dashboard (`/dashboard`) and TUI (`P` overlay) show sidecar status: enabled/disabled, URL, mode, threshold, timeout, max batch.
+- **Static blocklist merge** — Sidecar-erased tools are merged with the existing dashboard/TUI manual blocklist (`src/utils/tool-blocklist.ts`).
+
+### fix(cross-platform): replace hardcoded `/tmp` paths with `tmpdir()` and normalize `resolve()` to `join()`
+
+Seven debug log sites across `src/handlers/dashboard.ts`, `src/handlers/messages.ts`,
+`src/index.ts`, and `src/tui.ts` wrote to the literal string `/tmp/test_model.log`,
+which fails silently on Windows (no such directory). All now use
+`join(tmpdir(), 'test_model.log')` so the OS temp directory is resolved correctly
+on macOS (`/var/folders/.../T`), Linux (`/tmp`), and Windows (`%TEMP%`).
+
+Three error messages in `src/agent-tools.ts` reported blocking paths outside the
+literal string `/tmp/`, but the actual allowed temp root is `TMP_ROOT_RAW` (from
+`os.tmpdir()`). Messages now interpolate `${TMP_ROOT_RAW}` so the reported path
+matches the enforcement logic on every platform.
+
+Five path-construction sites in `src/agent-session.ts` used `resolve()` with
+embedded forward slashes (`'.pi/agent/skills'`, `'.agents/.skill-lock.json'`,
+`'.pi/skills'`) where `join()` is the correct API for joining path segments.
+Changed to `join()` for consistency with the rest of the codebase and to avoid
+the (harmless but misleading) appearance of POSIX-only paths in Windows builds.
+One `resolve()` at line 338 was kept for path normalization of user input.
+
+### build(sea): name `build:native` output with the host target triple
+
+`outputName()` in `scripts/build-sea.js` now emits
+`model-proxy-v3-<host target triple>` — `-x86_64-apple-darwin`,
+`-aarch64-apple-darwin`, `-x86_64-unknown-linux-gnu`,
+`-aarch64-unknown-linux-gnu`, `-x86_64-pc-windows-msvc.exe`,
+`-aarch64-pc-windows-msvc.exe` — instead of the platform-tagged `-macos-<arch>`
+/ `-linux-<arch>` / `-win.exe` names. That is the shape Tauri's `externalBin`
+expects on disk (it appends `-<triple>`, plus `.exe` on Windows, to the untagged
+entry), so the tray's `stage-sidecar.sh` copies the SEA across with no rename.
+Windows ARM is now named `aarch64-pc-windows-msvc` rather than being left
+arch-agnostic as `-win.exe`.
+
+### feat(config): resolve the default config path in the working directory or the home directory
+
+When `PROXY_CONFIG_PATH` is unset, the default is no longer the bare relative
+`./proxy_config.toml`. `resolveDefaultProxyConfigPath()`
+(`src/utils/config-loader.ts`) now returns `./proxy_config.toml` when it exists
+(the repo checkout in dev), else `~/.config/model-proxy-v3/proxy_config.toml`,
+creating the home directory (`~/.config/model-proxy-v3`) so there is somewhere to
+drop a config. Used by both `src/server.ts` and `src/cli.ts`; the RPC and
+dashboard paths read `env.PROXY_CONFIG_PATH`, so they inherit it.
+
+This is what lets the Tauri tray spawn the SEA sidecar with no environment
+(`docs/design_tauri_tray.md` §7): a GUI app's working directory is not the repo,
+so the old relative default read the wrong file or none. A config dropped in
+`~/.config/model-proxy-v3/` is now found. The `TEST_CONFIG` override in
+`src/server.ts` keeps precedence over this default.
+
+### feat(rpc): add `--rpc` JSON-RPC 2.0 control channel on stdio
+
+`--rpc` starts a newline-delimited JSON-RPC 2.0 server on stdio alongside the
+HTTP server, so an external supervisor (the Tauri tray in
+`docs/design_tauri_tray.md`) can start, inspect and control the proxy over the
+same pipe that carries its process handle — no port to discover and no key to
+pass. It is a *mode*, not a CLI command: `src/server.ts` strips it from argv
+before `runCli()`, and it is mutually exclusive with `AGENT`/`TUI` (all three
+own stdout), failing loud with exit 2 rather than picking a winner.
+
+`src/rpc.ts` is lazily imported from inside the `server.listen` callback, so the
+HTTP socket is already bound before the first request is read — a reply to
+`status.get` proves the port is live, and no readiness probe is needed. Stdin
+EOF calls the existing `shutdown()`, so the proxy cannot outlive the core that
+spawned it (an orphan would hold port 8788).
+
+Every method dispatches to a function the proxy already exposes
+(`src/handlers/dashboard.ts` and the config loader); the RPC layer adds no new
+state. Notifications are **poll-derived** (1 s, emit-on-change) rather than
+instrumented into the request path, which is why `src/index.ts` and
+`src/utils/dashboard-stats.ts` are untouched: `stats.tick` reads
+`getActiveRequestCount()`/`getTokensInWindow()`, and `config.changed` polls the
+config file's mtime. The method and notification tables, error codes and
+lifecycle are specified in `docs/design_tauri_tray.md` §3.
+
+### fix(server): route proxy diagnostics to stderr
+
+`src/server.ts` now redirects `console.log`/`info`/`debug` to stderr at startup,
+so stdout carries only machine-readable output — CLI subcommand payloads
+(`src/cli.ts` writes those with `process.stdout.write`) and, in `--rpc` mode, the
+NDJSON JSON-RPC control channel (see `docs/design_tauri_tray.md`).
+
+Previously every proxy log level, including `warn` and `error`, went to stdout
+via `console.log` in `src/utils/logger.ts`; a single log line on stdout would
+have been parsed as a corrupt JSON-RPC frame. Redirecting the methods in one
+place covers the direct `console.log/info/debug` call sites in
+`src/utils/key-store.ts` and `src/utils/privacy-filter.ts` as well, and any
+`console.log` added later. `console.error`/`warn` already wrote to stderr.
+
+`AGENT=true` is covered too, but its task output is unaffected: the streamed
+reply deltas and the pi-tui prompts are written with `process.stdout.write`, so
+they stay on stdout, while its status/progress lines (the in-place
+`printProcessLog` line in `src/agent-session.ts` now writes to stderr) land with
+the proxy's logs. Docker is unaffected (`Dockerfile` has no redirection; both
+streams go to the container log), as are TUI mode (which overrides these methods
+again) and the Cloudflare Workers target (no stdout/stderr split — the logger is
+unchanged).
+
+### fix(agent): shorten the model-picker verification prompt
+
+The `AGENT=true` model picker verifies a chosen model with a loopback
+`/v1/messages` call before starting the session. It asked
+`"hi, which model and agent are right here?"`, but the candidate Agent is built
+with the full system prompt and tool set, so the model read that as a real task
+and started exploring the working directory instead of answering — slow, and
+redundant since the picker line already names the model.
+
+The prompt is now `Reply "ok". Do not use tools.` (`VERIFY_PROMPT` in
+`src/agent-session.ts`, shared by the display line and the call so the two can't
+drift). The gate is unchanged: a reply is still required and an error still
+sends you back to the picker.
+
+### feat(passthrough): `/passthrough/v1/*` verbatim upstream forwarding
+
+New routing mode: a request to `/passthrough/<path>` is forwarded verbatim to a
+configured upstream, bypassing model routing, composite selection, schedule,
+transforms, privacy filtering, and kompress. The client's path and body are
+relayed unchanged; only the auth header is rewritten when the target declares
+`key`.
+
+Configured with inline tables under a single `[passthrough]` section (short
+field names are canonical; `base_url`/`url`, `api_key`/`key`, `upstream_mode`/
+`mode` are accepted as aliases):
+
+```toml
+[passthrough]
+openai = {base = "https://api.openai.com", mode = "openai-completions", share = 1}
+# key = "sk-..."   # optional; overrides the client key upstream
+```
+
+Behavior (see `docs/design_passthrough_mode.md`):
+
+- **Endpoint → mode** is a fixed map: `/v1/messages` and
+  `/v1/messages/count_tokens` → `anthropic-messages`; `/v1/chat/completions` →
+  `openai-completions`; `/v1/responses`, `/v1/responses/input_tokens`,
+  `/v1/responses/compact` → `openai-responses`; `/v1/interactions` →
+  `gemini-interactions`; `/v1beta/models/*` and `/v1/models/*` with a
+  `:generateContent`/`:streamGenerateContent`/`:countTokens` action →
+  `gemini-generatecontent`. An unmapped path is a 404.
+- **Candidates** are the targets whose `mode` matches, picked by weighted random
+  on `share` (default 1) — the weight only applies within a pool, so a `mode`
+  with a single target always uses it whatever its `share`. No candidates for
+  that mode is a 404.
+- **Schema gate**: a body that does not match the mode's required shape is a 400
+  (`messages[]` for the completions/messages modes, `input` for responses and
+  interactions, `contents[]` for generateContent).
+- **URL** is a plain join — `stripTrailingSlash(base) + '/' + path` — so a base
+  already ending in a path prefix (e.g. `https://gw.example.com/anthropic`)
+  composes as written and the client path is never rewritten.
+- **Retained**: the global client-key presence check, the `auth_server` gate,
+  logging, upstream status recording, per-target `timeout`, and usage recording
+  (streaming and non-streaming) keyed on the body's `model` (or `unknown` when
+  the body carries none). `[remote].record_server` receives the same payload as
+  the normal routes. `[general] global_token_limit` is also enforced — it runs
+  before dispatch, so a passthrough request is refused once the window limit is
+  reached. Endpoint stats include `/passthrough/v1/*` in both the request-count
+  and the timing tables (min/avg/max), recorded on the request path like the
+  normal routes — time-to-first-byte for SSE.
+- **Credential**: `target.key` wins when set, otherwise the caller's key is used.
+  Either way the credential is re-emitted in the header the mode actually reads —
+  `x-api-key` (`anthropic-messages`), `x-goog-api-key` (Gemini), or
+  `Authorization: Bearer` (OpenAI) — and the other credential headers are dropped,
+  so an upstream never receives two credentials and an `anthropic-messages`
+  upstream gets `x-api-key` rather than a Bearer token it would ignore.
+  Non-credential headers (e.g. `anthropic-beta`) are forwarded unchanged.
+- **NOT applied — local token counting**: `LOCAL_TIKTOKEN` and the native
+  `count_tokens` handler do not run for passthrough requests.
+  `/passthrough/v1/messages/count_tokens` is forwarded verbatim to the upstream,
+  so the returned count is the upstream's, never a local tiktoken estimate.
+- **Streaming usage caveat**: the request body is forwarded byte-for-byte, so the
+  proxy never injects `stream_options.include_usage`. For an `openai-completions`
+  SSE stream whose request omits it, the upstream usually drops the final usage
+  chunk and no tokens are counted — a warning is logged per such request.
+  `anthropic-messages` / `openai-responses` / Gemini streams carry usage natively
+  and are unaffected.
+- **SSRF**: `[passthrough]` target `base` hosts are added to the shared
+  `getAllowedHostsFromConfig` allowlist, the same list `[models.*].base_url`
+  hosts feed — so they also become reachable through the existing
+  `/http/<host>/…` dynamic route (design doc §11.13).
+- **Key store**: `[passthrough]` target `key`s are covered by
+  `[general] store_key_in_system`, like `[models.*]` api_keys. Since a
+  passthrough target has no model id, its keychain account is
+  `passthrough.<name>/<base>`.
+
+Integration suite `tests/integration/18_passthrough/` (TC5101–TC5111) covers the
+mode mapping, usage-counted-once behavior, 404/400 gates, and the plain-join URL.
+
+### fix(config): short field names in a `[models.*]` section are now a reported error
+
+A `[models.<category>]` section takes only the long field names (`upstream_mode`,
+`base_url`, `api_key`); the short aliases (`mode`, `url`, `key`) belong to inline
+entries and `[passthrough]` targets. Writing a short alias at section level used to
+drop the key silently — the target lost its base_url/mode/key with no message. It is
+now reported as a config error (TUI/dashboard status and console), naming the long
+form to use. Inline entries keep accepting both forms.
+
+### fix(stats): native Anthropic responses were counted twice
+
+Token usage for `/v1/messages` against an `anthropic-messages` upstream was
+recorded twice, so the dashboard, the TUI, and `[remote].record_server` all saw
+2× the real token counts for that path.
+
+`src/handlers/claude.ts` recorded usage itself — it teed the SSE body and piped
+one branch through `createUsageTrackingTransformStream(accountingModel)`, and on
+the non-streaming branch it parsed a clone and called `recordModelUsage` /
+`recordUpstreamResponseToolNames` directly. But `src/index.ts` wraps *every* 2xx
+response after the handler returns: `text/event-stream` bodies get the same
+tracker, `application/json` bodies get `extractUsageFromResponsePayload` →
+`recordModelUsage`. `recordModelUsage` accumulates with no dedup, so both
+recorders fired for the same bytes and the same model id. The handler-local
+recorder predates the centralized block in `index.ts` and was left behind when
+it was added.
+
+`claude.ts` now returns the upstream body untouched and does no usage or tool
+recording — `index.ts` already covers it, and covers more: composite-alias
+windows, the remote `record_server` call, `record_response_body`, and tool names
+attributed to the calling agent (the handler-local copy dropped that
+attribution). The one behavior change: when `attemptModelId` is undefined the
+handler's `requestBody.model` fallback used to record local token stats, and that
+degenerate path now records none. `attemptModelId` is always set for
+`/v1/messages` in practice (`route.modelAlias || candidateName`).
+
+New suite `tests/integration/17_token_counting/` (TC4101–TC4105) guards this.
+Each case sums `total_tokens` across all rows of `GET
+/dashboard/api/stats/models` before and after one request and requires the delta
+to equal the usage the client was told about — exactly once, so a 2× delta
+fails. It covers non-streaming and streaming `/v1/messages`,
+`/v1/chat/completions` (including the force-injected
+`stream_options.include_usage` chunk), and Gemini `:streamGenerateContent?alt=sse`.
+Candidates are discovered from the live config per upstream mode, so the suite is
+not tied to particular model ids; unusable candidates print `(skipped: ...)`.
+Verified by restoring the old tee: TC4102 fails with `delta 50 != 25 (2x)`, and
+passes with the fix.
+
+### feat(cli): `--export-openclaw-providers`
+
+The CLI gained `--export-openclaw-providers`, which prints the `models.providers`
+block for an OpenClaw config (`~/.openclaw/openclaw.json`) — a single provider
+(`model-proxy-v3`, the same id `--export-pi-models` uses) holding one entry per
+configured target model and alias, each pointed at this proxy's loopback origin.
+Like `--export-pi-models` it prints to stdout and writes nothing, so the output
+can be merged into an existing config by hand; `models.mode` is `merge`, so
+importing it does not drop OpenClaw's other providers. The provider declares
+`api: 'anthropic-messages'` and `auth: 'api-key'`, and its `apiKey` is the same
+dummy `sk-hi` — the proxy's client auth is a presence check, and configured
+target `api_key` values are never emitted. Model entries carry
+`id`/`name`/`reasoning`/`input`/`cost`/`contextWindow`/`maxTokens` from the
+shared `buildProxyPiModel`, inheriting `api` and `baseUrl` from the provider.
+
+The previously unreferenced `OpenClaw*` interfaces in `config-loader.ts` were
+also corrected to the real schema: `models.providers` is an object keyed by
+provider id (not an array), the api field is `api` (not `apiSchema`), and the
+provider block carries `auth`.
+
+### fix(build): `build:native` fails fast on a Node that cannot host SEA
+
+`npm run build:native` on Homebrew Node 26.4.0 died at the blob step with a bare
+`Error: Command failed: .../node --experimental-sea-config ...` wrapping "Single
+executable application is disabled." — after the typecheck and the esbuild
+bundle had already run, and without naming either of the two real causes. That
+bottle is built with SEA compiled out (`single_executable_application=false`)
+*and* is a shared-library build (`node_shared=true`: a ~37KB launcher plus
+`libnode.147.dylib`), so it can neither generate a blob nor have one injected
+into it — the fuse lives in the dylib, not in the launcher this script patches.
+
+`scripts/build-sea.js` now runs `assertSeaCapableHost()` before anything else,
+checking both flags and reporting every problem it finds plus the fix: build
+with an official, self-contained Node (nodejs.org, nvm, `actions/setup-node`),
+or, without touching the system Node, `npx --yes --package=node@26 node
+scripts/build-sea.js`. The header comment is corrected to match — it previously
+offered binary size as the test and claimed `--experimental-sea-config` "passes
+on the unusable stub", which stopped being true on Node 26.
+
+The native build was previously undocumented outside this changelog; README now
+has a **Deployment → Native single-file binary** section giving `npm run
+build:native` and the `npx` backup above.
+
+### feat(cli): config inspection subcommands on the server entrypoint
+
+`dist/server.js` now parses its own argv (`src/cli.ts`) before listening: with no
+arguments it starts the HTTP server exactly as before, and with `--list-models
+[--json]`, `--validate-config`, `--export-pi-models`, or `--help`/`-h` it runs that
+command and exits. This gives a way to check what a config file actually
+resolves to (targets, composite/schedule aliases, inherited `base_url`/`mode`)
+without booting the proxy or opening the dashboard, and to feed the configured
+aliases to a pi-agent-core session as `Model` objects.
+
+`--export-pi-models` emits the `~/.pi/agent/models.json` file shape — a single
+`providers` entry (`model-proxy-v3`) holding one pi-ai `Model` per target model
+and alias — so its output can be merged straight into that file. The provider's
+`apiKey` is the dummy `sk-hi`: the proxy's client auth is a presence check, and
+configured target `api_key` values are never emitted.
+
+It also carries the `defaultProvider`/`defaultModel` pair pi keeps in
+`~/.pi/agent/settings.json`, so one command covers both files. `--default-model
+<id>` picks the default (must be a configured model or alias — otherwise a usage
+error); when omitted it falls back to the first configured model.
+
+The commands read the local TOML only (`$PROXY_CONFIG_PATH`, default
+`./proxy_config.toml`) — Consul/Apollo remote sources are deliberately not
+consulted. `--list-models` reuses `toDashboardConfigPayload`, so `--json` is the
+same sanitized shape the dashboard serves with `api_key` values stripped; its
+table lists each composite/schedule alias target on its own line (long target
+lists were unreadable comma-joined into one cell), with a space before each
+target's attribute list (`grok46 (share=10)`), and prints no dash rule under
+the headers, keeping `MODE` as the last column of the target-models table;
+`--validate-config` reuses the parser's own validation (`parseSimpleToml` logs each
+finding and records the arrays) rather than running a second set of checks.
+
+To keep the CLI off the production dependency graph, the pi-ai `Model` builder
+moved to `src/utils/pi-model-catalog.ts` (dependency-free) — `pi-ai` is a
+devDependency not shipped in the image, so `agent-session.ts`'s `buildSelfModel`
+now delegates to it, and the shared provider id lives there too instead of being
+duplicated. The shared builder's default `input` is now `['text']` (previously
+`['text', 'image']`), so both the export and the agent session declare
+text-only input; its `reasoning` is now `true` (previously `false`), so pi
+treats the proxy's aliases as reasoning-capable in the exported models file and
+in agent sessions alike.
+
+Exit codes: `0` success / `1` command failed (unreadable or invalid config) /
+`2` usage error. Covered by `tests/unit/cli.test.ts`.
+
+### fix(agent): pass a `Context` to `loadSkills()` after the pi-agent-core 0.85 bump
+
+`@earendil-works/pi-agent-core` moved from `^0.81.1` to `^0.85.1`, and in that
+range `loadSkills()` grew a third parameter: `loadSkills(env, dirs, context)`.
+The context is a `@earendil-works/chord` `Context`, threaded into every
+`ExecutionEnv` call the loader makes (`fileInfo`, `listDir`, `readTextFile`, …)
+so directory walks can be cancelled and attributed to a telemetry parent. The
+build failed with `TS2554: Expected 3 arguments, but got 2` at all three call
+sites.
+
+Each site now passes `BACKGROUND_CONTEXT` — the shared non-cancellable root
+context, which is what these loads are: they run outside any request/session
+scope (skill discovery at startup and the `add_skill` tool's post-install
+re-read), so there is no parent context to derive from and nothing to cancel.
+
+### fix(build): quote cmd.exe words so `build:native` runs on Windows
+
+`npm run build:native` failed on Windows before it reached SEA. `run()`
+(`scripts/build-sea.js`) uses `shell: true` on Windows because `npx` there is
+`npx.cmd`, and `execFileSync` with a shell joins the command and argv with plain
+spaces and escapes nothing — so cmd re-split every word on whitespace before the
+child saw it. The esbuild banner (`--banner:js=const __SEA_IMPORT_META_URL__ =
+...`) was the first casualty: esbuild received the fragments as extra positional
+inputs and rejected the build with "Must use outdir when there are multiple
+input files". The next step failed the same way with `process.execPath` —
+`C:\Program Files\nodejs\node.exe` — which cmd truncated to `C:\Program` ("is
+not recognized as an internal or external command").
+
+The fix adds `quoteForCmd`, applied to the command and every argument when a
+shell is used: words containing whitespace or a cmd control character
+(`&|<>^()`) are wrapped in double quotes, which cmd strips before exec while
+preserving the inner text (the banner's single quotes survive). Bare words are
+left untouched so POSIX argv is unchanged and a path ending in a backslash is
+not mis-parsed as an escaped quote. A word containing a literal double quote —
+which no argument here does — fails loud rather than mis-quote.
+
+### feat(build): the win32 single-executable build stores keys in its own file body
+
+`store_key_in_system = true` now works inside the **win32** SEA binary.
+`@github/keytar` needs too many dependencies on Windows (Visual Studio Build Tools
+with the C++ workload + Python 3, via node-gyp) to be worth carrying into
+a self-contained single-file distribution, so the win32 build substitutes an
+in-binary store there: `loadKeytar`'s failure falls through to
+`tryBodyKeyStore()` (`src/utils/body-key-store.ts`), which returns a
+`KeytarLike` (`src/utils/key-store.ts:37-42`, unchanged) whose backing store is
+the executable's own file body (`process.execPath`): each `setPassword` appends
+one `{service, account, password}` record at EOF via `src/utils/body-record.ts`,
+and reads walk the record chain backwards, newest-per-account winning. macOS and
+Linux are unchanged — they keep the OS keychain via `@github/keytar` — and
+Docker, Workers, and macOS/Linux SEA binaries keep the fatal `KeyStoreError`.
+The record format (`$ReCorDeR` tail, CRC32, backwards-linked list) is the one from
+`store-in-body`, ported path-parameterized; CRC32 is a local table
+implementation rather than `node:zlib`'s, which would add a `>=20.15` floor the
+Workers/`nodejs_compat` module graph should not inherit.
+
+The gate (`tryBodyKeyStore`) is deliberately narrow — `process.platform ===
+'win32'`, a real SEA binary (`node:sea` `isSea()`, imported through a
+non-literal specifier like the existing `KEYTAR_MODULE` so no bundler resolves
+it statically), and an `execPath` basename that is not `node`/`node.exe`. Any
+gate failing returns `null` and the caller keeps its existing fatal error, so
+the body store can never be pointed at a plain Node install.
+
+Appending to a **running** `.exe` is not the reference's single rename: a
+Windows image cannot be renamed-over by name while mapped. So `appendRecord`
+tries the cheap path first — open `self` `'r+'` and append at EOF with no copy
+of the ~110 MB binary — and only if Windows denies that open falls back to
+copy → append → `rename(self → self.<uniq>.old)` → `rename(tmp → self)`, with
+the leftover `.old` swept on the next start and a restore-from-`.old` if the
+swap half-completes. The `.old` name is unique per append because a fixed name
+is un-renamable-over (the first `.old` is the still-mapped original).
+
+**Security: the records are plaintext inside the `.exe`.** That is not secrecy
+— anyone who can read the binary can read the keys — the gain is a
+self-contained single-file distribution whose keys travel with the binary
+instead of sitting in `proxy_config.toml`. It is a downgrade from an OS
+keychain, needs a writable directory beside the executable, and is wiped by a
+rebuild (a fresh blob is injected into a fresh copy of `node`). Documented in
+[README.md](./README.md) and
+[docs/configuration-reference.md](./docs/configuration-reference.md); the
+`scripts/build-sea.js` banner and `EXTERNALS` comment now say win32 is
+supported rather than fatal.
+
+New tests: `tests/unit/body-record.test.ts` (round-trip, oldest→newest order,
+link chain, CRC-corruption stopping the walk, non-linking to a foreign tail,
+the swap flow end-to-end, stale-swap sweep) and
+`tests/unit/body-key-store.test.ts` (set/get, miss → `null`,
+last-write-wins, `findCredentials` latest-per-account service-filtered,
+malformed record throwing loud, and the non-win32 gate returning `null`). The
+Windows *semantics* — which tier engages, and a read-only directory failing
+loud — still need a real Windows host; that is called out in the plan.
+
+### feat(remote): send `version` on the stats usage record
+
+The proxy now sends a `version` field on every `ModelUsageRecordPayload` POSTed
+to `[remote] record_server`. `src/utils/model-usage-recorder.ts` gains a
+`PROTOCOL_VERSION = 'v1'` constant, set as `version` in
+`buildModelUsageRecordPayload` — a fixed proxy constant, sent on every record
+regardless of the auth response (the proxy does not echo the auth service's
+advertised era). The stats service does not validate it: the POST is
+fire-and-forget and the proxy still reads only `response.ok`.
+
+The stats **response** body carries no `version`: only the auth `200` body
+advertises the contract era. `tests/scripts/mock-auth-stats-server.js` answers
+`/v1/model-usage` with `{ "ok": true }` (was `{ "version": "v1", "ok": true }`)
+and now logs the received `version` from each record; `PROTOCOL_VERSION` remains
+on the `/v1/validate` response. [docs/architecture/auth-stats-protocol.md](docs/architecture/auth-stats-protocol.md)
+documents the auth `200` example body (`version` + a two-rung `targets[]`
+ladder) and the `ModelUsageRecordPayload` `version` field.
+
+### feat(remote): require `version` on the auth `200` response
+
+The auth service's `200` body **must** now carry a non-empty string `version`
+(the bundled sidecar sends `"v1"`). A `200` whose body is missing `version`, is
+not a JSON object, or carries a blank/non-string value is rejected with `401`
+before any routing — a service that does not speak the versioned contract fails
+loudly instead of being silently trusted (previously the field was advisory and
+ignored). The check is a *presence* check; `"v1"` is the current contract era.
+The stats `POST` is fire-and-forget and its response never gates the client, so
+its `version` field remains unenforced. New helper
+`hasRequiredProtocolVersion` in `src/utils/target-retry.ts`; the gate lives in
+`src/index.ts` (401 on failure).
+
+### test(mock): `/v1/` route prefix, `version` field, ladder externalized to mock_targets.json
+
+`tests/scripts/mock-auth-stats-server.js` now serves `/v1/validate` and
+`/v1/model-usage` (was `/validate` / `/model-usage`), and both `200` responses
+carry a `version` body field (`PROTOCOL_VERSION = "v1"`) advertising the
+wire-contract era. The auth ladder moved out of the source into
+`tests/scripts/mock_targets.json`, which the server reads at startup (fails loud
+if missing or invalid); `MOCK_TARGETS_JSON` still overrides it inline. The
+`version` field is required by the proxy (see the entry above); see
+[docs/architecture/auth-stats-protocol.md](docs/architecture/auth-stats-protocol.md).
+
+### change(remote): raise the default `[remote] max_targets` ladder cap from 4 to 16
+
+The auth `targets[]` failover ladder's default attempt bound is now `16` (was
+`4`). The knob itself is unchanged — an explicit `[remote] max_targets` still
+overrides the default, and entries are still deduped then truncated to the cap.
+
+### feat(remote): per-rung `retry` override on the auth `targets[]` ladder
+
+An auth `targets[]` descriptor may now carry a `retry` (non-negative integer)
+field that overrides `[remote] max_target_retries` for that rung only, falling
+back to the config default when absent — so one ladder may mix a rung that
+retries twice with rungs that retry once (or not at all, `retry: 0`). `retry_on`
+still gates which statuses trigger a same-rung retry; `retry` only sets the
+count. The per-rung `timeout` field is unchanged (milliseconds). The mock auth
+sidecar's default ladder now emits `timeout: 10000, retry: 1`.
+
+### test(mock): auth sidecar validates the client key, then selects rungs by alias
+
+`tests/scripts/mock-auth-stats-server.js` `/validate` now models the real auth
+contract end-to-end:
+
+- It reads the CLIENT's original key (the one the proxy forwards under
+  `auth_passthrough_with = "user_key"`) from `x-api-key`, then a Bearer
+  `Authorization`, then `x-goog-api-key`, and checks it against a
+  `MOCK_USER_KEYS` allowlist (comma-separated, default `sk-test`). A key
+  matching none — or none presented — is rejected with `401`.
+- On a valid key it returns the configured ladder filtered by alias: only rungs
+  whose `alias` equals the request body's `model` are served; no match (or no
+  model) yields `{ targets: [] }`, so the proxy falls back to normal config
+  resolution.
+
+### fix(remote): drop host allowlist for auth-ladder rungs; replace `section:'free'` hack
+
+The auth `targets[]` failover ladder no longer validates a rung's `base` host
+against the config host allowlist. The auth server is a trusted routing
+authority and a descriptor is self-contained, so its destination need not appear
+as a configured model `base_url`; previously such rungs were silently dropped
+(`base host '…' is not allowed`). Only the `base` URL **syntax** is still checked.
+
+- `src/utils/target-retry.ts` — `validateEntry` drops the `isHostAllowed` check
+  (keeps `new URL` well-formedness). The unused `DescriptorValidationOptions`
+  interface (and its `allowedHostsEnv` / `defaultMode` fields), the
+  `validateDescriptorEntries` `opts` parameter, and the now-unused
+  `isHostAllowed` import are removed. Call site `src/index.ts` updated to
+  `validateDescriptorEntries(rawTargets)`.
+- `descriptorToRoute` no longer sets `section: 'free'` to force a rung's key
+  upstream. It sets a new `ModelRouteConfig.explicitApiKey` flag instead, and
+  `buildRouteAttempt` (`src/index.ts`) applies the key when
+  `route.explicitApiKey` is set — removing the abuse of the unrelated
+  `[models.free]` section semantics.
+- `README.md` and the `tests/scripts/mock-auth-stats-server.js` docblock/banner
+  updated to state rung hosts are not allowlist-checked. Tests updated: unit
+  allowlist tests now assert any well-formed host is accepted; new integration
+  case **TC4010** covers a non-config, non-loopback rung host.
+
+### fix(dashboard): single shared `UPSTREAM_MODES` list (adds `gemini-interactions`)
+
+`gemini-interactions` was already a valid `upstream_mode` at runtime (the
+failover ladder accepted it) but two authoring lists omitted it, so the dashboard
+model-target wizard could not offer it and `upsertModelTarget` rejected it as an
+invalid mode. The upstream-mode list was also duplicated across several modules
+that had drifted out of sync.
+
+- New `src/utils/upstream-modes.ts` exports the single `UPSTREAM_MODES` constant
+  (and `UpstreamMode` type) — the authoritative order is `openai-completions`
+  first, which is also the wizard's default new-target mode.
+- `src/utils/config-loader.ts`: the local `MODEL_TARGET_UPSTREAM_MODES` const is
+  removed; `upsertModelTarget` validates against `UPSTREAM_MODES`. (Its old type
+  was `TransformSchema[]` — the wrong type: this is an upstream-mode whitelist,
+  not a transform-set schema, and `gemini-interactions` has no `SCHEMA_PATHS`
+  entry.)
+- `src/utils/target-retry.ts`: the local `KNOWN_MODES`/`KnownMode` are removed in
+  favour of `UPSTREAM_MODES`.
+- `src/handlers/dashboard.ts`: the wizard's `MODES`, the category-level
+  `upstreamModeSelect`, and the per-model `perModelModeSelect` now interpolate
+  `UPSTREAM_MODES` via `JSON.stringify`, so the embedded client script cannot
+  drift from the server list again.
+- `upsertModelTarget` unit test and the TC720 comment updated to the five-mode set.
+
+### feat(remote): flat `[remote]` config table + auth `targets[]` failover ladder
+
+The `[remote]` config is now a **single flat table** (breaking — see below), and
+the auth service's `200` response body may carry a `targets[]` **failover
+ladder** that the proxy walks before falling back to config-file model
+resolution.
+
+**Breaking config rename.** The nested `[remote.authentication]` and
+`[remote.recording]` subsections are **removed**; their fields move to the flat
+`[remote]` table under role-prefixed keys (`auth_*`, `record_*`). There is no
+dual-parse — a config still using a nested subsection triggers a `console.warn`
+naming the flat replacement, and its fields are no longer read.
+
+```toml
+[remote]
+auth_server           = "https://auth.example.com/validate"
+auth_with_model       = false
+auth_with_body        = false
+auth_passthrough_with = "user_key"
+max_targets           = 4        # cap on the targets[] ladder attempts
+max_target_retries    = 1        # per-descriptor retry_on re-hits (0 disables)
+record_server         = "http://127.0.0.1:8080/model-usage"
+record_response_body  = false
+```
+
+- **auth `targets[]` failover ladder**: when the auth `200` body carries a
+  `targets` array, each entry is a **self-contained descriptor** (`target` +
+  `base` required; `mode` / `key` / `otac` / `transforms` / `timeout` /
+  `retry_on` optional) and the proxy owns routing for that request — skipping
+  `[models.*]` / `[composite]` / `[schedule]` resolution.
+- **A rung's `key` replaces the caller's credential**: a non-empty descriptor
+  `key` is sent upstream in place of the caller's key (it overwrites the mode's
+  auth header, not adds to it) and needs no `auth_passthrough_with = "config_key"`
+  opt-in; an entry without a `key` still forwards the caller's credential, so a
+  ladder may mix server-pinned and caller-supplied keys. Documented as a Notice
+  in `README.md` and `docs/architecture/auth-stats-protocol.md`.
+- **Two retry axes**: axis 1 advances the ladder on `429` / any `5xx` / transport
+  (→`502`) / abort-timeout (→`504`), bounded by `max_targets`; a deterministic
+  `4xx` is terminal. Axis 2 re-hits the same rung per a descriptor's `retry_on`,
+  bounded by `max_target_retries`. An invalid entry is dropped (logged) and the
+  ladder continues — including when it is `targets[0]`; if all entries are
+  invalid (or the body is empty / not-JSON / not-`200`), normal config
+  resolution runs.
+- **dispatch keys reserved**: `dispatch_server`, `max_dispatches`,
+  `dispatch_timeout_ms`, `buffer_non_sse` are parsed but **not yet implemented**
+  (the on-failure dispatch path is deferred).
+- New `src/utils/target-retry.ts` (descriptor parsing / validation / capping)
+  with unit tests; `tests/integration/16_security/target_retry_ladder.test.js`
+  covers failover, terminal-4xx, same-target `retry_on`, and the composite
+  short-circuit.
+
+### fix(responses): shorten flattened namespace tool names over the 64-char `function.name` limit
+
+Follow-up to the prefixed-name flattening entry below. Chat Completions (and
+Anthropic/Gemini) cap `function.name` at 64 chars in addition to the
+`[a-zA-Z0-9_-]` charset, so a `<namespace>_Z_<tool>` flattened name built from
+long namespace and tool names would be rejected by the upstream.
+
+- `flattenNamespaces` now shortens any flattened name longer than 64 chars to a
+  readable truncated head plus a per-request monotonic counter (e.g.
+  `<head>_1`), which keeps the name identifiable while guaranteeing distinct
+  long names never collide.
+- The namespace map is generalized from `Map<flatName, namespacePath>` to
+  `Map<flatName, { name, namespace? }>` (exported `NamespaceMap` /
+  `NamespaceMapEntry`), so the original bare `name` is recovered by a single
+  map lookup rather than by slicing the namespace prefix off the (possibly
+  shortened) flat name. Both reverse sites
+  (`convertCompletionsToResponses` and the `splitNamespace` helper in
+  `streamCompletionsAsResponses`) use the lookup.
+- `tests/unit/responses-completions-roundtrip.test.ts`: map-shape assertions
+  updated, plus a new test that an over-64 flattened name shortens to exactly
+  64 chars and round-trips to the original `name`/`namespace`.
+
+### fix(responses): prefix flattened namespace tool names and restore the `name`/`namespace` split on `function_call` output items
+
+Follow-up to the namespace flattening in "fix(responses): flatten
+`namespace`-wrapped tools..." below. That entry discarded the namespace name
+entirely, which caused two problems: (1) two namespaces containing a tool with
+the same bare name flattened to duplicate keys in the Chat Completions
+`tools[]` array, and (2) when the upstream called a flattened tool, the
+resulting `function_call` output item carried only the bare `name` with no
+`namespace`, so the client couldn't tell which namespace produced the call —
+even though the Responses API spec gives `function_call` a separate optional
+`namespace: string` field alongside `name` (`docs/openai-response-final.md`).
+
+- **Flatten with prefixed names**: `flattenNamespaces` now renames each leaf
+  tool to `<namespace>_Z_<tool>`, nesting joined with `_Z_` at every level
+  (e.g. `outer_Z_nested_Z_deep_fn`), fixing collisions and preserving enough
+  information to reverse the mapping. The separator is a shared
+  `NAMESPACE_SEPARATOR` const, default `_Z_` and overridable via the
+  `NAMESPACE_SEPARATOR` env var (read once at module load), rather than a
+  bare `_` so the namespace/tool boundary stays visually distinct from single
+  underscores inside namespace names (e.g. `mcp__cua_repl`). The value must
+  match `/^[a-zA-Z0-9_-]+$/` (the `function.name` charset) — an out-of-charset
+  value throws at startup instead of silently producing tool names the
+  upstream rejects. It builds a
+  `Map<flatName, namespacePath>` (path joined with `.`, e.g. `outer.nested`)
+  as a side output.
+- **Thread the map to the response side**: the map is attached to the returned
+  `OpenAIRequest` as a non-enumerable `__namespaceMap` property (via
+  `Object.defineProperty`) so the return type stays `OpenAIRequest` — existing
+  call sites, `JSON.stringify` round-trips, and deep-equality assertions are
+  unaffected. `getNamespaceMap(request)` reads it back.
+  `convertCompletionsToResponses` / `convertCompletionsToCompactedResponse` /
+  `streamCompletionsAsResponses` accept the map as an optional param; when a
+  tool call's `name` is a key in the map, the emitted `function_call` item gets
+  the bare tool `name` and the original `namespace` path. Unmapped (plain
+  top-level) tools are emitted unchanged — fully backward-compatible.
+
+- `src/converters/responses-to-completions.ts`: prefixed-name flattening,
+  `NAMESPACE_MAP_KEY` / `getNamespaceMap` export.
+- `src/converters/completions-to-responses.ts`: optional `namespaceMap` param,
+  `namespace?: string` on the output item type, split restore in the
+  `function_call` build.
+- `src/handlers/responses.ts`: thread the map through `handleAsCompletions`
+  (stream + non-stream) and `handleResponsesCompactRequest`; `splitNamespace`
+  helper in `streamCompletionsAsResponses` applied at the
+  `output_item.added` / `output_item.done` / `response.completed` emission
+  points.
+- `tests/unit/responses-completions-roundtrip.test.ts`: prefixed-name +
+  `namespaceMap` assertions, a namespaced round-trip test, a
+  non-namespaced-passthrough test.
+
+### fix(responses): default a missing input item `type` to `"message"` instead of dropping it
+
+Per the Responses API spec, `type` on an input item is optional and defaults
+to `"message"` when the item carries `role`/`content` (`EasyInputMessage` /
+`Message` in `docs/openai-response-methods-create.md`). The converter used to
+treat a typeless item as unrecognized — silently excluded from the assistant-
+turn merge and hit the `warnUnhandledItem` fallback in
+`convertInputItemToMessages`, dropping the message's content from the
+upstream conversation. `convertInputItemsToMessages` in
+`src/converters/responses-to-completions.ts` now normalizes `item.type` to
+`'message'` up front when it's `undefined` but `role`/`content` are present,
+before either the assistant-turn merge or per-item conversion branch on it.
+Affects all three conversion paths (`openai-completions`,
+`anthropic-messages`, `gemini`); passthrough to an `openai-responses`
+upstream is untouched since the body is forwarded as-is.
+
+### test(agent-tools): quote a spliced tmp-path in the /tmp/ rm test; skip the signal-kill test on win32
+
+Two follow-on test fixes after switching the bash tool's shell to bare `'sh'`
+(previous entry):
+
+- "allows rm on a path under the real /tmp/ tree" spliced `tmpdir()`'s
+  Windows-native backslash path unquoted into the command string
+  (`` `rm ${tmpFile}` ``). On win32 the command runs under Git Bash's
+  `sh -c`, which treats an unquoted backslash as its own shell escape
+  character and strips it, so `rm` received a mangled path and silently did
+  nothing — the file survived and the assertion failed. Fixed by
+  single-quoting the path (`` `rm '${tmpFile}'` ``), which is what a real
+  shell-safe command would do regardless of platform — not a
+  Windows-specific workaround. Every other test in this file that splices an
+  absolute path into a command is wrapped in `assert.rejects()`, where the
+  path-escape check rejects the command from its raw string before it ever
+  reaches `sh -c` — so backslash-mangling never mattered for those; this is
+  the one test where the command is expected to actually execute.
+- "does not misreport an externally-signaled kill as a timeout" relies on
+  `kill -TERM $$` delivering a real POSIX signal that `execFile` surfaces via
+  `error.signal`. Git Bash/MSYS2's `sh` doesn't do that: `error.signal` stays
+  `null` and `error.code` comes back as an MSYS2-specific numeric encoding,
+  so the command resolves instead of rejecting. This is a platform capability
+  gap in Git Bash's signal emulation, not a bash-tool bug, so the test is
+  skipped on `win32` via `t.skip(...)` with the reason recorded instead of
+  being weakened or deleted.
+
+### fix(agent-tools): bash tool hardcoded `/bin/sh`, which doesn't resolve via `execFile` on Windows
+
+`execFile` calls the OS spawn API directly — it doesn't go through any
+shell's own path translation, so an absolute POSIX path like `/bin/sh` isn't
+valid on Windows even with Git Bash installed, and the spawn fails with
+`ENOENT` before the command ever runs (surfaced honestly as of the previous
+fix below, instead of silently misreporting success).
+
+- `src/agent-tools.ts`: changed the bash tool's `execFile('/bin/sh', ...)` to
+  `execFile('sh', ...)`, resolving the executable via `PATH` instead. `sh` is
+  always present on Unix and, on Windows, resolves to Git for Windows'
+  `sh.exe` when installed — this file already assumes POSIX shell syntax
+  throughout (see the rm/mv denylist patterns), so relying on a POSIX shell
+  being on `PATH` isn't a new dependency, just no longer hardcoded to a
+  POSIX-only absolute path. (Deliberately not `'bash'`: Windows ships a WSL
+  `bash.exe` shim in `System32` with no `sh.exe` equivalent, which could
+  shadow Git Bash's `bash.exe` depending on `PATH` order — `'sh'` has no such
+  ambiguity.)
+- Fixes 5 of the 7 tests in `tests/unit/agent-tools.test.ts` that were still
+  failing after the fail-loud fix below.
+
+### fix(agent-tools): bash tool silently "succeeded" on a spawn failure instead of failing loud
+
+The `bash` tool's `execFile` callback only rejected the promise when it
+detected a timeout or a signal kill; any other `error` (e.g. the child
+process failing to spawn at all) fell through to
+`resolvePromise({ stdout, stderr, code: child.exitCode })` — reporting
+success with whatever nonsense `child.exitCode` held, rather than surfacing
+the real failure (Rule 8: fail loud, never swallow errors).
+
+Concretely: on a machine where the hardcoded `/bin/sh` executable can't be
+spawned (`ENOENT`), Node sets `child.exitCode` to the *negative libuv errno*
+(`-4058` for `ENOENT`) instead of `null`, and the old code returned that as
+if it were a real command exit code — so every `bash` call silently reported
+`exit code: -4058` and empty stdout instead of erroring, and any test
+asserting "does not reject" on a normal command passed for the wrong reason.
+
+- `src/agent-tools.ts`: the callback now distinguishes a real exit (execFile
+  sets `error.code` to the *numeric* exit code, matching `child.exitCode`)
+  from a spawn failure (`error.code` is an errno *string* like `'ENOENT'`,
+  `child.exitCode` is a negative libuv number) — `typeof error.code ===
+  'string'` now rejects with a clear `Failed to run command: <message>`
+  instead of resolving.
+- This is a general correctness fix (any spawn failure on any platform —
+  bad executable, `EACCES`, etc. — now surfaces honestly), not specific to
+  the `/bin/sh` case. Whether/how to make the bash tool's shell executable
+  itself resolve on Windows is a separate, not-yet-decided question — see
+  the now-honest failures in `tests/unit/agent-tools.test.ts` ("bash —
+  normal execution", "bash — Section 12 rm/mv path confinement", "bash —
+  timeout vs. non-timeout kill") for the current state on a Windows
+  machine where `/bin/sh` doesn't resolve via `execFile`.
+
+### test(agent-tools): skip symlink-escape tests when the OS won't allow creating symlinks
+
+Three `write_file`/`read_file` path-confinement tests create a symlink
+(`fs.symlinkSync`) to prove the escape-via-symlink case is actually blocked.
+On Windows, `symlinkSync` throws `EPERM: operation not permitted` for a
+non-elevated user without Developer Mode enabled — an OS privilege gate, not
+a bug in `src/agent-tools.ts` or the tests. This left the tests failing (not
+skipping) with a misleading `EPERM`, on any Windows machine without that
+privilege.
+
+- `tests/unit/agent-tools.test.ts`: added a `CAN_SYMLINK` capability probe
+  (create+delete one throwaway symlink at module load) and each of the three
+  symlink-based tests now calls `t.skip(...)` with a clear reason and
+  returns early when the probe failed, instead of calling `symlinkSync` and
+  failing on the resulting `EPERM`.
+- No change to `src/agent-tools.ts` — the path-confinement logic under test
+  is unaffected; only test *setup* (symlink creation) needed the guard.
+- To actually exercise these tests locally on Windows: enable Developer Mode
+  (Settings → Privacy & security → For developers) or run the test command
+  elevated.
+
+### fix(agent-session): disable pi-scoped skill loading on win32 (upstream `ignore` crash)
+
+`gatherSkillCandidates` (agent-session skills picker) crashed on Windows for
+any skills directory containing real files, not just malformed-lock-file edge
+cases — `RangeError: path should be a path.relative()d string` from the
+`ignore` package.
+
+Root cause is upstream, in `@earendil-works/pi-agent-core`'s `loadSkills()`:
+its `NodeExecutionEnv` resolves paths with `node:path` (backslashes on
+win32), then `skills.js`'s internal `relativeEnvPath()` strips the root
+prefix via naive `"/"`-string slicing instead of `path.relative()` — on
+win32 that never matches, so a raw absolute Windows path gets passed to
+`ignore().ignores(...)`, which throws.
+
+- `src/agent-session.ts`: `gatherSkillCandidates` now skips the `loadSkills()`
+  call on `process.platform === 'win32'` (logs why via the existing
+  `[skills]` diagnostic line) and returns no pi-scoped candidates on that
+  platform. Lock-file-based other-agent candidates (`gatherOtherAgentCandidates`)
+  don't go through `loadSkills()` and are unaffected.
+- `tests/unit/agent-session.test.ts`: tests that load a real pi-scoped skill
+  now branch on `IS_WIN32` and assert the disabled-on-win32 behavior on that
+  platform, and the real-loading behavior elsewhere.
+- Tracked upstream against `@earendil-works/pi-agent-core`; revisit once
+  fixed there.
+
+### fix(config): one unresolvable `STORE_KEY_IN_SYSTEM` sentinel no longer blocks startup
+
+Previously, if any single `api_key` sentinel could not be resolved from the OS
+keychain (no exact account and no best-effort base_url match), `applySystemKeyStore`
+threw a fatal `KeyStoreError` that aborted the entire config load — so one missing
+key stopped *every* model from loading and the proxy from starting (and, in TUI
+mode, left the screen stuck on "Loading…"; see the next entry).
+
+An unresolvable sentinel now skips just that slot instead of failing everything
+(Rule 8: fail loud, not fail-everything):
+
+- `src/utils/key-store.ts`: the resolve pass clears the offending slot to `''`
+  (identical to "not configured" — every consumer falls back through the normal
+  `api_key` chain: per-entry → section → `default_upstream.default_api_key` →
+  caller/user key), logs `[key-store] … no key was found …`, and collects it in a
+  new `unresolved` list. `applySystemKeyStore` now returns
+  `{ config, unresolved }`. The keychain itself being unavailable (`loadKeytar`
+  failure) and Consul/Apollo sentinels remain fatal `KeyStoreError`s.
+- `src/utils/config-loader.ts`: appends each `unresolved` entry to
+  `_validationErrors`, so it surfaces in the TUI message line, the dashboard
+  status bar (`config_errors`), and the console.
+- `tests/unit/key-store.test.ts`: the two "fails loud" tests now assert the slot
+  is cleared + reported (and that other slots still resolve) instead of rejecting.
+- Docs updated: `README.md`, `docs/configuration-reference.md`.
+
+### fix(tui): surface config-load errors on the initial "Loading…" screen
+
+If the first `loadConfig()` call at TUI startup threw (e.g. a
+`KeyStoreError` for an unresolvable `STORE_KEY_IN_SYSTEM` sentinel), the
+`refresh()` catch block recorded the error via `view.setMessage(...)`, but
+the header render returned early on `!snapshot` before ever reading that
+message — so the TUI looked permanently stuck on "Loading…" with no visible
+diagnostic (and `console.error` is silenced in TUI mode).
+
+- `src/tui.ts`: `DashboardView`'s render now appends the current message
+  (if set and not the default `'Ready'`) below `'Loading…'` while no
+  snapshot has loaded yet.
+
+### fix(responses): flatten `namespace`-wrapped tools and best-effort convert `custom` tools when merging `additional_tools`
+
+The `additional_tools` merge added in the previous entry only kept entries
+with `type === 'function'`. Per `docs/openai-response-final.md`,
+`AdditionalTools.tools[]` also allows `Namespace` (`{ type: "namespace", name,
+tools: [...] }`, grouping `function`/`custom` tools under a shared name) and
+bare `Custom` tools — both were silently dropped, matching CLAUDE.md rule 8
+("fail loud") only for the wrapper, not its contents. A real client request
+with 3 namespaces / 11 tools converted to zero upstream tools.
+
+- **`flattenNamespaces`** recursively unwraps `namespace` entries (namespaces
+  can nest) before the existing `function`/`custom` filter runs. Chat
+  Completions has no namespace concept, so the grouping is discarded and only
+  the leaf tools remain.
+- **`custom` tools are best-effort converted to `function` tools** with a
+  permissive `{ input: string }` parameter schema, since Chat Completions has
+  no unconstrained-text tool type and `custom` tools carry no `parameters` to
+  translate. A warning is logged (`warn?.logger`) naming the tool, since the
+  model now sees a structured-argument tool instead of free text.
+
+- `src/converters/responses-to-completions.ts`: `flattenNamespaces` helper,
+  `custom` → `function` conversion with warning.
+- `tests/unit/responses-completions-roundtrip.test.ts`: recursive namespace
+  flattening test, custom-tool conversion + warning test.
+
+### feat(responses): reject programmatic tool calling on completions upstreams, with an opt-in downgrade transform
+
+Follow-up to a review of the refreshed Responses API spec
+(`docs/openai-response-final.md` vs the older `docs/openai-response.md`). The
+line diff is ~370k lines but almost entirely reordering noise — sections were
+retitled and resorted (old: Create, Retrieve, Delete, Cancel, Compact; new:
+Cancel, Compact, Create, Delete, Get). The substantive changes:
+
+- **`FunctionCallOutput`**: `call_id` went from required `string` to optional
+  `string or null`, and the item gained `caller` (`Direct` / `Program`
+  attribution), `name`, and `namespace`. Additive — the converter ignores the
+  new fields, and an absent `call_id` correctly yields `undefined`. No code
+  change needed; a regression test locks the tolerance in.
+- **`ResponseOutputItem` union grew** from "17 more" to "25 more" variants:
+  `FunctionCallOutput`, `ComputerCallOutput`, `LocalShellCallOutput`,
+  `McpApprovalResponse`, and `CustomToolCallOutput` are now valid *output*
+  items, not input-only.
+- **New `program` / `program_output` items** (programmatic tool calling) —
+  absent from the old spec. See below.
+- **`previous_response_id`, `conversation`, `context_management` /
+  `compact_threshold`**: only `| null` nullability added, no functional
+  change. `ResponseCompactionItem` was inlined as `Compaction { encrypted_content,
+  type, id }` (dropping `created_by`) — cosmetic.
+- Lower priority, not acted on: `moderation`, `prompt_cache_options` /
+  `prompt_cache_diagnostics` (`prompt_cache_retention` now deprecated), three
+  new error codes, two new `incomplete_details.reason` values, and nine new
+  shell/steer streaming events.
+
+**Unrecognized input items are no longer dropped silently.**
+`convertInputItemToMessages` had no fallback branch, so any item type it did
+not know vanished from the upstream conversation with no trace (CLAUDE.md rule
+8). It now logs a warning naming the dropped type. `convertResponsesToChatCompletions`
+and `convertInputItemsToMessages` take an optional trailing
+`ConversionWarnings { logger?, requestId? }` argument; existing two-argument
+callers are unaffected.
+
+**`program` / `program_output` are rejected with a 400 rather than converted.**
+`program` carries a flat JavaScript `code` string (no structured sub-calls to
+map onto `tool_calls`) plus a `fingerprint` the spec says "must be
+round-tripped" — and a Chat Completions `messages` array has nowhere to carry
+an opaque replay token. Flattening to text or to a synthetic tool call would
+produce a conversation that looks intact while silently breaking program
+replay upstream, so the converter throws `ValidationError` (400,
+`invalid_request_error`) pointing at the `openai-responses` passthrough
+upstream instead. No handler plumbing was needed: `createErrorResponse`
+already maps `ClaudeProxyError.status`.
+
+Reachability was traced before adding the reject: only a *client* can put
+these items on the completions path. `handleAsPassthrough` never writes to the
+conversation store and never parses the response body, and all four
+`saveConversation` / `appendConversationThreadItems` call sites live in
+`handleAsCompletions`, storing output items the proxy itself constructs
+(`message`, `function_call`, `reasoning` only). Stored replay cannot
+reintroduce a `program` item.
+
+**New opt-in built-in `project_program_to_node_tool`** downgrades these items
+onto an ordinary `node` function call for testing against upstreams where you
+have verified the behavior. It runs at `before_conversion`, so the converter
+never sees the original items and the 400 remains the default. The projection
+is lossy in two documented ways — `fingerprint` becomes a model-authored
+argument (breaking round-tripping), and it would otherwise invent a tool the
+client never declared, so it only fires when a `node` tool is already
+declared. See [docs/transforms-reference.md](./docs/transforms-reference.md#project_program_to_node_tool--downgrade-programmatic-tool-calling).
+
+- `src/converters/responses-to-completions.ts`: `ConversionWarnings` param,
+  warn-on-unrecognized fallback, `program`/`program_output` reject.
+- `src/handlers/responses.ts`: passes `{ logger, requestId }` at all five
+  `convertResponsesToChatCompletions` call sites.
+- `src/utils/config-loader.ts`: registers `project_program_to_node_tool` in
+  `BuiltinName` / `BUILTIN_NAMES`.
+- `src/utils/request-transform.ts`: implements the built-in.
+- `docs/transforms-reference.md`: built-in table row + reference section.
+- `tests/unit/responses-completions-roundtrip.test.ts`: `caller`/optional
+  `call_id` tolerance, warn-vs-drop, and three reject tests (both item types,
+  plus mid-conversation position).
+- `tests/unit/request-transform.test.ts`: six tests for the built-in
+  (both projections, tool-declaration gating in both tool shapes, order
+  preservation, no-op).
+
+`tests/unit/responses-conversation-state.test.ts` needed no changes — the
+conversation-state fields had no functional spec change.
+
+### fix(responses): handle array-form `function_call_output.output` when converting to Chat Completions
+
+Per the Responses API schema, `function_call_output.output` can be a string
+or an array of `input_text`/`input_image`/`input_file` parts, not just a
+string. `convertInputItemToMessages` was blindly casting it to `string`,
+which silently mangled array-form tool output (e.g. image results) sent
+upstream.
+
+Now reuses the existing `convertResponsesContentToCompletions` helper (same
+union already handled for message content) instead of the unchecked cast.
+
+- `src/converters/responses-to-completions.ts`: `function_call_output` branch
+  now converts `output` via `convertResponsesContentToCompletions`.
+- `tests/unit/responses-completions-roundtrip.test.ts`: regression tests for
+  array-form text-only and text+image output.
+
+### feat(responses): handle `additional_tools` input items when converting to Chat Completions
+
+The Responses API lets a request declare extra tools for a turn via an input
+item shaped `{ type: "additional_tools", role: "developer", tools: [...] }`
+(role is always `"developer"`). This item type was previously unhandled:
+`convertInputItemToMessages` silently dropped it (no branch matched), and its
+`tools` were never forwarded upstream — so tools declared this way were
+invisible to `openai-completions`/`anthropic-messages`/gemini-mode upstreams
+(the passthrough `openai-responses` path already worked, since native
+Responses API upstreams understand the item natively).
+
+`convertResponsesToChatCompletions` now collects `tools` from every
+`additional_tools` input item and merges them with the request's top-level
+`tools` before the existing flat→nested conversion runs — same
+function-tools-only filter as `tools` already had (non-function types like
+`mcp`, `web_search`, `code_interpreter` are dropped, matching existing
+behavior for the top-level field). The `additional_tools` item itself still
+emits no message, now via an explicit branch instead of falling through.
+
+- `src/converters/responses-to-completions.ts`: collect + merge `additional_tools`
+  tools; explicit no-op branch in `convertInputItemToMessages`.
+- `tests/unit/responses-completions-roundtrip.test.ts`: regression tests for
+  merging, combining with top-level `tools`, and a missing/malformed `tools` field.
+
+### feat(config): add `openai-completions` as the default upstream mode in the model target wizard
+
+Both the TUI (`m` key) and dashboard "Add target model" wizard now include
+`openai-completions` as the first/default choice in the upstream mode picker,
+moving it ahead of `anthropic-messages`. The validation set in
+`upsertModelTarget` is updated to match the full `TransformSchema` closed set.
+
+- `src/utils/config-loader.ts`: `MODEL_TARGET_UPSTREAM_MODES` now includes
+  `openai-completions` at index 0.
+- `src/tui.ts`: `openModelModePicker` choices reordered to match.
+- `src/handlers/dashboard.ts`: `MODES` array updated, `state.mode` defaults
+  to `openai-completions` automatically.
+- `tests/unit/config-loader.test.ts`: "accepts all three valid upstream modes"
+  test updated to four modes.
+- `tests/integration/07_dashboard/dashboard_api.test.js`: comment updated.
+
+### feat(config): blank api_key in the model target wizard reuses a same-base_url keychain entry
+
+When the api-key field is left blank in the "Add target model" wizard (TUI `m`
+and dashboard), `upsertModelTarget` now first scans sibling entries within the
+*same category* for one already storing `STORE_KEY_IN_SYSTEM` whose effective
+base_url (entry's own, falling back to the category's) matches this entry's —
+using the same base_url prefix-relation scoring the keychain best-effort
+resolver uses (`scoreBaseUrlMatch`, extracted from `key-store.ts`'s
+`scoreAccountMatch`; target-name similarity intentionally not considered
+here, only base_url). If a match is found, the new entry adopts the sentinel
+so it resolves from the same keychain account instead of silently landing on
+the category's plaintext `api_key` (previous blank behavior, still the
+fallback when no match is found). Editing an entry never matches against
+itself, so clearing a previously-plaintext key by blanking the field still
+clears it rather than resurrecting a sentinel.
+
+- `src/utils/key-store.ts`: new exported `scoreBaseUrlMatch` (base_url-only
+  half of `scoreAccountMatch`, reused by both).
+- `src/utils/config-loader.ts`: `upsertModelTarget` — same-category
+  `STORE_KEY_IN_SYSTEM` lookup on blank `api_key`.
+- `src/handlers/dashboard.ts`: wizard step-3 helper text updated to mention
+  the new blank-key behavior.
+- `tests/unit/config-loader.test.ts`: regression tests for same-base_url
+  match, category-base_url-fallback match, no-match (stays blank),
+  cross-category isolation, and self-exclusion on edit.
+
+### fix(config): reject hand-typed `STORE_KEY_IN_SYSTEM` sentinel in the model target wizard
+
+Closes the TODO left in the `feat(config)` entry below. The "Add target model"
+wizard's api-key field (TUI `m` and dashboard) had no guardrail against a user
+typing/pasting the literal sentinel `STORE_KEY_IN_SYSTEM` by hand. Unlike
+`applySystemKeyStore`'s own store-pass (which only ever writes the sentinel
+right after storing a real plaintext key to the matching keychain account), a
+hand-typed sentinel was written verbatim with no keychain entry behind it. On
+next load, resolution keys off `<target>/<base_url>` and could silently
+succeed against an unrelated or stale keychain entry sharing that account
+(wrong key, no error) instead of failing loud.
+
+`upsertModelTarget` now throws when `patch.api_key === STORE_KEY_IN_SYSTEM`
+unless the entry being edited already held that exact sentinel (the
+"leave unchanged" edit path, which is backed by a real keychain entry). Both
+the TUI wizard and the dashboard wizard call this same function, so the
+guardrail applies to both without duplicating the check.
+
+- `src/utils/config-loader.ts`: `upsertModelTarget` — compare `patch.api_key`
+  against the existing entry's index-2 value before accepting the sentinel.
+- `tests/unit/config-loader.test.ts`: regression tests for add, edit-not-
+  previously-sentinel (both throw), and edit-already-sentinel (allowed).
+
+### fix(tui): custom model test sent the wrong api key for plain `[models.*]` targets
+
+Testing a plain (non-composite) model target in the TUI's custom model test
+(e.g. `bbb`) could send the proxy-wide `default_upstream.default_api_key`
+upstream instead of the model's own key — a 401 from the upstream provider,
+even though the config and keychain were both correct and the dashboard's own
+"test" button worked fine for the same model.
+
+Root cause: the TUI's test resolver (`resolveModelTestConfig`) reads the
+sanitized dashboard snapshot (`snapshot.config`), where every model entry has
+already been reduced to `[target, base_url, mode]` with `api_key` stripped for
+display. For a model whose category has no category-level `api_key` (e.g. a
+one-off entry under its own `[models.<category>]` section), the resolver had
+no source for the entry's real key and fell through to
+`categoryConfig.api_key || config.default_upstream?.default_api_key` — both
+undefined-or-wrong for that entry — so `executeModelTest` sent the *proxy's*
+default key (a different provider/account entirely) instead of failing loud
+or using the model's own key.
+
+`resolveModelTestConfig` now also accepts the real, unsanitized `ProxyConfig`
+and uses `getModelRouteConfig(modelId, realConfig).apiKey` — the same resolver
+the dashboard's test button already uses — as the fallback ahead of
+`default_upstream`, for both the array and inline-table entry shapes.
+
+- `src/tui.ts`: `resolveModelTestConfig` (new `realConfig` param + api key
+  fallback), both call sites in `runModelTest`/`executeModelTest`; exported
+  the function (matches the existing `buildTestTextRequest`-style convention)
+  so it's unit-testable.
+- `tests/unit/tui.test.ts`: new file — regression tests asserting the real
+  per-model key is used instead of the wrong proxy-wide default.
+
+### fix(dashboard): inline-table `[models.*]` entries dropped from the sanitized snapshot
+
+An entry written as an inline table (e.g. `bbb = {target = "...", base_url = "...",
+api_key = "...", mode = "..."}` — the shape `upsertModelTarget`/the "Add target
+model" wizard writes) was silently dropped by `sanitizeDashboardCategoryConfig`,
+which only handled array- and string-shaped entries. The TUI's model-test picker
+reads this sanitized snapshot (`toDashboardConfigPayload` via `getDashboardSnapshot`),
+so testing such a model there found no config, fell back to wrong defaults
+(`anthropic-messages` mode, no api key), and failed — while the dashboard's own
+"test" button worked because `handleDashboardTestModel` resolves the model
+against the real, unsanitized config via `getModelRouteConfig`.
+
+`sanitizeDashboardCategoryConfig` now also converts object-shaped entries into
+the same 3-element `[target, base_url, mode]` shape used for arrays (`api_key`
+stripped either way).
+
+- `src/utils/config-loader.ts`: `sanitizeDashboardCategoryConfig` object branch.
+- `tests/unit/config-loader.test.ts`: regression test for the inline-table case.
+
+**TODO:** the "Add target model" wizard's API-key field (TUI `m` and dashboard)
+has no guardrail against a user typing/pasting the literal sentinel
+`STORE_KEY_IN_SYSTEM` by hand. Unlike `applySystemKeyStore`'s own store-pass
+(which only ever writes the sentinel after it has just stored a real plaintext
+key to the matching keychain account), a hand-typed sentinel is written
+verbatim with no keychain entry behind it. On next load, resolution keys off
+`<target>/<base_url>` and can silently succeed against an unrelated or stale
+keychain entry that happens to share that account (wrong key, no error) instead
+of failing loud — hit this exactly with `bbb` (`target =
+"nvidia/nemotron-3-ultra-550b-a55b:free"`, `base_url =
+"https://openrouter.ai/api/v1"`), which resolved to a stale key left over
+under that account and got rejected by OpenRouter; fixed by overwriting that
+keychain entry, no code change needed. Consider validating in the wizard (and/or
+`upsertModelTarget`) that a literal `STORE_KEY_IN_SYSTEM` is only accepted when
+a keychain entry already exists for the resulting `<target>/<base_url>` account.
+
+### feat(dashboard): 'Add target model' wizard in web dashboard
+
+Adds a web-dashboard equivalent of the TUI's "Add target" wizard (see the
+`feat(tui)` entry below): a new "Add target model" button, styled and
+structured like the existing "Add composite alias" wizard (step counter,
+Back/Next/Cancel, inline status-line validation, Esc-to-cancel-at-any-step).
+6 steps: alias key → target model id → api key → base url → upstream mode →
+category (pick an existing `[models.*]` section from a `<select>`, or
+choose "+ new category…" to type a new section name).
+
+Saves through a new dedicated endpoint backed by the same
+`upsertModelTargetFromDashboard` mutator the TUI wizard uses, rather than
+the generic whole-page config save — the whole-page path
+(`collectConfigPayload` → `PUT /dashboard/api/config`) intentionally never
+round-trips `transforms`/`max_tokens` (config-file-only fields) and this
+avoids touching that path at all; only the single new/edited entry is
+written. The existing per-category "Add model entry" quick-add
+(`openAddModelWizard`) is unchanged.
+
+- `src/handlers/dashboard.ts`: `handleDashboardUpsertModelTarget` handler,
+  new `modelTargetWizard` modal markup, `openAddModelTargetWizard()` client
+  wizard, `add-model-target` trigger button/click-dispatch branch.
+- `src/index.ts`: new route `POST /dashboard/api/models/:category/:aliasKey`.
+- Integration tests in `tests/integration/07_dashboard/dashboard_api.test.js`
+  (TC719 valid upsert round-trip, TC720 invalid-mode 400 rejection).
+
+### feat(tui): 'Add target' wizard bound to 'm' key
+
+Top-level `m` key in the TUI (Dashboard view) opens an "Add target" panel listing all
+`[models.*]` entries across categories. Selecting an existing entry opens a 4-step
+wizard (target model id → api key → base url → upstream mode) pre-filled with its
+current values for editing. Choosing "+ _input new target_" collects an alias key,
+then runs the same 4 steps, followed by a final category step: pick an existing
+`[models.*]` section from a list, or choose "+ _input new category_" to type a new
+section name. Saves to `proxy_config.toml` via the existing dashboard persistence
+path (`saveConfigMutation` → `loadProxyConfigFromPath` → `persistProxyConfigToPath`
+→ `clearProxyConfigCache`).
+
+- `src/utils/config-loader.ts`: new `upsertModelTarget` mutator preserving
+  indices 4 (transforms) and 5 (max_tokens) when editing, validating upstream
+  mode against the closed set (`anthropic-messages`, `openai-responses`,
+  `gemini-generatecontent`).
+- `src/handlers/dashboard.ts`: `upsertModelTargetFromDashboard` wrapper and
+  `getModelTargetFromDashboard` read helper (returns real api_key/mode since
+  the TUI only has the sanitized dashboard snapshot).
+- `src/tui.ts`: `openModelTargetPicker`, `openModelTargetWizard`,
+  `openModelCategoryPicker` (last step for new targets only, editing keeps its
+  existing category), `openModelModePicker` — callback-chained multi-step
+  flow using existing `ListOverlay` and `openPrompt` helpers. Esc at any step,
+  including the trailing category step, cancels the whole wizard.
+- Unit tests in `tests/unit/config-loader.test.ts` covering index 4-5 preservation,
+  invalid mode rejection, add shape, sentinel round-trip, and serialize/reparse.
+
+
+
+### feat(build): `npm run build:native` single-file executable
+
+Adds a second distribution channel alongside the existing one. `npm run build`
+is unchanged — `tsc` to `dist/*.js`, run as `node dist/server.js` with
+`node_modules` beside it, which is what the Dockerfile ships. `npm run
+build:native` (`scripts/build-sea.js`) instead produces one self-contained
+binary in `dist/`, named per platform/arch (`model-proxy-v3-macos-arm64`,
+`model-proxy-v3-linux-x64`, `model-proxy-v3-win.exe`, …).
+
+The pipeline is Node's built-in SEA (Single Executable Application): esbuild
+bundles `src/server.ts` and its whole dependency graph into one CJS file,
+`--experimental-sea-config` turns that into a blob, the host `node` binary is
+copied, and `postject` injects the blob into the copy. On macOS the copy is
+re-signed, since injecting a section invalidates the existing signature. A
+`tsc --noEmit` preflight runs first — esbuild strips types without checking
+them, so without it a native build could ship code `npm run build` would
+reject.
+
+**Cross-compilation is not possible.** The output *is* a copy of the Node that
+built it, so each target platform needs its own build host (CI matrix, VM, or
+container). This is inherent to SEA, not a limitation of the script.
+
+**The build Node must be official and self-contained** (nodejs.org, nvm,
+`actions/setup-node`). Homebrew and some distro packages ship `node` as a small
+launcher against a shared `libnode`; the SEA sentinel fuse lives in the library
+rather than the launcher, so injection fails. Check by size — a real one is
+~110MB, the stub ~50KB. The script reads the fuse out of the binary at build
+time rather than assuming `postject`'s default, because its spelling
+(`NODE_SEA_FUSE_` vs `POSTJECT_SENTINEL_`) and hash change between Node
+releases; it fails with that diagnostic when no fuse is found.
+
+Not in the binary, both matching the Docker image and both failing loud rather
+than silently:
+
+- **System keychain** (`@github/keytar`) — a native `.node` addon, which SEA
+  has no mechanism to embed. `store_key_in_system = true` raises the existing
+  `KeyStoreError`, as it already does in Docker (`--omit=optional`).
+- **`sdk://` routes** (the `chatjimmy` submodule) — loaded through a
+  deliberately non-literal relative specifier so it stays optional at build
+  time. That specifier is relative to the *source file*, and a SEA binary has
+  no source tree, so it cannot resolve regardless of what sits next to the
+  executable. The existing catch reports `ChatJimmy SDK not available`.
+
+Two bundling details worth recording, both found by running the binary rather
+than by reading the source:
+
+- **`import.meta.url` had to be defined explicitly.** Bundling ESM to CJS
+  leaves `import.meta` with no equivalent and esbuild emits `import_meta = {}`,
+  making `import.meta.url` `undefined`. `@earendil-works/pi-tui` calls
+  `createRequire(import.meta.url)` at *module scope*, so it threw
+  `ERR_INVALID_ARG_VALUE` the moment that initializer ran — killing `TUI=1` and
+  `AGENT=1` at startup while plain HTTP serving looked fine, because both
+  import pi-tui lazily. A `--define` plus banner now supplies a real `file://`
+  URL derived from `process.execPath`. pi-tui uses that `require` only to probe
+  for an optional native addon inside a `try`/`catch`, and SEA cannot ship
+  native addons anyway, so the probe now *misses* instead of *throwing*; TUI
+  modifier-key detection is degraded in the binary, on every platform equally.
+- **`npx` needs a shell on Windows.** There `npx` is `npx.cmd`, and
+  `execFileSync` spawns executables directly — `CreateProcess` cannot run a
+  batch script, and Node 20+ additionally refuses `.cmd` via `execFile` without
+  a shell (CVE-2024-27980). `shell` is now set on win32 only, so POSIX gains no
+  extra quoting layer.
+
+Installing for a native build must **not** use `--omit=optional`, unlike the
+Dockerfile: esbuild ships its platform binary (`@esbuild/darwin-arm64`,
+`@esbuild/linux-x64`, …) as an optional dependency, and omitting it leaves
+esbuild unable to run.
+
+Verified on macOS arm64 only: builds, runs from a directory containing just the
+binary and a `proxy_config.toml` (no `node_modules`, no source tree), serves
+`/dashboard` and `/v1/models`, and starts under both `TUI=1` and `AGENT=1`.
+Linux and Windows are expected to work — the script branches correctly for
+them and nothing in `src/` is platform-specific — but have not been run.
+`proxy_config.toml` is still read from the working directory at runtime
+(`PROXY_CONFIG_PATH`); it is not embedded.
+
+### fix(agent): close three path/log confinement holes and two bash edge cases
+
+Follow-up review of `src/agent-session.ts` / `src/agent-tools.ts`. Each item below
+was reproduced against the running tools before being fixed, and has a regression
+test in `tests/unit/agent-tools.test.ts`.
+
+Security:
+
+- **Symlink bypass of write confinement** — `isPathAllowed` compared only the
+  *lexical* (`path.resolve`) form of a target, so a symlink inside the working
+  directory pointing outside it passed the check and the write followed the link,
+  reporting success on an in-scope path while clobbering a file outside both
+  allowed roots. The agent could plant that symlink itself (`ln -s` is on no
+  denylist), making it a self-contained bypass. Both the lexical and the
+  symlink-resolved form are now required to be in scope, so a link can only ever
+  narrow what is reachable, never widen it. Resolution walks up to the deepest
+  *existing* ancestor (`realpath` fails on a not-yet-created file, the normal
+  `write_file` case), which also catches a symlinked parent directory.
+- **`read_file` had no path check at all** — unlike `write_file` it never called
+  `isPathAllowed`, so the agent could read anything the operator's account could
+  (`~/.ssh/id_rsa`, `~/.aws/credentials`, `proxy_config.toml`'s
+  `default_api_key`). Because the session's provider is the proxy itself,
+  anything read was sent upstream as conversation context. Now confined to the
+  same roots as writes.
+- **Trajectory log was symlink-attackable** — `TRAJ=1` appended to a fixed
+  `<os.tmpdir()>/agent_trajectory.log`, re-resolving the path on every write. On
+  Linux `os.tmpdir()` is normally the shared world-writable `/tmp`, where any
+  local user could pre-create that name as a symlink and capture the whole
+  transcript (task text, file contents in tool results) while clobbering a file
+  of their choosing; the log was also mode `0644`. The name now carries a
+  per-session random suffix and is opened **once** with
+  `O_EXCL|O_NOFOLLOW|O_APPEND` at mode `0600`, held for the session.
+
+Correctness:
+
+- **Compound commands hid a second `rm`/`mv`** — the extraction regex matched
+  only the first `rm`/`mv` in the whole command string, folding everything after
+  it (including an independent second invocation) into that first match's
+  argument list instead of checking it. Each `&&`/`||`/`;`/`|`-separated segment
+  is now checked on its own.
+- **Any signal exit was reported as a timeout** — `execFile`'s `error.killed` /
+  `error.signal` are set whenever a process ends via a signal, whether Node's
+  `timeout` fired, the child killed itself, or something external killed it (OOM
+  killer, manual `SIGKILL`). A command killed after two seconds was reported as
+  "timed out after 60s". A dedicated timer now tracks whether *our* timeout
+  actually fired; other signal exits report the signal instead.
+
+The `⚠️ No OS-level sandbox` caveat is unchanged and still applies: `bash` runs
+with the operator's full privileges, and the command denylist remains raw
+string/regex matching, evadable by obfuscation. These fixes close gaps in the
+path confinement the code already claimed to enforce; they do not add a sandbox.
+
+### feat(agent): interactive `AGENT=true` coding session backed by the proxy itself
+
+A new `AGENT=true`/`1` mode (`src/agent-session.ts`, mirroring the existing
+`TUI=true` convention in `server.ts`) runs an interactive
+[`@earendil-works/pi-agent-core`](https://www.npmjs.com/package/@earendil-works/pi-agent-core)
+session whose LLM provider is the proxy's own loopback `/v1/messages` — so an
+agent task exercises the same routing, composite aliases, quota accounting and
+privacy filtering as any other client.
+
+Flow: pick a working directory → pick a model → verify with a "hi" round-trip →
+set a budget → state a task → run → summarize file changes → prompt for a
+follow-up task against the same agent and budget.
+
+- **Tools** (`src/agent-tools.ts`): `read_file`, `write_file`, `bash`, plus
+  `find_skill`/`add_skill` when the `skills` CLI is available (probed once at
+  startup — tools that would always fail are not exposed at all). Skills are
+  loaded from both the project-scoped `.pi/skills` and a global dir.
+- **Budget**: prompt accepts tokens (`1m`, `50k`) or turns (`20`), prefilled with
+  `5m`. Submitting the prefill unchanged and submitting blank both apply the same
+  combined 5,000,000-token / 100-turn default; an explicitly typed value sets
+  exactly one limit. Turns is sized as a runaway-loop backstop, not the binding
+  limit — at a realistic ~30k tokens/turn the token budget trips first. Note
+  pi-agent-core itself imposes **no** turn limit — its `runLoop()` is an
+  unbounded `while(true)` — so this budget is the only stop condition besides
+  explicit exit. `/q`, `/quit`, `/exit` and ctrl+c end the session at either the
+  budget or the task prompt.
+- **Model picker** lists composite aliases first and target models last, each
+  labelled by kind. Ordering is local to the picker; the shared
+  `getConfiguredModelIds` (and therefore `GET /v1/models`) is unchanged.
+- **`TRAJ=1`** tees the session's console output to `agent_trajectory-<id>.log`
+  under the OS temp dir, ANSI stripped and blank lines dropped. Restored on every
+  exit path, including early returns. (Path and open flags hardened later — see
+  the `fix(agent)` entry above.)
+- **Log verbosity**: for the session's duration `LOG_LEVEL` is raised to `warn`
+  so per-request proxy chatter doesn't fight the agent's streamed reply;
+  restored on exit. Tool call/result lines are truncated to 120 chars.
+
+**No OS-level sandbox.** `bash` and `write_file` run with the operator's full
+privileges; pi-agent-core provides no confinement. Reads, writes, deletes and
+moves are confined to the working directory plus the real OS temp tree (reads and
+symlink resolution were added later — see the `fix(agent)` entry above), and
+`bash` blocks a small denylist of destructive patterns (`rm -rf`, `kill -9`,
+force push, `chmod -R 777`, `curl|sh`) — but the command denylist is raw
+string/regex matching, not a shell parser, and is evadable by obfuscation. It
+guards against an agent mistake, not an adversary. A startup warning states this
+explicitly.
+
+### refactor(logs): shorten per-request log lines and request ids
+
+Request-line logging was verbose enough to be hard to scan, especially
+interleaved with an agent session's own output:
+
+- `src/index.ts` composite-attempt line is now comma-separated, dropping the
+  `for`/`to` filler and the trailing upstream mode:
+  `/v1/messages,forclaw,https://openrouter.ai/api/v1/chat/completions`
+- `src/handlers/messages.ts` upstream line drops the user-agent prefix,
+  `upstream (stream=…)` and `thinking (…)` in favour of a flag list, with the
+  user-agent moved to the end:
+  `minimax/minimax-m3:free,(s,t) [openai-completions] <ua>`, where `s` means
+  streaming and `t` means thinking is *enabled* (a `{type: "disabled"}` block
+  counts as off, matching the existing `thinkingType` check).
+- `shortRequestId` (`src/utils/logger.ts`) now displays the last 8 digits of the
+  timestamp and 6 chars of the UUID: `req_1783840535295_2a042b05-…-5266bdbac7f1`
+  → `req_40535295_5266bd`. Two deliberate losses: the truncated timestamp
+  discards multiples of 1e8 ms so it repeats every **~27.8 hours** (recoverable
+  as `prefix * 1e8 + shown`, but not a full date), and the 6-char fragment is 24
+  bits, so ids sharing a displayed millisecond collide far more readily than
+  before. Both are fine for reading a log by eye; neither is a unique key. The
+  full id is unchanged everywhere outside log display, including upstream
+  correlation. Non-matching ids (e.g. the literal `config`) pass through
+  untouched.
+
+When `AGENT=true`, the shared logger also dims every remaining line to dark gray
+and drops startup-only `config` diagnostics outright. Non-AGENT modes
+(`server.ts`, `tui.ts`) are unaffected.
+
+### fix(quota): record upstream rate-limit usage from every endpoint, not just `/v1/messages`
+
+`recordUpstreamRateLimit` (which populates the passively-recorded
+`anthropic-ratelimit-unified-5h-utilization` value, both per-model and
+per-upstream-host) was only wired into the native `/v1/messages` handler
+(`claude.ts`). Requests reaching the same upstream through any other
+endpoint/format — `/v1/chat/completions`, `/v1/messages` (compat path),
+`/v1/responses` (all sub-routes: anthropic-messages, completions,
+input_tokens, compact, passthrough), and the OpenAI-format handlers —
+never recorded quota, even though quota is a property of the upstream host,
+not the endpoint used to reach it. `recordUpstreamRateLimit` is now called
+after every upstream `fetch()` in `chat-completions.ts`, `messages.ts`,
+`openai.ts`, `responses.ts` (7 call sites), and `gemini.ts` (3 call sites,
+no-ops today since Gemini doesn't send this header, but wired for
+consistency and any future Anthropic-compatible bridging).
+
+`getModelQuota` (the active-polling path used for Kimi/DeepSeek/MiniMax/
+OpenRouter/Zhipu usage) needed no equivalent change: all 4 call sites
+(`tui.ts` quota picker, `tui.ts` composite overlay refresh, and both
+`dashboard.ts` `/dashboard/api/quota` variants) already resolve routes via
+`getModelRouteConfig`/`getConfiguredModelIds`/`modelChoices`, which key
+purely off each model's config entry (`target`, `base_url`, `api_key`) —
+never off which proxy endpoint serves it. It was never endpoint-scoped, so
+there was nothing to fix.
+
+### fix(stats): record tokens for native Gemini streams, force `include_usage` on streaming chat/completions passthrough, map Gemini cached tokens
+
+Three usage-statistics gaps closed (column semantics per endpoint are now
+documented in a new README table under "Token usage statistics columns"):
+
+- **Native Gemini streaming recorded zero tokens.** `:streamGenerateContent?alt=sse`
+  chunks carry `usageMetadata`, but the SSE usage tracker only looked for
+  OpenAI-shaped `data.usage`. The no-event branch now also parses
+  `usageMetadata` (`promptTokenCount` / `candidatesTokenCount` /
+  `totalTokenCount` / `cachedContentTokenCount`), final-chunk running totals
+  winning.
+- **Gemini `cachedContentTokenCount` was dropped everywhere except the
+  streaming Gemini→Claude converter.** It is now mapped to `cached_tokens` in
+  the JSON usage extractor (`extractUsageFromResponsePayload`), the
+  non-streaming Gemini→Claude conversion (`cache_read_input_tokens`), and the
+  `/v1/interactions` non-streaming handler (`total_cached_tokens`, which the
+  streaming converter already consumed). Note Gemini's `promptTokenCount`
+  includes the cached portion, same semantics as OpenAI `prompt_tokens`.
+- **Streaming `/v1/chat/completions` native passthrough didn't force
+  `stream_options.include_usage`.** OpenAI only emits the usage-bearing final
+  chunk when the client sets it; the proxy now forces `include_usage: true` on
+  the forwarded body (mirroring the existing converted-route behavior in the
+  messages handler / claude-to-openai converter). The extra chunk is
+  spec-compliant and forwarded to the client unchanged.
+
+Unit tests added for the `cachedContentTokenCount` JSON mapping and native
+Gemini SSE capture (tests/unit/token-usage.test.ts).
+
+### feat(tui): live-refresh the 'Model Quota' picker while open
+
+The Model Quota picker built its quota entries once when opened, so rows kept
+showing the values from open time — e.g. a stale `Quota: 100% 5h left` — even
+though every upstream response updates the passively recorded
+`anthropic-ratelimit-unified-5h-utilization` value (recorded per request in the
+anthropic-messages handler; verified against a live Anthropic-compatible upstream,
+which forwards
+the header on every response). The picker now keeps its live state
+(`quotaPickerState`) and is rebuilt from the 500ms refresh loop
+(`refreshQuotaPicker`, same pattern as the composite overlay's quota refresh):
+row suffixes and the highlighted row's `Quota:` status line update as new
+upstream responses arrive while the overlay is open. Provider quota fetches
+stay bounded by `getModelQuota`'s 30s cache; the anthropic-5h fallback is a
+plain in-memory map read.
+
+### fix(build): keytar dependency now installs prebuilt; Docker skips it; dead config removed
+
+The `@github/keytar` optionalDependency is now pinned as
+`github:github/node-keytar#v7.10.6` instead of `file:submodules/node-keytar`, and
+the root `postinstall` (git submodule + forced `npx node-gyp rebuild`) is gone:
+`npm install` fetches the addon from GitHub and its install script downloads a
+prebuilt NAPI binary (ABI 3) — no compiler or Python needed; node-gyp compiles
+from source only as the fallback when the prebuilt download fails. The
+`submodules/node-keytar` submodule is kept as a local source copy for development
+but is no longer used by `npm install`.
+
+The Dockerfile now installs with `--omit=optional --ignore-scripts`, excluding
+the keytar addon (no OS keychain in the image; `store_key_in_system` keeps
+failing loud there) — previously the root postinstall's `git submodule` call
+would have broken the image build.
+
+Also removed the dead `allowScripts` / `lavamoat.allowScripts` blocks from
+`package.json` (they referenced `@lavamoat/allow-scripts`, which is not a
+dependency). README and `docs/configuration-reference.md` updated to describe
+the prebuilt-first install, per-platform system/toolchain requirements (runtime
+keychain backend per OS; build toolchain only for the source-build fallback),
+and the headless-Linux keyring caveat.
+
 ### fix(tui): quota picker falls back to shared host-level usage when a model alias has no recording
 
 Models sharing the same `(target_url, api_key)` (e.g. `codelite`, `codesmall`,
@@ -174,8 +2161,8 @@ success, with exponential backoff (5s → 30min) on failure.
 
 Anthropic-routed models have no usage endpoint, but Anthropic-compatible
 upstreams report the account-wide 5h-window used fraction (0-1) in the
-`anthropic-ratelimit-unified-5h-utilization` response header (same source as
-pi-proxy). The `anthropic-messages` passthrough now records this per model on
+`anthropic-ratelimit-unified-5h-utilization` response header. The
+`anthropic-messages` passthrough now records this per model on
 real traffic (no polling — a value appears only after the first proxied
 request to that model) and derives a usage-left percent
 (`(1 - utilization)` clamped at 0%) as a fallback when the route has no usage
@@ -490,7 +2477,7 @@ relevant README summary section:
   composite/fusion/coordinator aliases (incl. `toolset` recipes), token
   limits windowing, schedule aliases, and the routing-hierarchy
   level-by-level details.
-- **`docs/auth-stats-protocol.md`** — wire-level contract for the
+- **`docs/architecture/auth-stats-protocol.md`** — wire-level contract for the
   remote auth and stats sidecars (requests, headers, OTAC linkage,
   dynamic routing override).
 - **`docs/configuration-reference.md`** — all TOML sections

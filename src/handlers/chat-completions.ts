@@ -9,6 +9,7 @@ import { logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import { addForwardedHeaders, normalizeOpenAIAuthHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.js';
+import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { validateOpenAICompletionsRequest } from '../utils/validation.js';
 import { ValidationError } from '../utils/errors.js';
 import { completionsToResponsesBody, completionsToClaudeBody, claudeJsonToSyntheticCompletions } from './openai.js';
@@ -100,7 +101,7 @@ export async function handleChatCompletionsPassthrough(
       method: 'POST',
       headers: anthropicFetchHeaders,
       body: JSON.stringify(claudeBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
     });
 
     if (route) {
@@ -112,6 +113,7 @@ export async function handleChatCompletionsPassthrough(
 
     logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, upstreamResponse.headers);
     recordResponseStatusCodeFromUpstream(upstreamResponse.status);
+    recordUpstreamRateLimit(model, (name) => upstreamResponse.headers.get(name), targetUrl);
     logger.debug(requestId, `${path} resp: status=${upstreamResponse.status} stream=${isStreaming}`);
 
     if (!upstreamResponse.ok) {
@@ -247,7 +249,7 @@ export async function handleChatCompletionsPassthrough(
       method: 'POST',
       headers: responsesFetchHeaders,
       body: JSON.stringify(responsesBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
     });
 
     if (route) {
@@ -260,6 +262,7 @@ export async function handleChatCompletionsPassthrough(
 
     logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, responsesUpstreamResponse.headers);
     recordResponseStatusCodeFromUpstream(responsesUpstreamResponse.status);
+    recordUpstreamRateLimit(model, (name) => responsesUpstreamResponse.headers.get(name), targetUrl);
     logger.debug(requestId, `${path} resp: status=${responsesUpstreamResponse.status} stream=${isStreaming}`);
 
     const responseHeaders = new Headers(responsesUpstreamResponse.headers);
@@ -340,7 +343,7 @@ export async function handleChatCompletionsPassthrough(
       method: 'POST',
       headers: geminiFetchHeaders,
       body: JSON.stringify(geminiBody),
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
     });
 
     if (route) {
@@ -352,6 +355,7 @@ export async function handleChatCompletionsPassthrough(
 
     logPipelineHeaders(logger, requestId, 'upstream-response', geminiTargetUrl, geminiUpstreamResponse.headers);
     recordResponseStatusCodeFromUpstream(geminiUpstreamResponse.status);
+    recordUpstreamRateLimit(model, (name) => geminiUpstreamResponse.headers.get(name), geminiTargetUrl);
     logger.debug(requestId, `${path} resp: status=${geminiUpstreamResponse.status} stream=${isStreaming}`);
 
     if (!geminiUpstreamResponse.ok) {
@@ -447,6 +451,14 @@ export async function handleChatCompletionsPassthrough(
     return new Response(JSON.stringify(completions), { status: 200, headers: geminiOutHeaders });
   }
 
+  // Per OpenAI spec, streaming usage is only emitted when stream_options.include_usage
+  // is set. Force it on so the SSE usage tracker records tokens even when the
+  // client didn't ask for them (the extra final usage chunk is spec-compliant
+  // and forwarded to the client as part of the passthrough stream).
+  if (isStreaming) {
+    parsedBody.stream_options = { ...(parsedBody.stream_options as Record<string, unknown> | undefined), include_usage: true };
+  }
+
   logPipelineStage(logger, requestId, 'upstream-request', targetUrl, parsedBody);
   const defaultFetchHeaders = { 'Content-Type': 'application/json', ...addForwardedHeaders(authHeaders, request) };
   logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, defaultFetchHeaders);
@@ -454,7 +466,7 @@ export async function handleChatCompletionsPassthrough(
     method: 'POST',
     headers: defaultFetchHeaders,
     body: JSON.stringify(parsedBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
   });
 
   if (route) {
@@ -467,6 +479,7 @@ export async function handleChatCompletionsPassthrough(
 
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, upstreamResponse.headers);
   recordResponseStatusCodeFromUpstream(upstreamResponse.status);
+  recordUpstreamRateLimit((parsedBody.model as string) || modelId, (name) => upstreamResponse.headers.get(name), targetUrl);
   logger.debug(requestId, `${path} resp: status=${upstreamResponse.status} stream=${isStreaming}`);
 
   // Forward the response body as-is. Pure passthrough: outbound body to the

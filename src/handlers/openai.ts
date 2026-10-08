@@ -10,6 +10,7 @@ import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
+import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { handleTargetApiError } from '../utils/errors.js';
 import { OpenAIContent, OpenAIMessage } from '../types/openai.js';
 import { decodeDataUri } from '../converters/claude-to-gemini.js';
@@ -810,6 +811,7 @@ async function forwardCompletionsAsAnthropicMessages(
   logger: Logger,
   originalRequest: Request,
   env?: Env,
+  route?: ModelRouteConfig,
 ): Promise<Response> {
   const claudeBody = await completionsToClaudeBody(openaiRequest, model);
 
@@ -848,12 +850,13 @@ async function forwardCompletionsAsAnthropicMessages(
     method: 'POST',
     headers: anthropicFetchHeaders,
     body: JSON.stringify(claudeBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
   recordResponseStatusCodeFromUpstream(response.status);
   recordUpstreamResponseToolCount('anthropic-messages', 0);
+  recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
     const upstreamBody = await response.text();
@@ -994,7 +997,7 @@ async function forwardCompletionsAsOpenAIResponses(
     method: 'POST',
     headers: responsesFetchHeaders,
     body: JSON.stringify(responsesBody),
-    signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
   if (route) {
@@ -1007,6 +1010,7 @@ async function forwardCompletionsAsOpenAIResponses(
   logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
   recordResponseStatusCodeFromUpstream(response.status);
   recordUpstreamResponseToolCount('openai-responses', 0);
+  recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
     const upstreamBody = await response.text();
@@ -1220,7 +1224,7 @@ export async function handleOpenAIRequest(
     if (upstreamMode === 'anthropic-messages') {
       return forwardCompletionsAsAnthropicMessages(
         openaiRequest, targetUrl, authHeaders, requestId,
-        openaiRequest.model as string, activeLogger, request, env,
+        openaiRequest.model as string, activeLogger, request, env, route,
       );
     }
     if (upstreamMode === 'openai-responses') {
@@ -1293,7 +1297,7 @@ export async function handleOpenAIRequest(
             method: 'POST',
             headers: openaiFetchHeaders,
             body: JSON.stringify(upstreamBody),
-            signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+            signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
         });
 
         if (route) {
@@ -1308,6 +1312,7 @@ export async function handleOpenAIRequest(
         logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
         recordResponseStatusCodeFromUpstream(response.status);
         recordUpstreamResponseToolCount('openai-completions', 0);
+        recordUpstreamRateLimit((openaiRequest.model as string) || modelId, (name) => response.headers.get(name), targetUrl);
 
         // Handle target API errors
         if (!response.ok) {

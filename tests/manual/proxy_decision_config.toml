@@ -1,0 +1,8 @@
+[general]
+port = 18788
+
+[decision]
+backend = "laya"
+url = "http://127.0.0.1:19999/decision"
+# api_key = ""  # not set for this test
+timeout_ms = 5000

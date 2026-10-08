@@ -24,16 +24,27 @@ const LOG_LEVELS: Record<LogLevel, number> = {
 };
 
 /**
- * Shorten a request id for log display only: keep the `req_<timestamp>_`
- * prefix and the last 12 chars of the UUID suffix.
+ * Shorten a request id for log display only: keep the last 8 digits of the
+ * `req_<unix_ms>_` timestamp and the first 6 chars of the UUID's final group.
  * e.g. req_1783840535295_2a042b05-4d3f-4411-a808-5266bdbac7f1
- *   →  req_1783840535295_5266bdbac7f1
+ *   →  req_40535295_5266bd
+ *
+ * Dropping the timestamp's leading digits discards multiples of 1e8 ms, so the
+ * displayed value repeats every ~27.8 hours — enough to time and correlate
+ * requests in a live/recent log, but NOT a full date. Recover the original as
+ * `<dropped prefix> * 1e8 + <shown digits>`; over a window longer than ~27.8h
+ * two distinct requests can display the same digits. The 6-char UUID fragment is
+ * 24 bits (~16.7M values), so concurrent requests within the same displayed ms
+ * can collide far more readily than the full id — fine for eyeballing a log,
+ * not a unique key. The full id is unchanged everywhere else (it's what upstream
+ * correlation uses) — this is display only.
+ *
  * Non-matching ids are logged unchanged.
  */
 function shortRequestId(requestId: string): string {
-  const m = /^(req_\d+_)(.+)$/.exec(requestId);
+  const m = /^req_(\d+)_(.+)$/.exec(requestId);
   if (!m) return requestId;
-  return m[1] + m[2].slice(-12);
+  return `req_${m[1].slice(-8)}_${m[2].slice(-12, -6)}`;
 }
 
 /** Pipeline stage at which a message body is being logged. */
@@ -73,6 +84,19 @@ export function logPipelineStage(
   logger.trace(requestId, `[${PIPELINE_STAGE_LABEL[stage]}] ${endpoint}: ${preview}`);
 }
 
+// AGENT=true runs the interactive agent-session.ts TUI, which already dims its
+// own status output (see the dim() helper there) so it reads as background
+// chatter behind the agent's streamed reply. The shared proxy logger below has
+// no such treatment normally (server.ts/tui.ts want it plain) — but interleaved
+// into an agent session it's the same kind of background noise, so it's dimmed
+// the same way there, and startup-only config diagnostics (requestId 'config')
+// are dropped outright since they have no ongoing value once the session is running.
+const AGENT_MODE = process.env.AGENT === 'true' || process.env.AGENT === '1';
+
+function dim(text: string): string {
+  return `\x1b[90m${text}\x1b[0m`;
+}
+
 const AUTH_HEADER_KEYS = new Set(['authorization', 'x-api-key', 'x-goog-api-key', 'anthropic-beta']);
 
 /**
@@ -103,31 +127,29 @@ export function createLogger(env: Env | Record<string, unknown>): Logger {
   const logLevel = (['trace', 'debug', 'info', 'warn', 'error'].includes(logLevelRaw) ? logLevelRaw : 'info') as LogLevel;
   const minLevel = LOG_LEVELS[logLevel];
 
+  function emit(level: string, requestId: string, message: string, args: unknown[]): void {
+    if (AGENT_MODE && requestId === 'config') return; // startup-only diagnostics, not useful mid-session
+    const line = AGENT_MODE
+      ? `[${level}] ${message}`
+      : `[${shortRequestId(requestId)}] [${level}] ${message}`;
+    console.log(AGENT_MODE ? dim(line) : line, ...args);
+  }
+
   return {
     trace: (requestId: string, message: string, ...args: unknown[]) => {
-      if (minLevel <= -1) {
-        console.log(`[${shortRequestId(requestId)}] [TRACE] ${message}`, ...args);
-      }
+      if (minLevel <= -1) emit('TRACE', requestId, message, args);
     },
     debug: (requestId: string, message: string, ...args: unknown[]) => {
-      if (minLevel <= 0) {
-        console.log(`[${shortRequestId(requestId)}] [DEBUG] ${message}`, ...args);
-      }
+      if (minLevel <= 0) emit('DEBUG', requestId, message, args);
     },
     info: (requestId: string, message: string, ...args: unknown[]) => {
-      if (minLevel <= 1) {
-        console.log(`[${shortRequestId(requestId)}] [INFO] ${message}`, ...args);
-      }
+      if (minLevel <= 1) emit('INFO', requestId, message, args);
     },
     warn: (requestId: string, message: string, ...args: unknown[]) => {
-      if (minLevel <= 2) {
-        console.log(`[${shortRequestId(requestId)}] [WARN] ${message}`, ...args);
-      }
+      if (minLevel <= 2) emit('WARN', requestId, message, args);
     },
     error: (requestId: string, message: string, ...args: unknown[]) => {
-      if (minLevel <= 3) {
-        console.log(`[${shortRequestId(requestId)}] [ERROR] ${message}`, ...args);
-      }
+      if (minLevel <= 3) emit('ERROR', requestId, message, args);
     },
   };
 }

@@ -1,4 +1,5 @@
 import { isToolBlocked } from './dashboard-stats.js';
+import { toolNameOf } from './tool-shapes.js';
 import type { Logger } from '../types/shared.js';
 
 export type EraseResult = {
@@ -20,18 +21,25 @@ export type EraseResult = {
  * upstreams reject tools: []). Past `tool_use` / `tool_result` blocks in
  * message history are intentionally left alone — only the tool schema is
  * removed.
+ *
+ * @param sidecarEraseNames - Optional set of tool names to erase from sidecar judge decision.
+ *   These are merged with the static blocklist (dashboard stats).
  */
 export function eraseBlockedTools(
   body: Record<string, unknown>,
   log: Logger | undefined,
   requestId: string,
+  sidecarEraseNames: string[] = [],
 ): EraseResult {
   const result: EraseResult = { erasedNames: [], toolChoiceReset: false };
   const tools = body.tools;
   if (!Array.isArray(tools) || tools.length === 0) {
-    sanitizeToolChoice(body, result);
+    sanitizeToolChoice(body, result, sidecarEraseNames);
     return result;
   }
+
+  // Convert sidecar names to a Set for O(1) lookup
+  const sidecarBlocked = new Set(sidecarEraseNames);
 
   const filtered: unknown[] = [];
   for (const tool of tools) {
@@ -45,7 +53,7 @@ export function eraseBlockedTools(
       const newDecls = t.functionDeclarations.filter((d) => {
         if (!d || typeof d !== 'object') return true;
         const name = (d as Record<string, unknown>).name;
-        if (typeof name === 'string' && isToolBlocked(name)) {
+        if (typeof name === 'string' && (isToolBlocked(name) || sidecarBlocked.has(name))) {
           result.erasedNames.push(name);
           return false;
         }
@@ -59,8 +67,8 @@ export function eraseBlockedTools(
       continue;
     }
     // Claude / OpenAI / Responses shape
-    const name = extractToolName(t);
-    if (name && isToolBlocked(name)) {
+    const name = toolNameOf(t);
+    if (name && (isToolBlocked(name) || sidecarBlocked.has(name))) {
       result.erasedNames.push(name);
       continue;
     }
@@ -75,7 +83,7 @@ export function eraseBlockedTools(
     }
   }
 
-  sanitizeToolChoice(body, result);
+  sanitizeToolChoice(body, result, sidecarEraseNames);
 
   if (result.erasedNames.length > 0) {
     log?.info(requestId, `Erased blocked tools from request: ${result.erasedNames.join(', ')}`);
@@ -87,18 +95,11 @@ export function eraseBlockedTools(
   return result;
 }
 
-function extractToolName(tool: Record<string, unknown>): string | undefined {
-  // Claude / Responses (rare): { name, ... }
-  if (typeof tool.name === 'string') return tool.name;
-  // OpenAI / Responses: { type: 'function', function: { name, ... } }
-  if (tool.function && typeof tool.function === 'object') {
-    const fn = tool.function as Record<string, unknown>;
-    if (typeof fn.name === 'string') return fn.name;
-  }
-  return undefined;
-}
-
-function sanitizeToolChoice(body: Record<string, unknown>, result: EraseResult): void {
+function sanitizeToolChoice(
+  body: Record<string, unknown>,
+  result: EraseResult,
+  sidecarEraseNames: string[],
+): void {
   const tc = body.tool_choice;
   if (!tc || typeof tc !== 'object') return;
   const choice = tc as Record<string, unknown>;
@@ -109,8 +110,9 @@ function sanitizeToolChoice(body: Record<string, unknown>, result: EraseResult):
     const fn = choice.function as Record<string, unknown>;
     if (typeof fn.name === 'string') referenced = fn.name;
   }
-  if (referenced && isToolBlocked(referenced)) {
+  if (referenced && (isToolBlocked(referenced) || sidecarEraseNames.includes(referenced))) {
     body.tool_choice = 'auto';
     result.toolChoiceReset = true;
   }
 }
+

@@ -1,0 +1,22 @@
+[general]
+budget_to_effort_low = 8000
+budget_to_effort_medium = 20000
+budget_to_effort_high = 0
+
+[models.FREE]
+upstream_mode = "openai-completions"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "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"
+"inclusionai-ling-3.0-flash-fin" = {target = "inclusionai/ling-3.0-flash-fin:free"}
+dots-studio-dots-3-note-preview = {target = "dots-studio/dots-3-note-preview:free"}
+"nvidia-nemotron-3.5-lightning" = {target = "nvidia/nemotron-3.5-lightning:free"}
+"poolside-laguna-s-2.1" = {target = "poolside/laguna-s-2.1:free"}
+"poolside-laguna-xs-2.1" = {target = "poolside/laguna-xs-2.1:free"}
+nvidia-nemotron-3-ultra-550b-a55b = {target = "nvidia/nemotron-3-ultra-550b-a55b:free"}
+minimax-minimax-m3 = {target = "minimax/minimax-m3:free"}
+nvidia-nemotron-3-super-120b-a12b = {target = "nvidia/nemotron-3-super-120b-a12b:free"}
+
+[composite]
+"free-model" = {"inclusionai-ling-3.0-flash-fin" = {share = 12}, "dots-studio-dots-3-note-preview" = {share = 12}, "nvidia-nemotron-3.5-lightning" = {share = 12}, "poolside-laguna-s-2.1" = {share = 12}, "poolside-laguna-xs-2.1" = {share = 12}, "nvidia-nemotron-3-ultra-550b-a55b" = {share = 12}, "minimax-minimax-m3" = {share = 12}, "nvidia-nemotron-3-super-120b-a12b" = {share = 12}}
+"free-model-fusion" = {fusion_options = {judge_required = false}, "inclusionai-ling-3.0-flash-fin" = {fusion = 1, role = "panel"}, "dots-studio-dots-3-note-preview" = {fusion = 1, role = "panel"}, "nvidia-nemotron-3.5-lightning" = {fusion = 1, role = "panel"}, "poolside-laguna-s-2.1" = {fusion = 1, role = "panel"}, "poolside-laguna-xs-2.1" = {fusion = 1, role = "panel"}, "nvidia-nemotron-3-ultra-550b-a55b" = {fusion = 1, role = "panel"}, "minimax-minimax-m3" = {fusion = 1, role = "judge"}, "nvidia-nemotron-3-super-120b-a12b" = {role = "synth"}}
+"free-model-coordinator" = {"inclusionai-ling-3.0-flash-fin" = {coord = 1, role = "planner"}, "dots-studio-dots-3-note-preview" = {coord = 1, role = "executor"}}

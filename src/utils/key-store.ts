@@ -14,17 +14,34 @@
  *
  * This is a local/dev-host feature: the keytar native addon requires an OS
  * keychain (no Docker/distroless, no Cloudflare Workers). When the feature is
- * enabled but the keychain is unavailable, the error is fatal — no silent
- * fallback.
+ * enabled but the keychain itself is unavailable, the error is fatal — no
+ * silent fallback (it would affect every key).
  *
- * Scope: ONLY configured api_key values of `[models.*]` targets (and
- * `[default_upstream].default_api_key`) in the local `proxy_config.toml` file.
- * Not applied to Consul/Apollo config-center sources; composite/schedule
- * aliases carry no api_key of their own; and caller/user keys from request
- * headers are never stored — an empty api_key (auth passthrough) is skipped.
+ * Exception — the win32 single-executable build: `@github/keytar` needs too
+ * many dependencies on Windows (Visual Studio Build Tools with the C++ workload
+ * + Python 3, via node-gyp) to be worth carrying into a self-contained
+ * single-file distribution, so that build stores the keys in the executable's
+ * own file body instead (body-key-store.ts, addressed by `process.execPath`).
+ * That store is PLAINTEXT inside the exe — a deliberate portability-for-secrecy
+ * trade, only used where an OS keychain is not practical. macOS and Linux keep
+ * the OS keychain via `@github/keytar`; Docker, Cloudflare Workers and
+ * macOS/Linux SEA binaries keep the fatal error above.
+ *
+ * An individual sentinel that has no matching keychain entry is NOT fatal:
+ * that one slot is cleared to
+ * `''` (== "not configured", so the normal api_key fallback chain applies) and
+ * reported, so the rest of the config still loads and the proxy still starts.
+ *
+ * Scope: ONLY configured api_key values of `[models.*]` targets,
+ * `[default_upstream].default_api_key`, and `[passthrough]` target `key`s in the
+ * local `proxy_config.toml` file. Not applied to Consul/Apollo config-center
+ * sources; composite/schedule aliases carry no api_key of their own; and
+ * caller/user keys from request headers are never stored — an empty api_key
+ * (auth passthrough) is skipped.
  */
 
 import { copyFileSync, readFileSync, writeFileSync } from 'fs';
+import { tryBodyKeyStore } from './body-key-store.js';
 import type { ModelCategoryConfig, ProxyConfig } from './config-loader.js';
 
 export const KEY_STORE_SERVICE = 'model_proxy_v3';
@@ -63,6 +80,7 @@ interface KeySlot {
  * - category-level `api_key` → account `<category>/<category base_url>`
  * - entry-level `api_key` (index 2) → account `<target>/<entry or category base_url>`
  * - `default_upstream.default_api_key` → account `default_upstream/<default_base_url>`
+ * - `[passthrough].<name>.key` → account `passthrough.<name>/<base>`
  */
 function collectKeySlots(config: ProxyConfig): KeySlot[] {
   const slots: KeySlot[] = [];
@@ -107,6 +125,19 @@ function collectKeySlots(config: ProxyConfig): KeySlot[] {
     });
   }
 
+  // Passthrough targets have no model id, so the account is namespaced by the
+  // `[passthrough]` target name instead.
+  for (const [name, target] of Object.entries(config.passthrough ?? {})) {
+    if (target.key === undefined) continue;
+    const holder = target as { key?: string };
+    slots.push({
+      location: `passthrough.${name}.key`,
+      account: keychainAccount(`passthrough.${name}`, target.base ?? ''),
+      get: () => holder.key,
+      set: (v) => { holder.key = v; },
+    });
+  }
+
   return slots;
 }
 
@@ -124,15 +155,42 @@ export function findSentinelApiKeys(config: ProxyConfig): string[] {
  *  build the submodule); absence is a runtime KeyStoreError instead. */
 const KEYTAR_MODULE = '@github/keytar';
 
+/** findCredentials (broad keychain enumeration, as opposed to the scoped
+ *  getPassword lookup) has been observed to hang indefinitely rather than
+ *  resolve or reject — bound it so a stuck call fails loud after
+ *  FIND_CREDENTIALS_TIMEOUT_MS instead of hanging the process forever. */
+const FIND_CREDENTIALS_TIMEOUT_MS = 60_000;
+
+/** Exported for direct unit testing with a short timeout — the 60s production
+ *  value would make a real timeout-firing test too slow to run routinely. */
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(() => rejectPromise(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => { clearTimeout(timer); resolvePromise(value); },
+      (err) => { clearTimeout(timer); rejectPromise(err); },
+    );
+  });
+}
+
 async function loadKeytar(opts: { keytarImpl?: KeytarLike }): Promise<KeytarLike> {
   if (opts.keytarImpl) return opts.keytarImpl;
   try {
     const mod = await import(KEYTAR_MODULE);
     return ((mod as { default?: KeytarLike }).default ?? mod) as KeytarLike;
   } catch (err) {
+    // win32 SEA fallback: keytar needs too many dependencies on Windows (VS
+    // Build Tools + Python 3, via node-gyp), so the win32 single-executable
+    // build stores the keys in the executable's own file body instead (see
+    // body-key-store.ts). Null on every other platform, and on any binary that
+    // is not a real SEA whose execPath basename is not node/node.exe — so a
+    // plain Node install is never a target.
+    const body = await tryBodyKeyStore();
+    if (body) return body;
     throw new KeyStoreError(
       `store_key_in_system = true but the system keychain is unavailable: ${(err as Error).message}` +
-      ` (requires the @github/keytar native addon and an OS keychain — not available in Docker/Workers)`,
+      ` (requires the @github/keytar native addon and an OS keychain — not available in Docker/Workers;` +
+      ` on win32, a single-executable build substitutes an in-binary body store automatically)`,
     );
   }
 }
@@ -142,6 +200,14 @@ export interface ApplySystemKeyStoreOptions {
   configPath?: string;
   /** Injectable keytar implementation (tests). */
   keytarImpl?: KeytarLike;
+}
+
+/** One api_key slot whose sentinel could not be resolved from the keychain
+ *  (location + reason), recorded instead of thrown so config load can skip
+ *  just that slot and keep going. */
+export interface UnresolvedKeySentinel {
+  location: string;
+  message: string;
 }
 
 /**
@@ -154,17 +220,22 @@ export interface ApplySystemKeyStoreOptions {
  *    plaintext key literal is replaced with `"STORE_KEY_IN_SYSTEM"`
  *    (targeted text replacement; comments and layout are preserved).
  * 3. Resolve pass — every `STORE_KEY_IN_SYSTEM` sentinel is replaced
- *    in-memory with the key fetched from the keychain. A missing keychain
- *    entry is fatal.
+ *    in-memory with the key fetched from the keychain. A slot whose sentinel
+ *    cannot be resolved is cleared to `''` (same as "not configured" — every
+ *    consumer of these slots falls back to the next key in the chain, or to
+ *    caller-supplied/user_key auth) and recorded in the returned
+ *    `unresolved` list instead of failing the whole config load; the
+ *    keychain itself being unavailable (`loadKeytar` failure) is still fatal,
+ *    since that affects every sentinel, not just one.
  *
  * No-op when `store_key_in_system` is not true or outside Node.js.
  */
 export async function applySystemKeyStore(
   config: ProxyConfig,
   opts: ApplySystemKeyStoreOptions = {},
-): Promise<ProxyConfig> {
+): Promise<{ config: ProxyConfig; unresolved: UnresolvedKeySentinel[] }> {
   if (!isNodeEnvironment || config.general?.store_key_in_system !== true) {
-    return config;
+    return { config, unresolved: [] };
   }
 
   const keytar = await loadKeytar(opts);
@@ -198,17 +269,34 @@ export async function applySystemKeyStore(
   // similarity as tiebreaker — e.g. wanted "glm-5.3-anth/https://…/api/anthropic"
   // can fall back to "glm-5.3/https://…/api". Every fallback use is warned.
   let resolvedCount = 0;
+  const unresolved: UnresolvedKeySentinel[] = [];
   for (const slot of slots) {
     if (slot.get() !== STORE_KEY_IN_SYSTEM) continue;
     const exact = await keytar.getPassword(KEY_STORE_SERVICE, slot.account);
-    const resolved = exact !== null
-      ? { key: exact, account: slot.account }
-      : await findBestEffortKey(keytar, slot.account);
+    let resolved: { key: string; account: string } | null;
+    if (exact !== null) {
+      resolved = { key: exact, account: slot.account };
+    } else {
+      // No exact match — falls back to findCredentials, which enumerates every
+      // keychain item for this service. Unlike the scoped getPassword lookup
+      // above, this broader call can trigger a macOS Keychain Access GUI
+      // prompt ("model_proxy_v3 wants to access your keychain...") that
+      // renders in its own window, not this terminal — print a notice first
+      // so a silent wait here isn't mistaken for a genuine hang (Rule 8).
+      console.log(`[key-store] no exact keychain match for "${slot.account}" — searching all stored keys` +
+        ' (if this pauses, check for a macOS Keychain Access permission dialog and click "Always Allow")');
+      resolved = await findBestEffortKey(keytar, slot.account);
+    }
     if (!resolved) {
-      throw new KeyStoreError(
-        `${slot.location} is "${STORE_KEY_IN_SYSTEM}" but no key was found in the system keychain` +
-        ` (service "${KEY_STORE_SERVICE}", account "${slot.account}" — exact and best-effort base_url match)`,
-      );
+      // Unresolvable sentinel: clear this one slot (same as "not configured"
+      // — downstream `||` fallback chains treat '' like undefined) and record
+      // it instead of throwing, so the rest of the config still loads.
+      const message = `${slot.location} is "${STORE_KEY_IN_SYSTEM}" but no key was found in the system keychain` +
+        ` (service "${KEY_STORE_SERVICE}", account "${slot.account}" — exact and best-effort base_url match)`;
+      console.error(`[key-store] ${message}`);
+      slot.set('');
+      unresolved.push({ location: slot.location, message });
+      continue;
     }
     if (resolved.account !== slot.account) {
       console.warn(`[key-store] exact keychain account "${slot.account}" not found — using best-effort match "${resolved.account}"`);
@@ -225,7 +313,7 @@ export async function applySystemKeyStore(
     (config as ProxyConfig & { _api_keys_in_system_store?: boolean })._api_keys_in_system_store = true;
   }
 
-  return config;
+  return { config, unresolved };
 }
 
 /**
@@ -239,7 +327,12 @@ export async function listSystemKeychainAccounts(): Promise<string[]> {
     if (!keytar.findCredentials) {
       throw new Error('keytar build does not support findCredentials');
     }
-    const credentials = await keytar.findCredentials(KEY_STORE_SERVICE);
+    const credentials = await withTimeout(
+      keytar.findCredentials(KEY_STORE_SERVICE),
+      FIND_CREDENTIALS_TIMEOUT_MS,
+      `keytar.findCredentials("${KEY_STORE_SERVICE}") did not respond within ${FIND_CREDENTIALS_TIMEOUT_MS / 1000}s` +
+        ' (check for a stuck macOS Keychain Access permission dialog)',
+    );
     return credentials.map((c) => c.account).sort((a, b) => a.localeCompare(b));
   } catch (err) {
     throw new Error(`Cannot list system keychain keys: ${(err as Error).message}`);
@@ -258,6 +351,26 @@ function normalizeBaseUrl(url: string): string {
 }
 
 /**
+ * base_url-only compatibility score between two base_urls: exact match beats
+ * a prefix relation (e.g. "https://x/api" vs "https://x/api/anthropic",
+ * longer shared prefix ranks higher); -1 when unrelated. Shared by
+ * scoreAccountMatch (adds target-name tiebreak, for keychain account lookup)
+ * and upsertModelTarget's same-category STORE_KEY_IN_SYSTEM base_url match
+ * (target-name intentionally not considered there).
+ */
+export function scoreBaseUrlMatch(wantedBaseUrl: string, candidateBaseUrl: string): number {
+  const bw = normalizeBaseUrl(wantedBaseUrl);
+  const bc = normalizeBaseUrl(candidateBaseUrl);
+  if (bw === bc) {
+    return 1_000_000;
+  }
+  if (bw.startsWith(bc) || bc.startsWith(bw)) {
+    return 100_000 + Math.min(bw.length, bc.length);
+  }
+  return -1;
+}
+
+/**
  * Compatibility score between a wanted account and a candidate account.
  * Returns -1 when the base_urls are unrelated (no fallback allowed);
  * otherwise base_url match dominates and target-name similarity tiebreaks.
@@ -265,17 +378,8 @@ function normalizeBaseUrl(url: string): string {
 function scoreAccountMatch(wanted: string, candidate: string): number {
   const w = splitAccount(wanted);
   const c = splitAccount(candidate);
-  const bw = normalizeBaseUrl(w.baseUrl);
-  const bc = normalizeBaseUrl(c.baseUrl);
-
-  let baseScore: number;
-  if (bw === bc) {
-    baseScore = 1_000_000;
-  } else if (bw.startsWith(bc) || bc.startsWith(bw)) {
-    // Prefix relation (e.g. "https://x/api" vs "https://x/api/anthropic");
-    // longer shared base ranks higher.
-    baseScore = 100_000 + Math.min(bw.length, bc.length);
-  } else {
+  const baseScore = scoreBaseUrlMatch(w.baseUrl, c.baseUrl);
+  if (baseScore < 0) {
     return -1;
   }
 
@@ -294,8 +398,14 @@ async function findBestEffortKey(keytar: KeytarLike, wantedAccount: string): Pro
   if (!keytar.findCredentials) return null;
   let credentials: Array<{ account: string; password: string }>;
   try {
-    credentials = await keytar.findCredentials(KEY_STORE_SERVICE);
-  } catch {
+    credentials = await withTimeout(
+      keytar.findCredentials(KEY_STORE_SERVICE),
+      FIND_CREDENTIALS_TIMEOUT_MS,
+      `keytar.findCredentials("${KEY_STORE_SERVICE}") did not respond within ${FIND_CREDENTIALS_TIMEOUT_MS / 1000}s` +
+        ' (check for a stuck macOS Keychain Access permission dialog)',
+    );
+  } catch (err) {
+    console.warn(`[key-store] best-effort lookup for "${wantedAccount}" failed: ${(err as Error).message}`);
     return null;
   }
   let best: { key: string; account: string; score: number } | null = null;

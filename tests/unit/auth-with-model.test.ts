@@ -74,6 +74,13 @@ function installMockFetch(authUrl: string) {
         }
       }
       authCalls.push({ url, headers: reqHeaders });
+      if (authStatus === 200) {
+        // A passing auth response MUST advertise the wire-contract `version`.
+        return new Response(JSON.stringify({ version: 'v1' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       return new Response(null, { status: authStatus });
     }
 
@@ -99,7 +106,7 @@ const BASE_TOML = `
 [dashboard]
 api_key = "dash"
 
-[remote.authentication]
+[remote]
 auth_server = "${AUTH_URL}"
 
 [models.claude]
@@ -113,7 +120,7 @@ const AUTH_WITH_MODEL_TOML = `
 [dashboard]
 api_key = "dash"
 
-[remote.authentication]
+[remote]
 auth_server = "${AUTH_URL}"
 auth_with_model = true
 

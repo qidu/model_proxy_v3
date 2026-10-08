@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../../src/converters/completions-to-responses.js';
-import { convertResponsesToChatCompletions, convertInputItemsToMessages } from '../../src/converters/responses-to-completions.js';
+import { convertResponsesToChatCompletions, convertInputItemsToMessages, getNamespaceMap } from '../../src/converters/responses-to-completions.js';
 import { completionsToClaudeBody } from '../../src/handlers/openai.js';
 import type { OpenAIResponse } from '../../src/types/openai.js';
 
@@ -220,6 +220,228 @@ describe('convertResponsesToChatCompletions', () => {
     assert.equal(out.tools!.length, 1);
   });
 
+  it('merges tools from an `additional_tools` input item into the request tools', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              { type: 'function', name: 'lookup', description: 'Lookup', parameters: { type: 'object' } },
+            ],
+          },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+    );
+
+    assert.equal(out.tools!.length, 1);
+    assert.equal(out.tools![0].type, 'function');
+    assert.equal((out.tools![0] as any).function.name, 'lookup');
+    // The additional_tools item itself must not produce a message.
+    assert.equal(out.messages.length, 1);
+    assert.equal(out.messages[0].role, 'user');
+  });
+
+  it('combines top-level tools with additional_tools tools, and still drops non-function ones', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          { type: 'additional_tools', role: 'developer', tools: [{ type: 'function', name: 'extra', parameters: {} }] },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+        tools: [
+          { type: 'function', name: 'search', parameters: {} },
+          { type: 'web_search_preview' },
+        ],
+      },
+      'model',
+    );
+
+    assert.equal(out.tools!.length, 2);
+    const names = out.tools!.map(t => (t as any).function.name).sort();
+    assert.deepEqual(names, ['extra', 'search']);
+  });
+
+  it('ignores an additional_tools item with a missing or non-array tools field', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          { type: 'additional_tools', role: 'developer' },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+    );
+
+    assert.equal(out.tools, undefined);
+    assert.equal(out.messages.length, 1);
+  });
+
+  it('flattens namespace-wrapped tools (recursively), prefixing names with the namespace path', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'outer',
+                description: '',
+                tools: [
+                  { type: 'function', name: 'inner_fn', parameters: { type: 'object' } },
+                  {
+                    type: 'namespace',
+                    name: 'nested',
+                    description: '',
+                    tools: [{ type: 'function', name: 'deep_fn', parameters: {} }],
+                  },
+                ],
+              },
+            ],
+          },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+    );
+
+    const names = out.tools!.map(t => (t as any).function.name).sort();
+    assert.deepEqual(names, ['outer_Z_inner_fn', 'outer_Z_nested_Z_deep_fn']);
+
+    const namespaceMap = getNamespaceMap(out);
+    assert.deepEqual(namespaceMap?.get('outer_Z_inner_fn'), { name: 'inner_fn', namespace: 'outer' });
+    assert.deepEqual(namespaceMap?.get('outer_Z_nested_Z_deep_fn'), { name: 'deep_fn', namespace: 'outer.nested' });
+  });
+
+  it('shortens a flattened name over the 64-char function.name limit and round-trips it', () => {
+    const ns = 'a'.repeat(40);
+    const toolName = 'b'.repeat(40);
+    const out = convertResponsesToChatCompletions(
+      {
+        tools: [
+          { type: 'namespace', name: ns, description: '', tools: [{ type: 'function', name: toolName, parameters: { type: 'object' } }] },
+        ],
+        input: [{ type: 'message', role: 'user', content: 'hi' }],
+      },
+      'model',
+    );
+
+    const flatName = (out.tools![0] as any).function.name as string;
+    assert.equal(flatName.length, 64, `expected a 64-char shortened name, got ${flatName.length}`);
+    const namespaceMap = getNamespaceMap(out);
+    assert.deepEqual(namespaceMap?.get(flatName), { name: toolName, namespace: ns });
+
+    const completion = {
+      id: 'chatcmpl-long', object: 'chat.completion' as const, created: 1700000000, model: 'model',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: flatName, arguments: '{}' } }] },
+        finish_reason: 'tool_calls' as const,
+      }],
+    };
+    const responsesResponse = convertCompletionsToResponses(completion, 'model', namespaceMap);
+    const fnCall = responsesResponse.output.find(o => o.type === 'function_call')!;
+    assert.equal(fnCall.name, toolName);
+    assert.equal((fnCall as any).namespace, ns);
+  });
+
+  it('restores the original name/namespace split on the function_call output item', () => {
+    const out = convertResponsesToChatCompletions(
+      {
+        tools: [
+          {
+            type: 'namespace',
+            name: 'crm',
+            description: '',
+            tools: [{ type: 'function', name: 'lookup', parameters: { type: 'object' } }],
+          },
+        ],
+        input: [{ type: 'message', role: 'user', content: 'hi' }],
+      },
+      'model',
+    );
+    const namespaceMap = getNamespaceMap(out);
+
+    const completion = {
+      id: 'chatcmpl-ns', object: 'chat.completion' as const, created: 1700000000, model: 'model',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'crm_Z_lookup', arguments: '{}' } }] },
+        finish_reason: 'tool_calls' as const,
+      }],
+    };
+
+    const responsesResponse = convertCompletionsToResponses(completion, 'model', namespaceMap);
+    const fnCall = responsesResponse.output.find(o => o.type === 'function_call')!;
+    assert.equal(fnCall.name, 'lookup');
+    assert.equal((fnCall as any).namespace, 'crm');
+  });
+
+  it('leaves non-namespaced tool call names unaffected when namespaceMap is empty/omitted', () => {
+    const completion = {
+      id: 'chatcmpl-plain', object: 'chat.completion' as const, created: 1700000000, model: 'model',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant' as const, content: null, tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'plain_fn', arguments: '{}' } }] },
+        finish_reason: 'tool_calls' as const,
+      }],
+    };
+
+    const responsesResponse = convertCompletionsToResponses(completion, 'model');
+    const fnCall = responsesResponse.output.find(o => o.type === 'function_call')!;
+    assert.equal(fnCall.name, 'plain_fn');
+    assert.equal((fnCall as any).namespace, undefined);
+  });
+
+  it('best-effort converts a custom tool to a function tool and warns', () => {
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    const out = convertResponsesToChatCompletions(
+      {
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'functions',
+                description: '',
+                tools: [{ type: 'custom', name: 'exec', description: 'Run a command' }],
+              },
+            ],
+          },
+          { type: 'message', role: 'user', content: 'hi' },
+        ],
+      },
+      'model',
+      { logger, requestId: 'req-1' },
+    );
+
+    assert.equal(out.tools!.length, 1);
+    const tool = out.tools![0] as any;
+    assert.equal(tool.type, 'function');
+    assert.equal(tool.function.name, 'functions_Z_exec');
+    assert.equal(tool.function.description, 'Run a command');
+    assert.deepEqual(tool.function.parameters, {
+      type: 'object',
+      properties: { input: { type: 'string' } },
+      required: ['input'],
+    });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /best-effort converting custom tool 'functions_Z_exec'/);
+    assert.deepEqual(getNamespaceMap(out)?.get('functions_Z_exec'), { name: 'exec', namespace: 'functions' });
+  });
+
   it('maps tool_choice { type: "function", name: "fn" } to nested format', () => {
     const out = convertResponsesToChatCompletions(
       { input: 'hi', tool_choice: { type: 'function', name: 'fn' } },
@@ -389,6 +611,61 @@ describe('convertInputItemsToMessages', () => {
     assert.equal(msgs[1].tool_call_id, 'c1');
   });
 
+  it('tolerates a function_call_output with a caller field and no call_id (new spec fields)', () => {
+    // OpenAI's spec now allows `caller` (Direct/Program attribution) on
+    // function_call_output, and call_id is now optional/nullable. Neither is
+    // read by the converter, so this just locks in that unknown/absent fields
+    // don't break conversion.
+    const msgs = convertInputItemsToMessages([
+      { type: 'function_call', call_id: 'c1', name: 'search', arguments: '{"q":"x"}' },
+      {
+        type: 'function_call_output',
+        call_id: 'c1',
+        output: 'result',
+        caller: { type: 'direct' },
+      },
+    ]);
+
+    assert.equal(msgs.length, 2);
+    assert.equal(msgs[1].role, 'tool');
+    assert.equal(msgs[1].content, 'result');
+    assert.equal(msgs[1].tool_call_id, 'c1');
+  });
+
+  it('converts array-form function_call_output text parts to a string', () => {
+    const msgs = convertInputItemsToMessages([
+      {
+        type: 'function_call_output',
+        call_id: 'c1',
+        output: [{ type: 'input_text', text: 'result' }],
+      },
+    ]);
+
+    assert.equal(msgs[0].role, 'tool');
+    assert.equal(msgs[0].content, 'result');
+  });
+
+  it('converts array-form function_call_output with an image to content parts', () => {
+    const msgs = convertInputItemsToMessages([
+      {
+        type: 'function_call_output',
+        call_id: 'c1',
+        output: [
+          { type: 'input_text', text: 'see image' },
+          { type: 'input_image', image_url: 'https://example.com/x.png' },
+        ],
+      },
+    ]);
+
+    assert.equal(msgs[0].role, 'tool');
+    assert.ok(Array.isArray(msgs[0].content));
+    const parts = msgs[0].content as Array<Record<string, unknown>>;
+    assert.equal(parts[0].type, 'text');
+    assert.equal(parts[0].text, 'see image');
+    assert.equal(parts[1].type, 'image_url');
+    assert.deepEqual(parts[1].image_url, { url: 'https://example.com/x.png' });
+  });
+
   it('attaches pending reasoning_content to the next assistant turn', () => {
     const msgs = convertInputItemsToMessages([
       { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'deep thought' }] },
@@ -430,5 +707,91 @@ describe('convertInputItemsToMessages', () => {
     ]);
 
     assert.equal(msgs[0].role, 'system');
+  });
+
+  it('warns (not silently drops) on an unrecognized item type', () => {
+    // The Responses API item union keeps growing. An item this converter does
+    // not know still emits no message, but must be reported rather than
+    // vanishing from the upstream conversation — CLAUDE.md rule 8 (fail loud).
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    const msgs = convertInputItemsToMessages(
+      [{ type: 'computer_call_output', id: 'x1', call_id: 'c1', output: {} }],
+      { logger, requestId: 'req-1' },
+    );
+
+    assert.equal(msgs.length, 0, 'unrecognized item emits no message');
+    assert.equal(warnings.length, 1, 'exactly one warning for the dropped item');
+    assert.match(warnings[0], /unrecognized input item type: computer_call_output/);
+  });
+
+  it('rejects a program item with a 400 ValidationError rather than degrading it', () => {
+    // `program` carries a flat `code` string plus an opaque `fingerprint` the
+    // spec says must be round-tripped. Chat Completions can carry neither, so
+    // converting would silently break program replay upstream. Refuse instead.
+    assert.throws(
+      () => convertInputItemsToMessages([
+        { type: 'program', id: 'p1', call_id: 'c1', code: 'console.log(1)', fingerprint: 'fp-abc' },
+      ]),
+      (err: any) => {
+        assert.equal(err.name, 'ValidationError');
+        assert.equal(err.status, 400, 'surfaces to the client as a 400, not a 500');
+        assert.equal(err.type, 'invalid_request_error');
+        assert.match(err.message, /program/);
+        assert.match(err.message, /openai-responses/, 'points at the passthrough upstream as the fix');
+        return true;
+      },
+    );
+  });
+
+  it('rejects a program_output item with a 400 ValidationError', () => {
+    assert.throws(
+      () => convertInputItemsToMessages([
+        { type: 'program_output', id: 'o1', call_id: 'c1', result: '42', status: 'completed' },
+      ]),
+      (err: any) => {
+        assert.equal(err.name, 'ValidationError');
+        assert.equal(err.status, 400);
+        assert.match(err.message, /program_output/);
+        return true;
+      },
+    );
+  });
+
+  it('rejects a program item even when it is buried among valid items', () => {
+    // The reject must not depend on position — a mid-conversation program item
+    // is exactly the replay case that would otherwise be silently flattened.
+    assert.throws(
+      () => convertInputItemsToMessages([
+        { type: 'message', role: 'user', content: 'hi' },
+        { type: 'program', id: 'p1', call_id: 'c1', code: 'x()', fingerprint: 'fp' },
+        { type: 'message', role: 'assistant', content: 'done' },
+      ]),
+      (err: any) => err.name === 'ValidationError' && err.status === 400,
+    );
+  });
+
+  it('does not warn for recognized item types that intentionally emit nothing', () => {
+    // `additional_tools` and `reasoning` are consumed elsewhere and emit no
+    // message by design — they must not be reported as dropped.
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    convertInputItemsToMessages(
+      [
+        { type: 'additional_tools', role: 'developer', tools: [] },
+        { type: 'message', role: 'user', content: 'hi' },
+      ],
+      { logger, requestId: 'req-2' },
+    );
+
+    assert.deepEqual(warnings, [], 'no warnings for recognized types');
   });
 });

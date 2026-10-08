@@ -4,10 +4,15 @@
  * Wraps the Workers fetch handler with a native HTTP server
  */
 
+// Must stay the first import: it normalizes --tui/--agent/--dashboard into the
+// TUI/AGENT/DASHBOARD env vars at import time, before utils/logger.ts freezes
+// AGENT_MODE. See mode-flags.ts.
+import { MODE_FLAGS } from './mode-flags.js';
 import { createServer } from 'http';
 import type { Env } from './types/shared.js';
-import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit } from './utils/config-loader.js';
-import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled } from './utils/dashboard-stats.js';
+import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit, resolveDefaultProxyConfigPath } from './utils/config-loader.js';
+import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled, setTokenRetentionWindow } from './utils/dashboard-stats.js';
+import { runCli } from './cli.js';
 
 const port = parseInt(process.env.PORT || '8788', 10);
 
@@ -32,17 +37,23 @@ const env: NodeEnv = {
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || '*',
   LOCAL_TIKTOKEN: process.env.LOCAL_TIKTOKEN || 'false',
   ALLOWED_HOSTS: process.env.ALLOWED_HOSTS || '127.0.0.1,localhost',
+  ENABLE_DYNAMIC_ROUTING: process.env.ENABLE_DYNAMIC_ROUTING || 'false',
   IMAGE_BLOCK_DATA_MAX_SIZE: process.env.IMAGE_BLOCK_DATA_MAX_SIZE || '10485760',
-  LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+  // AGENT=true's interactive TUI is noisy at the default 'info' level (every
+  // proxy request logs its own line) — default to 'warn' in that mode unless
+  // the user explicitly set LOG_LEVEL.
+  LOG_LEVEL: process.env.LOG_LEVEL || ((process.env.AGENT === 'true' || process.env.AGENT === '1') ? 'warn' : 'info'),
   GEMINI_API_VERSION: process.env.GEMINI_API_VERSION || 'v1beta',
   MESSAGES_UPSTREAM_MODE: (process.env.MESSAGES_UPSTREAM_MODE as 'native' | 'openai-completions') || 'openai-completions',
   INTERACTIONS_UPSTREAM_MODE: (process.env.INTERACTIONS_UPSTREAM_MODE as 'native' | 'openai-completions') || 'native',
   GENERATE_CONTENT_UPSTREAM_MODE: (process.env.GENERATE_CONTENT_UPSTREAM_MODE as 'native' | 'openai-completions') || 'native',
-  PROXY_CONFIG_PATH: process.env.PROXY_CONFIG_PATH || (process.env.TEST_CONFIG ? `./${process.env.TEST_CONFIG}proxy_config.toml` : './proxy_config.toml'),
+  PROXY_CONFIG_PATH: process.env.PROXY_CONFIG_PATH || (process.env.TEST_CONFIG ? `./${process.env.TEST_CONFIG}proxy_config.toml` : resolveDefaultProxyConfigPath()),
   PROXY_CONFIG_CONSUL: process.env.PROXY_CONFIG_CONSUL,
   PROXY_CONFIG_APOLLO: process.env.PROXY_CONFIG_APOLLO,
   PORT: process.env.PORT || '8788',
   DEV_NO_KEY: process.env.DEV_NO_KEY || 'false',
+  PROXY_CLIENT_API_KEY: process.env.PROXY_CLIENT_API_KEY,
+  AGENT: process.env.AGENT,
   CONVERSATION_STATE: process.env.CONVERSATION_STATE || 'false',
   PRIVACY_FILTER_URL: process.env.PRIVACY_FILTER_URL,
   PRIVACY_FILTER_TIMEOUT_MS: process.env.PRIVACY_FILTER_TIMEOUT_MS,
@@ -55,6 +66,43 @@ const env: NodeEnv = {
   KOMPRESS_KEEP_RATIO: process.env.KOMPRESS_KEEP_RATIO,
   KOMPRESS_MIN_CHARS: process.env.KOMPRESS_MIN_CHARS,
 };
+
+// Diagnostics go to stderr so stdout carries only machine-readable output: the
+// CLI subcommand payloads (src/cli.ts) and, in --rpc mode, the NDJSON JSON-RPC
+// control channel (docs/design_tauri_tray.md). Proxy logging funnels through
+// console.log (src/utils/logger.ts), with a few direct console.log/info/debug
+// call sites besides, so redirect the methods once here rather than at each
+// site — this covers console.log calls added later too. console.error/warn
+// already write to stderr. AGENT=true's interactive session is unaffected in
+// substance: its task output (streamed reply deltas, pi-tui prompts) is written
+// with process.stdout.write and stays on stdout, while its status/progress
+// lines go through console.log and land here on stderr alongside the proxy's
+// own logs. TUI=true overrides these methods again below.
+console.log = console.error;
+console.info = console.error;
+console.debug = console.error;
+
+// The MODE_FLAGS (`--rpc`, `--tui`, `--agent`, `--dashboard`) are *modes*, not
+// runCli() commands: runCli() rejects unknown args and exits after every command,
+// so strip them before the scan. A real command beside them (`--rpc --list-models`)
+// still runs and exits as usual. mode-flags.ts already turned --tui/--agent/
+// --dashboard into the TUI/AGENT/DASHBOARD env vars that the rest of this file reads.
+const argv = process.argv.slice(2);
+const rpcEnabled = argv.includes('--rpc');
+
+// CLI subcommands exit before the server starts. No args (runCli returns null)
+// preserves the previous behavior of starting the HTTP server.
+const cliExitCode = runCli(argv.filter((arg) => !(MODE_FLAGS as readonly string[]).includes(arg)), env);
+if (cliExitCode !== null) {
+  process.exit(cliExitCode);
+}
+
+// --rpc, TUI and AGENT all want stdout (RPC frames vs. TUI rendering vs. agent
+// output), so combining them is a startup error rather than a silent winner.
+if (rpcEnabled && (env.AGENT === 'true' || env.AGENT === '1' || process.env.TUI === 'true' || process.env.TUI === '1')) {
+  console.error('[FATAL] --rpc cannot be combined with AGENT or TUI: all three own stdout.');
+  process.exit(2);
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -148,23 +196,38 @@ const server = createServer(async (req, res) => {
 });
 
 let stopTui: (() => void) | undefined;
+let stopRpc: (() => void) | undefined;
+let agentSessionPromise: Promise<void> | undefined;
 
 server.listen(port, '0.0.0.0', async () => {
   console.log(`Server running on http://0.0.0.0:${port} (version: ${env.VERSION})`);
-  console.log(` and dashboard at http://0.0.0.0:${port}/dashboard`);
+  console.log(` and dashboard at http://127.0.0.1:${port}/dashboard`);
 
   if (env.DEV_NO_KEY === 'true' || env.DEV_NO_KEY === '1') {
     console.warn('[WARN] DEV_NO_KEY is enabled: model requests may omit authentication headers. Do not use in production.');
   }
 
   // Token stats persistence (JSONL dump + restore) is opt-in: it only runs
-  // when the TUI dashboard or the standalone DUMP timer is active. Without
-  // it, stats live purely in memory, capped at the 30d retention window by
-  // recordTokenHeatmapEvent.
-  const tuiEnabled = process.env.TUI === 'true' || process.env.TUI === '1';
+  // when the dashboard is enabled (--dashboard, or --tui/--agent which imply
+  // it) or the standalone DUMP timer is active. Without it, stats live purely
+  // in memory, capped at the 30d retention window by recordTokenHeatmapEvent.
+  let tuiEnabled = process.env.TUI === 'true' || process.env.TUI === '1';
+  const agentEnabled = process.env.AGENT === 'true' || process.env.AGENT === '1';
   const dumpEnabled = process.env.DUMP === 'true' || process.env.DUMP === '1';
-  const persistenceEnabled = tuiEnabled || dumpEnabled;
+  const dashboardEnabled = process.env.DASHBOARD === 'true' || process.env.DASHBOARD === '1';
+  const persistenceEnabled = dashboardEnabled || tuiEnabled || dumpEnabled;
   setStatsPersistenceEnabled(persistenceEnabled);
+
+  // Retention window: 31 days when any mode flag is set (--dashboard/--tui/--agent/--rpc),
+  // 1 day in plain proxy mode. This controls the in-memory tokenHeatmapEvents cap,
+  // which feeds global token limit enforcement (1w/1m windows) and the dashboard heatmap.
+  const anyModeFlag = dashboardEnabled || tuiEnabled || agentEnabled || rpcEnabled || dumpEnabled;
+  setTokenRetentionWindow(anyModeFlag ? 31 : 1);
+
+  if (agentEnabled && tuiEnabled) {
+    console.warn('[WARN] Both AGENT and TUI are set; AGENT takes precedence and the dashboard TUI will not start.');
+    tuiEnabled = false;
+  }
 
   if (persistenceEnabled) {
     // Restore token stats from log with a retention window sized to fit the
@@ -195,7 +258,27 @@ server.listen(port, '0.0.0.0', async () => {
     loadTokenStatsFromLog(retentionDays);
   }
 
-  if (tuiEnabled && process.stdin.isTTY && process.stdout.isTTY) {
+  if (agentEnabled && process.stdin.isTTY && process.stdout.isTTY) {
+    // Lazy import: pi-agent-core/pi-tui/pi-ai are devDependencies, not shipped in the production image
+    const { startAgentSession } = await import('./agent-session.js');
+    agentSessionPromise = startAgentSession({
+      env,
+      loadConfig: async (forceReload?: boolean) => {
+        if (forceReload) clearProxyConfigCache();
+        return loadProxyConfig(env);
+      },
+      port,
+    }).catch((err) => {
+      console.error('Agent session failed:', (err as Error).message);
+    }).finally(() => {
+      // The agent session owns the terminal for its whole lifetime; once it
+      // ends (clean exit, cancel, or error) there's no interactive use left
+      // for this process, and nothing else was keeping the server open on
+      // its behalf — shut down the same way SIGINT does instead of leaving
+      // an orphaned server with no one attached to it.
+      shutdown();
+    });
+  } else if (tuiEnabled && process.stdin.isTTY && process.stdout.isTTY) {
     console.log = () => {};
     console.info = () => {};
     console.warn = () => {};
@@ -213,21 +296,41 @@ server.listen(port, '0.0.0.0', async () => {
       readOnly: !!env.PROXY_CONFIG_CONSUL || !!env.PROXY_CONFIG_APOLLO,
     });
   } else {
-    // Non-TUI mode: eagerly load config to validate and show errors in console
+    // Non-TUI/non-agent mode: eagerly load config to validate and show errors in console
     loadProxyConfig(env).catch((err) => {
       console.error('Failed to load config at startup:', (err as Error).message);
     });
+
+    if (rpcEnabled) {
+      // Lazy import: pi-tui/pi-agent-core are devDependencies, but rpc.ts is
+      // bundled into the SEA blob like tui.js/agent-session.js. Starting here,
+      // inside the listen callback, means the port is bound before the first
+      // request is read — a reply to status.get proves the socket is live.
+      const { startRpc } = await import('./rpc.js');
+      stopRpc = startRpc({
+        env,
+        loadConfig: async (forceReload?: boolean) => {
+          if (forceReload) clearProxyConfigCache();
+          return loadProxyConfig(env);
+        },
+        port,
+        shutdown,
+      });
+    }
   }
 });
 
 let shuttingDown = false;
-process.on('SIGINT', () => {
+function shutdown(): void {
   if (shuttingDown) {
-    // Second Ctrl+C: force-quit without waiting for in-flight requests
+    // Second shutdown trigger (e.g. Ctrl+C during close): force-quit without
+    // waiting for in-flight requests
     process.exit(130);
   }
   shuttingDown = true;
   stopTui?.();
+  stopRpc?.();
   server.close(() => process.exit(0));
   server.closeAllConnections();
-});
+}
+process.on('SIGINT', shutdown);
