@@ -8,12 +8,11 @@
  * - /https/api.qnaigc.com/openai/v1/models/deepseek-v3.1/v1/messages (Messages API)
  */
 
-import { validateBetaFeatures } from './beta-features.js';
-
 import { validateBetaFeatures as validateBetaFeaturesUtil } from './beta-features.js';
 import { createLogger } from './logger.js';
+import { pickRawApiKey } from './auth-headers.js';
 
-export { parseDynamicRoute, getHandlerType, buildTargetUrl, extractAuthHeaders, transformAuthHeadersForUpstream, isHostAllowed, getAllowedHosts, formatApiKeyForUpstream, normalizeOpenAIAuthHeaders };
+export { parseDynamicRoute, getHandlerType, buildTargetUrl, extractAuthHeaders, transformAuthHeadersForUpstream, isHostAllowed, getAllowedHosts, formatApiKeyForUpstream };
 
 // Default allowed hosts for SSRF protection
 const DEFAULT_ALLOWED_HOSTS = ['127.0.0.1', 'localhost'];
@@ -404,42 +403,20 @@ function transformAuthHeadersForUpstream(
   // Determine priority based on endpoint
   const isMessagesEndpoint = endpointPath?.startsWith('/v1/messages');
   const isOpenAIEndpoint = upstreamMode === 'openai-completions' || upstreamMode === 'openai-responses';
-  const isGeminiEndpoint = endpointPath?.startsWith('/v1/interactions') ||
-                          endpointPath?.startsWith('/v1beta/models/') ||
-                          endpointPath?.startsWith('/v1/models/');
+  const isGeminiEndpoint = isGeminiApiPath(endpointPath);
 
   if (isMessagesEndpoint) {
     // /v1/messages: x-api-key > Authorization (no x-goog-api-key)
-    if (xApiKey) {
-      apiKey = xApiKey.startsWith('Bearer ') ? xApiKey.substring(7) : xApiKey;
-    } else if (authHeader) {
-      apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
-    }
+    apiKey = pickRawApiKey([xApiKey, authHeader]);
   } else if (isOpenAIEndpoint) {
     // OpenAI endpoints: Authorization > x-api-key (no x-goog-api-key)
-    if (authHeader) {
-      apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
-    } else if (xApiKey) {
-      apiKey = xApiKey.startsWith('Bearer ') ? xApiKey.substring(7) : xApiKey;
-    }
+    apiKey = pickRawApiKey([authHeader, xApiKey]);
   } else if (isGeminiEndpoint) {
     // Gemini endpoints prefer x-goog-api-key
-    if (googApiKey) {
-      apiKey = googApiKey.startsWith('Bearer ') ? googApiKey.substring(7) : googApiKey;
-    } else if (xApiKey) {
-      apiKey = xApiKey.startsWith('Bearer ') ? xApiKey.substring(7) : xApiKey;
-    } else if (authHeader) {
-      apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
-    }
+    apiKey = pickRawApiKey([googApiKey, xApiKey, authHeader]);
   } else {
     // Default: Authorization > x-api-key > x-goog-api-key
-    if (authHeader) {
-      apiKey = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
-    } else if (xApiKey) {
-      apiKey = xApiKey.startsWith('Bearer ') ? xApiKey.substring(7) : xApiKey;
-    } else if (googApiKey) {
-      apiKey = googApiKey.startsWith('Bearer ') ? googApiKey.substring(7) : googApiKey;
-    }
+    apiKey = pickRawApiKey([authHeader, xApiKey, googApiKey]);
   }
   
   // If no API key found, return empty headers
@@ -509,6 +486,20 @@ function transformAuthHeadersForUpstream(
 
 
 /**
+ * True for Gemini native API paths: the interactions API (v1 and v1beta) and
+ * models/{id} calls with any method suffix. The bare v1[/beta]/models model-list
+ * endpoint is excluded — it is OpenAI-convention and classified separately.
+ * Accepts paths with or without a leading slash.
+ */
+function isGeminiApiPath(path: string | undefined): boolean {
+  if (!path) return false;
+  const p = path.startsWith('/') ? path.slice(1) : path;
+  return p.startsWith('v1/interactions') ||
+         p.startsWith('v1beta/interactions') ||
+         /^v1(?:beta)?\/models\/[^/]+/.test(p);
+}
+
+/**
  * Determine handler type based on Claude endpoint
  */
 function getHandlerType(claudeEndpoint: string): 'models' | 'token-counting' | 'messages' | 'interactions' | 'generateContent' {
@@ -525,12 +516,12 @@ function getHandlerType(claudeEndpoint: string): 'models' | 'token-counting' | '
   }
 
   // Gemini Interactions API endpoints
-  if (claudeEndpoint.startsWith('v1/interactions') || claudeEndpoint.startsWith('v1beta/interactions')) {
+  if (isGeminiApiPath(claudeEndpoint) && (claudeEndpoint.startsWith('v1/interactions') || claudeEndpoint.startsWith('v1beta/interactions'))) {
     return 'interactions';
   }
 
   // Gemini generateContent endpoints
-  if ((claudeEndpoint.startsWith('v1beta/models/') || claudeEndpoint.startsWith('v1/models/')) && claudeEndpoint.includes(':generateContent')) {
+  if (isGeminiApiPath(claudeEndpoint) && claudeEndpoint.includes(':generateContent')) {
     return 'generateContent';
   }
 
@@ -567,23 +558,6 @@ function formatApiKeyForUpstream(apiKey: string, upstreamMode: string): Record<s
   }
 
   return headers;
-}
-
-function normalizeOpenAIAuthHeaders(authHeaders: Record<string, string>, targetUrl: string): Record<string, string> {
-  const url = targetUrl.toLowerCase();
-  if (!url.includes('.cognitiveservices.azure.com') && !url.includes('.openai.azure.com')) {
-    return authHeaders;
-  }
-
-  const authorization = authHeaders['Authorization'] || authHeaders['authorization'];
-  const rawKey = authHeaders['api-key'] || authHeaders['x-api-key'] || (authorization?.replace(/^Bearer\s+/i, ''));
-  if (!rawKey) return authHeaders;
-
-  const normalized: Record<string, string> = { ...authHeaders, 'api-key': rawKey };
-  delete normalized['Authorization'];
-  delete normalized['authorization'];
-  delete normalized['x-api-key'];
-  return normalized;
 }
 
 /**

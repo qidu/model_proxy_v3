@@ -42,6 +42,7 @@ import {
   applyDashboardConfigUpdate,
   toDashboardConfigPayload,
   upsertModelTarget,
+  getDefaultUpstreamConfig,
   resolveDefaultProxyConfigPath,
   HOME_PROXY_CONFIG_PATH,
   type ProxyConfig,
@@ -2114,5 +2115,118 @@ describe('resolveDefaultProxyConfigPath', () => {
       if (!homeConfigDirExisted) rmSync(homeConfigDir, { recursive: true, force: true });
       if (!homeConfigRootExisted) rmSync(homeConfigRoot, { recursive: true, force: true });
     }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// getDefaultUpstreamConfig
+// ---------------------------------------------------------------------------
+
+describe('getDefaultUpstreamConfig', () => {
+  it('prefers the [models.default] table over [default_upstream] for every key', () => {
+    const proxyConfig: ProxyConfig = {
+      models: {
+        default: {
+          upstream_mode: 'anthropic-messages',
+          base_url: 'https://cat.example.com',
+          api_key: 'cat-key',
+        },
+      },
+      default_upstream: {
+        upstream_mode: 'openai-completions',
+        default_base_url: 'https://fallback.example.com',
+        default_api_key: 'fallback-key',
+      },
+    };
+    assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
+      upstreamMode: 'anthropic-messages',
+      baseUrl: 'https://cat.example.com',
+      apiKey: 'cat-key',
+    });
+  });
+
+  it('ignores an array-typed [models.default] and falls back to [default_upstream]', () => {
+    const proxyConfig: ProxyConfig = {
+      models: {
+        default: ['alias', 'https://arr.example.com', 'arr-key'],
+      },
+      default_upstream: {
+        upstream_mode: 'openai-responses',
+        default_base_url: 'https://fallback.example.com',
+        default_api_key: 'fallback-key',
+      },
+    };
+    assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
+      upstreamMode: 'openai-responses',
+      baseUrl: 'https://fallback.example.com',
+      apiKey: 'fallback-key',
+    });
+  });
+
+  it('applies [default_upstream] per key when [models.default] is absent', () => {
+    const proxyConfig: ProxyConfig = {
+      default_upstream: {
+        upstream_mode: 'gemini-generatecontent',
+        default_base_url: 'https://fallback.example.com',
+      },
+    };
+    assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
+      upstreamMode: 'gemini-generatecontent',
+      baseUrl: 'https://fallback.example.com',
+      apiKey: undefined,
+    });
+  });
+
+  it("uses the 'openai-completions' literal only when both sources are absent", () => {
+    assert.deepEqual(getDefaultUpstreamConfig({}), {
+      upstreamMode: 'openai-completions',
+      baseUrl: undefined,
+      apiKey: undefined,
+    });
+  });
+
+  it('lets an explicit primary override [models.default] entirely (per-key, not merged)', () => {
+    const proxyConfig: ProxyConfig = {
+      models: {
+        default: {
+          upstream_mode: 'anthropic-messages',
+          base_url: 'https://cat.example.com',
+          api_key: 'cat-key',
+        },
+      },
+      default_upstream: {
+        upstream_mode: 'openai-completions',
+        default_base_url: 'https://fallback.example.com',
+        default_api_key: 'fallback-key',
+      },
+    };
+    assert.deepEqual(
+      getDefaultUpstreamConfig(proxyConfig, { upstream_mode: 'gemini-interactions' }),
+      {
+        upstreamMode: 'gemini-interactions',
+        baseUrl: 'https://fallback.example.com',
+        apiKey: 'fallback-key',
+      },
+      'primary supplies upstream_mode only; base_url/api_key come from [default_upstream]',
+    );
+  });
+
+  it('treats an empty-string primary value as unset and falls through per key', () => {
+    const proxyConfig: ProxyConfig = {
+      default_upstream: {
+        upstream_mode: 'openai-responses',
+        default_base_url: 'https://fallback.example.com',
+        default_api_key: 'fallback-key',
+      },
+    };
+    assert.deepEqual(
+      getDefaultUpstreamConfig(proxyConfig, { upstream_mode: '' }),
+      {
+        upstreamMode: 'openai-responses',
+        baseUrl: 'https://fallback.example.com',
+        apiKey: 'fallback-key',
+      },
+    );
   });
 });

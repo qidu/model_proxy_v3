@@ -655,6 +655,26 @@ export function resolveTransforms(
   return [...modeSets, ...lookup(categoryTransforms), ...lookup(entryTransforms)];
 }
 
+/**
+ * Resolve the default upstream config chain: `primary` (default: the [models.default]
+ * category, when it's a table rather than an array-of-tables) -> [default_upstream]
+ * -> built-in literal for upstreamMode only. baseUrl/apiKey come back undefined when
+ * nothing is configured; callers that need a literal fallback (e.g. 'http://localhost')
+ * apply it to the result.
+ */
+export function getDefaultUpstreamConfig(
+  proxyConfig: ProxyConfig,
+  primary?: Pick<ModelCategoryConfig, 'upstream_mode' | 'base_url' | 'api_key'>,
+): { upstreamMode: string; baseUrl: string | undefined; apiKey: string | undefined } {
+  const defaultCategory = proxyConfig.models?.default;
+  const source = primary ?? (defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined);
+  return {
+    upstreamMode: source?.upstream_mode || proxyConfig.default_upstream?.upstream_mode || 'openai-completions',
+    baseUrl: source?.base_url || proxyConfig.default_upstream?.default_base_url,
+    apiKey: source?.api_key || proxyConfig.default_upstream?.default_api_key,
+  };
+}
+
 function resolveModelRouteFromEntry(
   modelEntry: string | string[],
   categoryConfig: ModelCategoryConfig,
@@ -662,15 +682,8 @@ function resolveModelRouteFromEntry(
   modelName?: string,
   sectionName?: string,
 ): ModelRouteConfig {
-  const categoryUpstreamMode = categoryConfig.upstream_mode ||
-                               proxyConfig.default_upstream?.upstream_mode ||
-                               'openai-completions';
-  const categoryBaseUrl = categoryConfig.base_url ||
-                          proxyConfig.default_upstream?.default_base_url ||
-                          'http://localhost';
-
-  const categoryApiKey = categoryConfig.api_key ||
-                        proxyConfig.default_upstream?.default_api_key;
+  const { upstreamMode: categoryUpstreamMode, baseUrl, apiKey: categoryApiKey } = getDefaultUpstreamConfig(proxyConfig, categoryConfig);
+  const categoryBaseUrl = baseUrl || 'http://localhost';
 
   if (Array.isArray(modelEntry)) {
     const [modelAlias, modelBaseUrl, modelApiKey, modelMode] = modelEntry;
@@ -871,23 +884,13 @@ function selectWeightedCompositeCandidate<T extends { targetConfig: CompositeTar
  * Get model-specific routing config with category inheritance
  */
 function getDefaultModelRoute(proxyConfig: ProxyConfig): ModelRouteConfig {
-  const defaultCategory = proxyConfig.models?.default;
-  const defaultCategoryConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
-  const defaultMode = defaultCategoryConfig?.upstream_mode ||
-                     proxyConfig.default_upstream?.upstream_mode ||
-                     'openai-completions';
-  const defaultBaseUrl = defaultCategoryConfig?.base_url ||
-                        proxyConfig.default_upstream?.default_base_url ||
-                        'http://localhost';
-
-  const defaultApiKey = defaultCategoryConfig?.api_key ||
-                       proxyConfig.default_upstream?.default_api_key;
+  const { upstreamMode, baseUrl, apiKey } = getDefaultUpstreamConfig(proxyConfig);
 
   return {
-    targetUrl: defaultBaseUrl,
-    apiKey: parseApiKey(defaultApiKey),
-    upstreamMode: defaultMode,
-    transforms: resolveTransforms(defaultMode, undefined, undefined, proxyConfig),
+    targetUrl: baseUrl || 'http://localhost',
+    apiKey: parseApiKey(apiKey),
+    upstreamMode,
+    transforms: resolveTransforms(upstreamMode, undefined, undefined, proxyConfig),
   };
 }
 

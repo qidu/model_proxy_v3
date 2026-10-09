@@ -5,6 +5,58 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refactor(config-loader): extract `getDefaultUpstreamConfig` for the default-upstream lookup chain
+
+`src/utils/config-loader.ts`, `src/index.ts`, `src/utils/target-retry.ts`, `tests/unit/config-loader.test.ts` — five copies of the same three-rung config chain (`[models.default]` table → `[default_upstream]` → literal default) now resolve through one exported helper.
+
+- **The chain had five members.** `parseFixedRoute` and the `/health` handler (`src/index.ts`) each inlined it for raw `upstream_mode`/`base_url` values; `getDefaultModelRoute` and `resolveModelRouteFromEntry` (`config-loader.ts`) ran the same chain with their own `'http://localhost'` base-url literal; `descriptorToRoute` (`target-retry.ts`) ran a mode-only stub of it. All five now call `getDefaultUpstreamConfig(proxyConfig, primary?)`, where `primary` defaults to the `[models.default]` category (with the `!Array.isArray` guard, since the TOML parser can also produce an array-of-tables under that key) and may be overridden per call site — a category config, or `{ upstream_mode: descriptor.mode }`.
+- **Per-site literals stay per-site.** The helper only supplies the `'openai-completions'` literal for mode; the `'http://localhost'` base-url literals remain at the two config-loader call sites that had them, and `parseFixedRoute`'s tolerate-undefined base-url coercion (`|| ''` downstream) is unchanged. The `ModelRouteConfig` returned by `getDefaultModelRoute` is field-for-field identical.
+- **Deliberately not folded**: four sites that read `default_upstream?.default_api_key` directly with no `[models.default]` rung (`src/index.ts:1669`, `src/index.ts:1752`, `src/handlers/dashboard.ts:3643`, `src/handlers/dashboard.ts:3649`) — giving them the rung would be a behavior change, not a refactor, and is left for a separate decision.
+- **Tests**: new 6-test `getDefaultUpstreamConfig` suite in `tests/unit/config-loader.test.ts` — table-wins, array-typed `models.default` ignored, per-key `[default_upstream]` fallback, literal only when both absent, explicit-primary override semantics (per-key, not merged), empty-string fall-through.
+
+**Verification status**: `npm run typecheck` (pass), `npm run test:unit` — **1520 tests, 1520 pass, 0 fail** — and `npm run build` (pass) executed on this tree.
+
+### refactor(auth-headers): import `normalizeOpenAIAuthHeaders` from its own module, drop the routing re-export
+
+`src/handlers/openai.ts`, `src/handlers/responses.ts`, `src/handlers/chat-completions.ts`, `src/handlers/messages.ts`, `src/utils/routing.ts` — when `normalizeOpenAIAuthHeaders` moved into `src/utils/auth-headers.ts` (entry below) it kept a re-export shim in `routing.ts` so the handler files didn't have to move in that pass. They move now.
+
+- All four handlers import `normalizeOpenAIAuthHeaders` from `../utils/auth-headers.js` directly (merged into existing auth-headers import lines where present, e.g. alongside `repackBearerCredential` and `resolveIncomingAuthorization`); `addForwardedHeaders` stays from `routing.js`. All 14 call sites untouched.
+- The shim is gone: `routing.ts` no longer imports or re-exports the name (`pickRawApiKey`, which routing uses internally, stays). Pre-removal greps confirmed zero internal uses in `routing.ts` and exactly these four importers repo-wide.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1514 tests, 1514 pass, 0 fail** — executed on this tree; counts unchanged, as expected for an import-only change.
+
+### fix(routing): stop sending `/v1/models` list requests down the gemini credential chain, and unify the gemini classifiers
+
+`src/utils/routing.ts`, `tests/unit/routing.test.ts` — two related cleanups of the gemini path classification.
+
+- **`/v1/models` is a list endpoint, not a gemini call.** `isGeminiEndpoint` in `transformAuthHeadersForUpstream` matched the prefix `/v1/models/`, which also covers the OpenAI-convention model-list path; an `anthropic-messages`-mode list request carrying both `Authorization` and `x-goog-api-key` would then have the **goog key** chosen for the anthropic upstream (401). The matcher now requires a segment after `models/` — genuine gemini calls (`models/{id}`, `models/{id}:generateContent|:streamGenerateContent|:countTokens`, bare model gets) still match, while the bare list endpoint falls to the default `Authorization > x-api-key > goog` chain.
+- **One predicate for both classifiers.** `isGeminiApiPath` (leading-slash agnostic, since the two call sites receive differently-normalized inputs) now backs both `transformAuthHeadersForUpstream`'s credential priority and `getHandlerType`'s handler selection, replacing three ad-hoc pattern sets. `getHandlerType`'s behavior is input-equivalent (verified by walking list/beta-list/`:generateContent`/`:streamGenerateContent`-throws/interactions shapes — identical results, including the throw paths). Side effect, the intended one: `/v1beta/interactions*` requests now get goog-first credential priority like their `/v1/interactions*` siblings, instead of falling into the default chain.
+- **Tests**: 7 new cases in `tests/unit/routing.test.ts` — the list-endpoint regression (anthropic-mode `/v1/models` + dual credentials → emits `x-api-key: sk-anthropic`), a `:generateContent` positive control, goog-only fall-through on the list endpoint, `/v1beta/interactions` priority + Authorization-only fall-through, and `getHandlerType` pins for `v1beta/interactions` and the throw paths.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1514 tests, 1514 pass, 0 fail** — executed on this tree.
+
+### chore(converters,routing): delete dead model-list converters and a stale beta-features import
+
+`src/converters/openai-to-claude.ts`, `src/utils/routing.ts`, `tests/unit/openai-to-claude.test.ts` — dead code removal, no runtime behavior change.
+
+- **`convertOpenAIModelsToClaude` and `mergeClaudeModelsResponse` are gone.** The former was test-only — its live functionality already lives inline in `src/index.ts`'s `claude-cli` model-list branch, which never called it. The latter had zero call sites anywhere: orphaned when an earlier commit (`32121b2`, per the history below) re-pointed the test suite to `mergeOpenAIModelsResponse` — a different, still-used export; the near-identical names hid the death. Swept with them: `unixToRFC3339` (its only caller was the deleted converter), the `ClaudeModelsResponse`/`ClaudeModel` import bindings, and a pre-existing unreferenced `OpenAIModel` import binding. Module-level `DEFAULT_CONTEXT_LENGTH`/`DEFAULT_MAX_TOKENS` stay — still used by `mergeOpenAIModelsResponse`.
+- **`routing.ts` dropped a stale import**: the bare `validateBetaFeatures` binding was imported at line 11 but only the `validateBetaFeatures as validateBetaFeaturesUtil` alias was ever used.
+- **Tests**: the 2-test `convertOpenAIModelsToClaude` describe block and its import left with it; no tests existed for `mergeClaudeModelsResponse`. The other suites (`mergeOpenAIModelsResponse`, token-counting) untouched. CHANGELOG references to both names are history and stay.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1507 tests, 1507 pass, 0 fail** (−2) — executed on this tree.
+
+### refactor(auth-headers): deduplicate credential-header logic into a new shared module
+
+`src/utils/auth-headers.ts` (new), `src/index.ts`, `src/utils/routing.ts`, `src/handlers/passthrough.ts`, `src/handlers/openai.ts`, `src/handlers/chat-completions.ts`, `tests/unit/auth-headers.test.ts` (new) — sixteen scattered copies of "recover or repack an API key from auth headers" now live behind one module.
+
+- **Six strip/repack sites folded.** `getRawEndpointUserKey` (`index.ts`), `extractCallerKey` (`passthrough.ts`), the incoming-key block (`openai.ts`), and the anthropic/gemini header repacks (`chat-completions.ts`, two sites in one file) each re-implemented bearer-strip with different header orders, fallbacks, and strip mechanics. They now delegate to `stripBearerPrefix`, `extractRawCredential` (both header orders), `resolveIncomingAuthorization` (three-header recovery from raw request headers), and `repackBearerCredential`. `normalizeOpenAIAuthHeaders` moved in from `routing.ts`.
+- **Ten ternaries folded.** `transformAuthHeadersForUpstream`'s four per-endpoint credential priority chains were ten `startsWith('Bearer ') ? x.substring(7) : x` sites; they are now four `pickRawApiKey([...])` calls preserving each chain's order. `pickRawApiKey` uses the legacy **truthiness** semantics — an empty preferred header falls through to the next credential. (A `!= null` "first present wins" variant was tried and reverted after it produced a real regression: empty `x-api-key` + valid `Authorization` yielded `''`, and the caller then emitted no auth headers at all.)
+- **Uniform stripping.** All sites now use the case-insensitive `/^Bearer\s+/i` regex; the two exact-case `startsWith('Bearer ')` sites previously sent `bearer k` (lowercase) or multi-space prefixes verbatim as the key — a latent bug fixed by the fold. Deliberate edge-case changes, consistent with the majority behavior: `extractCallerKey` strips case-insensitively, and `getRawEndpointUserKey` falls through to the goog key on an empty `Bearer ` token.
+- **Intentionally untouched**: `extractAuthHeaders`'s prefix-*wrap* guard (`routing.ts:313-318`, the last non-shared bearer handler) adds rather than strips a prefix and serves a different role; folding it was judged not worth the blast radius. The four direct `default_upstream?.default_api_key` reads are recorded in the `getDefaultUpstreamConfig` entry above.
+- **Tests**: new `tests/unit/auth-headers.test.ts` — 24 tests for the module plus 9 for `pickRawApiKey`, covering both header orders, stripping variants, empty-source fall-through, `Bearer `-token-wins-returns-empty semantics, and the Azure normalization.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1514 tests, 1514 pass, 0 fail** (1500 after the module landed, +9 for the `pickRawApiKey` fold, then updated in place for the truthiness fix) — executed on this tree.
+
 ### refactor(sdk): drop the `chatjimmy` submodule and stub `sdk://` routes out of existence
 
 `src/utils/sdk-handler.ts`, `package.json`, `scripts/build-sea.js`, `scripts/init-proxy-config-in-consul-server.sh`, `src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `tests/unit/sdk-handler.test.ts` (new), `tests/README.md`, `tests/providers/llama/messages.sh`, `docs/getting-started/README_DETAILS.md`, `docs/getting-started/configuration-guide.md`, `docs/reference/configuration-reference.md`, `docs/architecture/design_tauri_tray.md`, `docs/architecture/plan-split-cloudflare-worker-vs-local.md`, `docs/architecture/plan-llm-as-a-verifier-plugin.md`, `docs/contributing/security-review.md`, `docs/contributing/security-review-3.md`, `docs/contributing/security-review-4.md`, `.gitmodules` — removes the `submodules/chatjimmy` git submodule and the SDK code path it backed. `sdk://` config values still load; every request to one now fails loud instead of silently routing.

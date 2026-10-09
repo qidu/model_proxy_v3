@@ -12,7 +12,7 @@
  */
 
 import type { ProxyConfig, ModelRouteConfig } from './config-loader.js';
-import { resolveTransforms } from './config-loader.js';
+import { resolveTransforms, getDefaultUpstreamConfig } from './config-loader.js';
 import { ClaudeProxyError, classifyTransportError } from './errors.js';
 import { UPSTREAM_MODES } from './upstream-modes.js';
 
@@ -241,7 +241,7 @@ export function dedupeAndCap(
  * `auth_passthrough_with = "config_key"`.
  */
 export function descriptorToRoute(descriptor: RemoteTargetDescriptor, proxyConfig: ProxyConfig): ModelRouteConfig {
-  const mode = descriptor.mode || proxyConfig.default_upstream?.upstream_mode || 'openai-completions';
+  const { upstreamMode: mode } = getDefaultUpstreamConfig(proxyConfig, { upstream_mode: descriptor.mode });
   return {
     targetUrl: descriptor.base,
     apiKey: descriptor.key,

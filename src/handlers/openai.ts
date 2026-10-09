@@ -5,7 +5,8 @@ import { convertOpenAIToGeminiGenerateContent, convertOpenAIToGeminiInteractions
 import { createLogger, logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import { isSdkUrl, handleSdkOpenAIRequest } from '../utils/sdk-handler.js';
 import type { Env, Logger } from '../types/shared.js';
-import { addForwardedHeaders, normalizeOpenAIAuthHeaders } from '../utils/routing.js';
+import { addForwardedHeaders } from '../utils/routing.js';
+import { resolveIncomingAuthorization, normalizeOpenAIAuthHeaders } from '../utils/auth-headers.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
@@ -1124,10 +1125,7 @@ export async function handleOpenAIRequest(
     // with a stray client header breaks the /v1beta/models (Gemini) path, which
     // dispatches here, while /v1/responses (handleResponsesRequest) does not.
     if (!authHeaders['Authorization']) {
-        const incomingKey =
-            (authTokenIn ? authTokenIn.replace(/^Bearer\s+/i, '') : '') ||
-            apiKey ||
-            (googApiKey ? googApiKey.replace(/^Bearer\s+/i, '') : '');
+        const incomingKey = resolveIncomingAuthorization(request.headers);
         if (incomingKey) {
             authHeaders['Authorization'] = `Bearer ${incomingKey}`;
         }

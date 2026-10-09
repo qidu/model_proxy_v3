@@ -9,6 +9,7 @@ import { Env } from './types/shared.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
+import { extractRawCredential } from './utils/auth-headers.js';
 import { createErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { createLogger, type Logger } from './utils/logger.js';
 import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled } from './handlers/models.js';
@@ -40,7 +41,7 @@ import {
   handleDashboardUpsertModelTarget,
   handleDashboardUpsertScheduleTarget,
 } from './handlers/dashboard.js';
-import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget } from './utils/config-loader.js';
+import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget, getDefaultUpstreamConfig } from './utils/config-loader.js';
 import { parseAuthTargets, hasRequiredProtocolVersion, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
 import { detectCoordinatorStage } from './utils/coordinator.js';
 import {
@@ -335,11 +336,7 @@ function applyCorsHeaders(response: Response, request: Request, env: Env): Respo
 }
 
 function getRawEndpointUserKey(authHeaders: Record<string, string>): string {
-  const authorization = authHeaders['Authorization'] || authHeaders['authorization'];
-  if (authorization) {
-    return authorization.replace(/^Bearer\s+/i, '');
-  }
-  return authHeaders['x-goog-api-key'] || '';
+  return extractRawCredential(authHeaders, 'authorization-first') ?? '';
 }
 
 function validateDashboardApiAuth(request: Request, proxyConfig: ProxyConfig): Response | null {
@@ -635,13 +632,7 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   forceStreaming?: boolean;
 } {
   // Get default config from [models.default] or [default_upstream]
-  const defaultCategory = proxyConfig.models?.default;
-  const defaultCategoryConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
-  const defaultMode = defaultCategoryConfig?.upstream_mode || 
-                      proxyConfig.default_upstream?.upstream_mode || 
-                      'openai-completions';
-  const defaultBaseUrl = defaultCategoryConfig?.base_url || 
-                        proxyConfig.default_upstream?.default_base_url;
+  const { upstreamMode: defaultMode, baseUrl: defaultBaseUrl } = getDefaultUpstreamConfig(proxyConfig);
 
   // Endpoints whose target does not depend on the upstream mode keep their own
   // branches; everything else goes through the shared (path × upstream_mode) table.
@@ -945,10 +936,7 @@ export default {
 
       // Health check endpoint (also for root path)
       if (path === '/health' || path === '/') {
-        const defaultCategory = proxyConfig.models?.default;
-        const defaultCategoryConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
-        const healthBaseUrl = defaultCategoryConfig?.base_url ||
-                             proxyConfig.default_upstream?.default_base_url;
+        const { baseUrl: healthBaseUrl } = getDefaultUpstreamConfig(proxyConfig);
         const healthUrl = `${healthBaseUrl}/v1/models`;
         const healthAuth = extractAuthHeaders(request);
 
