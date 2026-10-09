@@ -21,6 +21,9 @@ import {
   restoreConsoleOutput,
   SPINNER_CHARS,
   agentTitleGlyph,
+  agentInputPrompt,
+  DiffText,
+  looksLikeDiff,
 } from '../../src/agent-session.js';
 import type { ProxyConfig } from '../../src/utils/config-loader.js';
 import { CURSOR_MARKER, Box, Input, Markdown, visibleWidth, type MarkdownTheme } from '@earendil-works/pi-tui';
@@ -471,6 +474,25 @@ describe('formatUsage', () => {
     );
   });
 
+  it('compacts million-scale token usage to two decimal places', () => {
+    assert.equal(
+      formatUsage(1_930_000, 1, DEFAULT_BUDGET),
+      'usage: 1.93m tokens / 50m limit and 1 / 100 turns',
+    );
+    assert.equal(formatUsage(2_000_000, 1, DEFAULT_BUDGET), 'usage: 2m tokens / 50m limit and 1 / 100 turns');
+  });
+
+  it('compacts billion-scale token usage with a "b" unit', () => {
+    assert.equal(
+      formatUsage(2_500_000_000, 1, DEFAULT_BUDGET),
+      'usage: 2.5b tokens / 50m limit and 1 / 100 turns',
+    );
+    assert.equal(
+      formatUsage(3_000_000_000, 1, DEFAULT_BUDGET),
+      'usage: 3b tokens / 50m limit and 1 / 100 turns',
+    );
+  });
+
   it('omits the turn part when the budget has no turn limit', () => {
     assert.equal(formatUsage(1276, 1, { tokens: 50_000 }), 'usage: 1276 tokens / 50,000 limit');
   });
@@ -791,15 +813,15 @@ describe('agentTitleGlyph', () => {
   it('starts on π and holds it for 14 ticks, then cycles o,u,n', () => {
     // Ticks are 1-based: startTuiSpinner increments spinnerTick before its first
     // glyph, so tick 0 never reaches this function.
-    const seq = Array.from({ length: 20 }, (_, i) => agentTitleGlyph(i + 1));
-    assert.deepEqual(seq, [...Array(14).fill('π'), 'o', 'u', 'n', 'o', 'u', 'n']);
+    const seq = Array.from({ length: 23 }, (_, i) => agentTitleGlyph(i + 1));
+    assert.deepEqual(seq, [...Array(14).fill('π'), 'o', 'o', 'o', 'u', 'u', 'u', 'n', 'n', 'n']);
   });
 
-  it('repeats that 20-tick cycle', () => {
+  it('repeats that 23-tick cycle', () => {
     // The cycle is the property the animation depends on, so assert it separately
     // from the first cycle's exact contents.
-    for (let tick = 1; tick <= 20; tick++) {
-      assert.equal(agentTitleGlyph(tick + 20), agentTitleGlyph(tick), `tick ${tick} does not repeat`);
+    for (let tick = 1; tick <= 23; tick++) {
+      assert.equal(agentTitleGlyph(tick + 23), agentTitleGlyph(tick), `tick ${tick} does not repeat`);
     }
   });
 
@@ -810,6 +832,83 @@ describe('agentTitleGlyph', () => {
         `unexpected glyph at tick ${tick}`,
       );
     }
+  });
+});
+
+describe('agentInputPrompt', () => {
+  it('shows a plain > prompt in follow-up mode while idle', () => {
+    assert.equal(agentInputPrompt(false, null), '> ');
+  });
+
+  it('badges steer mode with ⚡ while idle', () => {
+    assert.equal(agentInputPrompt(true, null), '⚡> ');
+  });
+
+  it('uses the busy frame instead of > while running', () => {
+    assert.equal(agentInputPrompt(false, '⠇'), '⠇ ');
+    assert.equal(agentInputPrompt(true, '⠇'), '⚡⠇ ');
+  });
+
+  it('swaps > for ! while the input carries the shell prefix', () => {
+    assert.equal(agentInputPrompt(false, null, true), '! ');
+    assert.equal(agentInputPrompt(true, null, true), '⚡! ');
+  });
+});
+
+describe('looksLikeDiff', () => {
+  const DIFF = '--- a/f.ts\n+++ b/f.ts\n@@ -1,2 +1,2 @@\n-old\n+new\n context';
+
+  it('is true for unified diff output (git diff, diff -u)', () => {
+    assert.equal(looksLikeDiff(DIFF), true);
+  });
+
+  it('is false for plain prose and empty output', () => {
+    assert.equal(looksLikeDiff('just some words\nacross lines'), false);
+    assert.equal(looksLikeDiff(''), false);
+  });
+
+  it('is false when only one marker kind is present (--help listings have only -)', () => {
+    assert.equal(looksLikeDiff('Usage: cmd [options]\n  -h, --help  show help'), false);
+    assert.equal(looksLikeDiff('+++ b/f.ts only additions'), false);
+  });
+});
+
+describe('DiffText', () => {
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
+
+  it('paints - lines green and + lines red, keeping their exact characters', () => {
+    const rows = new DiffText('-removed\n+added\n context').render(80);
+    assert.equal(rows.length, 3);
+    assert.ok(rows[0].startsWith('\x1b[32m'), 'removed line should open green foreground');
+    assert.ok(rows[1].startsWith('\x1b[31m'), 'added line should open red foreground');
+    assert.ok(rows[2].startsWith('\x1b[2m'), 'context line should be dim');
+    assert.equal(stripAnsi(rows[0]), '-removed');
+    assert.equal(stripAnsi(rows[1]), '+added');
+    assert.equal(stripAnsi(rows[2]), ' context');
+  });
+
+  it('does not mangle indentation the way Markdown bullets did', () => {
+    const rows = new DiffText('-    indented removal').render(80);
+    assert.equal(stripAnsi(rows[0]), '-    indented removal');
+  });
+
+  it('colors only the text — rows are unpadded and end with a reset', () => {
+    const rows = new DiffText('-x').render(20);
+    assert.equal(rows.length, 1);
+    assert.ok(rows[0].endsWith('\x1b[0m'));
+    assert.equal(stripAnsi(rows[0]), '-x');
+  });
+
+  it('wraps long lines, continuing the line color on every wrapped row', () => {
+    const long = '+' + 'a'.repeat(50);
+    const rows = new DiffText(long).render(30);
+    assert.ok(rows.length > 1, '50-char line should wrap at width 30');
+    for (const row of rows) assert.ok(row.startsWith('\x1b[31m'), 'every wrapped row keeps the red foreground');
+    assert.equal(stripAnsi(rows.join('')), long, 'wrapping preserves all characters');
+  });
+
+  it('renders nothing at zero width', () => {
+    assert.deepEqual(new DiffText('-x\n+y').render(0), []);
   });
 });
 

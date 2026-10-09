@@ -220,16 +220,17 @@ runningAgent.subscribe((event) => {
 - Integrates with existing pi-tui components (Markdown, Box, Input)
 - Avoids stdin/raw-mode conflicts with agent's stdout/stderr
 
-### 2. Queue Semantics: followUp() Only
+### 2. Queue Semantics: followUp() by Default, steer() on ctrl-s
 
-**Decision**: Mid-run input goes into `followUp()` queue (one-at-a-time drain).
+**Decision**: Mid-run input defaults to the `followUp()` queue (one-at-a-time drain). Pressing ctrl-s toggles **steer mode**: while active, mid-run input goes into the `steeringQueue` instead, which the agent loop drains at turn boundaries *within* the running task — the message lands after the agent's current turn rather than after the whole task. Toggling back returns to follow-up. The active mode is shown as a ⚡ badge in the input prompt (`⚡> ` idle, `⚡⠇ ` while the spinner runs) and steered lines echo with the same badge; a transient proxy-log row announces each toggle.
 
-**Alternative considered**: `steer()` (immediate), Both prefix-selected.
+**Alternative considered**: `steer()` always-on, both prefix-selected per message.
 
 **Rationale**:
-- `followUp()` respects agent's turn boundaries — input waits until agent decides it's done
-- Default `followUpMode: "one-at-a-time"` prevents input flooding
-- `steer()` would interrupt agent mid-turn, breaking tool execution flow
+- `followUp()` respects agent's autonomy — input waits until the agent decides the task is done; that stays the default so a running plan isn't derailed by accident
+- `steer()` only changes *when* the message is injected (at the next turn boundary, not mid-tool-call), so tool execution flow is not interrupted — the earlier concern that steer would break in-flight tool calls doesn't apply at queue-drain points
+- A mode toggle (sticky until ctrl-s again) beats a per-message prefix: the user decides the interrupt policy per interruption, not per keystroke, and the prompt badge makes the current policy visible before they type
+- Default `followUpMode`/`steeringMode` are `"one-at-a-time"`, preventing input flooding in either mode
 
 ### 3. Markdown Streaming Strategy
 

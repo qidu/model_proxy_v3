@@ -22,6 +22,7 @@ import {
   TuiMainScreen,
   Input,
   getKeybindings,
+  matchesKey,
   type Component,
   type Focusable,
   type SelectItem,
@@ -29,6 +30,7 @@ import {
   Spacer,
   Markdown,
   TruncatedText,
+  wrapTextWithAnsi,
   type MarkdownTheme,
   type DefaultTextStyle,
 } from '@earendil-works/pi-tui';
@@ -447,6 +449,69 @@ export class RuledInput implements Component, Focusable {
   }
 }
 
+// Foreground colors for diff-like shell output, keyed by the line's leading
+// character. '-' lines render green, '+' lines red (this session's convention,
+// inverted from git's default); context lines stay dim like other shell
+// output. Swap the two constants to flip.
+const DIFF_REMOVED_FG = '\x1b[32m'; // lines starting with '-'
+const DIFF_ADDED_FG = '\x1b[31m';   // lines starting with '+'
+const DIFF_CONTEXT_DIM = '\x1b[2m'; // everything else, matching dimStyle
+const DIFF_STYLE_RESET = '\x1b[0m';
+
+/** True when shell output should get diff coloring: it contains at least one
+ *  line starting with '+' and one starting with '-'. Any unified diff (git
+ *  diff/show/log -p, diff -u) has both; ordinary command output — including
+ *  --help listings, whose flags start with '-' — essentially never has bare
+ *  '+' lines. */
+export function looksLikeDiff(output: string): boolean {
+  let hasAdditions = false;
+  let hasRemovals = false;
+  for (const line of output.split('\n')) {
+    if (line.startsWith('+')) hasAdditions = true;
+    else if (line.startsWith('-')) hasRemovals = true;
+    if (hasAdditions && hasRemovals) return true;
+  }
+  return false;
+}
+
+/** Renders shell output that looksLikeDiff as literal text — never through
+ *  Markdown, whose bullet parsing turns '+ '/'- ' lines into list items,
+ *  normalizes both markers to the first one seen, and erases the add/remove
+ *  distinction. Lines keep their exact characters (indentation included);
+ *  '-' lines render in green, '+' lines in red, and every wrapped row keeps
+ *  its line's color. */
+export class DiffText implements Component {
+  private readonly lines: string[];
+  constructor(output: string) {
+    this.lines = output.split('\n');
+  }
+  invalidate(): void {}
+  render(width: number): string[] {
+    if (width <= 0) return [];
+    const rows: string[] = [];
+    for (const line of this.lines) {
+      const added = line.startsWith('+');
+      const removed = !added && line.startsWith('-');
+      const style = added ? DIFF_ADDED_FG : removed ? DIFF_REMOVED_FG : DIFF_CONTEXT_DIM;
+      for (const chunk of wrapTextWithAnsi(line, width)) {
+        rows.push(style + chunk + DIFF_STYLE_RESET);
+      }
+    }
+    return rows;
+  }
+}
+
+/** Transcript component for `!` shell output: diff-like output gets per-line
+ *  foreground colors via DiffText so the +/- markers survive literally; other
+ *  output keeps the Markdown path (prose, lists, and code in ordinary command
+ *  output still render nicely). Callers always push the raw text — never the
+ *  styled render — into shellOutputs, so the model sees unchanged content. */
+function shellOutputComponent(output: string): Component {
+  return looksLikeDiff(output)
+    ? new DiffText(output)
+    : new Markdown(output, 0, 1, currentTheme, dimStyle);
+}
+
 /** Show a single-line text prompt in its own throwaway TUI screen; resolves with the entered text (possibly ''), or null on cancel. */
 async function promptText(title: string, defaultValue = ''): Promise<string | null> {
   const terminal = new ProcessTerminal();
@@ -492,7 +557,10 @@ let currentTheme: MarkdownTheme;
 let dimStyle: DefaultTextStyle;
 let errorStyle: DefaultTextStyle;
 
-// Variables used in updateStatusBar and runAgentTurn (defined in runAgentSession scope, hoisted here for access)
+// Session-scoped counters read by updateStatusBar/buildStatusLine (module
+// functions the TUI calls outside runAgentSession's scope) — runAgentSession
+// assigns/resets these on entry; it must NOT declare locals of the same
+// names, or the status bar reads stale copies and shows zeros forever.
 let selected: Set<string> = new Set();
 let skillsUsed = 0;
 let toolsUsed = 0;
@@ -504,10 +572,15 @@ let committedForTurn = false;
 let runningAgent: Agent | null = null;
 let budgetHit = false;
 let quitRequested = false;
-let budget: Budget | null = null;
 let tokensUsed = 0;
 let turnsUsed = 0;
 let currentAssistantMessageContent = '';
+// Input routing for mid-run submissions: false (default) queues a followUp —
+// the message runs only after the agent would otherwise stop; true (toggled
+// with ctrl-s) steers — the message is injected after the agent's current
+// turn, inside the running task. Only meaningful while isAgentRunning; the
+// badge in the prompt shows the active mode either way.
+let steerMode = false;
 
 /** Default theme for Markdown rendering */
 function getDefaultTheme(): MarkdownTheme {
@@ -584,6 +657,35 @@ async function startPersistentTui(): Promise<void> {
       nextTaskResolver(null);
     }
   };
+  // Transient '!' prompt while the input starts with the shell prefix: wrap
+  // handleInput — the choke point every keystroke reaches (RuledInput
+  // delegates to it after history navigation) — and resync the prompt from
+  // the value. pi-tui's Input has no change callback, so this is the one
+  // place to observe it.
+  const rawHandleInput = bottomInput.handleInput.bind(bottomInput);
+  bottomInput.handleInput = (data: string) => {
+    rawHandleInput(data);
+    syncShellPrompt();
+  };
+  // The prompt already shows the shell indicator (`!`), so hide the value's own
+  // leading `!` while idle or the line renders doubled ("! !ls"). The value
+  // keeps its `!` — the task loops' `startsWith('!')` check and the history
+  // entry both read it. Render is the only place the display is derived, so the
+  // value+cursor are swapped around the call and restored immediately after.
+  const rawRender = bottomInput.render.bind(bottomInput);
+  bottomInput.render = (width: number) => {
+    const input = bottomInput as unknown as { value: string; cursor: number };
+    if (tuiSpinnerInterval !== null || !input.value.startsWith('!')) return rawRender(width);
+    const { value, cursor } = input;
+    input.value = value.slice(1);
+    input.cursor = Math.max(0, cursor - 1);
+    try {
+      return rawRender(width);
+    } finally {
+      input.value = value;
+      input.cursor = cursor;
+    }
+  };
 
   // Root container: conversationArea | proxyLogLine | statusBar | inputRow
   // statusBar sits just above the '─' rule (drawn by RuledInput wrapper)
@@ -600,6 +702,14 @@ async function startPersistentTui(): Promise<void> {
   persistentTui.addChild(root);
   persistentTui.setFocus(inputRow);
   persistentTui.start();
+  // Ctrl-s toggles steer/follow-up input mode. An input listener runs before
+  // the focused component, so the Input never sees the key; ctrl+s is unbound
+  // in pi-tui's default keymap, so nothing else loses it.
+  persistentTui.addInputListener((data) => {
+    if (!matchesKey(data, 'ctrl+s')) return undefined;
+    toggleSteerMode();
+    return { consume: true };
+  });
   // Proxy log lines show in the single row directly above the status bar, newest
   // replacing the previous one (see captureConsoleOutput).
   captureConsoleOutput((line) => {
@@ -728,14 +838,58 @@ function clearAgentTitle(): void {
 }
 
 /** Which glyph the window title shows on a given spinner tick.
- *  π for 14 ticks, then cycles through o, u, n.
- *  At 150ms/tick: π for ~2.1s, then o/u/n each for ~0.45s. 20-tick cycle = 3s. Ticks start at 1. */
+ *  π for 14 ticks, then cycles through o, u, n, each held for 3 ticks — a
+ *  150ms blip flickers past unread, and a legible tab is the whole point of
+ *  the dance.
+ *  At 150ms/tick: π for ~2.1s, then o/u/n each for ~0.45s. 23-tick cycle = 3.45s. Ticks start at 1. */
 export function agentTitleGlyph(tick: number): string {
-  const remainder = (tick - 1) % 20;
+  const remainder = (tick - 1) % 23;
   if (remainder < 14) return 'π';
   const afterPi = remainder - 14;
   const cycleGlyphs = ['o', 'u', 'n'];
-  return cycleGlyphs[afterPi % cycleGlyphs.length];
+  return cycleGlyphs[Math.floor(afterPi / cycleGlyphs.length)];
+}
+
+/** Compose the input-area prompt for the current mode and busy state: a ⚡
+ *  badge prefixes it in steer mode, the busy braille frame replaces `>` while
+ *  the spinner runs, and `>` gives way to `!` while the input starts with the
+ *  shell-command prefix. One helper for the spinner tick and the settle path
+ *  so the two can never drift apart. Exported for the unit tests. */
+export function agentInputPrompt(steer: boolean, busyFrame: string | null, shell = false): string {
+  return `${steer ? '⚡' : ''}${busyFrame ?? (shell ? '!' : '>')} `;
+}
+
+/** True while the bottom input starts with `!` — the prefix the task loops
+ *  treat as a shell command. */
+function inputHasShellPrefix(): boolean {
+  return bottomInput ? bottomInput.getValue().startsWith('!') : false;
+}
+
+/** Resync the idle prompt after the input text changed: a leading `!` swaps
+ *  the `>` indicator for `!` (and back when the prefix disappears). Called
+ *  from the wrapped handleInput in startPersistentTui — the choke point every
+ *  keystroke reaches — and after submissions, which clear the value without
+ *  passing through handleInput. While the spinner runs the braille frame owns
+ *  the prompt: `!` is not a shell prefix mid-run, so there is nothing to do. */
+function syncShellPrompt(): void {
+  if (!bottomInput || tuiSpinnerInterval !== null) return;
+  setInputPrompt(agentInputPrompt(steerMode, null, inputHasShellPrefix()));
+}
+
+/** Toggle steer mode (bound to ctrl-s in startPersistentTui). Feedback goes to
+ *  the transient proxy-log row rather than the transcript, and the input
+ *  prompt badge shows the new mode. */
+function toggleSteerMode(): void {
+  steerMode = !steerMode;
+  // While the spinner runs it owns the prompt text; idle, resync from the
+  // current input (a leading '!' shows the shell indicator instead of '>').
+  setInputPrompt(tuiSpinnerInterval !== null
+    ? agentInputPrompt(steerMode, PROMPT_SPINNER_CHARS[spinnerTick % PROMPT_SPINNER_CHARS.length])
+    : agentInputPrompt(steerMode, null, inputHasShellPrefix()));
+  setProxyLogRow(proxyLogLine, steerMode
+    ? '[π] steer mode on — input joins the running turn after its current step (ctrl-s back to follow-up)'
+    : '[π] follow-up mode — input waits for the agent to finish before running');
+  requestRender();
 }
 
 /** Set the prompt indicator shown before the input text. pi-tui's Input exposes
@@ -761,9 +915,9 @@ function startTuiSpinner(): void {
       requestRender();
     }
     // Also animate the input prompt to show agent is busy
-    setInputPrompt(`${PROMPT_SPINNER_CHARS[spinnerTick % PROMPT_SPINNER_CHARS.length]} `);
-    // Also alternate the title's π with * so the window tab itself shows that
-    // the agent is busy — the transcript may be scrolled off screen.
+    setInputPrompt(agentInputPrompt(steerMode, PROMPT_SPINNER_CHARS[spinnerTick % PROMPT_SPINNER_CHARS.length]));
+    // Also run the title's π through the o/u/n dance so the window tab itself
+    // shows that the agent is busy — the transcript may be scrolled off screen.
     writeAgentTitle(agentTitleGlyph(spinnerTick));
   }, 150);
 }
@@ -776,7 +930,7 @@ function stopTuiSpinner(clear = false): void {
     tuiSpinnerInterval = null;
   }
   spinnerTick = 0;
-  setInputPrompt('> ');
+  setInputPrompt(agentInputPrompt(steerMode, null, inputHasShellPrefix()));
   if (clear) {
     clearAgentTitle();
   } else {
@@ -784,19 +938,36 @@ function stopTuiSpinner(clear = false): void {
   }
 }
 
-/** Update the status bar with current stats */
-function updateStatusBar(): void {
-  if (!statusBar) return;
+/** Build the shared `(π …)` status line: skill/tool tallies, the de-duped
+ *  tool-name list, and animated dots while a tool is in flight. Rendered by
+ *  the TUI status bar (updateStatusBar) and, when no TUI owns the screen, the
+ *  raw process-log line in runAgentSession — one function so the two renderers
+ *  can never drift apart (they once did, and the status bar showed stale
+ *  zeros while the process log showed live counts). */
+function buildStatusLine(): string {
   const skillsList = selected.size > 0 ? `(${[...selected].join(',')})` : '';
+  // De-duped union of completed tool calls plus any still in flight, so
+  // a long-running tool stays visible at the tail of the list rather
+  // than vanishing between start and end.
   const seen = new Set<string>();
   const ordered: string[] = [];
   for (const name of [...toolsUsedNames, ...pendingToolNames]) {
     if (!seen.has(name)) { seen.add(name); ordered.push(name); }
   }
   const toolsList = ordered.length > 0 ? `(${ordered.join(',')})` : '';
+  // Only animate dots while at least one tool is in flight; idle turns
+  // show a stable suffix so the line doesn't keep flickering for no
+  // reason between the agent's text deltas.
   const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
-  const suffix = skillsList || toolsList ? ` ${skillsList} | ${toolsList}` : '';
-  const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results)${suffix}${dots}`);
+  const parts = [skillsList, toolsList].filter((p) => p !== '').join(' | ');
+  const suffix = parts !== '' ? ` ${parts}` : '';
+  return dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results)${suffix}${dots}`);
+}
+
+/** Update the status bar with current stats */
+function updateStatusBar(): void {
+  if (!statusBar) return;
+  const line = buildStatusLine();
 
   // Create a temporary Markdown component for the status bar
   statusBar.clear();
@@ -808,6 +979,10 @@ function updateStatusBar(): void {
 /** Handle input submission from the bottom input */
 function handleInputSubmit(value: string): void {
   bottomInput.setValue('');
+  // The submitted value may have carried the '!' shell prefix; with the input
+  // now empty the prompt returns to '>'. Done here rather than only in the
+  // keystroke wrapper so any submit path resets the indicator.
+  syncShellPrompt();
 
   // Add to history (skip quit commands, empty strings, and command outputs)
   addToHistory(value);
@@ -830,14 +1005,17 @@ function handleInputSubmit(value: string): void {
   }
 
   if (isAgentRunning) {
-    // Mid-run: send as followUp (UserMessage object)
-    runningAgent?.followUp({
-      role: 'user',
-      content: value,
-      timestamp: Date.now(),
-    });
-    // Visual feedback: add as user message immediately
-    const userMsg = new Markdown(`> ${value}`, 0, 1, currentTheme, dimStyle);
+    // Mid-run: steer mode injects after the agent's current turn, inside the
+    // running task; follow-up mode (the default) waits until the agent would
+    // otherwise stop. Both are plain user messages to the model.
+    const message = { role: 'user' as const, content: value, timestamp: Date.now() };
+    if (steerMode) {
+      runningAgent?.steer(message);
+    } else {
+      runningAgent?.followUp(message);
+    }
+    // Visual feedback: add as user message immediately, badged like the prompt
+    const userMsg = new Markdown(`${steerMode ? '⚡' : '>'} ${value}`, 0, 1, currentTheme, dimStyle);
     conversationArea.addChild(userMsg);
     requestRender();
   } else {
@@ -1205,11 +1383,18 @@ export function formatBudget(budget: Budget): string {
   return parts.join(' / ');
 }
 
-/** Per-task usage line, e.g. "usage: 1276 tokens / 50m limit and 1 / 100 turns".
+/** Compact million/billion-scale token usage to at most two decimal places. */
+function formatTokensUsed(tokens: number): string {
+  if (tokens >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(2).replace(/\.?0+$/, '')}b`;
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}m`;
+  return String(tokens);
+}
+
+/** Per-task usage line, e.g. "usage: 1.93m tokens / 50m limit and 1 / 100 turns".
  *  A pair is omitted entirely when the budget leaves that dimension unbounded. */
 export function formatUsage(tokensUsed: number, turnsUsed: number, budget: Budget): string {
   const parts: string[] = [];
-  if (budget.tokens !== undefined) parts.push(`${tokensUsed} tokens / ${formatTokenBudget(budget.tokens)} limit`);
+  if (budget.tokens !== undefined) parts.push(`${formatTokensUsed(tokensUsed)} tokens / ${formatTokenBudget(budget.tokens)} limit`);
   if (budget.turns !== undefined) parts.push(`${turnsUsed} / ${budget.turns} turns`);
   return `usage: ${parts.join(' and ')}`;
 }
@@ -1409,11 +1594,11 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   console.log(dim('[proxy] checking global/project skills...'));
   const skillCandidates = await gatherSkillCandidates(workDir);
   let startupSkills = '';
-  let skillsUsed = 0;
-  // Hoisted so the process-log line below can render the names of the skills
-  // the user actually loaded for this run, not just a count. Empty when there
-  // were no candidates to pick from in the first place.
-  let selected: Set<string> = new Set();
+  // skillsUsed/selected are module-scope (updateStatusBar renders them in the
+  // TUI status bar) — reset, don't redeclare. Redeclaring shadowed them and
+  // the status bar showed zeros no matter what the run actually did.
+  skillsUsed = 0;
+  selected = new Set();
   if (skillCandidates.length > 0) {
     selected = (await pickMultiFromList(
       'Select skills to load for this task:',
@@ -1708,22 +1893,18 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // semantics shouldStopAfterTurn documents, via abort() instead. Usage
   // accumulates across follow-up tasks in the loop below (not reset per
   // task) — the budget is for the whole session, same as the original design.
-  let turnsUsed = 0;
-  let tokensUsed = 0;
-  let toolsUsed = 0;
-  let resultsReceived = 0;
-  // Names of skills that have actually been invoked in this run (de-duped).
-  // Populated as the agent's message stream references them; rendered in the
-  // process-log line so a long skill-driven turn is visibly attributable
-  // rather than just "1 skills".
-  const skillsUsedNames: string[] = [];
-  // Names of tools the agent has called so far (de-duped) plus the in-flight
-  // one — rendered as `<a, b, c>` in the process-log line so the user can
-  // see what's currently happening without scrolling the transcript.
+  // turnsUsed/tokensUsed/toolsUsed/resultsReceived are module-scope:
+  // updateStatusBar (the TUI status bar) reads them on every tool event, so
+  // this function assigns them — zeroed once in the init block below —
+  // rather than declaring locals. Shadowing them left the status bar at
+  // 0 forever. skillsUsed/selected are reset where the skill picker runs.
+  //
+  // toolsUsedNames: names of tools the agent has called so far (de-duped).
+  // pendingToolNames: tools currently in-flight (start without matching end),
+  // joined with toolsUsedNames so a long-running tool stays visible at the
+  // tail of the list. Both render as `(a, b, c)` in the status line so the
+  // user can see what's happening without scrolling the transcript.
   toolsUsedNames = [];
-  // Names of tools currently in-flight (start without matching end). Joined
-  // with toolsUsedNames in the log so a tool that's been running a while is
-  // still visible at the tail of the list.
   pendingToolNames = [];
   // Print a process-log line in place by clearing the current row and
   // returning the cursor to column 0 — successive calls overwrite each
@@ -1739,21 +1920,23 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // plain console.log line when stderr isn't a TTY (e.g. piped to a file) — the
   // carriage return would just corrupt the log.
   const isTty = Boolean(process.stdout.isTTY);
-  // The process-log line below is written to stderr, so both its in-place
-  // rendering and the ticker that animates its dots are gated on stderr's
-  // TTY-ness — not stdout's. Gating the ticker on stdout would emit a plain
-  // progress line every 400ms into a piped stderr log.
+  // The process-log line below is written to stderr, so its in-place
+  // rendering is gated on stderr's TTY-ness — not stdout's. Writing it
+  // into a piped stderr would just corrupt the log with carriage returns.
   const isStderrTty = Boolean(process.stderr.isTTY);
   // Ticks 0..2 every 400ms while the agent is running, so the trailing
-  // dots on the process-log line animate `.` -> `..` -> `...` -> `.`
-  // and visibly indicate progress during the whole turn (including
-  // LLM-only steps with no tools, which can take several seconds for
-  // larger models — without dots the line looks frozen between the
-  // user's input and the first text delta). The interval is started
-  // when a run begins and cleared when it settles, so idle time
-  // between turns doesn't burn a timer. No-op (and no interval
-  // created) when stdout isn't a TTY.
-  let progressTick = 0;
+  // dots on the status line animate `.` -> `..` -> `...` -> `.` and
+  // visibly indicate progress during the whole turn (including LLM-only
+  // steps with no tools, which can take several seconds for larger
+  // models — without dots the line looks frozen between the user's input
+  // and the first text delta). progressTick is module-scope so both
+  // renderers of the line share it. The interval is started when a run
+  // begins and cleared when it settles, so idle time between turns
+  // doesn't burn a timer. Each tick drives whichever renderer is live:
+  // the TUI status bar while the persistent TUI owns the screen, the
+  // raw process-log line otherwise. Without a TTY stderr AND no TUI
+  // there is nothing to animate, so no interval is created (a plain
+  // progress line every 400ms would flood a piped log).
   let progressInterval: ReturnType<typeof setInterval> | null = null;
   const stopProgressInterval = () => {
     if (progressInterval !== null) {
@@ -1763,29 +1946,21 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     progressTick = 0;
   };
   const startProgressInterval = () => {
-    if (progressInterval !== null || !isStderrTty) return;
+    if (progressInterval !== null || (!isStderrTty && !persistentTui)) return;
     progressInterval = setInterval(() => {
       progressTick = (progressTick + 1) % 3;
-      printProcessLog();
+      if (persistentTui) updateStatusBar();
+      else printProcessLog();
     }, 400);
   };
   const printProcessLog = () => {
-    const skillsList = selected.size > 0 ? `(${[...selected].join(',')})` : '';
-    // De-duped union of completed tool calls plus any still in flight, so
-    // a long-running tool stays visible at the tail of the list rather
-    // than vanishing between start and end.
-    const seen = new Set<string>();
-    const ordered: string[] = [];
-    for (const name of [...toolsUsedNames, ...pendingToolNames]) {
-      if (!seen.has(name)) { seen.add(name); ordered.push(name); }
-    }
-    const toolsList = ordered.length > 0 ? `(${ordered.join(',')})` : '';
-    // Only animate dots while at least one tool is in flight; idle turns
-    // show a stable suffix so the line doesn't keep flickering for no
-    // reason between the agent's text deltas.
-    const dots = pendingToolNames.length > 0 ? ` ${'.'.repeat(progressTick + 1)}` : '';
-    const suffix = skillsList || toolsList ? ` ${skillsList} | ${toolsList}` : '';
-    const line = dim(`(π ${skillsUsed} skills, ${toolsUsed} tools, ${resultsReceived} results)${suffix}${dots}`);
+    // While the persistent TUI owns the screen its status bar (fed by
+    // updateStatusBar) already renders this exact line above the '─' rule.
+    // A raw stderr write would land on the '>' input row — the TUI parks
+    // the cursor there (see captureConsoleOutput) — and blink against the
+    // TUI's own redraws, so it must not be written at all here.
+    if (persistentTui) return;
+    const line = buildStatusLine();
     if (isStderrTty) {
       process.stderr.write(`\r\x1b[K${line}`);
     } else {
@@ -1795,14 +1970,14 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   const commitProcessLog = () => {
     if (isTty) process.stdout.write('\n');
   };
-  // Note: committedForTurn, budgetHit, quitRequested, runningAgent, budget, tokensUsed, turnsUsed,
+  // Note: committedForTurn, budgetHit, quitRequested, runningAgent, tokensUsed, turnsUsed,
   // toolsUsed, resultsReceived, toolsUsedNames, pendingToolNames, progressTick,
-  // selected, skillsUsed are defined at module scope and initialized here:
+  // selected, skillsUsed are defined at module scope and initialized here.
+  // budget stays local to runAgentSession — every use of it is in this function:
   committedForTurn = false;
   budgetHit = false;
   quitRequested = false;
   runningAgent = agent;
-  budget = budget; // budget is already set from the prompt
   tokensUsed = 0;
   turnsUsed = 0;
   toolsUsed = 0;
@@ -1914,8 +2089,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 0, 1, currentTheme, dimStyle);
         conversationArea.addChild(exitMsg);
         if (output) {
-          const outMsg = new Markdown(output, 0, 1, currentTheme, dimStyle);
-          conversationArea.addChild(outMsg);
+          conversationArea.addChild(shellOutputComponent(output));
           shellOutputs.push(output);
         }
         requestRender();
@@ -2027,8 +2201,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           const exitMsg = new Markdown(dim(`[π shell] exit code: ${result.code}`), 0, 1, currentTheme, dimStyle);
           conversationArea.addChild(exitMsg);
           if (output) {
-            const outMsg = new Markdown(output, 0, 1, currentTheme, dimStyle);
-            conversationArea.addChild(outMsg);
+            conversationArea.addChild(shellOutputComponent(output));
             shellOutputs.push(output);
           }
           requestRender();
