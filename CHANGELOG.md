@@ -5,6 +5,27 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): emit Gemini-enum `finishReason` and keep finish-only chunks in the OpenAI→generateContent conversion
+
+`src/converters/openai-to-gemini.ts`, `tests/unit/openai-to-gemini.test.ts` — an OpenAI-upstream model tested through the proxy's Gemini endpoint (`/v1beta/models/{alias}:streamGenerateContent`, e.g. from the agent-session endpoint-schema picker via pi-ai / `@google/genai`) failed verification even though the reply arrived fine, because the egress conversion violated the Gemini finish-reason contract twice.
+
+- **Lowercase `finishReason` leaked through.** The converter copied OpenAI's `finish_reason` verbatim (`"stop"`), but the Gemini API uses the uppercase enum (`"STOP"`, `"MAX_TOKENS"`, …) and strict SDKs switch on it — `@google/genai`'s `mapStopReason` throws `Unhandled stop reason: stop`. A new `toGeminiFinishReason()` helper maps `stop`/`tool_calls`/`function_call` → `STOP`, `length` → `MAX_TOKENS`, `content_filter` → `SAFETY`, passes through values that are already uppercase enum members, and maps unknown lowercase values to `OTHER`.
+- **Finish-only chunks were dropped.** OpenAI upstreams end streams with an empty-delta chunk carrying only `finish_reason`; with zero convertible parts the converter deleted `candidates`, the SSE loop in `src/handlers/openai.ts` skipped the chunk, and the stream ended with no `finishReason` anywhere — `@google/genai` then throws `Google stream ended without a finish reason`. Such chunks now emit a candidate with empty `parts` and the mapped `finishReason`; genuinely empty keepalive chunks (no finish reason) are still dropped.
+- pi-ai catches either throw and marks the assistant message `stopReason: "error"`, which is why agent-session's verification reported "verifying failed" on a healthy round-trip. The Interactions sibling converter carries no `finishReason` field and needed no change.
+- **Tests**: `tests/unit/openai-to-gemini.test.ts` — existing lowercase assertion updated to `STOP`, plus 4 new cases: the 5-entry lowercase→uppercase mapping table, uppercase passthrough (`RECITATION`), unknown lowercase → `OTHER`, and the finish-only chunk (empty delta + `finish_reason: 'stop'` → candidate with empty parts + `STOP`, not dropped).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1538 tests, 1538 pass, 0 fail** — executed on this tree, plus a live end-to-end check against `tsx src/server.ts` with an OpenRouter-backed alias: `:streamGenerateContent?alt=sse` now terminates with `finishReason: "STOP"` and non-streaming `:generateContent` returns `"STOP"` (both previously lowercase/absent).
+
+### chore(handlers,converters): delete verified-dead gemini code paths
+
+`src/handlers/gemini.ts`, `src/converters/claude-to-gemini.ts`, `src/converters/gemini-streaming.ts`, `docs/dead-duplicate-code-review.md` — dead-code removals from the repo-wide review (findings and per-item fix status live in the review doc).
+
+- **`gemini.ts`**: the unused `GeminiConfig`/`DEFAULT_GEMINI_CONFIG`/`getGeminiConfig()` block, the never-called `extractInteractionId()`, and the unreachable `'openai-compatible'` `endpointType` branches — unreachable because the router dispatches only `'interactions'`/`'native-gemini'` into this handler (openai-compatible clients bound for a Gemini upstream go through `chat-completions.ts`/`responses.ts`), and a Gemini `generateContent` upstream can never return an OpenAI-shaped body. Both `endpointType` unions narrowed accordingly; the consequentially-unused imports (`convertGeminiToClaudeResponse`, `convertOpenAIToClaudeResponse`, `createStreamTransformer`) removed. `convertGeminiToClaudeResponse` is now production-dead (test-only) and flagged as such in the review doc.
+- **`claude-to-gemini.ts`**: the ~240-line dead island of six internal converters (`convertClaudeMessagesToGeminiInput`, `convertClaudeContentToGemini`, `mapClaudeImageMimeToGemini`, `convertClaudeToolToGemini`, `convertClaudeConfigToGemini`, `convertClaudeToolChoiceToGemini`) that only ever called each other, plus the imports only they used; the live `decodeDataUri` and both exported entry points are untouched.
+- **`gemini-streaming.ts`**: `processContentDelta`, never called (the live handlers inline the same event construction).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1538 tests, 1538 pass, 0 fail** — executed on this tree. No test changes were needed: existing suites only import the live exports.
+
 ### fix(agent): hide the shell `!` in the input, reset the prompt after submit
 
 `src/agent-session.ts` — typing a leading `!` swapped the input prompt from `>` to `!`, but the value still carried its own `!`, so the line rendered doubled (`! !ls`). `render` is now wrapped while idle to drop the value's leading `!` from the display (the value keeps it for the task loops' `startsWith('!')` check and the history entry), and `handleInputSubmit` clears the indicator back to `>` as soon as a command is emitted rather than relying on the next keystroke.

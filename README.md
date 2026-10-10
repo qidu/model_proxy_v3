@@ -394,6 +394,33 @@ Notes:
 - **Indirect transform via `openai-completions`** means the request body is routed through OpenAI Chat Completions as an intermediate shape before reaching the target upstream family. This covers two cases: (a) Gemini endpoint input becomes Chat Completions, then becomes Claude Messages or OpenAI Responses; (b) `/v1/messages` routed to an `openai-responses` upstream becomes Chat Completions, then Responses `input`. This reuses the Chat Completions middle mode for code reuse while preserving the original client endpoint response shape.
 - Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/architecture/routing-review.md) for tradeoffs and recommendations.
 
+### Code map: endpoints → handlers → converters
+
+**Handlers** (`src/handlers/`) own the HTTP pipeline for one route shape — URL building, auth headers, hooks, the upstream `fetch`, streaming mechanics, and observability.
+**Converters** (`src/converters/`) are pure schema translations between API dialects (request, response, and SSE event shapes) — no network, routing, or logging.
+
+| Client endpoint | Handler | Cross-format converters used |
+|---|---|---|
+| `POST /v1/messages` | `claude.ts` (anthropic upstream), `gemini.ts` (gemini upstream), `messages.ts` (openai upstreams) | `claude-to-gemini`, `gemini-to-claude`, `gemini-streaming`, `claude-to-openai`, `openai-to-claude`, `streaming` |
+| `POST /v1/chat/completions` | `chat-completions.ts` | `claude-to-gemini` (`convertCompletionsToGeminiGenerateContentBody`), `openai-to-claude`, `streaming` |
+| `POST /v1/responses`, `/v1/responses/input_tokens`, `/v1/responses/compact` | `responses.ts` | `responses-to-completions`, `completions-to-responses`, `openai-to-claude` |
+| `POST /v1/interactions` | `gemini.ts` (gemini upstream), `openai.ts` (other upstreams) | `gemini-to-claude`, `openai-to-gemini` (`convertOpenAIToGeminiInteractions`) |
+| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` / `:countTokens` | `gemini.ts` (gemini upstream), `openai.ts` (other upstreams) | `openai-to-gemini` (`convertOpenAIToGeminiGenerateContent`), `gemini-streaming` |
+| `POST /v1/messages/count_tokens` | `token-counting.ts` | `utils/token-counting` (local tiktoken counting) |
+| `GET /v1/models` | `models.ts` | — (passthrough listing) |
+| `POST /v1/embeddings` | `embeddings.ts` | — (passthrough) |
+| `GET /dashboard`, `POST /decision`, `POST /passthrough/v1/...` | `dashboard.ts`, `decision.ts`, `passthrough.ts` | — |
+
+Upstream modes a route can select (full transform matrix in [Supported `upstream_mode`](#supported-upstream_mode) above):
+
+| `upstream_mode` | Upstream API family |
+|---|---|
+| `anthropic-messages` | Claude Messages (`/v1/messages`) |
+| `openai-completions` | OpenAI Chat Completions (`/v1/chat/completions`) |
+| `openai-responses` | OpenAI Responses (`/v1/responses`) |
+| `gemini-generatecontent` | Gemini generateContent (`/v1beta/models/{model}:generateContent`) |
+| `gemini-interactions` | Gemini Interactions (served through the generateContent endpoint) |
+
 
 ### Token usage statistics columns
 

@@ -365,25 +365,6 @@ function handleGeminiEvent(
 }
 
 /**
- * Process accumulated text content delta
- */
-function processContentDelta(
-    text: string,
-    controller: TransformStreamDefaultController<string>,
-    model: string,
-    requestId: string,
-    state: StreamingState
-): void {
-    state.accumulatedText += text;
-    const deltaEvent = {
-        type: 'content_block_delta',
-        index: state.contentIndex,
-        delta: { type: 'text_delta', text },
-    };
-    controller.enqueue(`event: content_block_delta\ndata: ${stringify(deltaEvent)}\n\n`);
-}
-
-/**
  * Map Gemini content type to Claude content block type
  */
 function mapGeminiContentTypeToClaude(geminiType: string): string {

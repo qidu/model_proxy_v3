@@ -2180,7 +2180,7 @@ class DashboardApp {
   openModelTargetPicker(): void {
     const snap = this.viewSnapshot();
     if (!snap) return;
-    const NEW_TARGET = ' new';
+    const NEW_TARGET = '\0new';
     const choices: SelectItem[] = [
       { value: NEW_TARGET, label: '+ _input new target_', description: 'add a new [models.*] entry' },
     ];
@@ -2190,7 +2190,7 @@ class DashboardApp {
         if (!Array.isArray(value)) continue;
         const [target] = value;
         choices.push({
-          value: `${category} ${aliasKey}`,
+          value: `${category}\0${aliasKey}`,
           label: `${category}.${aliasKey}`,
           description: target || aliasKey,
         });
@@ -2216,7 +2216,7 @@ class DashboardApp {
           });
           return;
         }
-        const [category, aliasKey] = item.value.split(' ');
+        const [category, aliasKey] = item.value.split('\0');
         this.openModelTargetWizard(category, aliasKey);
       },
       () => {

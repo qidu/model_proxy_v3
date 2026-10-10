@@ -10,11 +10,8 @@ import { Logger, createLogger, logPipelineStage, logPipelineHeaders } from '../u
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { GeminiInteractionRequest, GeminiInteractionResponse } from '../types/gemini.js';
 import { convertClaudeToGeminiRequest } from '../converters/claude-to-gemini.js';
-import { convertGeminiToClaudeResponse } from '../converters/gemini-to-claude.js';
 import { convertGeminiGenerateContentToClaude } from '../converters/gemini-to-claude.js';
 import { createGeminiStreamTransformer, createNativeGeminiStreamTransformer } from '../converters/gemini-streaming.js';
-import { convertOpenAIToClaudeResponse } from '../converters/openai-to-claude.js';
-import { createStreamTransformer } from '../converters/streaming.js';
 import { handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
@@ -22,32 +19,6 @@ import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.j
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
-
-/**
- * Gemini API configuration
- */
-interface GeminiConfig {
-    baseUrl: string;
-    apiVersion: string;
-}
-
-/**
- * Default Gemini API configuration
- */
-const DEFAULT_GEMINI_CONFIG: GeminiConfig = {
-    baseUrl: 'https://generativelanguage.googleapis.com',
-    apiVersion: 'v1beta',
-};
-
-/**
- * Get Gemini API configuration from environment
- */
-function getGeminiConfig(env: Env): GeminiConfig {
-    return {
-        baseUrl: DEFAULT_GEMINI_CONFIG.baseUrl,
-        apiVersion: DEFAULT_GEMINI_CONFIG.apiVersion,
-    };
-}
 
 /**
  * Check if request is in native Gemini format
@@ -541,18 +512,6 @@ function constructGeminiUrl(targetUrl: string, request: Request, geminiRequest: 
 }
 
 /**
- * Extract interaction ID from path
- */
-function extractInteractionId(path: string): string {
-    const parts = path.split('/');
-    const interactionIndex = parts.findIndex(p => p === 'interactions');
-    if (interactionIndex >= 0 && parts[interactionIndex + 1]) {
-        return parts[interactionIndex + 1];
-    }
-    throw new Error('Invalid interaction path');
-}
-
-/**
  * Handle non-streaming response
  */
 async function handleGeminiNonStreamingResponse(
@@ -560,7 +519,7 @@ async function handleGeminiNonStreamingResponse(
     model: string,
     requestId: string,
     logger: Logger,
-    endpointType: 'interactions' | 'openai-compatible' | 'native-gemini' = 'interactions'
+    endpointType: 'interactions' | 'native-gemini' = 'interactions'
 ): Promise<Response> {
     try {
         // Upstream-response headers are logged by callers; only body is logged here.
@@ -574,18 +533,6 @@ async function handleGeminiNonStreamingResponse(
             const nativeOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
             logPipelineHeaders(logger, requestId, 'outbound', ':generateContent (native)', nativeOutHeaders);
             return new Response(responseText, { status: response.status, headers: nativeOutHeaders });
-        } else if (endpointType === 'openai-compatible') {
-            // Parse OpenAI-compatible response
-            const openaiResponse = JSON.parse(responseText);
-            const claudeResponse = convertOpenAIToClaudeResponse(
-                openaiResponse,
-                model,
-                requestId
-            );
-            logPipelineStage(logger, requestId, 'outbound', '/v1/messages', claudeResponse);
-            const openaiCompatOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
-            logPipelineHeaders(logger, requestId, 'outbound', '/v1/messages', openaiCompatOutHeaders);
-            return new Response(JSON.stringify(claudeResponse), { status: 200, headers: openaiCompatOutHeaders });
         } else {
             // Parse native Gemini generateContent response
             const geminiResponse = JSON.parse(responseText);
@@ -612,7 +559,7 @@ async function handleGeminiStreamingResponse(
     model: string,
     requestId: string,
     logger: Logger,
-    endpointType: 'interactions' | 'openai-compatible' | 'native-gemini' = 'interactions'
+    endpointType: 'interactions' | 'native-gemini' = 'interactions'
 ): Promise<Response> {
     if (!response.body) {
         throw new Error('Response body is not readable');
@@ -626,8 +573,6 @@ async function handleGeminiStreamingResponse(
         // Create streaming transformer based on endpoint type
         const transformer = endpointType === 'native-gemini'
             ? createNativeGeminiStreamTransformer(model, requestId)
-            : endpointType === 'openai-compatible'
-            ? createStreamTransformer(model, requestId)
             : createGeminiStreamTransformer(model, requestId);
 
         // Create a tee to read the raw response while also transforming it

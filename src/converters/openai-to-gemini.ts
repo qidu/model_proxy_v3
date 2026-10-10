@@ -107,6 +107,32 @@ function coerceArgsToSchema(args: Record<string, unknown>, paramSchema: Record<s
     return out;
 }
 
+/**
+ * Map an OpenAI `finish_reason` to the Gemini `FinishReason` enum.
+ * Gemini SDKs switch on the uppercase enum and throw on anything else
+ * (e.g. @google/genai's mapStopReason throws `Unhandled stop reason`), so the
+ * raw lowercase OpenAI value must never pass through.
+ */
+function toGeminiFinishReason(finishReason: unknown): string | undefined {
+    if (typeof finishReason !== 'string' || finishReason === '' || finishReason === 'null') {
+        return undefined;
+    }
+    switch (finishReason) {
+        case 'stop':
+        case 'tool_calls':
+        case 'function_call':
+            return 'STOP';
+        case 'length':
+            return 'MAX_TOKENS';
+        case 'content_filter':
+            return 'SAFETY';
+        default:
+            // Already a Gemini enum value (gemini-shaped passthrough) — pass through;
+            // an unknown lowercase value maps to OTHER rather than leaking verbatim.
+            return finishReason === finishReason.toUpperCase() ? finishReason : 'OTHER';
+    }
+}
+
 export function convertOpenAIToGeminiGenerateContent(
     openaiResponse: any,
     modelId: string,
@@ -159,8 +185,13 @@ export function convertOpenAIToGeminiGenerateContent(
             });
         }
 
-        // Skip empty content chunks in streaming
-        if (parts.length === 0) {
+        const finishReason = toGeminiFinishReason(choice.finish_reason);
+
+        // Skip empty content chunks in streaming — unless the chunk carries the
+        // finish_reason: strict Gemini clients (@google/genai) end the stream on
+        // finishReason and throw "stream ended without a finish reason" if the
+        // finish-only chunk (empty delta) is dropped.
+        if (parts.length === 0 && finishReason === undefined) {
             // Return minimal response without candidates
             delete geminiResponse.candidates;
             return geminiResponse;
@@ -175,8 +206,8 @@ export function convertOpenAIToGeminiGenerateContent(
         };
 
         // Only add finishReason if it's present and meaningful
-        if (choice.finish_reason && choice.finish_reason !== 'null') {
-            candidate.finishReason = choice.finish_reason;
+        if (finishReason !== undefined) {
+            candidate.finishReason = finishReason;
         }
 
         geminiResponse.candidates.push(candidate);
