@@ -5,6 +5,46 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(judge): judge state carries only tool name + description; noul mode chunks to cover every tool
+
+`src/utils/tool-judge-sidecar.ts`, `src/utils/tool-shapes.ts`, `tests/unit/tool-judge-sidecar.test.ts`, `docs/architecture/design_tool_judge_sidecar_protocol.md`, `docs/getting-started/proxy_config.example.toml`, `docs/getting-started/validating_tool_judge_sidecar.md` — two changes to what the judge is shown and how many tools reach it.
+
+- **Tool context is name + description, not schema.** `buildStateText` serialized each tool's full parameter schema into the state (`1. Read: {"type":"object",…}`), which burned the sidecar encoder's small token budget. `ToolRecord` now carries an optional `description` extracted from all three wire shapes (Claude `description`, OpenAI `function.description`, Gemini `functionDeclarations[].description`; omitted entirely when absent so record shape is unchanged), and the state line is `N. name: description` (600-char cap, `MAX_SCHEMA_CHARS` renamed `MAX_TOOL_DESCRIPTION_CHARS`). Tools without a description render as just `N. name` and are judged on the name alone.
+- **noul mode chunks instead of skipping.** Tools past `max_batch_tools` used to be silently kept (`skippedNames`); now the tool list is judged in sequential chunks of `max_batch_tools` per request, each chunk's state carrying only its own tools. Per-request timeout is unchanged: `N questions × timeout_ms`, hard-capped at 2000ms. A failed chunk fails open for just its tools; other chunks still judge. `skippedNames` stays in the `JudgeResult` shape but is always empty; the "over max_batch_tools" log text is gone.
+- **Tests**: the old "caps the batch at max_batch_tools" test became a chunking test (4 tools at `max_batch_tools = 2` → 2 requests, disjoint question sets, per-chunk state isolation, all 4 judged); the §4.1-sections and truncation tests now pin the name+description line and the schema's absence; the choice-mode isolation test matches the description-less line format.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree.
+
+### feat(judge): strip client-injected content from the judged prompt
+
+`src/utils/tool-judge-sidecar.ts`, `tests/unit/tool-judge-sidecar.test.ts` — the judged `User prompt` line carried whatever client harnesses embedded in the user message (a Claude Code `<system-reminder>` date block is ~60 tokens of the sidecar's 512-token budget and says nothing about tool relevance). `stripClientInjectedContent` now cleans the prompt line in three layers; the upstream request body is never touched.
+
+- **Layer 1, known tags.** Blocks stripped with contents and surrounding whitespace (`\s*`, so Claude Code's newline+indentation separators between adjacent blocks are handled): `system-reminder` (Claude Code), `environment_context` (Codex), `local-command-stdout`/`-stderr` (Claude Code `! cmd`), `ide_opened_file`/`ide_selection` (Claude Code IDE integration), `command-message` (slash-command boilerplate). Open/close names must match via a `\1` backreference — unclosed or mismatched tags pass through. The Claude Code local-command `Caveat: The messages below were generated…` paragraph is matched to end-of-line.
+- **Slash-command unwrapping.** `<command-name>` and `<command-args>` hold what the user actually typed, so their tags are removed but the inner text is kept (`<command-name>/mcp</command-name>…hi` → `/mcp\n\nhi`).
+- **Layer 2, generalized leading tag blocks.** Any leading paragraph wholly wrapped in a matched tag pair and followed by a blank line is stripped regardless of tag name, covering clients whose tags we don't know. The blank-line requirement is the safety rail: `<div>x</div> what does this HTML render?` is untouched.
+- **Layer 3, heuristic fallback.** Only when no tag matched at all: blank-line-separated leading paragraphs made *entirely* of machine-looking lines (`key: value`, ISO dates, bare paths, single-line tag pairs) are dropped, keeping from the first human-looking paragraph on. Genuine multi-paragraph prompts (`here is the error:\n\nTypeError: boom\n\nhow do I fix it?`) survive because one prose line keeps a paragraph.
+- **Tests**: 12 buildStateText cases cover each layer — per-tag stripping, command unwrap, mid-message blocks, unclosed-tag passthrough, unknown-tag generalized stripping, blank-line gating, machine-paragraph dropping, prose preservation.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree.
+
+### feat(judge): debug trail for sidecar request, response, decisions, and erasures
+
+`src/utils/tool-judge-sidecar.ts`, `src/utils/tool-blocklist.ts`, `src/index.ts` — at `LOG_LEVEL=debug` a judged request now leaves a complete trail: the exact request payload (`Tool judge sidecar request to <url> (<mode> mode, N question(s), timeout Xms): <json>`, truncated at 4000 chars, logged from the same serialized string that goes on the wire), the raw sidecar response body, one line per tool decision with its factor (`Bash -> erase (confidence=0.1203, noul=0.12)`), per-tool unjudged markers, the existing summary, a pre-erase notice, and per-tool erase lines that name the source — `static blocklist` vs `judge sidecar, confidence=X.XXXX` — via a new `eraseFactors` map on `JudgeResult` threaded into `eraseBlockedTools` (new optional parameter).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree; live-verified against a remote laya-mlx sidecar (request → raw response → decisions → summary → erasures all present in one request id's log).
+
+### fix(logger): `createLogger` falls back to `process.env.LOG_LEVEL`
+
+`src/utils/logger.ts` — `createLogger` read the level only from its argument, so every module-scope `createLogger({})` (the tool-judge sidecar client among them) was pinned to `info` and its debug output was silently dropped even with `LOG_LEVEL=debug` — the symptom was a request-scoped debug line appearing while the same request's judge-side debug lines vanished. The level now resolves as `env.LOG_LEVEL ?? process.env.LOG_LEVEL ?? 'info'`. `process` access was already assumed in this module (the `AGENT` check at load time), and the fallback also unsticks the other `createLogger({})` call sites.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree.
+
+### fix(health): warn and skip the model count when no default upstream is configured
+
+`src/index.ts` — the `/health` handler interpolated `getDefaultUpstreamConfig`'s possibly-undefined `baseUrl` straight into `` `${baseUrl}/v1/models` ``, producing a fetch of `undefined/v1/models` and a confusing `Failed to parse URL` error on any config without a `[models.default]` table or `[default_upstream].default_base_url`. The handler now logs `Health check: no default upstream configured … — skipping upstream model count` at warn level and falls through to the existing `404 No models Found.` response without attempting the fetch.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree, plus a live check: `GET /health` on a config without a default upstream now emits the warning and the 404, with no parse error.
+
 ### fix(converters): emit Gemini-enum `finishReason` and keep finish-only chunks in the OpenAI→generateContent conversion
 
 `src/converters/openai-to-gemini.ts`, `tests/unit/openai-to-gemini.test.ts` — an OpenAI-upstream model tested through the proxy's Gemini endpoint (`/v1beta/models/{alias}:streamGenerateContent`, e.g. from the agent-session endpoint-schema picker via pi-ai / `@google/genai`) failed verification even though the reply arrived fine, because the egress conversion violated the Gemini finish-reason contract twice.

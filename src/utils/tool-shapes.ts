@@ -16,7 +16,9 @@
 
 export interface ToolRecord {
   name: string;
-  /** Parameter schema, kept whole — the judge serializes it into the state text. */
+  /** Tool description when the client sent one — the judge renders it as the tool's context. */
+  description?: string;
+  /** Parameter schema, kept whole. */
   schema: Record<string, unknown>;
 }
 
@@ -24,21 +26,25 @@ function asSchema(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
 }
 
+function asDescription(value: unknown): { description?: string } {
+  return typeof value === 'string' && value.length > 0 ? { description: value } : {};
+}
+
 /** One Claude/OpenAI/Responses entry, or undefined when it names no tool. */
 function flatRecord(tool: unknown): ToolRecord | undefined {
   if (!tool || typeof tool !== 'object') return undefined;
   const t = tool as Record<string, unknown>;
 
-  // Claude, and the flat Responses shape: { name, input_schema?, parameters? }
+  // Claude, and the flat Responses shape: { name, description?, input_schema?, parameters? }
   if (typeof t.name === 'string' && t.name.length > 0) {
-    return { name: t.name, schema: asSchema(t.input_schema ?? t.parameters) };
+    return { name: t.name, ...asDescription(t.description), schema: asSchema(t.input_schema ?? t.parameters) };
   }
 
-  // OpenAI / Responses: { type: 'function', function: { name, parameters } }
+  // OpenAI / Responses: { type: 'function', function: { name, description?, parameters } }
   if (t.function && typeof t.function === 'object') {
     const fn = t.function as Record<string, unknown>;
     if (typeof fn.name === 'string' && fn.name.length > 0) {
-      return { name: fn.name, schema: asSchema(fn.parameters) };
+      return { name: fn.name, ...asDescription(fn.description), schema: asSchema(fn.parameters) };
     }
   }
 
@@ -59,14 +65,14 @@ function recordsOf(tool: unknown): ToolRecord[] {
   if (!tool || typeof tool !== 'object') return [];
   const t = tool as Record<string, unknown>;
 
-  // Gemini native body: { functionDeclarations: [{ name, parameters }] }
+  // Gemini native body: { functionDeclarations: [{ name, description?, parameters }] }
   if (Array.isArray(t.functionDeclarations)) {
     const out: ToolRecord[] = [];
     for (const decl of t.functionDeclarations) {
       if (!decl || typeof decl !== 'object') continue;
       const d = decl as Record<string, unknown>;
       if (typeof d.name !== 'string' || d.name.length === 0) continue;
-      out.push({ name: d.name, schema: asSchema(d.parameters) });
+      out.push({ name: d.name, ...asDescription(d.description), schema: asSchema(d.parameters) });
     }
     return out;
   }

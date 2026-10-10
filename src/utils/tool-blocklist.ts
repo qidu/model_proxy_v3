@@ -24,12 +24,15 @@ export type EraseResult = {
  *
  * @param sidecarEraseNames - Optional set of tool names to erase from sidecar judge decision.
  *   These are merged with the static blocklist (dashboard stats).
+ * @param sidecarEraseFactors - Optional map of sidecar-erased tool name to the
+ *   judge's confidence factor, used only to enrich the debug log.
  */
 export function eraseBlockedTools(
   body: Record<string, unknown>,
   log: Logger | undefined,
   requestId: string,
   sidecarEraseNames: string[] = [],
+  sidecarEraseFactors?: Record<string, number>,
 ): EraseResult {
   const result: EraseResult = { erasedNames: [], toolChoiceReset: false };
   const tools = body.tools;
@@ -40,6 +43,14 @@ export function eraseBlockedTools(
 
   // Convert sidecar names to a Set for O(1) lookup
   const sidecarBlocked = new Set(sidecarEraseNames);
+
+  const eraseSource = (name: string): string => {
+    if (isToolBlocked(name)) return 'static blocklist';
+    const factor = sidecarEraseFactors?.[name];
+    return factor !== undefined
+      ? `judge sidecar, confidence=${factor.toFixed(4)}`
+      : 'judge sidecar';
+  };
 
   const filtered: unknown[] = [];
   for (const tool of tools) {
@@ -55,6 +66,7 @@ export function eraseBlockedTools(
         const name = (d as Record<string, unknown>).name;
         if (typeof name === 'string' && (isToolBlocked(name) || sidecarBlocked.has(name))) {
           result.erasedNames.push(name);
+          log?.debug(requestId, `Erasing tool '${name}' (${eraseSource(name)})`);
           return false;
         }
         return true;
@@ -70,6 +82,7 @@ export function eraseBlockedTools(
     const name = toolNameOf(t);
     if (name && (isToolBlocked(name) || sidecarBlocked.has(name))) {
       result.erasedNames.push(name);
+      log?.debug(requestId, `Erasing tool '${name}' (${eraseSource(name)})`);
       continue;
     }
     filtered.push(tool);

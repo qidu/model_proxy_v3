@@ -605,7 +605,7 @@ openai-responses   = ["max_tokens_rename"]
 # mode = "noul"                               # "choice" (per-tool) or "noul" (batch)
 # threshold = 0.5                             # relevance threshold 0.0-1.0
 # timeout_ms = 50                             # per-question budget (default 50ms); N questions get N × this, capped at 2000ms
-# max_batch_tools = 50                        # batch size limit for noul mode
+# max_batch_tools = 50                        # tools per noul request; larger tool lists are judged in sequential chunks of this size
 # api_key = "optional-bearer-token"           # optional Authorization header
 
 # ---------------------------------------------------------------------------

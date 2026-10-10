@@ -3,6 +3,6 @@ port = 8777
 
 [decision]
 backend = "laya"
-url = "http://127.0.0.1:8081/decision"
+url = "http://100.100.80.231:8081/decision"
 timeout_ms = 5000
 # api_key = ""  # optional

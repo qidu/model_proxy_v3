@@ -937,24 +937,31 @@ export default {
       // Health check endpoint (also for root path)
       if (path === '/health' || path === '/') {
         const { baseUrl: healthBaseUrl } = getDefaultUpstreamConfig(proxyConfig);
-        const healthUrl = `${healthBaseUrl}/v1/models`;
         const healthAuth = extractAuthHeaders(request);
 
-        try {
-          const { count, cached } = await getModelCount(healthUrl, healthAuth, requestId, logger, env as unknown as Record<string, unknown>);
-          if (count > 0) {
-            return new Response(JSON.stringify({
-              status: 'ok',
-              models: count,
-              cached,
-              version: env.VERSION || 'unknown'
-            }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            });
+        if (!healthBaseUrl) {
+          logger.warn(
+            requestId,
+            'Health check: no default upstream configured ([models.default] table or [default_upstream].default_base_url) — skipping upstream model count',
+          );
+        } else {
+          const healthUrl = `${healthBaseUrl}/v1/models`;
+          try {
+            const { count, cached } = await getModelCount(healthUrl, healthAuth, requestId, logger, env as unknown as Record<string, unknown>);
+            if (count > 0) {
+              return new Response(JSON.stringify({
+                status: 'ok',
+                models: count,
+                cached,
+                version: env.VERSION || 'unknown'
+              }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+          } catch {
+            // Fall through to error
           }
-        } catch {
-          // Fall through to error
         }
         return new Response(JSON.stringify({
           error: 'No models Found.',
@@ -1402,7 +1409,13 @@ export default {
           // downstream path (single/composite/fusion) operates on the filtered
           // body. Mirrors the privacy-filter pattern above — mutate `body`, then
           // reserialize `bodyText` so the passthrough reconstruction picks it up.
-          const eraseResult = eraseBlockedTools(body, logger, requestId, sidecarEraseNames);
+          if (sidecarEraseNames.length > 0) {
+            logger.debug(
+              requestId,
+              `Tool judge sidecar: erasing ${sidecarEraseNames.length} tool(s) from request: ${sidecarEraseNames.join(', ')}`,
+            );
+          }
+          const eraseResult = eraseBlockedTools(body, logger, requestId, sidecarEraseNames, judgeResult.eraseFactors);
           if (eraseResult.erasedNames.length > 0 || eraseResult.toolChoiceReset) {
             bodyText = JSON.stringify(body);
           }

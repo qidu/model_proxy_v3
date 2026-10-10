@@ -123,8 +123,8 @@ export function logPipelineHeaders(
 }
 
 export function createLogger(env: Env | Record<string, unknown>): Logger {
-  const logLevelRaw = env.LOG_LEVEL as string;
-  const logLevel = (['trace', 'debug', 'info', 'warn', 'error'].includes(logLevelRaw) ? logLevelRaw : 'info') as LogLevel;
+  const logLevelRaw = (env.LOG_LEVEL ?? process.env.LOG_LEVEL) as string | undefined;
+  const logLevel = (['trace', 'debug', 'info', 'warn', 'error'].includes(logLevelRaw ?? '') ? logLevelRaw : 'info') as LogLevel;
   const minLevel = LOG_LEVELS[logLevel];
 
   function emit(level: string, requestId: string, message: string, args: unknown[]): void {

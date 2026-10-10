@@ -430,10 +430,11 @@ countTokens paths.
 
 FAIL-OPEN BY DESIGN: on 4xx/5xx/timeout/malformed response, tools are KEPT.
 Since the fix, this is reported rather than silent -- the summary line carries
-counts of unjudged and over-max_batch_tools tools, and a total failure logs
+counts of unjudged tools, and a total failure logs
 "Sidecar judged none of N tools — failing open" at warn level.
 
-TOOLS OVER max_batch_tools ARE KEPT, not judged, and counted in the log line.
+TOOLS OVER max_batch_tools are judged in sequential chunks of max_batch_tools
+per request -- no tools are skipped.
 
 
 -------------------------------------------------------------------------------
