@@ -5,6 +5,23 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### docs(readme): add Tool Judge Sidecar section with Clef decision API support
+
+`README.md` — added dedicated documentation for the `[tool_judge_sidecar]` section
+after the Decision endpoint, covering:
+- Two protocols: legacy sidecar (`/judge`) and Clef decision API (`/decision`, enabled
+  via `use_decision_api = true`)
+- Two modes: `choice` (per-tool) and `noul` (batch)
+- Fail-open behavior, response time expectations
+- Reference sidecar server commands for both protocols
+- Full configuration reference including new `use_decision_api` and `model` fields
+
+### fix(config): drop invalid tool_judge_sidecar.model values during parsing
+
+`src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts` — invalid `model` values in `[tool_judge_sidecar]` (e.g., `model = "invalid-model"`) are now silently dropped during TOML parsing instead of being stored and then flagged by `validateProxyConfig`. Valid values (`laya`, `clef`, `clef-flash`) are accepted; unrecognized values leave `model` as `undefined`, matching the behavior of other fields like `use_decision_api` that coerce/validate during parsing.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — all config-loader tests pass.
+
 ### feat(judge): judge state carries only tool name + description; noul mode chunks to cover every tool
 
 `src/utils/tool-judge-sidecar.ts`, `src/utils/tool-shapes.ts`, `tests/unit/tool-judge-sidecar.test.ts`, `docs/architecture/design_tool_judge_sidecar_protocol.md`, `docs/getting-started/proxy_config.example.toml`, `docs/getting-started/validating_tool_judge_sidecar.md` — two changes to what the judge is shown and how many tools reach it.

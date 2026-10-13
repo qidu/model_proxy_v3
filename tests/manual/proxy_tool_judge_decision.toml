@@ -1,0 +1,17 @@
+[default_upstream]
+default_base_url = "http://127.0.0.1:8788"
+default_api_key = "sk-no"
+
+[decision]
+backend = "laya"
+url = "http://127.0.0.1:8081/decision"
+timeout_ms = 5000
+
+[tool_judge_sidecar]
+judge_url = "http://127.0.0.1:8081/decision"
+use_decision_api = true
+model = "laya"
+threshold = 0.5
+mode = "choice"
+timeout_ms = 80
+max_batch_tools = 10

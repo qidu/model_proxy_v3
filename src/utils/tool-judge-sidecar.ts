@@ -38,6 +38,10 @@ export interface JudgeSidecarConfig {
   mode: 'choice' | 'noul';
   apiKey?: string;
   maxBatchTools: number;
+  /** Use the /decision API (Clef protocol) instead of the sidecar /judge endpoint. */
+  useDecisionApi?: boolean;
+  /** Model to use when calling the decision API (e.g., "clef" for Laya judge). */
+  model?: string;
 }
 
 
@@ -82,6 +86,100 @@ export interface JudgeDecision {
   factor: number;
   action: 'keep' | 'erase';
   reason: string;
+}
+
+// ============================================================================
+// Clef Protocol Types (for /decision API)
+// ============================================================================
+
+/** Clef protocol request body (doc §3.1). */
+export interface ClefRequest {
+  model: string;
+  state: string;
+  questions: Record<string, ClefQuestion>;
+}
+
+/** Clef protocol question (doc §3.2). */
+export interface ClefChoiceQuestion {
+  type: 'choice';
+  instructions: string;
+  /** Mapping of criterion label to description. */
+  criteria: Record<string, string>;
+}
+
+/** Clef protocol noul question (doc §3.2). */
+export interface ClefNoulQuestion {
+  type: 'noul';
+  instructions: string;
+}
+
+export type ClefQuestion = ClefChoiceQuestion | ClefNoulQuestion;
+
+/** Clef protocol answer (doc §3.3). */
+export interface ClefAnswer {
+  type: 'choice' | 'noul';
+  confidence: number;
+  action: { act_probability: number };
+  /** `choice` only: winning criterion label. */
+  choice?: string;
+  /** `choice` only: probability per criterion label. */
+  probabilities?: Record<string, number>;
+  /** `noul` only: relevance score 0.0–1.0. */
+  noul?: number;
+}
+
+/** Clef protocol response (doc §3.4). */
+export interface ClefResponse {
+  model: string;
+  answers: Record<string, ClefAnswer>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+}
+
+/**
+ * Adapt a sidecar JudgeRequest to a Clef request.
+ * Maps sidecar question types to Clef question types.
+ * Converts choice criteria from array (sidecar) to object (Clef).
+ */
+export function adaptToClefRequest(
+  request: JudgeRequest,
+  model: string,
+): ClefRequest {
+  const clefQuestions: Record<string, ClefQuestion> = {};
+  for (const [qid, question] of Object.entries(request.questions)) {
+    if (question.type === 'choice') {
+      // Convert criteria from array ["keep", "discard"] to object {"keep": "Keep the tool", "discard": "Discard the tool"}
+      const criteria: Record<string, string> = {};
+      for (const criterion of question.criteria) {
+        criteria[criterion] = criterion === 'keep' ? 'Keep the tool' : 'Discard the tool';
+      }
+      clefQuestions[qid] = {
+        type: 'choice',
+        instructions: question.instructions,
+        criteria,
+      };
+    } else {
+      clefQuestions[qid] = { type: 'noul', instructions: question.instructions };
+    }
+  }
+  return {
+    model,
+    state: request.state,
+    questions: clefQuestions,
+  };
+}
+
+/**
+ * Adapt a Clef response to a sidecar JudgeResponse.
+ * Clef returns a top-level `answers` map with ClefAnswer objects.
+ * Sidecar expects a flat map of question_id → JudgeAnswer.
+ * The structures are identical, so we just extract the answers map.
+ */
+export function adaptFromClefResponse(clefResponse: ClefResponse): JudgeResponse {
+  return clefResponse.answers;
 }
 
 // Result of the sidecar call
@@ -534,6 +632,97 @@ export async function callJudgeSidecar(
 }
 
 /**
+ * Call the /decision API (Clef protocol) with the given request.
+ * Returns null on any failure (timeout, non-2xx, malformed body) so the caller can fail open.
+ */
+export async function callDecisionApi(
+  config: JudgeSidecarConfig,
+  request: JudgeRequest,
+  requestId: string,
+): Promise<JudgeResponse | null> {
+  if (!config.model) {
+    logger.warn(requestId, 'Tool judge decision API: model not configured');
+    return null;
+  }
+  if (!config.judge_url) {
+    logger.warn(requestId, 'Tool judge decision API: judge_url not configured');
+    return null;
+  }
+
+  const questionCount = Object.keys(request.questions).length;
+  const timeoutMs = requestTimeoutMs(config, questionCount);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (config.apiKey) {
+      headers['Authorization'] = `Bearer ${config.apiKey}`;
+    }
+
+    const clefRequest = adaptToClefRequest(request, config.model);
+    const bodyJson = JSON.stringify(clefRequest);
+    // judge_url is the full decision endpoint URL (e.g., http://127.0.0.1:8081/decision)
+    const decisionEndpoint = config.judge_url.replace(/\/+$/, '');
+
+    logger.trace(requestId, `Tool judge decision API request (full): ${bodyJson}`);
+    logger.debug(
+      requestId,
+      `Tool judge decision API request to ${decisionEndpoint} ` +
+        `(${config.mode} mode, ${questionCount} question(s), model=${config.model}, timeout ${timeoutMs}ms): ${truncate(bodyJson, 4000)}`,
+    );
+
+    const resp = await fetch(decisionEndpoint, {
+      method: 'POST',
+      headers,
+      body: bodyJson,
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!resp.ok) {
+      logger.warn(requestId, `Tool judge decision API returned ${resp.status}: ${resp.statusText}`);
+      return null;
+    }
+
+    const text = await resp.text();
+    logger.trace(requestId, `Tool judge decision API response (full): ${text}`);
+    logger.debug(
+      requestId,
+      `Tool judge decision API raw response (${resp.status}, ${questionCount} question(s)): ${truncate(text, 4000)}`,
+    );
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      logger.warn(requestId, `Tool judge decision API returned malformed JSON: ${truncate(text, 200)}`);
+      return null;
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      logger.warn(requestId, `Tool judge decision API returned non-object body: ${truncate(text, 200)}`);
+      return null;
+    }
+
+    const clefResponse = data as ClefResponse;
+    return adaptFromClefResponse(clefResponse);
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof Error && err.name === 'AbortError') {
+      logger.warn(
+        requestId,
+        `Tool judge decision API timeout (${timeoutMs}ms for ${questionCount} question(s))`,
+      );
+    } else {
+      logger.warn(requestId, `Tool judge decision API error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return null;
+  }
+}
+
+/**
  * `judge_url` is the sidecar base URL (`http://127.0.0.1:8081`); the `/judge`
  * path is appended here. An already-complete `/judge` URL is left alone so a
  * config written against the doc's full-URL example still resolves.
@@ -576,20 +765,28 @@ export async function judgeTools(
     mode: sidecarConfig.mode ?? 'choice',
     apiKey: sidecarConfig.api_key,
     maxBatchTools: maxBatch,
+    useDecisionApi: sidecarConfig.use_decision_api ?? false,
+    model: sidecarConfig.model,
   };
 
   const startedAt = Date.now();
-  logger.debug(requestId, `Calling tool judge sidecar (${config.mode}, ${tools.length} tools)`);
+  const useDecisionApi = config.useDecisionApi;
+  const label = useDecisionApi ? 'decision API' : 'sidecar';
+  logger.debug(requestId, `Calling tool judge ${label} (${config.mode}, ${tools.length} tools)`);
 
   const decisions: JudgeDecision[] = [];
   const unjudgedNames: string[] = [];
   let rawResponse: JudgeResponse | undefined;
   let callFailed = false;
 
+  // Choose the appropriate call function based on config
+  const callFn = useDecisionApi ? callDecisionApi : callJudgeSidecar;
+  logger.debug(requestId, `Tool judge routing: using ${useDecisionApi ? 'callDecisionApi (Clef /decision)' : 'callJudgeSidecar (sidecar /judge)'}`);
+
   if (config.mode === 'choice') {
     // Doc §2.2 is single-tool: one request per tool, each with its own state.
     for (const tool of tools) {
-      const response = await callJudgeSidecar(
+      const response = await callFn(
         config,
         buildChoiceRequest(buildStateText(body, [tool])),
         requestId,
@@ -603,7 +800,7 @@ export async function judgeTools(
       } catch (err) {
         logger.warn(
           requestId,
-          `Tool judge sidecar gave an unusable answer for ${tool.name}: ${err instanceof Error ? err.message : String(err)}`,
+          `Tool judge ${label} gave an unusable answer for ${tool.name}: ${err instanceof Error ? err.message : String(err)}`,
         );
         unjudgedNames.push(tool.name);
       }
@@ -617,7 +814,7 @@ export async function judgeTools(
     for (let i = 0; i < tools.length; i += maxBatch) {
       const chunk = tools.slice(i, i + maxBatch);
       const chunkNames = chunk.map((tool) => tool.name);
-      const response = await callJudgeSidecar(
+      const response = await callFn(
         config,
         buildNoulRequest(buildStateText(body, chunk), chunkNames),
         requestId,
@@ -645,24 +842,24 @@ export async function judgeTools(
   for (const decision of decisions) {
     logger.debug(
       requestId,
-      `Tool judge sidecar: ${decision.toolName} -> ${decision.action} ` +
+      `Tool judge ${label}: ${decision.toolName} -> ${decision.action} ` +
         `(confidence=${decision.factor.toFixed(4)}, ${decision.reason})`,
     );
   }
   for (const name of unjudgedNames) {
-    logger.debug(requestId, `Tool judge sidecar: ${name} -> unjudged (kept)`);
+    logger.debug(requestId, `Tool judge ${label}: ${name} -> unjudged (kept)`);
   }
 
-  // Fail loud: anything the sidecar did not decide is reported, not hidden.
+  // Fail loud: anything the judge did not decide is reported, not hidden.
   const summary =
-    `Tool judge sidecar (mode=${config.mode}, threshold=${config.threshold}): ` +
+    `Tool judge ${label} (mode=${config.mode}, threshold=${config.threshold}): ` +
     `${judgedNames.length}/${tools.length} judged, ${eraseNames.length} to erase` +
     (unjudgedNames.length > 0 ? `, ${unjudgedNames.length} unjudged (kept)` : '') +
     ` in ${elapsedMs}ms`;
 
   let error: string | undefined;
   if (tools.length > 0 && judgedNames.length === 0) {
-    error = `Sidecar judged none of ${tools.length} tools — failing open`;
+    error = `Judge judged none of ${tools.length} tools — failing open`;
     logger.warn(requestId, summary);
   } else {
     const notes: string[] = [];
@@ -687,7 +884,7 @@ export async function judgeTools(
       skippedNames,
       eraseFactors,
       called: true,
-      error: error ?? 'Sidecar call failed (timeout or error) — failing open',
+      error: error ?? `Judge call failed (timeout or error) — failing open`,
     };
   }
 

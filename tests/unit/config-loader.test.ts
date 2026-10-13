@@ -514,6 +514,65 @@ describe('parseSimpleToml', () => {
     );
   });
 
+  it('parses [tool_judge_sidecar] use_decision_api as unquoted boolean true', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = true
+      model = "laya"
+    `);
+    assert.equal(cfg.tool_judge_sidecar?.use_decision_api, true);
+    assert.equal(cfg.tool_judge_sidecar?.model, 'laya');
+  });
+
+  it('parses [tool_judge_sidecar] use_decision_api as unquoted boolean false', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = false
+    `);
+    assert.equal(cfg.tool_judge_sidecar?.use_decision_api, false);
+  });
+
+  it('parses [tool_judge_sidecar] use_decision_api as quoted string true/false', () => {
+    const cfgTrue = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = "true"
+    `);
+    assert.equal(cfgTrue.tool_judge_sidecar?.use_decision_api, true);
+
+    const cfgFalse = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = "false"
+    `);
+    assert.equal(cfgFalse.tool_judge_sidecar?.use_decision_api, false);
+  });
+
+  it('parses [tool_judge_sidecar] model with valid values: laya, clef, clef-flash', () => {
+    for (const model of ['laya', 'clef', 'clef-flash'] as const) {
+      const cfg = parseSimpleToml(`
+        [tool_judge_sidecar]
+        judge_url = "http://127.0.0.1:8081"
+        use_decision_api = true
+        model = "${model}"
+      `);
+      assert.equal(cfg.tool_judge_sidecar?.model, model, `model ${model} should be accepted`);
+    }
+  });
+
+  it('drops [tool_judge_sidecar] model with invalid value', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = true
+      model = "invalid-model"
+    `);
+    // Invalid model should be ignored, leaving model undefined
+    assert.equal(cfg.tool_judge_sidecar?.model, undefined);
+  });
+
   it('accepts an unknown section as the very first header without crashing', () => {
     const cfg = parseSimpleToml(`
       [nonsense]

@@ -134,9 +134,17 @@ export interface ProxyConfig {
    * `mode`:
    *   - "choice": per-tool decision (default, uses "decision" question with "keep"/"discard" criteria)
    *   - "noul": batch scoring (uses "keep" question, returns score per tool)
+   *
+   * `use_decision_api` (optional): when true, tool judging is delegated to the
+   * `/decision` endpoint (Clef protocol) instead of a dedicated sidecar at
+   * `judge_url`. This reuses the same upstream (Laya/Cloudflare) as model
+   * selection. Requires `decision` config to be enabled.
+   *
+   * `model` (optional): which Clef model to use when `use_decision_api` is
+   * true. Defaults to "clef". Valid values: "clef", "clef-flash".
    */
   tool_judge_sidecar?: {
-    /** Sidecar base URL (e.g., "http://localhost:8765"). Required to enable. */
+    /** Sidecar base URL (e.g., "http://localhost:8765"). Required to enable (unless use_decision_api is true). */
     judge_url?: string;
     /** Timeout in milliseconds (default: 50) */
     timeout_ms?: number;
@@ -148,6 +156,10 @@ export interface ProxyConfig {
     api_key?: string;
     /** Maximum number of tools to send in a single batch request (default: 50) */
     max_batch_tools?: number;
+    /** Use the /decision API (Clef protocol) instead of a dedicated sidecar. Requires [decision] config. Default: false. */
+    use_decision_api?: boolean;
+    /** Clef model to use when use_decision_api is true: "clef" | "clef-flash". Default: "clef". */
+    model?: 'clef' | 'clef-flash';
   };
 
   /**
@@ -2270,6 +2282,69 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
     }
   }
 
+  // Validate tool_judge_sidecar config
+  if (config.tool_judge_sidecar) {
+    const tjs = config.tool_judge_sidecar;
+    if (!tjs.use_decision_api) {
+      // When not using decision API, judge_url is required
+      if (!tjs.judge_url || typeof tjs.judge_url !== 'string') {
+        errors.push({ path: 'tool_judge_sidecar.judge_url', message: 'judge_url is required when use_decision_api is false' });
+      } else {
+        try {
+          new URL(tjs.judge_url);
+        } catch {
+          errors.push({ path: 'tool_judge_sidecar.judge_url', message: 'judge_url must be a valid URL' });
+        }
+      }
+    } else {
+      // When using decision API, decision config must be enabled
+      if (!config.decision || !config.decision.url) {
+        errors.push({ path: 'tool_judge_sidecar.use_decision_api', message: 'decision config must be enabled with a valid url when use_decision_api is true' });
+      }
+    }
+    if (tjs.timeout_ms !== undefined && (typeof tjs.timeout_ms !== 'number' || tjs.timeout_ms <= 0)) {
+      errors.push({ path: 'tool_judge_sidecar.timeout_ms', message: 'timeout_ms must be a positive number (ms)' });
+    }
+    if (tjs.threshold !== undefined && (typeof tjs.threshold !== 'number' || tjs.threshold < 0 || tjs.threshold > 1)) {
+      errors.push({ path: 'tool_judge_sidecar.threshold', message: 'threshold must be a number between 0.0 and 1.0' });
+    }
+    if (tjs.mode !== undefined && tjs.mode !== 'choice' && tjs.mode !== 'noul') {
+      errors.push({ path: 'tool_judge_sidecar.mode', message: 'mode must be "choice" or "noul"' });
+    }
+    if (tjs.max_batch_tools !== undefined && (typeof tjs.max_batch_tools !== 'number' || tjs.max_batch_tools <= 0)) {
+      errors.push({ path: 'tool_judge_sidecar.max_batch_tools', message: 'max_batch_tools must be a positive number' });
+    }
+    if (tjs.model !== undefined && tjs.model !== 'clef' && tjs.model !== 'clef-flash' && tjs.model !== 'laya') {
+      errors.push({ path: 'tool_judge_sidecar.model', message: 'model must be "clef", "clef-flash", or "laya"' });
+    }
+    if (tjs.api_key !== undefined && typeof tjs.api_key !== 'string') {
+      errors.push({ path: 'tool_judge_sidecar.api_key', message: 'api_key must be a string' });
+    }
+  }
+
+  // Validate decision config
+  if (config.decision) {
+    const d = config.decision;
+    if (!d.backend || !['laya', 'cloudflare', 'clef'].includes(d.backend)) {
+      errors.push({ path: 'decision.backend', message: 'backend must be "laya", "cloudflare", or "clef"' });
+    }
+    if (!d.url || typeof d.url !== 'string') {
+      errors.push({ path: 'decision.url', message: 'url is required' });
+    } else {
+      try {
+        new URL(d.url);
+      } catch {
+        errors.push({ path: 'decision.url', message: 'url must be a valid URL' });
+      }
+    }
+    if (d.api_key !== undefined && typeof d.api_key !== 'string') {
+      errors.push({ path: 'decision.api_key', message: 'api_key must be a string' });
+    }
+    if (d.timeout_ms !== undefined && (typeof d.timeout_ms !== 'number' || d.timeout_ms <= 0)) {
+      errors.push({ path: 'decision.timeout_ms', message: 'timeout_ms must be a positive number (ms)' });
+    }
+  }
+
   return { errors, warnings, valid: errors.length === 0 };
 }
 
@@ -2513,6 +2588,30 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
   if (config.passthrough) {
     lines.push('[passthrough]');
     lines.push(...Object.entries(config.passthrough).map(([name, target]) => `${tomlKey(name)} = ${serializePassthroughTarget(target)}`));
+    lines.push('');
+  }
+
+  if (config.tool_judge_sidecar) {
+    const tjs = config.tool_judge_sidecar;
+    lines.push('[tool_judge_sidecar]');
+    if (tjs.judge_url !== undefined) lines.push(`judge_url = ${JSON.stringify(tjs.judge_url)}`);
+    if (tjs.timeout_ms !== undefined) lines.push(`timeout_ms = ${tjs.timeout_ms}`);
+    if (tjs.threshold !== undefined) lines.push(`threshold = ${tjs.threshold}`);
+    if (tjs.mode !== undefined) lines.push(`mode = ${JSON.stringify(tjs.mode)}`);
+    if (tjs.api_key !== undefined) lines.push(`api_key = ${JSON.stringify(tjs.api_key)}`);
+    if (tjs.max_batch_tools !== undefined) lines.push(`max_batch_tools = ${tjs.max_batch_tools}`);
+    if (tjs.use_decision_api !== undefined) lines.push(`use_decision_api = ${tjs.use_decision_api}`);
+    if (tjs.model !== undefined) lines.push(`model = ${JSON.stringify(tjs.model)}`);
+    lines.push('');
+  }
+
+  if (config.decision) {
+    const d = config.decision;
+    lines.push('[decision]');
+    if (d.backend !== undefined) lines.push(`backend = ${JSON.stringify(d.backend)}`);
+    if (d.url !== undefined) lines.push(`url = ${JSON.stringify(d.url)}`);
+    if (d.api_key !== undefined) lines.push(`api_key = ${JSON.stringify(d.api_key)}`);
+    if (d.timeout_ms !== undefined) lines.push(`timeout_ms = ${d.timeout_ms}`);
     lines.push('');
   }
 
@@ -3014,10 +3113,18 @@ export function parseSimpleToml(content: string): ProxyConfig {
           (config.privacy_filter as any)[cleanKey] = value;
         }
       } else if (currentSection === 'tool_judge_sidecar' && config.tool_judge_sidecar) {
-        // judge_url, mode and api_key are stored as strings; the numeric keys
+        // judge_url, mode, api_key, use_decision_api, model are stored as strings/booleans; the numeric keys
         // are coerced in the unquoted branch below.
         if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
           (config.tool_judge_sidecar as any)[cleanKey] = value;
+        } else if (cleanKey === 'model') {
+          // Only accept valid model values; drop invalid ones silently
+          if (value === 'clef' || value === 'clef-flash' || value === 'laya') {
+            (config.tool_judge_sidecar as any)[cleanKey] = value;
+          }
+          // invalid model values are ignored (not stored)
+        } else if (cleanKey === 'use_decision_api') {
+          (config.tool_judge_sidecar as any)[cleanKey] = value === 'true' || value === '1';
         }
       } else if (currentSection === 'decision' && config.decision) {
         // backend, url and api_key are stored as strings; timeout_ms is coerced
@@ -3354,6 +3461,10 @@ export function parseSimpleToml(content: string): ProxyConfig {
           }
         } else if (typeof cleanValueAny === 'string') {
           if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
+            (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
+          }
+        } else if (typeof cleanValueAny === 'boolean') {
+          if (cleanKey === 'use_decision_api') {
             (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
           }
         }

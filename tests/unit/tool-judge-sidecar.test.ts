@@ -24,7 +24,11 @@ import {
   parseNoulResponse,
   judgeTools,
   requestTimeoutMs,
+  adaptToClefRequest,
+  adaptFromClefResponse,
   type JudgeResponse,
+  type ClefRequest,
+  type ClefResponse,
 } from '../../src/utils/tool-judge-sidecar.js';
 
 const realFetch = globalThis.fetch;
@@ -715,6 +719,341 @@ describe('judgeTools', () => {
     assert.ok(elapsed < 60, `the per-request budget must not scale with tool count (took ${elapsed}ms)`);
     assert.deepEqual(result.eraseNames, []);
     assert.deepEqual(result.unjudgedNames, ['Bash', 'Read']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// judgeTools with useDecisionApi = true (Clef /decision endpoint)
+// ---------------------------------------------------------------------------
+
+describe('judgeTools with useDecisionApi = true', () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  function json(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const decisionConfig = {
+    judge_url: 'http://127.0.0.1:8081/decision',
+    timeout_ms: 50,
+    threshold: 0.5,
+    mode: 'choice' as const,
+    api_key: undefined,
+    max_batch_tools: 50,
+    use_decision_api: true,
+    model: 'laya',
+  };
+
+  it('calls the decision endpoint (not /judge) when useDecisionApi is true', async () => {
+    const calls: Array<{ url: string; request: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), request: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown> });
+      return json({
+        model: 'laya',
+        answers: { decision: { type: 'choice', confidence: 0.9, action: { act_probability: 0.7 }, choice: 'keep', probabilities: { keep: 0.8, discard: 0.2 } } },
+      });
+    }) as typeof fetch;
+
+    const body = {
+      messages: [{ role: 'user', content: 'test' }],
+      tools: [{ name: 'Bash', input_schema: {} }, { name: 'Read', input_schema: {} }],
+    };
+
+    const result = await judgeTools(body, proxyConfig(decisionConfig), 'req-1');
+
+    // Should call /decision endpoint directly, NOT /judge appended
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      ['http://127.0.0.1:8081/decision', 'http://127.0.0.1:8081/decision'],
+      'should call /decision endpoint directly without /judge suffix'
+    );
+
+    // Verify Clef-formatted request
+    assert.equal(calls[0].request.model, 'laya');
+    assert.deepEqual(calls[0].request.questions.decision.criteria, { keep: 'Keep the tool', discard: 'Discard the tool' });
+
+    assert.deepEqual(result.judgedNames, ['Bash', 'Read']);
+    assert.deepEqual(result.eraseNames, []);
+  });
+
+  it('noul mode: calls decision endpoint with batched questions', async () => {
+    const calls: Array<{ url: string; request: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), request: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown> });
+      return json({
+        model: 'laya',
+        answers: { Bash: { type: 'noul', confidence: 0.9, action: { act_probability: 0.7 }, noul: 0.8 }, Read: { type: 'noul', confidence: 0.9, action: { act_probability: 0.7 }, noul: 0.8 } },
+      });
+    }) as typeof fetch;
+
+    const body = {
+      messages: [{ role: 'user', content: 'test' }],
+      tools: [{ name: 'Bash', input_schema: {} }, { name: 'Read', input_schema: {} }],
+    };
+
+    const result = await judgeTools(body, proxyConfig({ ...decisionConfig, mode: 'noul' }), 'req-1');
+
+    // Should call /decision endpoint ONCE (batched in noul mode)
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      ['http://127.0.0.1:8081/decision'],
+      'noul mode should call /decision endpoint directly without /judge suffix'
+    );
+
+    // Verify Clef-formatted request has noul questions
+    assert.equal(calls[0].request.model, 'laya');
+    // Verify Clef-formatted request has noul questions
+    assert.equal(calls[0].request.model, 'laya');
+    assert.equal(calls[0].request.questions.Bash.type, 'noul');
+    assert.equal(calls[0].request.questions.Read.type, 'noul');
+
+    assert.deepEqual(result.judgedNames, ['Bash', 'Read']);
+    assert.deepEqual(result.eraseNames, []);
+  });
+
+  it('falls back to sidecar when useDecisionApi is false', async () => {
+    const calls: Array<{ url: string; request: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), request: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown> });
+      return json({
+        decision: { type: 'choice', confidence: 0.9, action: { act_probability: 0.7 }, choice: 'keep', probabilities: { keep: 0.8, discard: 0.2 } },
+      });
+    }) as typeof fetch;
+
+    const body = {
+      messages: [{ role: 'user', content: 'test' }],
+      tools: [{ name: 'Bash', input_schema: {} }],
+    };
+
+    const result = await judgeTools(body, proxyConfig({ ...decisionConfig, use_decision_api: false, judge_url: 'http://127.0.0.1:8081' }), 'req-1');
+
+    // Should call /judge endpoint (sidecar protocol)
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      ['http://127.0.0.1:8081/judge'],
+      'should call /judge endpoint when useDecisionApi is false'
+    );
+
+    assert.deepEqual(result.judgedNames, ['Bash']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clef Protocol Adapters (for /decision API)
+// ---------------------------------------------------------------------------
+
+describe('adaptToClefRequest', () => {
+  it('converts choice criteria from array to object with descriptions', () => {
+    const sidecarRequest = {
+      state: 'test state',
+      questions: {
+        decision: {
+          type: 'choice' as const,
+          instructions: 'test instructions',
+          criteria: ['keep', 'discard'],
+        },
+      },
+    };
+
+    const clefRequest = adaptToClefRequest(sidecarRequest, 'laya');
+
+    assert.equal(clefRequest.model, 'laya');
+    assert.equal(clefRequest.state, 'test state');
+    assert.deepEqual(clefRequest.questions.decision, {
+      type: 'choice',
+      instructions: 'test instructions',
+      criteria: { keep: 'Keep the tool', discard: 'Discard the tool' },
+    });
+  });
+
+  it('converts noul questions without criteria', () => {
+    const sidecarRequest = {
+      state: 'test state',
+      questions: {
+        Read: { type: 'noul' as const, instructions: 'Keep Read tool?' },
+        grep: { type: 'noul' as const, instructions: 'Keep grep tool?' },
+      },
+    };
+
+    const clefRequest = adaptToClefRequest(sidecarRequest, 'clef');
+
+    assert.equal(clefRequest.model, 'clef');
+    assert.deepEqual(clefRequest.questions.Read, { type: 'noul', instructions: 'Keep Read tool?' });
+    assert.deepEqual(clefRequest.questions.grep, { type: 'noul', instructions: 'Keep grep tool?' });
+  });
+
+  it('handles mixed choice and noul questions', () => {
+    const sidecarRequest = {
+      state: 'test state',
+      questions: {
+        decision: { type: 'choice' as const, instructions: 'instr', criteria: ['keep', 'discard'] },
+        Read: { type: 'noul' as const, instructions: 'Keep Read?' },
+      },
+    };
+
+    const clefRequest = adaptToClefRequest(sidecarRequest, 'laya');
+
+    assert.deepEqual(clefRequest.questions.decision.type, 'choice');
+    assert.deepEqual(clefRequest.questions.decision.criteria, { keep: 'Keep the tool', discard: 'Discard the tool' });
+    assert.deepEqual(clefRequest.questions.Read.type, 'noul');
+  });
+});
+
+describe('adaptFromClefResponse', () => {
+  it('extracts the answers map from a Clef response', () => {
+    const clefResponse: ClefResponse = {
+      model: 'laya',
+      answers: {
+        decision: { type: 'choice', confidence: 0.9, action: { act_probability: 0.7 }, choice: 'keep', probabilities: { keep: 0.8, discard: 0.2 } },
+        Read: { type: 'noul', confidence: 0.9, action: { act_probability: 0.7 }, noul: 0.8 },
+      },
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    };
+
+    const judgeResponse = adaptFromClefResponse(clefResponse);
+
+    assert.deepEqual(judgeResponse.decision, clefResponse.answers.decision);
+    assert.deepEqual(judgeResponse.Read, clefResponse.answers.Read);
+    // usage is dropped - sidecar response doesn't have it
+  });
+
+  it('returns empty object when answers is missing', () => {
+    const clefResponse = { model: 'laya', answers: {} } as ClefResponse;
+    const judgeResponse = adaptFromClefResponse(clefResponse);
+    assert.deepEqual(judgeResponse, {});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// callDecisionApi
+// ---------------------------------------------------------------------------
+
+describe('callDecisionApi', () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  function json(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const baseConfig = {
+    judge_url: 'http://127.0.0.1:8081/decision',
+    timeoutMs: 50,
+    threshold: 0.5,
+    mode: 'choice' as const,
+    apiKey: undefined,
+    maxBatchTools: 50,
+    useDecisionApi: true,
+    model: 'laya',
+  };
+
+  it('calls the decision endpoint with Clef-formatted request', async () => {
+    const calls: Array<{ url: string; request: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), request: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown> });
+      return json({
+        model: 'laya',
+        answers: { decision: { type: 'choice', confidence: 0.9, action: { act_probability: 0.7 }, choice: 'keep', probabilities: { keep: 0.8, discard: 0.2 } } },
+      });
+    }) as typeof fetch;
+
+    const { callDecisionApi } = await import('../../src/utils/tool-judge-sidecar.js');
+    const request = { state: 'test', questions: { decision: { type: 'choice', instructions: 'instr', criteria: ['keep', 'discard'] } } };
+    const response = await callDecisionApi(baseConfig, request, 'req-1');
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'http://127.0.0.1:8081/decision'); // no /judge appended
+    assert.equal(calls[0].request.model, 'laya');
+    assert.deepEqual(calls[0].request.questions.decision.criteria, { keep: 'Keep the tool', discard: 'Discard the tool' });
+    assert.deepEqual(response.decision.choice, 'keep');
+  });
+
+  it('includes Authorization header when apiKey is configured', async () => {
+    const headers: Array<Record<string, string>> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      headers.push((init?.headers ?? {}) as Record<string, string>);
+      return json({ model: 'laya', answers: { decision: { type: 'choice', confidence: 0.9, action: { act_probability: 0.7 }, choice: 'keep', probabilities: { keep: 0.8, discard: 0.2 } } } });
+    }) as typeof fetch;
+
+    const { callDecisionApi } = await import('../../src/utils/tool-judge-sidecar.js');
+    const configWithKey = { ...baseConfig, apiKey: 'secret-key' };
+    const request = { state: 'test', questions: { decision: { type: 'choice', instructions: 'instr', criteria: ['keep', 'discard'] } } };
+    await callDecisionApi(configWithKey, request, 'req-1');
+
+    assert.equal(headers[0].Authorization, 'Bearer secret-key');
+  });
+
+  it('returns null on non-2xx response', async () => {
+    globalThis.fetch = (async () => new Response('boom', { status: 500 })) as typeof fetch;
+
+    const { callDecisionApi } = await import('../../src/utils/tool-judge-sidecar.js');
+    const request = { state: 'test', questions: { decision: { type: 'choice', instructions: 'instr', criteria: ['keep', 'discard'] } } };
+    const response = await callDecisionApi(baseConfig, request, 'req-1');
+
+    assert.equal(response, null);
+  });
+
+  it('returns null on malformed JSON', async () => {
+    globalThis.fetch = (async () => new Response('{not json', { status: 200 })) as typeof fetch;
+
+    const { callDecisionApi } = await import('../../src/utils/tool-judge-sidecar.js');
+    const request = { state: 'test', questions: { decision: { type: 'choice', instructions: 'instr', criteria: ['keep', 'discard'] } } };
+    const response = await callDecisionApi(baseConfig, request, 'req-1');
+
+    assert.equal(response, null);
+  });
+
+  it('returns null when model is not configured', async () => {
+    const { callDecisionApi } = await import('../../src/utils/tool-judge-sidecar.js');
+    const configNoModel = { ...baseConfig, model: undefined };
+    const request = { state: 'test', questions: { decision: { type: 'choice', instructions: 'instr', criteria: ['keep', 'discard'] } } };
+    const response = await callDecisionApi(configNoModel, request, 'req-1');
+
+    assert.equal(response, null);
+  });
+
+  it('returns null when judge_url is not configured', async () => {
+    const { callDecisionApi } = await import('../../src/utils/tool-judge-sidecar.js');
+    const configNoUrl = { ...baseConfig, judge_url: '' };
+    const request = { state: 'test', questions: { decision: { type: 'choice', instructions: 'instr', criteria: ['keep', 'discard'] } } };
+    const response = await callDecisionApi(configNoUrl, request, 'req-1');
+
+    assert.equal(response, null);
+  });
+
+  it('respects timeout and aborts', async () => {
+    let signal: AbortSignal | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      signal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          const err = new Error('The operation was aborted');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      });
+    }) as typeof fetch;
+
+    const { callDecisionApi } = await import('../../src/utils/tool-judge-sidecar.js');
+    const configShortTimeout = { ...baseConfig, timeoutMs: 10 };
+    const request = { state: 'test', questions: { decision: { type: 'choice', instructions: 'instr', criteria: ['keep', 'discard'] } } };
+    const response = await callDecisionApi(configShortTimeout, request, 'req-1');
+
+    assert.equal(signal?.aborted, true);
+    assert.equal(response, null);
   });
 });
 
