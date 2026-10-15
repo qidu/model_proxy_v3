@@ -150,6 +150,13 @@ full wire-level contract.
 - **Composite aliases** — group several models under one name with weighted-random,
   primary/fallback (with runtime share decay on failure), fusion fan-out, or a
   planner→executor coordinator that hands off once a trigger tool appears.
+  - **Decision mode** — ability-based target selection via the Clef `/decision` API.
+    Targets declare comma-separated `ability` strings (e.g., `ability = "coding,reasoning,analysis"`).
+    When no static targeting (`primary`/`fallback`/`share`) is configured and at least one target has an
+    `ability` field, the proxy calls the Clef `/decision` endpoint with the request state and
+    receives a probabilistic choice. Fail-open: any decision API failure falls back to
+    declaration order. Config mirrors `JudgeSidecarConfig`: `decision = { model = "clef",
+    url = "https://…", api_key = "…", threshold = 0.5, timeout_ms = 3000, context_prompts = 1 }`.
 - **Schedule aliases** — timetable-based routing: pick which model (or composite)
   serves a request based on server-local hour-of-day and day-of-week, with a
   fallback target for any time outside the configured windows.
@@ -556,6 +563,18 @@ Incoming model names resolve through three stacked logic levels (see the
   - **fusion** — fan-out to parallel panel models with an optional judge and synth.
   - **coordinator** — planner → executor hand-off: routes to the planner until a trigger
     tool call (`ExitPlanMode`, `Edit`, `Write`, …) appears in the conversation history.
+  - **decision** — ability-based target selection via the Clef `/decision` API. Activates
+    **only** when no `primary`/`fallback`/`share` targeting is configured **and** at least
+    one target declares an `ability` field (comma-separated skills like
+    `ability = "coding,reasoning,analysis"`). The proxy POSTs `{model, state, questions}`
+    to the Clef `/decision` endpoint and receives `{answers: {target_selection:
+    {choice, probabilities, confidence}}}`. Fail-open: any decision API failure (network,
+    timeout, invalid response) falls back to declaration order. Config mirrors
+    `JudgeSidecarConfig`:
+    `decision = { model = "clef", url = "https://…", api_key = "…", threshold = 0.5,
+    timeout_ms = 3000, context_prompts = 1 }` — all fields optional except `model` and
+    `url` when the block is present. Static precedence: `primary` → `fallback` (ascending)
+    → `share` (weighted random) → `decision` (ability-based) → declaration order.
 - **Level 3 — `[schedule]`** aliases — pick one target by server-local hour-of-day /
   day-of-week windows, with an empty-window fallback target.
 - **Token limits** — global (`general.global_token_limit`) and per-alias caps over
@@ -600,6 +619,7 @@ level below* gets to serve this request:
 | 2 | `[composite]` (share / primary+fallback) | Weighted random or fallback order | 1 → 1 | Level 1 |
 | 2 | `[composite]` (fusion) | Role + `fusion_options` | 1 → N → 1 (panel×N + judge + synth) | Level 1 |
 | 2 | `[composite]` (coordinator) | Stage detection via `toolset` in messages history | 1 → 1 (planner → executor, one-way) | Level 1 |
+| 2 | `[composite]` (decision) | Ability-based via Clef `/decision` API | 1 → 1 | Level 1 |
 | 1 | `[models.*]` | Exact / `prefix-*` / `*` catch-all | 1 → 1 (one upstream) | — (sends) |
 
 

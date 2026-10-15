@@ -5,6 +5,20 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(composite): decision mode — Clef `/decision` API for ability-based target selection
+
+`src/utils/config-loader.ts`, `src/index.ts`, `tests/unit/config-loader.test.ts`, `docs/architecture/design_decision_composite_targeting.md` — new **decision mode** for `[composite]` aliases that uses the Clef `/decision` protocol to intelligently select a target model based on declared abilities.
+
+- **Trigger condition**: activates **only** when **no** static targeting (`primary`/`fallback`/`share`) is configured **and** at least one target has an `ability` field (comma-separated skills like `ability = "coding,reasoning,analysis"`).
+- **Protocol**: POST `{model, state, questions}` to the Clef `/decision` endpoint → returns `{answers: {target_selection: {choice, probabilities, confidence}}}`.
+- **Fail-open**: any decision API failure (network, timeout, invalid response) falls back to declaration order — same pattern as the tool judge sidecar.
+- **Config mirrors `JudgeSidecarConfig`**: `decision = { model = "clef", url = "https://…", api_key = "…", threshold = 0.5, timeout_ms = 3000, context_prompts = 1 }` — all fields optional except `model` and `url` when the block is present.
+- **Static precedence**: `primary` → `fallback` (ascending) → `share` (weighted random) → `decision` (ability-based) → declaration order.
+- **Quote-aware comma splitting** for `ability` field parsing (e.g., `"coding, reasoning, analysis"`).
+- **Integration**: `resolveCompositeWithDecision()` called from `src/index.ts` during composite alias resolution; uses existing `callDecisionApi()` to avoid duplication.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **all 201 config-loader tests pass** — executed on this tree.
+
 ### docs(readme): add Tool Judge Sidecar section with Clef decision API support
 
 `README.md` — added dedicated documentation for the `[tool_judge_sidecar]` section

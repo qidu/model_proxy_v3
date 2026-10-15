@@ -41,7 +41,7 @@ import {
   handleDashboardUpsertModelTarget,
   handleDashboardUpsertScheduleTarget,
 } from './handlers/dashboard.js';
-import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget, getDefaultUpstreamConfig } from './utils/config-loader.js';
+import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget, getDefaultUpstreamConfig, resolveCompositeWithDecision, DecisionRequestContext } from './utils/config-loader.js';
 import { parseAuthTargets, hasRequiredProtocolVersion, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
 import { detectCoordinatorStage } from './utils/coordinator.js';
 import {
@@ -1563,7 +1563,105 @@ export default {
             }
 
             if (!((request as any)._fusionPlan)) {
-            const compositeCandidates = getCompositeRouteCandidates(modelName, proxyConfig);
+            // Build decision context from request body for ability-based target selection
+            const decisionContext: DecisionRequestContext = {
+              requestId,
+              prompt: '',
+              recentUserMessages: [],
+              recentToolCalls: [],
+              tools: [],
+            };
+
+            // Extract user messages and tool calls from body
+            if (body && Array.isArray(body.messages)) {
+              const userMessages: string[] = [];
+              const toolCalls: Array<{ name: string; args: unknown }> = [];
+
+              for (const msg of body.messages) {
+                if (!msg || typeof msg !== 'object') continue;
+                const m = msg as Record<string, unknown>;
+                const role = m.role === 'model' ? 'assistant' : (m.role as string);
+                const content = m.parts ?? m.content;
+
+                if (role === 'user') {
+                  // Extract text from content
+                  let text = '';
+                  if (typeof content === 'string') {
+                    text = content;
+                  } else if (Array.isArray(content)) {
+                    for (const block of content) {
+                      if (block && typeof block === 'object' && typeof (block as Record<string, unknown>).text === 'string') {
+                        text += (block as Record<string, unknown>).text + '\n';
+                      }
+                    }
+                    text = text.trim();
+                  }
+                  if (text) userMessages.push(text);
+                } else if (role === 'assistant') {
+                  // Extract tool calls
+                  if (Array.isArray(content)) {
+                    for (const block of content) {
+                      if (block && typeof block === 'object') {
+                        const b = block as Record<string, unknown>;
+                        if (b.type === 'tool_use' && typeof b.name === 'string') {
+                          toolCalls.push({ name: b.name, args: b.input ?? {} });
+                        } else if (b.functionCall && typeof b.functionCall === 'object') {
+                          const fc = b.functionCall as Record<string, unknown>;
+                          if (typeof fc.name === 'string') toolCalls.push({ name: fc.name, args: fc.args ?? {} });
+                        }
+                      }
+                    }
+                  }
+                  if (Array.isArray(m.tool_calls)) {
+                    for (const call of m.tool_calls) {
+                      if (!call || typeof call !== 'object') continue;
+                      const fn = (call as Record<string, unknown>).function;
+                      if (fn && typeof fn === 'object') {
+                        const f = fn as Record<string, unknown>;
+                        if (typeof f.name === 'string') {
+                          let args: unknown = {};
+                          try { args = JSON.parse(typeof f.arguments === 'string' ? f.arguments : '{}'); } catch { args = f.arguments ?? {}; }
+                          toolCalls.push({ name: f.name, args });
+                        }
+                      }
+                    }
+                  }
+                  const functionCall = m.function_call;
+                  if (functionCall && typeof functionCall === 'object') {
+                    const f = functionCall as Record<string, unknown>;
+                    if (typeof f.name === 'string') {
+                      let args: unknown = {};
+                      try { args = JSON.parse(typeof f.arguments === 'string' ? f.arguments : '{}'); } catch { args = f.arguments ?? {}; }
+                      toolCalls.push({ name: f.name, args });
+                    }
+                  }
+                }
+              }
+
+              // Last user message is the current prompt, earlier ones are context
+              if (userMessages.length > 0) {
+                decisionContext.prompt = userMessages[userMessages.length - 1];
+                decisionContext.recentUserMessages = userMessages.slice(0, -1).slice(-3);
+              }
+              decisionContext.recentToolCalls = toolCalls.slice(-5);
+            }
+
+            // Extract available tools from body
+            if (body && Array.isArray(body.tools)) {
+              decisionContext.tools = body.tools.map((t: any) => ({
+                name: t.name || (t.function?.name || ''),
+                description: t.description || (t.function?.description || ''),
+              })).filter((t: any) => t.name);
+            }
+
+            // Try decision-aware resolution first
+            let compositeCandidates = await resolveCompositeWithDecision(modelName, proxyConfig, decisionContext);
+
+            // Fall back to default logic if decision API not used or failed
+            if (!compositeCandidates) {
+              compositeCandidates = getCompositeRouteCandidates(modelName, proxyConfig);
+            }
+
             compositeAliasName = (compositeCandidates.length > 0 || (request as any)._coordCandidate) ? modelName : undefined;
 
             // Token-limit enforcement: check tokens in the current duration window against the alias-level limit.

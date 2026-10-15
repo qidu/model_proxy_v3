@@ -45,6 +45,8 @@ import {
   getDefaultUpstreamConfig,
   resolveDefaultProxyConfigPath,
   HOME_PROXY_CONFIG_PATH,
+  buildDecisionState,
+  buildDecisionQuestions,
   type ProxyConfig,
   type TransformSet,
 } from '../../src/utils/config-loader.js';
@@ -2287,5 +2289,462 @@ describe('getDefaultUpstreamConfig', () => {
         apiKey: 'fallback-key',
       },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Composite Target ability field parsing and serialization
+// ---------------------------------------------------------------------------
+
+describe('Composite Target ability field', () => {
+  it('parses ability field from composite target config', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {"model-a" = {share = 1, ability = "coding,reasoning"}, "model-b" = {share = 1}}
+    `);
+    const targets = cfg.composite?.['alias-1'] as Record<string, unknown>;
+    assert.deepEqual(targets['model-a'], { share: 1, ability: 'coding,reasoning' });
+    assert.deepEqual(targets['model-b'], { share: 1 });
+  });
+
+  it('serializes ability field in composite target config', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          'model-a': { share: 1, ability: 'coding,reasoning' },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const toml = serializeProxyConfigToml(cfg);
+    const roundTripped = parseSimpleToml(toml);
+    const targets = roundTripped.composite?.['alias-1'] as Record<string, unknown>;
+    assert.deepEqual(targets['model-a'], { share: 1, ability: 'coding,reasoning' });
+    assert.deepEqual(targets['model-b'], { share: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Composite Model decision field parsing and serialization
+// ---------------------------------------------------------------------------
+
+describe('Composite Model decision field', () => {
+  it('parses decision block from composite model config', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {decision = {model = "clef", url = "http://localhost:8081/decision", api_key = "secret", threshold = 0.5, timeout_ms = 5000, context_prompts = 1}, "model-a" = {share = 1}, "model-b" = {share = 1}}
+    `);
+    const composite = cfg.composite?.['alias-1'] as any;
+    assert.deepEqual(composite.decision, {
+      model: 'clef',
+      url: 'http://localhost:8081/decision',
+      api_key: 'secret',
+      threshold: 0.5,
+      timeout_ms: 5000,
+      context_prompts: 1,
+    });
+    assert.deepEqual(composite['model-a'], { share: 1 });
+    assert.deepEqual(composite['model-b'], { share: 1 });
+  });
+
+  it('parses decision block with minimal fields (uses defaults)', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {decision = {model = "clef"}, "model-a" = {share = 1}, "model-b" = {share = 1}}
+    `);
+    const composite = cfg.composite?.['alias-1'] as any;
+    assert.equal(composite.decision?.model, 'clef');
+    assert.equal(composite.decision?.url, undefined);
+    assert.equal(composite.decision?.threshold, undefined);
+    assert.equal(composite.decision?.timeout_ms, undefined);
+    assert.equal(composite.decision?.context_prompts, undefined);
+  });
+
+  it('drops decision block with invalid model value', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {decision = {model = "invalid-model", url = "http://x"}, "model-a" = {share = 1}}
+    `);
+    const composite = cfg.composite?.['alias-1'] as any;
+    // Invalid model should be dropped
+    assert.equal(composite.decision, undefined);
+  });
+
+  it('serializes decision block in composite model config', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', api_key: 'secret', threshold: 0.5, timeout_ms: 5000, context_prompts: 1 },
+          'model-a': { share: 1 },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const toml = serializeProxyConfigToml(cfg);
+    const roundTripped = parseSimpleToml(toml);
+    const composite = roundTripped.composite?.['alias-1'] as any;
+    assert.deepEqual(composite.decision, {
+      model: 'clef',
+      url: 'http://localhost:8081/decision',
+      api_key: 'secret',
+      threshold: 0.5,
+      timeout_ms: 5000,
+      context_prompts: 1,
+    });
+  });
+
+  it('serializes decision block with minimal fields', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef' },
+          'model-a': { share: 1 },
+        },
+      },
+    };
+    const toml = serializeProxyConfigToml(cfg);
+    const roundTripped = parseSimpleToml(toml);
+    const composite = roundTripped.composite?.['alias-1'] as any;
+    assert.equal(composite.decision?.model, 'clef');
+    assert.equal(composite.decision?.url, undefined);
+    assert.equal(composite.decision?.threshold, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateProxyConfig - composite decision validation
+// ---------------------------------------------------------------------------
+
+describe('validateProxyConfig - composite decision validation', () => {
+  it('flags composite with decision but no ability on any target', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1 },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision' && e.message.includes('ability')));
+    assert.equal(r.valid, false);
+  });
+
+  it('passes when composite has decision and at least one target has ability', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1, ability: 'coding' },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(!r.errors.some(e => e.path === 'composite.alias-1.decision' && e.message.includes('ability')));
+  });
+
+  it('flags composite with decision.url but without decision.model', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.model' && e.message.includes('model')));
+    assert.equal(r.valid, false);
+  });
+
+  it('flags composite with decision threshold outside 0-1 range', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', threshold: 1.5 },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.threshold' && e.message.includes('threshold')));
+    assert.equal(r.valid, false);
+  });
+
+  it('flags composite with negative decision timeout_ms', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', timeout_ms: -100 },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.timeout_ms' && e.message.includes('timeout_ms')));
+    assert.equal(r.valid, false);
+  });
+
+  it('flags composite with invalid context_prompts (not positive integer)', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', context_prompts: 0 },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.context_prompts' && e.message.includes('context_prompts')));
+    assert.equal(r.valid, false);
+  });
+
+  it('allows decision config with url and model', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    // Should pass - url and model are provided
+    assert.ok(!r.errors.some(e => e.path === 'composite.alias-1.decision.url' && e.message.includes('url')));
+    assert.ok(!r.errors.some(e => e.path === 'composite.alias-1.decision.model' && e.message.includes('model')));
+    assert.equal(r.valid, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getCompositeAliasMode - decision mode
+// ---------------------------------------------------------------------------
+
+describe('getCompositeAliasMode - decision mode', () => {
+  it('returns decision when decision config present and at least one target has ability', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'dec': { decision: { model: 'clef', url: 'http://localhost/decision' }, 'a': { ability: 'coding' }, 'b': { ability: 'reasoning' } } },
+    };
+    assert.equal(getCompositeAliasMode('dec', cfg), 'decision');
+  });
+
+  it('returns share when decision config present but no target has ability', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'dec': { decision: { model: 'clef' }, 'a': { share: 1 }, 'b': { share: 1 } } },
+    };
+    assert.equal(getCompositeAliasMode('dec', cfg), 'share');
+  });
+
+  it('returns fallback when primary/fallback set (precedence over decision)', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'fb': { decision: { model: 'clef' }, 'a': { primary: true, ability: 'coding' }, 'b': { fallback: 1, ability: 'reasoning' } } },
+    };
+    assert.equal(getCompositeAliasMode('fb', cfg), 'fallback');
+  });
+
+  it('returns coordinator when coord present (precedence over decision)', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'coord': { decision: { model: 'clef' }, 'a': { coord: 1, role: 'planner', ability: 'coding' }, 'b': { coord: 1, role: 'executor' } } },
+    };
+    assert.equal(getCompositeAliasMode('coord', cfg), 'coordinator');
+  });
+
+  it('returns fusion when role present (precedence over decision)', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'fusion': { decision: { model: 'clef' }, 'a': { role: 'panel', ability: 'coding' }, 'b': { role: 'synth' } } },
+    };
+    assert.equal(getCompositeAliasMode('fusion', cfg), 'fusion');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveCompositeWithDecision
+// ---------------------------------------------------------------------------
+
+describe('resolveCompositeWithDecision', () => {
+  // Import the function - we need to import it from config-loader
+  // We'll use a mock decision function for testing
+
+  it('returns candidates unchanged when no decision config', async () => {
+    const { resolveCompositeWithDecision, getCompositeRouteCandidates } = await import('../../src/utils/config-loader.js');
+
+    const proxyConfig: ProxyConfig = {
+      composite: {
+        'test-alias': {
+          targets: {
+            'model-a': { share: 1, ability: 'coding' },
+            'model-b': { share: 1, ability: 'reasoning' },
+          },
+        },
+      },
+    };
+
+    const candidates = getCompositeRouteCandidates('test-alias', proxyConfig);
+    const context: DecisionRequestContext = { prompt: 'test', recentUserMessages: [], tools: [], recentToolCalls: [] };
+
+    const result = await resolveCompositeWithDecision('test-alias', proxyConfig, context);
+    assert.deepEqual(result, candidates);
+  });
+
+  it('returns candidates unchanged when no target has ability', async () => {
+    const { resolveCompositeWithDecision, getCompositeRouteCandidates } = await import('../../src/utils/config-loader.js');
+
+    const proxyConfig: ProxyConfig = {
+      composite: {
+        'test-alias': {
+          targets: {
+            'model-a': { share: 1 },
+            'model-b': { share: 1 },
+          },
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', threshold: 0.5, timeout_ms: 5000, context_prompts: 1 },
+        },
+      },
+    };
+
+    const candidates = getCompositeRouteCandidates('test-alias', proxyConfig);
+    const context: DecisionRequestContext = { prompt: 'test', recentUserMessages: [], tools: [], recentToolCalls: [] };
+
+    const result = await resolveCompositeWithDecision('test-alias', proxyConfig, context);
+    assert.deepEqual(result, candidates);
+  });
+
+  it('returns candidates unchanged when decision API call fails (fail-open)', async () => {
+    const { resolveCompositeWithDecision, getCompositeRouteCandidates } = await import('../../src/utils/config-loader.js');
+
+    const proxyConfig: ProxyConfig = {
+      composite: {
+        'test-alias': {
+          targets: {
+            'model-a': { share: 1, ability: 'coding' },
+            'model-b': { share: 1, ability: 'reasoning' },
+          },
+          decision: { model: 'clef', url: 'http://invalid-url/decision', threshold: 0.5, timeout_ms: 100, context_prompts: 1 },
+        },
+      },
+    };
+
+    const candidates = getCompositeRouteCandidates('test-alias', proxyConfig);
+    const context: DecisionRequestContext = { prompt: 'test', recentUserMessages: [], tools: [], recentToolCalls: [] };
+
+    const result = await resolveCompositeWithDecision('test-alias', proxyConfig, context);
+    // Should fail-open and return original candidates
+    assert.deepEqual(result, candidates);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DecisionRequestContext helpers
+// ---------------------------------------------------------------------------
+
+describe('buildDecisionState / buildDecisionQuestions', () => {
+  it('builds decision state from context', () => {
+    const context: DecisionRequestContext = {
+      prompt: 'Write a Python function',
+      recentUserMessages: ['Hello', 'Hi there!'],
+      tools: [{ name: 'write_file', description: 'Write a file' }],
+      recentToolCalls: [{ name: 'write_file', args: { path: 'test.py' } }],
+    };
+
+    const entries: Array<[string, CompositeTargetConfig]> = [
+      ['model-a', { ability: 'coding,reasoning' } as CompositeTargetConfig],
+      ['model-b', { ability: 'analysis' } as CompositeTargetConfig],
+      ['model-c', {} as CompositeTargetConfig],
+    ];
+
+    const state = buildDecisionState(context, entries);
+    assert.ok(state.includes('Write a Python function'));
+    assert.ok(state.includes('Hello'));
+    assert.ok(state.includes('Hi there!'));
+    assert.ok(state.includes('write_file'));
+    assert.ok(state.includes('model-a'));
+    assert.ok(state.includes('coding,reasoning'));
+  });
+
+  it('builds decision questions with target abilities', () => {
+    const entries: Array<[string, CompositeTargetConfig]> = [
+      ['model-a', { ability: 'coding,reasoning' } as CompositeTargetConfig],
+      ['model-b', { ability: 'analysis' } as CompositeTargetConfig],
+      ['model-c', {} as CompositeTargetConfig],
+    ];
+
+    const questions = buildDecisionQuestions(entries);
+    assert.ok(questions.target_selection);
+    assert.equal(questions.target_selection.type, 'choice');
+    assert.ok(questions.target_selection.criteria);
+    const criteriaKeys = Object.keys(questions.target_selection.criteria);
+    assert.ok(criteriaKeys.includes('model-a'));
+    assert.ok(criteriaKeys.includes('model-b'));
+    assert.ok(criteriaKeys.includes('model-c'));
   });
 });

@@ -16,6 +16,7 @@ import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
 import { createLogger } from './logger.js';
 import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
 import { UPSTREAM_MODES } from './upstream-modes.js';
+import { callDecisionApi, adaptToClefRequest, adaptFromClefResponse, type ClefRequest, type ClefChoiceQuestion } from './tool-judge-sidecar.js';
 
 // Check if we're running in Node.js environment
 const isNodeEnvironment = (typeof process !== 'undefined' && process.versions?.node) ||
@@ -544,13 +545,24 @@ export interface CompositeTargetConfig {
   fusion?: number;           // > 0 marks target as panel member (weight reserved for future use)
   coord?: number;            // > 0 marks target as coordinator participant (planner or executor)
   role?: FusionRole;         // explicit stage: 'panel' | 'judge' | 'synth' | 'planner' | 'executor'
+  ability?: string;          // comma-separated abilities, e.g. "coding,reasoning,analysis"
+}
+
+export interface DecisionConfig {
+  model: string;                 // "laya" | "clef" | "clef-flash" (decision backend model name)
+  url?: string;                  // full /decision endpoint URL (e.g., "http://localhost:8765/decision")
+  api_key?: string;              // optional Authorization header
+  threshold?: number;            // confidence threshold (default: 0.5)
+  timeout_ms?: number;           // per-request budget (default: 50ms)
+  context_prompts?: number;      // number of recent prompts to include (default: 1)
 }
 
 export interface CompositeModelConfig {
   token_limit?: TokenLimitConfig;
   fusion_options?: FusionOptions;
   toolset?: string[];        // coordinator trigger tool names; absent = default set; [] = any tool
-  [modelName: string]: CompositeTargetConfig | TokenLimitConfig | FusionOptions | string[] | undefined;
+  decision?: DecisionConfig; // decision API config for ability-based target selection
+  [modelName: string]: CompositeTargetConfig | TokenLimitConfig | FusionOptions | string[] | DecisionConfig | undefined;
 }
 
 export interface CoordinatorPlan {
@@ -594,7 +606,7 @@ export interface ScheduleWindow {
 // (always eligible, used when no other target's windows match "now").
 export type ScheduleConfig = Record<string, ScheduleWindow[]>;
 
-const COMPOSITE_META_KEYS = new Set(['token_limit', 'fusion_options', 'toolset']);
+const COMPOSITE_META_KEYS = new Set(['token_limit', 'fusion_options', 'toolset', 'decision']);
 
 function getCompositeTargetEntries(config: CompositeModelConfig | undefined): Array<[string, CompositeTargetConfig]> {
   return Object.entries(config || {}).filter(([key]) => !COMPOSITE_META_KEYS.has(key)) as Array<[string, CompositeTargetConfig]>;
@@ -941,7 +953,185 @@ export function getCompositeRouteCandidates(
   }));
 }
 
-export type CompositeAliasMode = 'coordinator' | 'fusion' | 'fallback' | 'share';
+/**
+ * Interface for request context passed to decision-aware resolution
+ */
+export interface DecisionRequestContext {
+  /** The user's current prompt (most recent user message) */
+  prompt: string;
+  /** Recent user messages for context (excluding the current prompt) */
+  recentUserMessages?: string[];
+  /** Recent tool calls for context */
+  recentToolCalls?: Array<{ name: string; args: unknown }>;
+  /** Available tools in the request */
+  tools?: Array<{ name: string; description?: string }>;
+  /** Request ID for logging */
+  requestId?: string;
+}
+
+/**
+ * Resolve composite alias with decision API for ability-based target selection.
+ * Returns reordered candidates if decision API succeeds, otherwise falls back to default ordering (fail-open).
+ * This function is async and should be called before the retry loop in the request handler.
+ */
+export async function resolveCompositeWithDecision(
+  modelName: string,
+  proxyConfig: ProxyConfig,
+  context: DecisionRequestContext,
+): Promise<CompositeRouteCandidate[]> {
+  // Get composite candidates from config
+  const candidates = getCompositeRouteCandidates(modelName, proxyConfig);
+
+  // Get decision config from composite model config
+  const compositeConfig = proxyConfig.composite?.[modelName];
+  const decisionConfig = compositeConfig?.decision ?? null;
+
+  // No decision config, use default candidates (fail-open)
+  if (!decisionConfig) {
+    return candidates;
+  }
+
+  // Check if any candidate has ability - if not, use default candidates (fail-open)
+  const hasAbility = candidates.some(c => c.targetConfig?.ability?.trim());
+  if (!hasAbility) {
+    return candidates;
+  }
+
+  // Build state for Clef request - convert candidates to entries format
+  const entries: Array<[string, CompositeTargetConfig]> = candidates.map(c => [
+    c.modelName,
+    c.targetConfig as CompositeTargetConfig,
+  ]);
+
+  // Build state and questions
+  const state = buildDecisionState(context, entries);
+  const questions = buildDecisionQuestions(entries);
+
+  // Prepare config for callDecisionApi (reuses JudgeSidecarConfig shape)
+  const judgeConfig = {
+    judge_url: decisionConfig.url,
+    model: decisionConfig.model,
+    apiKey: decisionConfig.api_key,
+    threshold: decisionConfig.threshold ?? 0.5,
+    timeoutMs: decisionConfig.timeout_ms ?? 50,
+    mode: 'choice' as const,
+    useDecisionApi: true,
+    maxBatchTools: 1,
+  };
+
+  // Build Clef request
+  const request: ClefRequest = {
+    model: decisionConfig.model,
+    state,
+    questions,
+  };
+
+  const requestId = context.requestId || `composite-${candidates[0]?.modelName || 'unknown'}`;
+
+  try {
+    const response = await callDecisionApi(judgeConfig as any, { state, questions } as any, requestId);
+
+    if (!response || !response.target_selection || response.target_selection.type !== 'choice') {
+      return candidates; // Invalid response, fallback to default (fail-open)
+    }
+
+    const selectedModel = response.target_selection.choice;
+    const confidence = response.target_selection.confidence ?? 0;
+    const threshold = decisionConfig.threshold ?? 0.5;
+
+    if (!selectedModel || confidence < threshold) {
+      return candidates; // No clear winner or low confidence, fallback to default (fail-open)
+    }
+
+    // Verify selected model exists in candidates
+    const selectedCandidate = candidates.find(c => c.modelName === selectedModel);
+    if (!selectedCandidate) {
+      return candidates; // Selected model not found, fallback to default (fail-open)
+    }
+
+    // Reorder: selected model first, rest in declaration order (preserving their relative order)
+    const otherCandidates = candidates.filter(c => c.modelName !== selectedModel);
+    return [selectedCandidate, ...otherCandidates];
+  } catch (err) {
+    // Any error (timeout, network, etc.) -> fail open to default ordering
+    return candidates;
+  }
+}
+
+/**
+ * Build the state text for the decision API request.
+ * Includes user prompt, recent context, available models with abilities, and tools.
+ */
+export function buildDecisionState(
+  context: DecisionRequestContext,
+  entries: Array<[string, CompositeTargetConfig]>,
+): string {
+  const lines: string[] = [];
+
+  // Current user prompt
+  if (context.prompt) {
+    lines.push(`User prompt: "${context.prompt}"`);
+  }
+
+  // Available models with their abilities
+  lines.push('Available models:');
+  for (const [name, cfg] of entries) {
+    if (cfg.ability?.trim()) {
+      lines.push(`- ${name}: ${cfg.ability}`);
+    } else {
+      lines.push(`- ${name}: (no abilities declared)`);
+    }
+  }
+
+  // Tools
+  if (context.tools && context.tools.length > 0) {
+    const toolNames = context.tools.map(t => t.name).join(', ');
+    lines.push(`Tools: [${toolNames}]`);
+  }
+
+  // Recent user messages (context)
+  if (context.recentUserMessages && context.recentUserMessages.length > 0) {
+    lines.push('Recent context:');
+    for (const msg of context.recentUserMessages.slice(-3)) {
+      lines.push(`- User: "${msg}"`);
+    }
+  }
+
+  // Recent tool calls
+  if (context.recentToolCalls && context.recentToolCalls.length > 0) {
+    for (const call of context.recentToolCalls.slice(-5)) {
+      lines.push(`- Assistant called: ${call.name}(${JSON.stringify(call.args)})`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Build the Clef choice question for target selection.
+ * Criteria are derived from each target's ability field.
+ */
+export function buildDecisionQuestions(
+  entries: Array<[string, CompositeTargetConfig]>,
+): Record<string, ClefChoiceQuestion> {
+  const criteria: Record<string, string> = {};
+  for (const [name, cfg] of entries) {
+    if (cfg.ability?.trim()) {
+      criteria[name] = `Abilities: ${cfg.ability}`;
+    } else {
+      criteria[name] = 'No specific abilities declared';
+    }
+  }
+  return {
+    target_selection: {
+      type: 'choice',
+      instructions: 'Select the best model for this task based on the user\'s prompt and each model\'s declared abilities.',
+      criteria,
+    },
+  };
+}
+
+export type CompositeAliasMode = 'coordinator' | 'fusion' | 'fallback' | 'share' | 'decision';
 
 export function getCompositeAliasMode(
   modelName: string,
@@ -966,6 +1156,13 @@ export function getCompositeAliasMode(
     cfg.primary === true || (typeof cfg.fallback === 'number' && cfg.fallback > 0)
   );
   if (hasPriority) return 'fallback';
+
+  // Decision mode: no primary/fallback/share configured, at least one target has ability, and composite has decision config
+  const hasDecisionConfig = compositeConfig.decision && compositeConfig.decision.model && compositeConfig.decision.url;
+  const hasAbility = entries.some(([, cfg]) => cfg.ability && cfg.ability.trim().length > 0);
+  if (hasDecisionConfig && hasAbility && !hasPriority) {
+    return 'decision';
+  }
 
   return 'share';
 }
@@ -1227,7 +1424,29 @@ function normalizeUpstreamThresholdValue(key: string, rawValue: string | number)
 function parseCompositeTargetConfig(value: string): CompositeTargetConfig {
   const config: CompositeTargetConfig = {};
   const cleaned = value.replace(/[{}]/g, '');
-  const fields = cleaned.split(',');
+  // Split on commas that are not inside quotes
+  const fields: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < cleaned.length; i++) {
+    const char = cleaned[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      current += char;
+      continue;
+    }
+    if (!inQuotes && char === ',') {
+      if (current.trim()) {
+        fields.push(current.trim());
+      }
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) {
+    fields.push(current.trim());
+  }
 
   for (const field of fields) {
     const trimmed = field.trim().replace(/^,/, '').replace(/,$/, '');
@@ -1301,6 +1520,12 @@ function parseCompositeTargetConfig(value: string): CompositeTargetConfig {
       } else {
         (config as any)._invalidRole = true;
       }
+      continue;
+    }
+
+    if (key === 'ability') {
+      const v = rawValue.replace(/^"|"$/g, '');
+      config.ability = v;
       continue;
     }
   }
@@ -1473,6 +1698,40 @@ function parseCompositeModelConfig(rawValue: string): CompositeModelConfig {
           }
           config.fusion_options = opts;
         } catch { /* ignore malformed fusion_options */ }
+      } else if (match[1].trim() === 'decision') {
+        // Parse decision object: {model = "...", url = "...", api_key = "...", threshold = ..., timeout_ms = ..., context_prompts = ...}
+        try {
+          const inner = match[2].trim().slice(1, -1);
+          const decision: DecisionConfig = { model: '' };
+          const fields: string[] = [];
+          let cur = ''; let d = 0; let iq = false;
+          for (let i = 0; i < inner.length; i++) {
+            const c = inner[i];
+            if (c === '"') { iq = !iq; cur += c; continue; }
+            if (!iq) { if (c === '{') d++; else if (c === '}') d--; else if (c === ',' && d === 0) { if (cur.trim()) fields.push(cur.trim()); cur = ''; continue; } }
+            cur += c;
+          }
+          if (cur.trim()) fields.push(cur.trim());
+          for (const f of fields) {
+            const kv = f.match(/^"?(\w+)"?\s*[=:]\s*(.+)$/);
+            if (!kv) continue;
+            const k = kv[1]; const rv = kv[2].trim().replace(/,$/, '').replace(/^"|"$/g, '');
+            if (k === 'model' || k === 'url' || k === 'api_key') {
+              (decision as any)[k] = rv;
+            } else if (k === 'threshold') {
+              const n = Number(rv); if (Number.isFinite(n) && n >= 0 && n <= 1) (decision as any).threshold = n;
+            } else if (k === 'timeout_ms' || k === 'context_prompts') {
+              const n = Number(rv); if (Number.isFinite(n) && n >= 0) (decision as any)[k] = n;
+            }
+          }
+          // Validate model is one of allowed values
+          const allowedModels = ['clef', 'clef-flash', 'laya'];
+          if (decision.model && allowedModels.includes(decision.model)) {
+            config.decision = decision;
+          } else {
+            (config as any)._invalidDecision = true;
+          }
+        } catch { /* ignore malformed decision */ }
       } else if (match[1].trim() === 'token_limit') {
         // Parse the nested token_limit object: {num = ..., duration = "..."} or {"num": ..., "duration": "..."}
         const inner = match[2].trim().slice(1, -1);
@@ -1756,6 +2015,9 @@ function serializeCompositeTargetConfig(config: CompositeTargetConfig): string {
   if (config.role !== undefined) {
     fields.push(`role = "${config.role}"`);
   }
+  if (config.ability !== undefined) {
+    fields.push(`ability = "${config.ability}"`);
+  }
   return `{${fields.join(', ')}}`;
 }
 
@@ -1779,6 +2041,18 @@ function serializeCompositeModelConfig(config: CompositeModelConfig): string {
   }
   if (Array.isArray(config.toolset)) {
     entries.push(`toolset = [${config.toolset.map(t => JSON.stringify(t)).join(', ')}]`);
+  }
+  if (config.decision) {
+    const d = config.decision;
+    const fields: string[] = [
+      `model = ${JSON.stringify(d.model)}`,
+    ];
+    if (d.url && d.url.length > 0) fields.push(`url = ${JSON.stringify(d.url)}`);
+    if (d.api_key) fields.push(`api_key = ${JSON.stringify(d.api_key)}`);
+    if (d.threshold !== undefined) fields.push(`threshold = ${d.threshold}`);
+    if (d.timeout_ms !== undefined) fields.push(`timeout_ms = ${d.timeout_ms}`);
+    if (d.context_prompts !== undefined) fields.push(`context_prompts = ${d.context_prompts}`);
+    entries.push(`decision = {${fields.join(', ')}}`);
   }
   for (const [modelName, targetConfig] of getCompositeTargetEntries(config)) {
     const serializedTarget = serializeCompositeTargetConfig((targetConfig || {}) as CompositeTargetConfig);
@@ -2342,6 +2616,54 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
     }
     if (d.timeout_ms !== undefined && (typeof d.timeout_ms !== 'number' || d.timeout_ms <= 0)) {
       errors.push({ path: 'decision.timeout_ms', message: 'timeout_ms must be a positive number (ms)' });
+    }
+  }
+
+  // Validate composite-level decision configs
+  if (config.composite) {
+    for (const [alias, compositeConfig] of Object.entries(config.composite)) {
+      if (compositeConfig && compositeConfig.decision) {
+        const d = compositeConfig.decision;
+        const basePath = `composite.${alias}.decision`;
+        if (!d.model || typeof d.model !== 'string') {
+          errors.push({ path: `${basePath}.model`, message: 'model is required' });
+        }
+        if (!d.url || typeof d.url !== 'string') {
+          errors.push({ path: `${basePath}.url`, message: 'url is required' });
+        } else {
+          try {
+            new URL(d.url);
+          } catch {
+            errors.push({ path: `${basePath}.url`, message: 'url must be a valid URL' });
+          }
+        }
+        if (d.api_key !== undefined && typeof d.api_key !== 'string') {
+          errors.push({ path: `${basePath}.api_key`, message: 'api_key must be a string' });
+        }
+        if (d.threshold !== undefined && (typeof d.threshold !== 'number' || d.threshold < 0 || d.threshold > 1)) {
+          errors.push({ path: `${basePath}.threshold`, message: 'threshold must be a number between 0.0 and 1.0' });
+        }
+        if (d.timeout_ms !== undefined && (typeof d.timeout_ms !== 'number' || d.timeout_ms <= 0)) {
+          errors.push({ path: `${basePath}.timeout_ms`, message: 'timeout_ms must be a positive number (ms)' });
+        }
+        if (d.context_prompts !== undefined && (typeof d.context_prompts !== 'number' || d.context_prompts < 1)) {
+          errors.push({ path: `${basePath}.context_prompts`, message: 'context_prompts must be a positive integer' });
+        }
+        // Error if decision config is present but no target has ability
+        const hasAbility = Object.values(compositeConfig).some(
+          (cfg: any) => cfg && cfg.ability && cfg.ability.trim().length > 0
+        );
+        if (!hasAbility) {
+          errors.push({ path: basePath, message: 'decision config requires at least one target with ability declared' });
+        }
+        // Warn if decision config coexists with primary/fallback/share on any target
+        const hasStaticSelection = Object.values(compositeConfig).some(
+          (cfg: any) => cfg && (cfg.primary === true || (cfg.fallback ?? 0) > 0 || (cfg.share ?? 0) > 0)
+        );
+        if (hasStaticSelection) {
+          warnings.push({ path: basePath, message: 'decision config is ignored when any target has primary/fallback/share configured' });
+        }
+      }
     }
   }
 
