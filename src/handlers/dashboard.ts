@@ -3637,16 +3637,19 @@ export async function handleDashboardTestModel(
     if (alias && alias.targets.length > 0) {
       upstreamMode = alias.targets[0].upstreamMode;
       // Composite aliases don't expose a per-target API key in the snapshot;
-      // fall back to the proxy-wide default. The proxy's auth check just
+      // fall back to the proxy-wide [models.default] api_key. The proxy's auth check just
       // needs any non-empty value, and this same key is what the upstream
       // call will use.
-      testApiKey = proxyConfig.default_upstream?.default_api_key;
+      const defaultCategory = proxyConfig.models?.default;
+      testApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
     } else {
       // Use getModelRouteConfig to correctly resolve the per-model mode (e.g. mode = "anthropic-messages"
       // on an entry inside models.free which has upstream_mode = "openai-completions").
       const route = getModelRouteConfig(modelId, proxyConfig);
       upstreamMode = route.upstreamMode;
-      testApiKey = route.apiKey || proxyConfig.default_upstream?.default_api_key;
+      const defaultCategory = proxyConfig.models?.default;
+      const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
+      testApiKey = route.apiKey || defaultApiKey;
     }
 
     const requestBody = buildTestToolRequest(upstreamMode);

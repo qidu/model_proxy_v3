@@ -2719,7 +2719,9 @@ class DashboardApp {
     //   gemini-*            -> x-goog-api-key: <key>
     // For composite aliases we fall back to the proxy-wide default_api_key
     // (read from the unsanitized config).
-    const testApiKey = modelConfig?.apiKey || this.proxyConfig?.default_upstream?.default_api_key;
+    const defaultCategory = this.proxyConfig?.models?.default;
+const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
+    const testApiKey = modelConfig?.apiKey || defaultApiKey;
     const authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
     if (testApiKey) {
       Object.assign(authHeaders, formatApiKeyForUpstream(testApiKey, upstreamMode));
@@ -3705,7 +3707,7 @@ export function resolveModelTestConfig(
       // The sanitized dashboard snapshot never carries a per-model api_key (it's
       // stripped for display), so look it up from the real config via the same
       // resolver the proxy/dashboard use, and use it as the fallback below —
-      // ahead of the proxy-wide default_upstream key, which belongs to a
+      // ahead of the [models.default] api_key, which belongs to a
       // different model entirely and must not be sent as this model's key.
       let realApiKey: string | undefined;
       if (realConfig) {
@@ -3713,6 +3715,11 @@ export function resolveModelTestConfig(
           realApiKey = getModelRouteConfig(modelId, realConfig).apiKey;
         } catch { /* fall through to other fallbacks below */ }
       }
+      // Defaults from [models.default] for fallback chain
+      const defaultCategory = config.models?.default;
+      const defaultUpstreamMode = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.upstream_mode : undefined;
+      const defaultBaseUrl = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.base_url : undefined;
+      const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
       // Check for per-model override in tuple [target, baseUrl, apiKey, mode]
       // (dashboard sanitizer strips 3rd element, so accept >= 2)
       if (Array.isArray(value) && value.length >= 2) {
@@ -3720,9 +3727,9 @@ export function resolveModelTestConfig(
         // Dashboard sanitized format: [target, base_url, mode] (3 elements, mode at index 2)
         const modelMode = (value.length >= 3 ? value[2] : undefined) as string | undefined;
         return {
-          upstreamMode: modelMode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
-          targetUrl: modelBaseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
-          apiKey: realApiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
+          upstreamMode: modelMode || categoryConfig.upstream_mode || defaultUpstreamMode || 'openai-completions',
+          targetUrl: modelBaseUrl || categoryConfig.base_url || defaultBaseUrl || "http://localhost",
+          apiKey: realApiKey || categoryConfig.api_key || defaultApiKey,
         };
       }
       // Inline-table form: e.g. "model" = {target = "...", base_url = "...", api_key = "...", mode = "..."}
@@ -3733,16 +3740,16 @@ export function resolveModelTestConfig(
         const apiKey = typeof entry.api_key === 'string' ? entry.api_key : undefined;
         const target = typeof entry.target === 'string' ? entry.target : undefined;
         return {
-          upstreamMode: mode || categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
-          targetUrl: baseUrl || categoryConfig.base_url || config.default_upstream?.default_base_url || 'http://localhost',
-          apiKey: realApiKey || apiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
+          upstreamMode: mode || categoryConfig.upstream_mode || defaultUpstreamMode || 'openai-completions',
+          targetUrl: baseUrl || categoryConfig.base_url || defaultBaseUrl || 'http://localhost',
+          apiKey: realApiKey || apiKey || categoryConfig.api_key || defaultApiKey,
           directModel: target || undefined,
         };
       }
       return {
-        upstreamMode: categoryConfig.upstream_mode || config.default_upstream?.upstream_mode || 'openai-completions',
-        targetUrl: categoryConfig.base_url || config.default_upstream?.default_base_url || "http://localhost",
-        apiKey: realApiKey || categoryConfig.api_key || config.default_upstream?.default_api_key,
+        upstreamMode: categoryConfig.upstream_mode || defaultUpstreamMode || 'openai-completions',
+        targetUrl: categoryConfig.base_url || defaultBaseUrl || "http://localhost",
+        apiKey: realApiKey || categoryConfig.api_key || defaultApiKey,
       };
     }
   }

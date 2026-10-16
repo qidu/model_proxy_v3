@@ -5,6 +5,12 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(config): remove `[default_upstream]` section, use `[models.default]` as sole fallback
+
+`src/utils/config-loader.ts`, `src/utils/key-store.ts`, `src/utils/consul-loader.ts`, `src/index.ts`, `src/tui.ts`, `proxy_config.toml` — deprecated `[default_upstream]` and its `default_*` keys are fully removed. The single fallback is now `[models.default]` with the same fields (`api_key`, `url`, `model`, `weight`, `timeout_ms`, `max_retries`, `headers`). All config sources (TOML, keychain, Consul/Apollo) and consumers (composite resolution, TUI model test, config_key mode) updated.
+
+**Breaking change**: configs with `[default_upstream]` must migrate to `[models.default]`.
+
 ### feat(composite): decision mode — Clef `/decision` API for ability-based target selection
 
 `src/utils/config-loader.ts`, `src/index.ts`, `tests/unit/config-loader.test.ts`, `docs/architecture/design_decision_composite_targeting.md` — new **decision mode** for `[composite]` aliases that uses the Clef `/decision` protocol to intelligently select a target model based on declared abilities.

@@ -1,7 +1,7 @@
 /**
  * Unit tests for key-store.ts (system keychain api-key store)
  *
- * Covers: store pass (keychain accounts per target/category/default_upstream),
+ * Covers: store pass (keychain accounts per target/category),
  * file rewrite (sentinel replacement + .bak backup + comment preservation),
  * resolve pass (sentinel → key; a missing entry is reported + slot cleared, not fatal),
  * no-op when flag off,
@@ -56,9 +56,9 @@ const SAMPLE_TOML = `# top comment
 [general]
 store_key_in_system = true
 
-[default_upstream]
-default_base_url = "https://api.default.dev"
-default_api_key = "sk-default-000"
+[models.default]
+base_url = "https://api.default.dev"
+api_key = "sk-default-000"
 
 [models.claude]
 upstream_mode = "anthropic-messages"
@@ -119,7 +119,7 @@ describe('applySystemKeyStore', () => {
       [
         'claude-opus-4/https://override.gpt.dev=sk-entry-222',
         'claude/https://api.claude.dev=sk-cat-111',
-        'default_upstream/https://api.default.dev=sk-default-000',
+        'default/https://api.default.dev=sk-default-000',
       ],
     );
     for (const c of setCalls) assert.equal(c.service, KEY_STORE_SERVICE);
@@ -155,7 +155,7 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     const keytar = makeMockKeytar(new Map([
       [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
       [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
-      [`${KEY_STORE_SERVICE}/default_upstream/https://api.default.dev`, 'sk-default-000'],
+      [`${KEY_STORE_SERVICE}/default/https://api.default.dev`, 'sk-default-000'],
       [`${KEY_STORE_SERVICE}/passthrough.openai/https://api.openai.example`, 'sk-pt-333'],
     ]));
     const config = parseSimpleToml(passthroughToml);
@@ -192,7 +192,7 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     const keytar = makeMockKeytar(new Map([
       [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
       [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
-      [`${KEY_STORE_SERVICE}/default_upstream/https://api.default.dev`, 'sk-default-000'],
+      [`${KEY_STORE_SERVICE}/default/https://api.default.dev`, 'sk-default-000'],
     ]));
     const { path } = writeTempConfig(sentinelToml);
     const config = parseSimpleToml(sentinelToml);
@@ -212,7 +212,7 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     const keytar = makeMockKeytar(new Map([
       [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
       [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
-      [`${KEY_STORE_SERVICE}/default_upstream/https://api.default.dev`, 'sk-default-000'],
+      [`${KEY_STORE_SERVICE}/default/https://api.default.dev`, 'sk-default-000'],
     ]));
     const config = parseSimpleToml(sentinelToml);
 
@@ -222,7 +222,8 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     assert.equal(claude.api_key, 'sk-cat-111');
     const gpt = config.models!.gpt as { 'claude-opus'?: string[] };
     assert.equal(gpt['claude-opus']![2], 'sk-entry-222');
-    assert.equal(config.default_upstream!.default_api_key, 'sk-default-000');
+    const defaultCat = config.models!.default as { api_key?: string };
+    assert.equal(defaultCat.api_key, 'sk-default-000');
   });
 
   it('falls back to a best-effort base_url match when the exact account is missing', async () => {
@@ -294,7 +295,7 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
     const keytar = makeMockKeytar(new Map([
       [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
       [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
-      [`${KEY_STORE_SERVICE}/default_upstream/https://api.default.dev`, 'sk-default-000'],
+      [`${KEY_STORE_SERVICE}/default/https://api.default.dev`, 'sk-default-000'],
     ]));
     const sentinelToml = SAMPLE_TOML
       .replace('sk-cat-111', STORE_KEY_IN_SYSTEM)
@@ -322,9 +323,10 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
     assert.match(unresolved[0].message, /claude\/https:\/\/api\.claude\.dev/);
     const claude = result.models!.claude as { api_key?: string };
     assert.equal(claude.api_key, '', 'unresolved slot cleared instead of left as the sentinel');
-    // Other slots (default_upstream, gpt entry) still resolve normally —
+    // Other slots (models.default, gpt entry) still resolve normally —
     // one bad sentinel does not block the rest of the config.
-    assert.equal(result.default_upstream!.default_api_key, 'sk-default-000');
+    const defaultCat = result.models!.default as { api_key?: string };
+    assert.equal(defaultCat.api_key, 'sk-default-000');
   });
 
   it('stores plaintext keys and resolves them in the same load (fresh migration)', async () => {

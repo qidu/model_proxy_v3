@@ -82,7 +82,7 @@ next rung on a retryable upstream failure, and skips resolving the model from
 |---|---|---|
 | `target` | string **required** | Real upstream model id to send (like an alias `target`). |
 | `base` / `base_url` | string **required** | Upstream base URL. |
-| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[default_upstream].upstream_mode`, else `openai-completions`. |
+| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[models.default].upstream_mode`, else `openai-completions`. |
 | `key` / `api_key` | string *(optional)* | Upstream API key for this rung only. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (subject to `auth_passthrough_with`). |
 | `otac` | string *(optional)* | Per-rung value replacing the `one_time_auth_code` header for the upstream call and the stats record. Overrides the auth response's OTAC header for this rung. |
 | `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached. |
@@ -91,7 +91,7 @@ next rung on a retryable upstream failure, and skips resolving the model from
 | `retry` | number *(optional)* | Max same-rung retries for **this rung** only, overriding `[remote] max_target_retries` (axis 2). `retry_on` still gates which statuses trigger it; `0` disables same-rung retry for the rung. |
 
 **Descriptors are self-contained — `target` and `base` are required.** A
-descriptor is not merged onto `[default_upstream]` / section / entry; the only
+descriptor is not merged onto `[models.default]` / section / entry; the only
 inherited field is `mode`. A missing `target`/`base` would fall back to
 `http://localhost` with no key, so entries that omit them are rejected (dropped
 with an error) rather than silently mis-routed.
@@ -367,7 +367,7 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /dashboard` | Web dashboard for config + stats |
 | `GET /dashboard/api/quota?model=<id>` | Remaining usage/credits for a model's route (minimax, deepseek, kimi, openrouter, zhipu, qnaigc coding plans; provider detected from the route host). `?base_url=<origin>` variant serves the web dashboard's per-URL "Usage Left" column, falling back to the recorded anthropic 5h percent. Dashboard `api_key` auth. |
 | `GET /config-reload` | Reload config from `PROXY_CONFIG_CONSUL` or `PROXY_CONFIG_APOLLO`. Only meaningful when a remote config source is set; returns `400`/`500` otherwise. Clears the config cache and re-fetches. |
-| `GET /health` (also `GET /`) | Health check. Probes the resolved default-category / `[default_upstream]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
+| `GET /health` (also `GET /`) | Health check. Probes the resolved `[models.default]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
 | `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar or Cloudflare Clef). See [Decision endpoint](#decision-endpoint-post-decision). |
 | `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
@@ -546,7 +546,7 @@ Incoming model names resolve through three stacked logic levels (see the
 
 - **Level 1 — `[models.*]`** — exact key → `prefix-*` wildcard → `*` catch-all lookup,
   with `base_url` / `api_key` / `upstream_mode` inherited per-entry → section →
-  `[default_upstream]`. An optional per-entry `max_tokens` (e.g.
+  `[models.default]`. An optional per-entry `max_tokens` (e.g.
   `"m" = {target = "...", max_tokens = 8192}`) fills the value when the request omits
   `max_tokens` (`anthropic-messages`) and caps larger client values at the
   `before_upstream` hook (all modes); when unset, the field is strict passthrough —
@@ -737,7 +737,7 @@ Most users only need `proxy_config.toml`; optional environment variables tune be
 The full field-by-field reference lives in
 [`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md):
 
-- **TOML sections** — `[general]`, `[default_upstream]`, `[remote]`,
+- **TOML sections** — `[general]`, `[models.default]`, `[remote]`,
   `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[decision]`,
   `[dashboard]`, `[passthrough]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
@@ -750,7 +750,7 @@ The full field-by-field reference lives in
   fatal: that slot is cleared (treated as unconfigured, so the normal api_key fallback
   applies) and reported as a config error in the TUI/dashboard/console, letting the rest
   of the models load and the proxy start. Scope:
-  configured api_keys of `[models.*]` targets, `default_upstream.default_api_key`,
+  configured api_keys of `[models.*]` targets, `[models.default].api_key`,
   and `[passthrough]` target `key`s
   in the local `proxy_config.toml` only — ignored for Consul/Apollo sources, N/A for
   composite aliases, and caller/user keys from request headers are never stored.

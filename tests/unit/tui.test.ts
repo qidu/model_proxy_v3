@@ -15,11 +15,12 @@ import { toDashboardConfigPayload, type ProxyConfig } from '../../src/utils/conf
 describe('resolveModelTestConfig', () => {
   it('falls back to the real per-model api_key (from realConfig) when the sanitized snapshot strips it', () => {
     const realConfig: ProxyConfig = {
-      default_upstream: {
-        default_base_url: 'https://api.minimaxi.com',
-        default_api_key: 'default-key-wrong-provider',
-      },
       models: {
+        default: {
+          upstream_mode: 'openai-completions',
+          base_url: 'https://api.minimaxi.com',
+          api_key: 'default-key-wrong-provider',
+        },
         bbc: {
           bbb: [
             'nvidia/nemotron-3-ultra-550b-a55b:free',
@@ -42,21 +43,20 @@ describe('resolveModelTestConfig', () => {
 
     // Without realConfig (old behavior), the per-model key is unavailable:
     // the sanitized snapshot carries neither the entry's own api_key (stripped)
-    // nor default_upstream (not part of the sanitized payload at all), so
-    // resolveModelTestConfig itself yields no apiKey. (executeModelTest's own
-    // separate default_upstream fallback is what used to paper over this with
-    // the wrong, different-provider key — that's the bug this test guards against.)
+    // nor models.default (not part of the sanitized payload at all), so
+    // resolveModelTestConfig itself yields no apiKey.
     const withoutRealConfig = resolveModelTestConfig(sanitizedConfig, 'bbb', undefined);
     assert.equal(withoutRealConfig?.apiKey, undefined);
   });
 
-  it('still prefers the category api_key over default_upstream when realConfig has no per-model key', () => {
+  it('still prefers the category api_key over models.default when realConfig has no per-model key', () => {
     const realConfig: ProxyConfig = {
-      default_upstream: {
-        default_base_url: 'https://api.minimaxi.com',
-        default_api_key: 'default-key-wrong-provider',
-      },
       models: {
+        default: {
+          upstream_mode: 'openai-completions',
+          base_url: 'https://api.minimaxi.com',
+          api_key: 'default-key-wrong-provider',
+        },
         free: {
           upstream_mode: 'openai-completions',
           base_url: 'https://openrouter.ai/api/v1',

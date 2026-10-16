@@ -111,13 +111,6 @@ function applyConsulKvEntry(config: ProxyConfig, entry: ConsulKvEntry): void {
     return;
   }
 
-  if (section === 'default_upstream' && parts.length >= 2) {
-    config.default_upstream ??= {};
-    const key = parts.slice(1).join('/');
-    (config.default_upstream as any)[key] = parseConsulScalarValue(rawValue);
-    return;
-  }
-
   if (section === 'defaults' && parts.length >= 2) {
     config.defaults ??= {};
     const key = parts.slice(1).join('/');

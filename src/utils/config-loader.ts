@@ -49,11 +49,7 @@ export interface ProxyConfig {
     dispatch_timeout_ms?: number;
     buffer_non_sse?: boolean;
   };
-  default_upstream?: {
-    upstream_mode?: string;
-    default_base_url?: string;
-    default_api_key?: string;
-  };
+  // [default_upstream] removed — use [models.default] for defaults
   models?: Record<string, ModelCategoryConfig | ModelArrayConfig>;
   composite?: Record<string, CompositeModelConfig>;
   schedule?: Record<string, ScheduleConfig>;
@@ -680,23 +676,24 @@ export function resolveTransforms(
 }
 
 /**
- * Resolve the default upstream config chain: `primary` (default: the [models.default]
- * category, when it's a table rather than an array-of-tables) -> [default_upstream]
- * -> built-in literal for upstreamMode only. baseUrl/apiKey come back undefined when
- * nothing is configured; callers that need a literal fallback (e.g. 'http://localhost')
- * apply it to the result.
+ * Resolve the default upstream config from [models.default] category.
+ * Returns undefined for baseUrl/apiKey when nothing is configured; callers
+ * that need a literal fallback (e.g. 'http://localhost') apply it to the result.
  */
 export function getDefaultUpstreamConfig(
   proxyConfig: ProxyConfig,
   primary?: Pick<ModelCategoryConfig, 'upstream_mode' | 'base_url' | 'api_key'>,
 ): { upstreamMode: string; baseUrl: string | undefined; apiKey: string | undefined } {
   const defaultCategory = proxyConfig.models?.default;
-  const source = primary ?? (defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined);
-  return {
-    upstreamMode: source?.upstream_mode || proxyConfig.default_upstream?.upstream_mode || 'openai-completions',
-    baseUrl: source?.base_url || proxyConfig.default_upstream?.default_base_url,
-    apiKey: source?.api_key || proxyConfig.default_upstream?.default_api_key,
-  };
+  const defaultConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
+
+  // Merge primary with defaultConfig: primary values take precedence, defaultConfig fills in missing keys
+  // Treat empty strings as "unset" so they fall through to defaults
+  const upstreamMode = (primary?.upstream_mode && primary.upstream_mode !== '' ? primary.upstream_mode : undefined) ?? defaultConfig?.upstream_mode ?? 'openai-completions';
+  const baseUrl = (primary?.base_url && primary.base_url !== '' ? primary.base_url : undefined) ?? defaultConfig?.base_url;
+  const apiKey = (primary?.api_key && primary.api_key !== '' ? primary.api_key : undefined) ?? defaultConfig?.api_key;
+
+  return { upstreamMode, baseUrl, apiKey };
 }
 
 function resolveModelRouteFromEntry(
@@ -2259,7 +2256,14 @@ export function stripSelfReferencingCompositeTargets(
 export function validateProxyConfig(config: ProxyConfig): ValidationResult {
   const errors: ConfigValidationError[] = [];
   const warnings: ConfigValidationError[] = [];
-  const reservedKeys = new Set(['upstream_mode', 'base_url', 'api_key']);
+  const reservedKeys = new Set([
+    'upstream_mode',
+    'base_url',
+    'api_key',
+    'budget_to_effort_low',
+    'budget_to_effort_medium',
+    'budget_to_effort_high',
+  ]);
 
   if (config.models) {
     for (const [categoryName, categoryConfig] of Object.entries(config.models)) {
@@ -2673,7 +2677,6 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
 /**
  * Validate every `base_url` value that ends up in a `targetUrl` passed to
  * `fetch()`. Mirrors the sources covered by `getAllowedHostsFromConfig`:
- *   - `[default_upstream].default_base_url`
  *   - `[models.*].base_url` (category level)
  *   - per-model `base_url` overrides (array element at index 1)
  *
@@ -2697,10 +2700,6 @@ function validateBaseUrls(config: ProxyConfig, errors: ConfigValidationError[]):
       errors.push({ path, message: `base_url is not a valid URL: ${trimmed}` });
     }
   };
-
-  if (config.default_upstream?.default_base_url) {
-    check(config.default_upstream.default_base_url, 'default_upstream.default_base_url');
-  }
 
   if (config.models) {
     for (const [categoryName, categoryConfig] of Object.entries(config.models)) {
@@ -2810,12 +2809,6 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
   if (config.general) {
     lines.push('[general]');
     lines.push(...serializeTomlSection(config.general as Record<string, unknown>));
-    lines.push('');
-  }
-
-  if (config.default_upstream) {
-    lines.push('[default_upstream]');
-    lines.push(...serializeTomlSection(config.default_upstream as Record<string, unknown>));
     lines.push('');
   }
 
@@ -2987,11 +2980,6 @@ export function getConfiguredModelIds(config: ProxyConfig): string[] {
  */
 export function getAllowedHostsFromConfig(config: ProxyConfig): string[] {
   const hosts = new Set<string>();
-
-  // [upstream].default_base_url
-  if (config.default_upstream?.default_base_url) {
-    try { hosts.add(new URL(config.default_upstream.default_base_url).host); } catch { /* ignore */ }
-  }
 
   // [models.*].base_url and per-model base_url overrides in array entries
   if (config.models) {
@@ -3272,10 +3260,6 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'general';
         currentCategory = null;
         config.general = {};
-      } else if (parts[0] === 'default_upstream') {
-        currentSection = 'default_upstream';
-        currentCategory = null;
-        config.default_upstream = {};
       } else if (parts[0] === 'models') {
         currentSection = 'models';
         currentCategory = parts[1] || null;
@@ -3392,6 +3376,8 @@ export function parseSimpleToml(content: string): ProxyConfig {
           (config.general as any)[cleanKey] = value;
         } else if (cleanKey === 'week_start_day') {
           (config.general as any)[cleanKey] = value === 'sunday' ? 'sunday' : 'monday';
+        } else if (cleanKey === 'budget_to_effort_low' || cleanKey === 'budget_to_effort_medium' || cleanKey === 'budget_to_effort_high') {
+          (config.general as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, value);
         }
       } else if (currentSection === 'remote' && config.remote) {
         if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with'
@@ -3405,8 +3391,6 @@ export function parseSimpleToml(content: string): ProxyConfig {
           const n = Number(value);
           if (Number.isFinite(n) && n >= 0) (config.remote as any)[cleanKey] = n;
         }
-      } else if (currentSection === 'default_upstream' && config.default_upstream) {
-        (config.default_upstream as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, value);
       } else if (currentSection === 'models' && currentCategory && config.models) {
         const category = config.models[currentCategory] as ModelCategoryConfig;
         if (cleanKey === 'upstream_mode' || cleanKey === 'base_url' || cleanKey === 'api_key') {
@@ -3762,8 +3746,6 @@ export function parseSimpleToml(content: string): ProxyConfig {
 
       if (currentSection === 'general' && config.general) {
         (config.general as any)[cleanKey] = typeof cleanValueAny === 'boolean' ? cleanValueAny : normalizeUpstreamThresholdValue(cleanKey, cleanValueAny as string | number);
-      } else if (currentSection === 'default_upstream' && config.default_upstream) {
-        (config.default_upstream as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, cleanValue);
       } else if (currentSection === 'defaults' && config.defaults) {
         (config.defaults as any)[cleanKey] = cleanValue;
       } else if (currentSection === 'privacy_filter' && config.privacy_filter) {

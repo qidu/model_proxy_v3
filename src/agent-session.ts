@@ -1632,20 +1632,22 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
 
   // Resolve a key to auth the loopback /v1/messages call with, same
   // precedence tui.ts's own model-test call already uses (PROXY_CLIENT_API_KEY
-  // override, else the proxy's own default_upstream.default_api_key, else
-  // DEV_NO_KEY): without this, every verification attempt 401s from the
-  // proxy's own auth check (src/index.ts) no matter which model is picked,
-  // which previously showed up as an unexplained infinite "pick a different
-  // model" loop (Rule 8: fail loud once, up front, instead of looping silently).
+  // override, else [models.default].api_key, else DEV_NO_KEY): without this,
+  // every verification attempt 401s from the proxy's own auth check
+  // (src/index.ts) no matter which model is picked, which previously showed up
+  // as an unexplained infinite "pick a different model" loop (Rule 8: fail loud
+  // once, up front, instead of looping silently).
   const devNoKey = env.DEV_NO_KEY === 'true' || env.DEV_NO_KEY === '1';
   const agentMode = env.AGENT === 'true' || env.AGENT === '1';
   const defaultAgentKey = agentMode ? 'sk-hi-agent-launched-in-proxy-v3' : undefined;
-  const clientApiKey = env.PROXY_CLIENT_API_KEY || defaultAgentKey || config.default_upstream?.default_api_key;
+  const defaultCategory = config.models?.default;
+  const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
+  const clientApiKey = env.PROXY_CLIENT_API_KEY || defaultAgentKey || defaultApiKey;
   if (!clientApiKey && !devNoKey && !defaultAgentKey) {
     console.error(
       '[proxy] Cannot start an agent session: no client API key available to authenticate the loopback\n' +
-      dim(' /v1/messages call. Set PROXY_CLIENT_API_KEY, configure [default_upstream] default_api_key\n') +
-      dim(' in proxy_config.toml, or set DEV_NO_KEY=true. Aborting agent session.'),
+        dim(' /v1/messages call. Set PROXY_CLIENT_API_KEY, configure [models.default] api_key\n') +
+        dim(' in proxy_config.toml, or set DEV_NO_KEY=true. Aborting agent session.'),
     );
     return;
   }

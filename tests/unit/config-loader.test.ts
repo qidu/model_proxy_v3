@@ -203,26 +203,27 @@ describe('parseSimpleToml', () => {
     assert.equal(cfg.general?.global_token_limit, '50k 1d');
   });
 
-  it('parses [default_upstream] section', () => {
+  it('parses [models.default] section', () => {
     const cfg = parseSimpleToml(`
-      [default_upstream]
+      [models.default]
       upstream_mode = "openai-completions"
-      default_base_url = "https://api.openai.com"
-      default_api_key = "sk-key"
+      base_url = "https://api.openai.com"
+      api_key = "sk-key"
     `);
-    assert.equal(cfg.default_upstream?.upstream_mode, 'openai-completions');
-    assert.equal(cfg.default_upstream?.default_base_url, 'https://api.openai.com');
-    assert.equal(cfg.default_upstream?.default_api_key, 'sk-key');
+    const def = cfg.models?.default as Record<string, unknown>;
+    assert.equal(def.upstream_mode, 'openai-completions');
+    assert.equal(def.base_url, 'https://api.openai.com');
+    assert.equal(def.api_key, 'sk-key');
   });
 
   it('coerces budget_to_effort_* values to numbers', () => {
     const cfg = parseSimpleToml(`
-      [default_upstream]
+      [general]
       budget_to_effort_low = "4000"
       budget_to_effort_high = "20000"
     `);
-    assert.equal(cfg.default_upstream?.budget_to_effort_low, 4000);
-    assert.equal(cfg.default_upstream?.budget_to_effort_high, 20000);
+    assert.equal(cfg.general?.budget_to_effort_low, 4000);
+    assert.equal(cfg.general?.budget_to_effort_high, 20000);
   });
 
   it('parses [models.gemini] category with inline-table entries', () => {
@@ -408,11 +409,12 @@ describe('parseSimpleToml', () => {
 
   it('handles inline comment after value containing # (no preceding space is preserved)', () => {
     const cfg = parseSimpleToml(`
-      [default_upstream]
-      default_api_key = "abc#def"
+      [models.default]
+      api_key = "abc#def"
     `);
     // '#' with no preceding space stays in the value
-    assert.equal(cfg.default_upstream?.default_api_key, 'abc#def');
+    const def = cfg.models?.default as Record<string, unknown>;
+    assert.equal(def.api_key, 'abc#def');
   });
 
   it('parses [privacy_filter] numeric and string fields', () => {
@@ -945,8 +947,8 @@ describe('getModelConfig', () => {
 describe('getModelRouteConfig', () => {
   it('resolves a direct model entry inheriting category base_url', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { upstream_mode: 'openai-completions' },
       models: {
+        default: { upstream_mode: 'openai-completions' },
         claude: {
           base_url: 'https://api.anthropic.com',
           api_key: 'sk-cat',
@@ -1004,8 +1006,7 @@ describe('getModelRouteConfig', () => {
 
   it('falls back to default model route when no entry matches', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { upstream_mode: 'openai-completions', default_base_url: 'https://def' },
-      models: { default: { '*': ['*', '', ''] } as any },
+      models: { default: { upstream_mode: 'openai-completions', base_url: 'https://def', '*': ['*', '', ''] } as any },
     };
     const r = getModelRouteConfig('unknown', cfg);
     assert.equal(r.targetUrl, 'https://def');
@@ -1162,10 +1163,10 @@ describe('validateProxyConfig', () => {
 
   it('flags invalid base_url (bad protocol)', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'ftp://bad' },
+      models: { default: { base_url: 'ftp://bad' } },
     };
     const r = validateProxyConfig(cfg);
-    assert.ok(r.errors.some(e => e.path === 'default_upstream.default_base_url'));
+    assert.ok(r.errors.some(e => e.path === 'models.default.base_url'));
   });
 
   // sdk:// is still accepted at load time (existing configs keep working) even
@@ -1180,7 +1181,7 @@ describe('validateProxyConfig', () => {
 
   it('flags unparseable base_url', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'not a url at all' },
+      models: { default: { base_url: 'not a url at all' } },
     };
     const r = validateProxyConfig(cfg);
     assert.ok(r.errors.some(e => e.message.includes('not a valid URL')));
@@ -1206,8 +1207,10 @@ describe('validateProxyConfig', () => {
 
   it('passes a clean config with valid: true', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'https://api.x.com', upstream_mode: 'openai-completions' },
-      models: { claude: { base_url: 'https://api.x.com', 'm1': ['m1', '', ''] } as any },
+      models: {
+        default: { base_url: 'https://api.x.com', upstream_mode: 'openai-completions' },
+        claude: { base_url: 'https://api.x.com', 'm1': ['m1', '', ''] } as any
+      },
     };
     const r = validateProxyConfig(cfg);
     assert.equal(r.valid, true, `expected valid, got errors: ${JSON.stringify(r.errors)}`);
@@ -1364,10 +1367,10 @@ describe('getConfiguredModelIds', () => {
 // ---------------------------------------------------------------------------
 
 describe('getAllowedHostsFromConfig', () => {
-  it('collects hosts from default_upstream + category base_url + per-entry override', () => {
+  it('collects hosts from models.default + category base_url + per-entry override', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'https://api.default.com' },
       models: {
+        default: { base_url: 'https://api.default.com' },
         claude: {
           base_url: 'https://api.cat.com',
           'm1': ['m1', 'https://api.override.com:8443', 'k'],
@@ -1382,8 +1385,10 @@ describe('getAllowedHostsFromConfig', () => {
 
   it('skips invalid URLs silently', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'not-a-url' },
-      models: { claude: { base_url: 'https://ok.com', 'm1': ['m1', 'also-bad', ''] } as any },
+      models: {
+        default: { base_url: 'not-a-url' },
+        claude: { base_url: 'https://ok.com', 'm1': ['m1', 'also-bad', ''] } as any,
+      },
     };
     const hosts = getAllowedHostsFromConfig(cfg);
     assert.ok(hosts.includes('ok.com'));
@@ -1741,30 +1746,31 @@ record_response_body = true
     });
   });
 
-  it('preserves [default_upstream] across parse→serialize→parse', () => {
+  it('preserves [models.default] across parse→serialize→parse', () => {
     const original = `
-[default_upstream]
-upstream_mode = "openai-completions"
-default_base_url = "https://api.qnaigc.com"
-default_api_key = "sk-56db1e204bf459"
+[general]
 budget_to_effort_low = 4000
 budget_to_effort_high = 20000
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://api.qnaigc.com"
+api_key = "sk-56db1e204bf459"
 `;
     const parsed = parseSimpleToml(original);
-    assert.equal(parsed.default_upstream?.upstream_mode, 'openai-completions');
-    assert.equal(parsed.default_upstream?.default_base_url, 'https://api.qnaigc.com');
-    assert.equal(parsed.default_upstream?.default_api_key, 'sk-56db1e204bf459');
-    assert.equal(parsed.default_upstream?.budget_to_effort_low, 4000);
-    assert.equal(parsed.default_upstream?.budget_to_effort_high, 20000);
+    assert.equal(parsed.models?.default?.upstream_mode, 'openai-completions');
+    assert.equal(parsed.models?.default?.base_url, 'https://api.qnaigc.com');
+    assert.equal(parsed.models?.default?.api_key, 'sk-56db1e204bf459');
+    assert.equal(parsed.general?.budget_to_effort_low, 4000);
+    assert.equal(parsed.general?.budget_to_effort_high, 20000);
 
     const roundTripped = parseSimpleToml(serializeProxyConfigToml(parsed));
-    assert.deepEqual(roundTripped.default_upstream, {
+    assert.deepEqual(roundTripped.models?.default, {
       upstream_mode: 'openai-completions',
-      default_base_url: 'https://api.qnaigc.com',
-      default_api_key: 'sk-56db1e204bf459',
-      budget_to_effort_low: 4000,
-      budget_to_effort_high: 20000,
+      base_url: 'https://api.qnaigc.com',
+      api_key: 'sk-56db1e204bf459',
     });
+    assert.equal(roundTripped.general?.budget_to_effort_low, 4000);
+    assert.equal(roundTripped.general?.budget_to_effort_high, 20000);
   });
 
   it('preserves per-entry max_tokens across parse→serialize→parse', () => {
@@ -2185,7 +2191,7 @@ describe('resolveDefaultProxyConfigPath', () => {
 // ---------------------------------------------------------------------------
 
 describe('getDefaultUpstreamConfig', () => {
-  it('prefers the [models.default] table over [default_upstream] for every key', () => {
+  it('uses [models.default] for all keys when present', () => {
     const proxyConfig: ProxyConfig = {
       models: {
         default: {
@@ -2193,11 +2199,6 @@ describe('getDefaultUpstreamConfig', () => {
           base_url: 'https://cat.example.com',
           api_key: 'cat-key',
         },
-      },
-      default_upstream: {
-        upstream_mode: 'openai-completions',
-        default_base_url: 'https://fallback.example.com',
-        default_api_key: 'fallback-key',
       },
     };
     assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
@@ -2207,34 +2208,24 @@ describe('getDefaultUpstreamConfig', () => {
     });
   });
 
-  it('ignores an array-typed [models.default] and falls back to [default_upstream]', () => {
+  it('ignores an array-typed [models.default] and uses defaults', () => {
     const proxyConfig: ProxyConfig = {
       models: {
         default: ['alias', 'https://arr.example.com', 'arr-key'],
       },
-      default_upstream: {
-        upstream_mode: 'openai-responses',
-        default_base_url: 'https://fallback.example.com',
-        default_api_key: 'fallback-key',
-      },
     };
     assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
-      upstreamMode: 'openai-responses',
-      baseUrl: 'https://fallback.example.com',
-      apiKey: 'fallback-key',
+      upstreamMode: 'openai-completions',
+      baseUrl: undefined,
+      apiKey: undefined,
     });
   });
 
-  it('applies [default_upstream] per key when [models.default] is absent', () => {
-    const proxyConfig: ProxyConfig = {
-      default_upstream: {
-        upstream_mode: 'gemini-generatecontent',
-        default_base_url: 'https://fallback.example.com',
-      },
-    };
+  it('uses defaults when [models.default] is absent', () => {
+    const proxyConfig: ProxyConfig = {};
     assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
-      upstreamMode: 'gemini-generatecontent',
-      baseUrl: 'https://fallback.example.com',
+      upstreamMode: 'openai-completions',
+      baseUrl: undefined,
       apiKey: undefined,
     });
   });
@@ -2256,29 +2247,26 @@ describe('getDefaultUpstreamConfig', () => {
           api_key: 'cat-key',
         },
       },
-      default_upstream: {
-        upstream_mode: 'openai-completions',
-        default_base_url: 'https://fallback.example.com',
-        default_api_key: 'fallback-key',
-      },
     };
     assert.deepEqual(
       getDefaultUpstreamConfig(proxyConfig, { upstream_mode: 'gemini-interactions' }),
       {
         upstreamMode: 'gemini-interactions',
-        baseUrl: 'https://fallback.example.com',
-        apiKey: 'fallback-key',
+        baseUrl: 'https://cat.example.com',
+        apiKey: 'cat-key',
       },
-      'primary supplies upstream_mode only; base_url/api_key come from [default_upstream]',
+      'primary supplies upstream_mode only; base_url/api_key come from [models.default]',
     );
   });
 
   it('treats an empty-string primary value as unset and falls through per key', () => {
     const proxyConfig: ProxyConfig = {
-      default_upstream: {
-        upstream_mode: 'openai-responses',
-        default_base_url: 'https://fallback.example.com',
-        default_api_key: 'fallback-key',
+      models: {
+        default: {
+          upstream_mode: 'openai-responses',
+          base_url: 'https://fallback.example.com',
+          api_key: 'fallback-key',
+        },
       },
     };
     assert.deepEqual(

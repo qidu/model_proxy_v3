@@ -279,7 +279,7 @@ describe('dedupeAndCap', () => {
 
 describe('descriptorToRoute', () => {
   const cfg = (over: Partial<ProxyConfig> = {}): ProxyConfig =>
-    ({ default_upstream: { upstream_mode: 'gemini-generatecontent' }, ...over }) as ProxyConfig;
+    ({ models: { default: { upstream_mode: 'gemini-generatecontent' } }, ...over }) as ProxyConfig;
 
   it('maps target/base/key into a self-contained route', () => {
     const route = descriptorToRoute({ target: 'gpt-4o', base: 'https://api.up', key: 'sk-x' }, cfg());
@@ -297,7 +297,7 @@ describe('descriptorToRoute', () => {
     assert.equal(withKey.section, undefined, 'section is no longer abused by descriptors');
   });
 
-  it('prefers descriptor.mode over default_upstream, falling back to openai-completions', () => {
+  it('prefers descriptor.mode over models.default, falling back to openai-completions', () => {
     const explicit = descriptorToRoute({ target: 'm', base: 'https://api.up', mode: 'anthropic-messages' }, cfg());
     assert.equal(explicit.upstreamMode, 'anthropic-messages');
 

@@ -299,7 +299,7 @@ The active proxy TOML must provide the upstream credential because the installed
 auth_passthrough_with = "config_key"
 ```
 
-The selected model route must define `api_key`, or an applicable unmatched model must have `default_api_key` under `[default_upstream]`. In `config_key` mode, the proxy injects that configured key instead of forwarding Antigravity's absent client key. `DEV_NO_KEY` must not be enabled in production.
+The selected model route must define `api_key`, or an applicable unmatched model must have `api_key` under `[models.default]`. In `config_key` mode, the proxy injects that configured key instead of forwarding Antigravity's absent client key. `DEV_NO_KEY` must not be enabled in production.
 
 For the Gemini transport, run the focused `max-m3` test with:
 

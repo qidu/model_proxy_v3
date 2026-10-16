@@ -411,7 +411,7 @@ const FIXED_ROUTE_ENDPOINTS: Record<UpstreamTargetKind, string> = {
 /**
  * Two routing dialects share the table below:
  *
- * - `fixed-route`: `[models.default]` / `[default_upstream]` routing (parseFixedRoute).
+ * - `fixed-route`: `[models.default]` routing (parseFixedRoute).
  * - `model-route`: the per-model builders — composite candidates, fusion, the
  *   remote auth-target ladder and the /v1/chat/completions model passthrough.
  *
@@ -620,7 +620,7 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
 /**
  * Parse fixed route and return target configuration
  * Fixed route: /v1/messages -> /v1/chat/completions
- * Uses [models.default] and [default_upstream] from proxy_config.toml
+ * Uses [models.default] from proxy_config.toml
  * The mode → target mapping is shared with model-specific routing (resolveUpstreamTarget).
  */
 function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
@@ -631,7 +631,7 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   modelId?: string;
   forceStreaming?: boolean;
 } {
-  // Get default config from [models.default] or [default_upstream]
+  // Get default config from [models.default]
   const { upstreamMode: defaultMode, baseUrl: defaultBaseUrl } = getDefaultUpstreamConfig(proxyConfig);
 
   // Endpoints whose target does not depend on the upstream mode keep their own
@@ -942,7 +942,7 @@ export default {
         if (!healthBaseUrl) {
           logger.warn(
             requestId,
-            'Health check: no default upstream configured ([models.default] table or [default_upstream].default_base_url) — skipping upstream model count',
+            'Health check: no default upstream configured ([models.default] table) — skipping upstream model count',
           );
         } else {
           const healthUrl = `${healthBaseUrl}/v1/models`;
@@ -1774,10 +1774,11 @@ export default {
               body: bodyText,
             });
 
-            // In config_key mode, apply default_upstream.default_api_key for models
+            // In config_key mode, apply [models.default] api_key for models
             // that fall through to the default route (no model-specific entry).
             if (useConfigKey) {
-              const defaultApiKey = proxyConfig.default_upstream?.default_api_key;
+              const defaultCategory = proxyConfig.models?.default;
+              const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
               if (defaultApiKey && upstreamMode) {
                 modelAuthHeaders = {
                   ...transformAuthHeadersForUpstream(request, upstreamMode, path, requestId, env as Record<string, unknown>),
@@ -1858,9 +1859,10 @@ export default {
             logger.debug(requestId, `No auth headers found for fixed routing ${upstreamMode}`);
           }
 
-          // In config_key mode, override with default_upstream.default_api_key for fixed routing
+          // In config_key mode, override with [models.default] api_key for fixed routing
           if (useConfigKey) {
-            const defaultApiKey = proxyConfig.default_upstream?.default_api_key;
+            const defaultCategory = proxyConfig.models?.default;
+            const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
             if (defaultApiKey) {
               modelAuthHeaders = { ...modelAuthHeaders, ...formatApiKeyForUpstream(defaultApiKey, upstreamMode) };
             }
