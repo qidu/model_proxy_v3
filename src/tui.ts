@@ -1768,7 +1768,7 @@ class DashboardApp {
       const thresholdPct = Math.round((sidecar.threshold ?? 0.5) * 100);
       sidecarStatus = `Tool Judge Sidecar: Enabled | ${modeLabel} | Threshold: ${thresholdPct}% | Timeout: ${sidecar.timeout_ms ?? 50}ms | Max batch: ${sidecar.max_batch_tools ?? 50} | ${sidecar.url}`;
     } else {
-      sidecarStatus = 'Tool Judge Sidecar: Not configured (add [tool_judge_sidecar] to config)';
+      sidecarStatus = 'Tool Judge Sidecar: Not configured (add [tool_judge] to config)';
     }
 
     if (this.overlay) this.hideOverlay();

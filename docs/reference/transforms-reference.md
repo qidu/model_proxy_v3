@@ -345,7 +345,7 @@ For every route, the effective transform list is resolved by merging three decla
 mode-defaults  →  sector-defaults  →  entry transforms
 ```
 
-- **mode-defaults**: `[transform_defaults]` — a map of `upstream_mode → [set_names]`. Applied to every route using that upstream mode.
+- **mode-defaults**: `[transforms.default]` — a map of `upstream_mode → [set_names]`. Applied to every route using that upstream mode.
 - **sector-defaults**: `transforms = "..."` on a `[models.<section>]` category block.
 - **entry transforms**: `transforms = "..."` in the model entry itself (5th element of the positional array, or `transforms` key in the inline-table form).
 

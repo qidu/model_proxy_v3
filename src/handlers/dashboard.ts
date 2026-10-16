@@ -3149,7 +3149,7 @@ export function handleDashboardPage(env: Env): Response {
         if (!sidecar || !sidecar.enabled) {
           container.innerHTML =
             '<p style="color:#666;">Not configured</p>' +
-            '<p style="font-size:12px;color:#888;">Add <code>[tool_judge_sidecar]</code> section to config to enable</p>';
+            '<p style="font-size:12px;color:#888;">Add <code>[tool_judge]</code> section to config to enable</p>';
           return;
         }
 

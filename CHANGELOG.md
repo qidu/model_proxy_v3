@@ -5,6 +5,36 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(config): remove deprecated `[tool_judge_sidecar]`, `[transform_defaults]`, `[decision]`, `[passthrough]` section headers
+
+`src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `tests/unit/transforms-config.test.ts`, `docs/getting-started/validating_tool_judge_sidecar.md` — the back-compat branches for the four old section headers are deleted. They now fall through to the generic unknown-section branch like any unsupported header: their keys are ignored, the config field stays unset, and an "unknown section header … keys under it are ignored" warning is recorded in `_validationWarnings` (surfaced in the TUI/dashboard status). The canonical headers `[tool_judge]`, `[transforms.default]`, `[models.decision]`, `[models.passthrough]` are unchanged, as are the `[models.decision.x]` / `[models.passthrough.x]` / `[transforms.default.x]` third-part guards.
+
+**Breaking change**: configs still using `[tool_judge_sidecar]`, `[transform_defaults]`, `[decision]`, or `[passthrough]` must rename them to `[tool_judge]`, `[transforms.default]`, `[models.decision]`, `[models.passthrough]` — until renamed, those sections silently stop applying (tool judging disabled, decision endpoint disabled, passthrough targets gone, transform mode-defaults unwired).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1604 tests, 1604 pass, 0 fail** — executed on this tree.
+
+### fix(config): rename section header — `[transform_defaults]` → `[transforms.default]`
+
+`src/utils/config-loader.ts`, `README.md`, `docs/getting-started/proxy_config.example.toml`, `docs/getting-started/proxy_config.transforms.example.toml`, `docs/reference/configuration-reference.md`, `docs/reference/transforms-reference.md`, `docs/reference/index.md`, `docs/api/list_of_api_and_schema.md`, `tests/unit/transforms-config.test.ts`, `tests/unit/config-loader.test.ts` — the transform-defaults section header gets a canonical name:
+
+- `[transform_defaults]` → `[transforms.default]`
+
+The parser intercepts `[transforms.default]` **before** the generic `[transforms.<name>]` branch (which would otherwise treat the second dotted part as a transform-set name), mapping it to the existing internal section `transform_defaults` with `currentCategory = null` — so it never creates a transform set named `default`, and all key parsing, validation, and the `config.transform_defaults` field are unchanged. **This reserves `default` as a transform-set name**: a config that declares `[transforms.default]` with actual transform-set keys (`schema`/ops) will now have those keys parsed as transform-defaults entries instead — rename such a set if you have one. The old `[transform_defaults]` header still parses but emits a deprecation `console.warn`, following the existing `[remote.authentication]` pattern; when both headers appear in one file, the later section wins (unchanged pre-existing behavior). `serializeProxyConfigToml` now writes `[transforms.default]`, so configs saved from the dashboard/TUI migrate on save. Docs, comments, and example configs updated; historical documents (prior `CHANGELOG.md` entries, `docs/architecture/`, `docs/contributing/`, `docs/plan-*.md`, `docs/review-*.md`) intentionally untouched.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1608 tests, 1608 pass, 0 fail** — executed on this tree.
+
+### fix(config): rename section headers — `[tool_judge]`, `[models.decision]`, `[models.passthrough]`
+
+`src/utils/config-loader.ts`, `src/handlers/decision.ts`, `src/handlers/dashboard.ts`, `src/tui.ts`, `src/utils/key-store.ts`, `proxy_config.toml`, `README.md`, `docs/getting-started/proxy_config.example.toml`, `docs/getting-started/validating_tool_judge_sidecar.md`, `docs/reference/configuration-reference.md`, `docs/reference/routing-and-aliases.md`, `tests/unit/config-loader.test.ts`, `tests/unit/key-store.test.ts`, `tests/unit/decision.test.ts`, `tests/manual/proxy_decision_config.toml`, `tests/manual/proxy_laya_real.toml`, `tests/manual/verify_decision_e2e.sh`, `tests/integration/README.md` — three TOML section headers get canonical names:
+
+- `[tool_judge_sidecar]` → `[tool_judge]`
+- `[decision]` → `[models.decision]`
+- `[passthrough]` → `[models.passthrough]`
+
+The parser's section dispatch maps each new header onto the existing internal section (`tool_judge_sidecar` / `decision` / `passthrough`), so all key parsing, validation, and the `ProxyConfig` fields are unchanged. `[models.decision]` and `[models.passthrough]` are intercepted **before** the generic `[models.*]` branch, so they never create `decision`/`passthrough` model categories. The old headers still parse but emit a deprecation `console.warn`, following the existing `[remote.authentication]` deprecation pattern; when both old and new headers appear in one file, the later section wins (unchanged pre-existing behavior). `serializeProxyConfigToml` now writes the canonical headers, so configs saved from the dashboard/TUI migrate on save. Docs, comments, and UI strings updated to the canonical names; historical documents (`CHANGELOG.md` prior entries, `docs/architecture/`, `docs/plan-*.md`, `docs/review-*.md`) intentionally untouched.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1604 tests, 1604 pass, 0 fail** — executed on this tree.
+
 ### fix(agent): resolve the loopback client key per selected model alias
 
 `src/agent-session.ts` — agent-session model verification 401ed for any alias whose upstream key differs from `[models.default].api_key`, even when the same model tested green in the dashboard/TUI. Root cause: outside the `free` section (and `config_key` mode) the proxy forwards the *caller's* credential upstream, and the agent session authenticated every loopback `/v1/messages` call with one static key — `PROXY_CLIENT_API_KEY`, else the placeholder `sk-hi-agent-launched-in-proxy-v3`, else the default key — so upstreams received the placeholder and answered 401 (`Invalid API key` / `Missing Authentication header`). The dashboard and TUI model tests were never affected because they already send the model's own configured key.

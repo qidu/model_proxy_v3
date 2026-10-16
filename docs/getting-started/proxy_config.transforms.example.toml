@@ -119,6 +119,6 @@ after_upstream.builtins = ["assemble_sse_chunks"]
 schema = "openai-responses"
 before_conversion.builtins = ["project_program_to_node_tool"]
 
-[transform_defaults]
+[transforms.default]
 openai-completions = ["max_tokens_rename"]
 openai-responses = ["max_tokens_rename"]

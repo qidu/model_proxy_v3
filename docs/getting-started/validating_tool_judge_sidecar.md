@@ -13,14 +13,15 @@ Validates three layers, in increasing order of coverage:
   Layer C  client unit path          -- judgeTools driven directly in-process
 
 Prerequisite for Layer B: src/utils/config-loader.ts must contain the
-[tool_judge_sidecar] dispatch branch. Before that fix the section was SILENTLY
+[tool_judge] dispatch branch. Before that fix the section was SILENTLY
 DROPPED (no error, no warning) and the judge never ran. Check with:
 
-    grep -n "tool_judge_sidecar" src/utils/config-loader.ts
+    grep -n "tool_judge" src/utils/config-loader.ts
 
-You should see a dispatch branch near the [privacy_filter] one (~line 2861),
-plus two value-assign branches (~2953, ~3281). If only the type declaration at
-~line 138 appears, Layer B cannot work no matter what the config says.
+You should see a `[tool_judge]` dispatch branch near the [privacy_filter] one
+(mapping to the internal `tool_judge_sidecar` section), plus value-assign
+branches keyed on that section name. If only the type declaration appears,
+Layer B cannot work no matter what the config says.
 
 
 -------------------------------------------------------------------------------
@@ -104,7 +105,7 @@ the real-world timeout budget. Raise it if you see "judged 0/N - failing open".
 [general]
 store_key_in_system = false
 
-[tool_judge_sidecar]
+[tool_judge]
 judge_url = "http://127.0.0.1:8081"
 timeout_ms = 50
 threshold = 0.5
@@ -460,12 +461,12 @@ Confirm nothing is left:
 
 SYMPTOM: proxy returns 200 fast, both tools reach upstream, NO judge line in
          the proxy log.
-CAUSE:   the [tool_judge_sidecar] section was not parsed, so judgeTools took its
+CAUSE:   the [tool_judge] section was not parsed, so judgeTools took its
          !sidecarConfig?.judge_url early return. Historically this was SILENT --
          an unknown TOML section falls through to a bare `continue`, so
          parseSimpleToml returned tool_judge_sidecar: undefined with
          _validationErrors and _validationWarnings both EMPTY.
-CHECK:   grep -n "tool_judge_sidecar" src/utils/config-loader.ts
+CHECK:   grep -n "tool_judge" src/utils/config-loader.ts
          and confirm the dispatch + two value-assign branches exist.
 
 SYMPTOM: "Tool judge sidecar (...): 0/2 judged, 2 unjudged (kept)" or

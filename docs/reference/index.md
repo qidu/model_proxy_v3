@@ -20,7 +20,7 @@ Detailed reference documentation for configuration, protocols, and internal mech
 
 ## Transforms & Hooks
 
-- [Transforms Reference](./transforms-reference.md) — Current reference: hooks, Tier-1 ops, Tier-2 built-ins, `[transforms.*]` / `[transform_defaults]` config
+- [Transforms Reference](./transforms-reference.md) — Current reference: hooks, Tier-1 ops, Tier-2 built-ins, `[transforms.*]` / `[transforms.default]` config
 
 ## Token Counting
 

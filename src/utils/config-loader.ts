@@ -153,7 +153,7 @@ export interface ProxyConfig {
     api_key?: string;
     /** Maximum number of tools to send in a single batch request (default: 50) */
     max_batch_tools?: number;
-    /** Use the /decision API (Clef protocol) instead of a dedicated sidecar. Requires [decision] config. Default: false. */
+    /** Use the /decision API (Clef protocol) instead of a dedicated sidecar. Requires [models.decision] config. Default: false. */
     use_decision_api?: boolean;
     /** Clef model to use when use_decision_api is true: "clef" | "clef-flash". Default: "clef". */
     model?: 'clef' | 'clef-flash';
@@ -187,9 +187,9 @@ export interface ProxyConfig {
 
 /**
  * Configuration for a single passthrough target, declared as an inline table
- * under `[passthrough]`:
+ * under `[models.passthrough]`:
  *
- *   [passthrough]
+ *   [models.passthrough]
  *   openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
  *
  * Short names are canonical here (targets are terse); the long aliases
@@ -2869,7 +2869,7 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
   if (config.transform_defaults) {
     const entries = Object.entries(config.transform_defaults);
     if (entries.length) {
-      lines.push('[transform_defaults]');
+      lines.push('[transforms.default]');
       for (const [mode, names] of entries) {
         lines.push(`${tomlKey(mode)} = [${names.map((n) => JSON.stringify(n)).join(', ')}]`);
       }
@@ -2901,14 +2901,14 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
   }
 
   if (config.passthrough) {
-    lines.push('[passthrough]');
+    lines.push('[models.passthrough]');
     lines.push(...Object.entries(config.passthrough).map(([name, target]) => `${tomlKey(name)} = ${serializePassthroughTarget(target)}`));
     lines.push('');
   }
 
   if (config.tool_judge_sidecar) {
     const tjs = config.tool_judge_sidecar;
-    lines.push('[tool_judge_sidecar]');
+    lines.push('[tool_judge]');
     if (tjs.judge_url !== undefined) lines.push(`judge_url = ${JSON.stringify(tjs.judge_url)}`);
     if (tjs.timeout_ms !== undefined) lines.push(`timeout_ms = ${tjs.timeout_ms}`);
     if (tjs.threshold !== undefined) lines.push(`threshold = ${tjs.threshold}`);
@@ -2922,7 +2922,7 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
 
   if (config.decision) {
     const d = config.decision;
-    lines.push('[decision]');
+    lines.push('[models.decision]');
     if (d.backend !== undefined) lines.push(`backend = ${JSON.stringify(d.backend)}`);
     if (d.url !== undefined) lines.push(`url = ${JSON.stringify(d.url)}`);
     if (d.api_key !== undefined) lines.push(`api_key = ${JSON.stringify(d.api_key)}`);
@@ -2998,7 +2998,7 @@ export function getAllowedHostsFromConfig(config: ProxyConfig): string[] {
     }
   }
 
-  // [passthrough] target base
+  // [models.passthrough] target base
   if (config.passthrough) {
     for (const target of Object.values(config.passthrough)) {
       if (target.base) {
@@ -3260,6 +3260,24 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'general';
         currentCategory = null;
         config.general = {};
+      } else if (parts[0] === 'models' && parts[1] === 'decision') {
+        // Canonical home of the decision config. Intercept before the generic
+        // [models.*] branch so "decision" is not created as a model category.
+        currentSection = 'decision';
+        currentCategory = null;
+        config.decision = {};
+        if (parts.length > 2) {
+          console.warn(`[config] [models.decision.${parts.slice(2).join('.')}] sections are not supported at line ${i + 1} — declare keys directly under [models.decision]`);
+        }
+      } else if (parts[0] === 'models' && parts[1] === 'passthrough') {
+        // Canonical home of passthrough targets. Intercept before the generic
+        // [models.*] branch so "passthrough" is not created as a model category.
+        currentSection = 'passthrough';
+        currentCategory = null;
+        if (!config.passthrough) config.passthrough = {};
+        if (parts.length > 2) {
+          console.warn(`[config] [models.passthrough.${parts.slice(2).join('.')}] sections are not supported at line ${i + 1} — declare targets as inline tables under [models.passthrough]: ${parts.slice(2).join('.')} = {base = "...", mode = "..."}`);
+        }
       } else if (parts[0] === 'models') {
         currentSection = 'models';
         currentCategory = parts[1] || null;
@@ -3297,18 +3315,24 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'privacy_filter';
         currentCategory = null;
         config.privacy_filter = {};
-      } else if (parts[0] === 'tool_judge_sidecar') {
+      } else if (parts[0] === 'tool_judge') {
         currentSection = 'tool_judge_sidecar';
         currentCategory = null;
         config.tool_judge_sidecar = {};
-      } else if (parts[0] === 'decision') {
-        currentSection = 'decision';
-        currentCategory = null;
-        config.decision = {};
       } else if (parts[0] === 'fetch') {
         currentSection = 'fetch';
         currentCategory = null;
         config.fetch = {};
+      } else if (parts[0] === 'transforms' && parts[1] === 'default') {
+        // Canonical home of transform defaults. Intercept before the generic
+        // [transforms.<name>] branch so "default" is not created as a transform
+        // set (this reserves "default" as a set name).
+        currentSection = 'transform_defaults';
+        currentCategory = null;
+        if (!config.transform_defaults) config.transform_defaults = {};
+        if (parts.length > 2) {
+          console.warn(`[config] [transforms.default.${parts.slice(2).join('.')}] sections are not supported at line ${i + 1} — declare keys directly under [transforms.default]`);
+        }
       } else if (parts[0] === 'transforms') {
         if (!parts[1]) {
           // A bare [transforms] names no transform set, so it matches no branch
@@ -3325,17 +3349,6 @@ export function parseSimpleToml(content: string): ProxyConfig {
           currentCategory = parts[1];
           if (!config.transforms) config.transforms = {};
           config.transforms[currentCategory] = { name: currentCategory, schema: 'openai-completions' };
-        }
-      } else if (parts[0] === 'transform_defaults') {
-        currentSection = 'transform_defaults';
-        currentCategory = null;
-        if (!config.transform_defaults) config.transform_defaults = {};
-      } else if (parts[0] === 'passthrough') {
-        currentSection = 'passthrough';
-        currentCategory = null;
-        if (!config.passthrough) config.passthrough = {};
-        if (parts[1]) {
-          console.warn(`[config] [passthrough.${parts[1]}] sections are not supported at line ${i + 1} — declare targets as inline tables under [passthrough]: ${parts[1]} = {base = "...", mode = "..."}`);
         }
       } else {
         // No branch claims this header. Leaving currentSection as it was would
@@ -3397,7 +3410,7 @@ export function parseSimpleToml(content: string): ProxyConfig {
           category[cleanKey] = value;
         } else if (cleanKey === 'mode' || cleanKey === 'url' || cleanKey === 'key') {
           // A [models.*] section takes ONLY the long names; the short aliases
-          // belong to inline entries and [passthrough] targets. Silently
+          // belong to inline entries and [models.passthrough] targets. Silently
           // dropping the key would lose base_url/mode/key with no message, so
           // report it (surfaced in the TUI/dashboard status).
           const longName = cleanKey === 'mode' ? 'upstream_mode' : cleanKey === 'url' ? 'base_url' : 'api_key';
@@ -3516,7 +3529,7 @@ export function parseSimpleToml(content: string): ProxyConfig {
         const cleanKey = ptTableMatch[1].trim().replace(/^"|"$/g, '');
         const seenKeyIdTable = `${currentSection}/${cleanKey}`;
         if (seenKeys.has(seenKeyIdTable)) {
-          console.warn(`[config] duplicate key "${cleanKey}" in [passthrough] at line ${i + 1} — earlier value is overwritten`);
+          console.warn(`[config] duplicate key "${cleanKey}" in [models.passthrough] at line ${i + 1} — earlier value is overwritten`);
         }
         seenKeys.add(seenKeyIdTable);
         const tableBody = ptTableMatch[2].slice(1, -1); // strip outer braces
@@ -3712,7 +3725,7 @@ export function parseSimpleToml(content: string): ProxyConfig {
           (config.privacy_filter as any)[cleanKey] = elements;
         }
       } else if (currentSection === 'transform_defaults' && config.transform_defaults) {
-        // transform_defaults: openai-completions = ["set_a", "set_b"]
+        // [transforms.default]: openai-completions = ["set_a", "set_b"]
         config.transform_defaults[cleanKey] = elements;
       } else if (currentSection === 'transforms' && currentCategory && config.transforms) {
         // transforms.<name>: builtins = ["lowercase_tool_schema_types"]

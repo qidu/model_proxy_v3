@@ -125,9 +125,9 @@ describe('applySystemKeyStore', () => {
     for (const c of setCalls) assert.equal(c.service, KEY_STORE_SERVICE);
   });
 
-  it('stores a [passthrough] target key under a passthrough.<name> account', async () => {
+  it('stores a [models.passthrough] target key under a passthrough.<name> account', async () => {
     const passthroughToml = `${SAMPLE_TOML}
-[passthrough]
+[models.passthrough]
 openai = {base = "https://api.openai.example", mode = "openai-completions", key = "sk-pt-333"}
 `;
     const keytar = makeMockKeytar();
@@ -149,7 +149,7 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
 
   it('resolves a passthrough sentinel in-memory from the keychain', async () => {
     const passthroughToml = `${SAMPLE_TOML}
-[passthrough]
+[models.passthrough]
 openai = {base = "https://api.openai.example", mode = "openai-completions", key = "${STORE_KEY_IN_SYSTEM}"}
 `;
     const keytar = makeMockKeytar(new Map([

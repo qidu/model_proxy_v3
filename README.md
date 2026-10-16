@@ -371,7 +371,7 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
 | `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar or Cloudflare Clef). See [Decision endpoint](#decision-endpoint-post-decision). |
 | `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
-| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
+| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[models.passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
 
 A Gemini `/v1/models/{model}:...` variant exists for each `/v1beta/models/{model}:...`
 endpoint. `:countTokens` is supported too: native Gemini routes forward to Gemini
@@ -501,7 +501,7 @@ it verbatim, so include the path). Setting both `backend` and `url` is what enab
 the route; without them `/decision` answers `503`.
 
 ```toml
-[decision]
+[models.decision]
 backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed)
 url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim
 # api_key = "optional-bearer-token"         # sent as Authorization: Bearer
@@ -738,8 +738,8 @@ The full field-by-field reference lives in
 [`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md):
 
 - **TOML sections** — `[general]`, `[models.default]`, `[remote]`,
-  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[decision]`,
-  `[dashboard]`, `[passthrough]`.
+  `[transforms.*]` / `[transforms.default]`, `[privacy_filter]`, `[models.decision]`,
+  `[dashboard]`, `[models.passthrough]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
   config `api_key` into the OS keychain (accounts `<target_model_id>/<base_url>` under
   the `model_proxy_v3` service) and rewrites the config file to `STORE_KEY_IN_SYSTEM`
@@ -751,7 +751,7 @@ The full field-by-field reference lives in
   applies) and reported as a config error in the TUI/dashboard/console, letting the rest
   of the models load and the proxy start. Scope:
   configured api_keys of `[models.*]` targets, `[models.default].api_key`,
-  and `[passthrough]` target `key`s
+  and `[models.passthrough]` target `key`s
   in the local `proxy_config.toml` only — ignored for Consul/Apollo sources, N/A for
   composite aliases, and caller/user keys from request headers are never stored.
   Local/dev-host feature only — fails loud when no OS keychain is available (Docker,
@@ -825,7 +825,7 @@ Also see [`proxy_config.example.toml`](./docs/getting-started/proxy_config.examp
 **Config field aliases** — The proxy accepts both canonical and short field names
 in different config contexts (e.g., `base_url`/`base`, `upstream_mode`/`mode`,
 `api_key`/`key`). The rules differ between `[models.*]` inline tables,
-section-level defaults, and `[passthrough]` entries. See
+section-level defaults, and `[models.passthrough]` entries. See
 [**Config field aliases**](./docs/reference/configuration-reference.md#config-field-aliases)
 in the configuration reference for the full mapping tables.
 
@@ -852,7 +852,7 @@ PROXY_URL=http://localhost:8788 API_KEY=sk-test node tests/run-integration-tests
 The [`docs/`](./docs/) folder has deep-dives on specific topics:
 
 - **Sidecar status & config** — `docs/architecture/status_of_sidecars_of_proxy.md` (summary of all sidecars: remote auth, privacy filter, image fetch, tool judge, kompress, coordinator, fusion, composite, schedule, transforms)
-- **Tool-judge sidecar** — supports two protocols: legacy sidecar (`/judge`) and Clef decision API (`/decision`, enabled via `use_decision_api = true` in `[tool_judge_sidecar]`). Two modes: `choice` (per-tool) and `noul` (batch). Laya context limit: per-checkpoint token budget (`max_len`: 512 for `convaiinnovations/laya`, 1,024 for multilingual/typed-decisions) shared by question prefix + state. The proxy uses character caps (2000/600/50) that don't map to tokens; exceeding the budget silently truncates the tool list — later tools vanish from the judge's view. See `docs/architecture/design_tool_judge_sidecar_protocol.md`, Clef schemas at `docs/api/decision/clef-schema-input.json` and `clef-schema-output.json`, and `submodules/laya-mlx/README.md`.
+- **Tool-judge sidecar** — supports two protocols: legacy sidecar (`/judge`) and Clef decision API (`/decision`, enabled via `use_decision_api = true` in `[tool_judge]`). Two modes: `choice` (per-tool) and `noul` (batch). Laya context limit: per-checkpoint token budget (`max_len`: 512 for `convaiinnovations/laya`, 1,024 for multilingual/typed-decisions) shared by question prefix + state. The proxy uses character caps (2000/600/50) that don't map to tokens; exceeding the budget silently truncates the tool list — later tools vanish from the judge's view. See `docs/architecture/design_tool_judge_sidecar_protocol.md`, Clef schemas at `docs/api/decision/clef-schema-input.json` and `clef-schema-output.json`, and `submodules/laya-mlx/README.md`.
 - **Routing & aliases** — `docs/reference/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `docs/getting-started/proxy_config.example.toml`, `docs/architecture/routing_refactor.md`, `docs/architecture/routing_config_revision.md`
 - **API endpoint details** — `docs/api/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
 - **Configuration guide** — `docs/getting-started/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
@@ -863,7 +863,7 @@ The [`docs/`](./docs/) folder has deep-dives on specific topics:
 - **Thinking / reasoning** — `docs/guides/claude-extended-thinking.md`, `docs/guides/claude-adaptive-thinking.md`
 - **API formats** — `docs/api/claude-api-reference.md`, `docs/api/gemini-api-reference.md`, `docs/api/openai-api-reference.md`
 - **Fusion & composite design** — `docs/architecture/design_fusion_composite_alias.md`
-- **Request/response transform hooks** — `docs/reference/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transform_defaults]` config) — plus `docs/architecture/design_request_transform_hooks.md` (original design) and `docs/contributing/implementation_of_request_transform_hooks.md` (implementation log)
+- **Request/response transform hooks** — `docs/reference/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transforms.default]` config) — plus `docs/architecture/design_request_transform_hooks.md` (original design) and `docs/contributing/implementation_of_request_transform_hooks.md` (implementation log)
 - **Agent harness integrations** — [`docs/guides/agents/`](./docs/guides/agents/) (per-agent guides; e.g. [using this proxy as an LLM provider for deepseek-harness](./docs/guides/agents/proxy-as-provider-for-deepseek-harness.md))
 
 ## Interactive agent session (optional)

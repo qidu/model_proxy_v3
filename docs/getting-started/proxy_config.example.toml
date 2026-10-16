@@ -361,12 +361,12 @@ base_url = "https://openrouter.ai/api"
 #   In a [models.*] section, add `transforms = "set_name"` (or a comma-separated
 #   list `"set_a,set_b"`) inside any model's inline table.
 #
-# [transform_defaults] wires sets to every model of a given upstream mode
+# [transforms.default] wires sets to every model of a given upstream mode
 #   without touching individual model entries. Keys are upstream-mode names;
 #   values are arrays of transform-set names applied before any per-model sets.
 #
 # Resolution order (left-to-right, each set sees the previous set's output):
-#   mode-defaults (transform_defaults) → category-level transforms → per-entry transforms
+#   mode-defaults (transforms.default) → category-level transforms → per-entry transforms
 
 # Example: rename `max_tokens` → `max_completion_tokens` for an OpenAI-responses upstream,
 # and inject a fixed `reasoning` effort field.
@@ -414,7 +414,7 @@ base_url = "https://openrouter.ai/api"
 #   "o3" = {target = "o3", transforms = "openai_responses_compat,strict_tools"}
 
 # Example: apply a transform to every openai-completions model automatically.
-# [transform_defaults]
+# [transforms.default]
 # openai-completions = ["strict_tools"]
 # anthropic-messages = ["inject_missing_tool_results_set"]
 
@@ -495,7 +495,7 @@ before_upstream.ops = [
 # DEFAULT — wire max_tokens_rename to every openai-completions and openai-responses
 # route automatically. Resolution order: mode-defaults → per-entry transforms, so a
 # per-entry no_max_completion_tokens set overrides this default for that model.
-[transform_defaults]
+[transforms.default]
 openai-completions = ["max_tokens_rename"]
 openai-responses   = ["max_tokens_rename"]
 
@@ -614,7 +614,7 @@ openai-responses   = ["max_tokens_rename"]
 #
 # To enable: set `judge_url` to your sidecar endpoint. The presence of `judge_url` is what
 # activates the feature (no separate `enabled` flag).
-[tool_judge_sidecar]
+[tool_judge]
 # judge_url = "http://localhost:8081"        # required to enable; base URL for legacy protocol (not /judge path), or full /decision endpoint URL when use_decision_api = true
 # mode = "choice"                              # "choice" (per-tool) or "noul" (batch)
 # threshold = 0.5                              # relevance threshold 0.0-1.0
@@ -652,7 +652,7 @@ openai-responses   = ["max_tokens_rename"]
 #
 # Laya's reference server:
 #   python submodules/laya-mlx/serve_judge.py --model convaiinnovations/laya --port 8765
-[decision]
+[models.decision]
 # backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed); required to enable
 # url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim; required to enable
 # api_key = "optional-bearer-token"           # optional, sent as Authorization: Bearer
@@ -668,7 +668,7 @@ openai-responses   = ["max_tokens_rename"]
 # appended). `buildUpstreamUrl`'s full-endpoint short-circuit and version-dedupe
 # are NOT used — the client's path is preserved verbatim.
 #
-# Each inline table under `[passthrough]` defines one target, keyed by an
+# Each inline table under `[models.passthrough]` defines one target, keyed by an
 # arbitrary name. Multiple entries with the same `mode` form a weighted pool
 # (by `share`, default 1) — `share` only matters inside such a pool, so a mode
 # with a single target always uses it whatever its `share` says. The auth key
@@ -678,7 +678,7 @@ openai-responses   = ["max_tokens_rename"]
 # Short field names are canonical here; the long aliases (base_url/url,
 # api_key/key, upstream_mode/mode) are also accepted.
 #
-# [passthrough]
+# [models.passthrough]
 # # Weighted pool: both targets serve openai-completions, split 20:30 (40% / 60%).
 # openai1 = {base = "https://api.openai-a.com", mode = "openai-completions", share = 20}
 # openai2 = {base = "https://api.openai-b.com", mode = "openai-completions", share = 30}

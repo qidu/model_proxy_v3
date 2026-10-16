@@ -33,7 +33,7 @@
  * reported, so the rest of the config still loads and the proxy still starts.
  *
  * Scope: ONLY configured api_key values of `[models.*]` targets,
- * `[models.default].api_key`, and `[passthrough]` target `key`s in the
+ * `[models.default].api_key`, and `[models.passthrough]` target `key`s in the
  * local `proxy_config.toml` file. Not applied to Consul/Apollo config-center
  * sources; composite/schedule aliases carry no api_key of their own; and
  * caller/user keys from request headers are never stored — an empty api_key
@@ -80,7 +80,7 @@ interface KeySlot {
  * - category-level `api_key` → account `<category>/<category base_url>`
  * - entry-level `api_key` (index 2) → account `<target>/<entry or category base_url>`
  * - `[models.default].api_key` → account `default/<default_base_url>`
- * - `[passthrough].<name>.key` → account `passthrough.<name>/<base>`
+ * - `[models.passthrough].<name>.key` → account `passthrough.<name>/<base>`
  */
 function collectKeySlots(config: ProxyConfig): KeySlot[] {
   const slots: KeySlot[] = [];
@@ -115,7 +115,7 @@ function collectKeySlots(config: ProxyConfig): KeySlot[] {
   }
 
   // Passthrough targets have no model id, so the account is namespaced by the
-  // `[passthrough]` target name instead.
+  // `[models.passthrough]` target name instead.
   for (const [name, target] of Object.entries(config.passthrough ?? {})) {
     if (target.key === undefined) continue;
     const holder = target as { key?: string };

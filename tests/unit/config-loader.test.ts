@@ -442,9 +442,9 @@ describe('parseSimpleToml', () => {
   // Without a dispatch branch for this section the parser silently dropped it,
   // so `judgeTools` always took its `!sidecarConfig?.judge_url` early return and
   // the sidecar could not be enabled from a config file at all.
-  it('parses [tool_judge_sidecar] numeric and string fields', () => {
+  it('parses [tool_judge] numeric and string fields', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       timeout_ms = 2000
       threshold = 0.65
@@ -462,9 +462,9 @@ describe('parseSimpleToml', () => {
     });
   });
 
-  it('parses unquoted [tool_judge_sidecar] string values', () => {
+  it('parses unquoted [tool_judge] string values', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = http://127.0.0.1:8081
       mode = choice
     `);
@@ -472,9 +472,9 @@ describe('parseSimpleToml', () => {
     assert.equal(cfg.tool_judge_sidecar?.mode, 'choice');
   });
 
-  it('drops unknown keys and wrong-typed values in [tool_judge_sidecar]', () => {
+  it('drops unknown keys and wrong-typed values in [tool_judge]', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       enabled = true
       threshold = "high"
@@ -518,9 +518,9 @@ describe('parseSimpleToml', () => {
     );
   });
 
-  it('parses [tool_judge_sidecar] use_decision_api as unquoted boolean true', () => {
+  it('parses [tool_judge] use_decision_api as unquoted boolean true', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       use_decision_api = true
       model = "laya"
@@ -529,35 +529,35 @@ describe('parseSimpleToml', () => {
     assert.equal(cfg.tool_judge_sidecar?.model, 'laya');
   });
 
-  it('parses [tool_judge_sidecar] use_decision_api as unquoted boolean false', () => {
+  it('parses [tool_judge] use_decision_api as unquoted boolean false', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       use_decision_api = false
     `);
     assert.equal(cfg.tool_judge_sidecar?.use_decision_api, false);
   });
 
-  it('parses [tool_judge_sidecar] use_decision_api as quoted string true/false', () => {
+  it('parses [tool_judge] use_decision_api as quoted string true/false', () => {
     const cfgTrue = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       use_decision_api = "true"
     `);
     assert.equal(cfgTrue.tool_judge_sidecar?.use_decision_api, true);
 
     const cfgFalse = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       use_decision_api = "false"
     `);
     assert.equal(cfgFalse.tool_judge_sidecar?.use_decision_api, false);
   });
 
-  it('parses [tool_judge_sidecar] model with valid values: laya, clef, clef-flash', () => {
+  it('parses [tool_judge] model with valid values: laya, clef, clef-flash', () => {
     for (const model of ['laya', 'clef', 'clef-flash'] as const) {
       const cfg = parseSimpleToml(`
-        [tool_judge_sidecar]
+        [tool_judge]
         judge_url = "http://127.0.0.1:8081"
         use_decision_api = true
         model = "${model}"
@@ -566,15 +566,169 @@ describe('parseSimpleToml', () => {
     }
   });
 
-  it('drops [tool_judge_sidecar] model with invalid value', () => {
+  it('drops [tool_judge] model with invalid value', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       use_decision_api = true
       model = "invalid-model"
     `);
     // Invalid model should be ignored, leaving model undefined
     assert.equal(cfg.tool_judge_sidecar?.model, undefined);
+  });
+
+  // -------------------------------------------------------------------------
+  // Renamed section headers. The old headers [tool_judge_sidecar], [decision],
+  // [passthrough] (and [transform_defaults], covered in transforms-config.test.ts)
+  // were REMOVED — they hit the unknown-section branch like any unsupported
+  // header. The canonical headers must produce the config objects, and
+  // [models.decision] / [models.passthrough] must NOT register
+  // "decision"/"passthrough" as model categories.
+  // -------------------------------------------------------------------------
+
+  const captureWarns = (fn: () => void): string[] => {
+    const original = console.warn;
+    const messages: string[] = [];
+    console.warn = (...args: unknown[]) => { messages.push(args.map(String).join(' ')); };
+    try {
+      fn();
+    } finally {
+      console.warn = original;
+    }
+    return messages;
+  };
+
+  it('rejects the removed [tool_judge_sidecar] header as an unknown section and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      threshold = 0.7
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.equal(cfg.tool_judge_sidecar, undefined);
+    assert.equal(cfg.general?.global_token_limit, 1234, 'parsing continues after the rejected section');
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'tool_judge_sidecar'),
+      `expected an unknown-section warning naming [tool_judge_sidecar], got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses the canonical [tool_judge] header without any section warning', () => {
+    let cfg!: ReturnType<typeof parseSimpleToml>;
+    const warns = captureWarns(() => {
+      cfg = parseSimpleToml(`
+        [tool_judge]
+        judge_url = "http://127.0.0.1:8081"
+        threshold = 0.7
+      `);
+    });
+    assert.equal(cfg.tool_judge_sidecar?.judge_url, 'http://127.0.0.1:8081');
+    assert.equal(cfg.tool_judge_sidecar?.threshold, 0.7);
+    assert.ok(
+      !warns.some((m) => m.includes('deprecated')),
+      `unexpected deprecation warning: ${JSON.stringify(warns)}`
+    );
+    const warnings = (cfg as any)._validationWarnings ?? [];
+    assert.ok(
+      !warnings.some((w: { path: string }) => w.path === 'tool_judge'),
+      `unexpected unknown-section warning for [tool_judge]: ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('rejects the removed [decision] header as an unknown section and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [decision]
+      backend = "laya"
+      url = "http://127.0.0.1:8081/decision"
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.equal(cfg.decision, undefined);
+    assert.equal(cfg.general?.global_token_limit, 1234, 'parsing continues after the rejected section');
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'decision'),
+      `expected an unknown-section warning naming [decision], got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses [models.decision] into config.decision without creating a models.decision category', () => {
+    let cfg!: ReturnType<typeof parseSimpleToml>;
+    const warns = captureWarns(() => {
+      cfg = parseSimpleToml(`
+        [models.decision]
+        backend = "laya"
+        url = "http://127.0.0.1:8081/decision"
+        timeout_ms = 5000
+      `);
+    });
+    assert.equal(cfg.decision?.backend, 'laya');
+    assert.equal(cfg.decision?.url, 'http://127.0.0.1:8081/decision');
+    assert.equal(cfg.decision?.timeout_ms, 5000);
+    assert.ok(
+      !warns.some((m) => m.includes('deprecated')),
+      `unexpected deprecation warning: ${JSON.stringify(warns)}`
+    );
+    // Intercepted before the generic [models.*] branch: no "decision" category.
+    assert.equal(cfg.models?.decision, undefined);
+    assert.deepEqual(getConfiguredModelIds(cfg), []);
+  });
+
+  it('rejects the removed [passthrough] header as an unknown section and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [passthrough]
+      openai = {base = "https://api.openai.com", mode = "openai-completions", share = 2}
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.equal(cfg.passthrough, undefined);
+    assert.equal(cfg.general?.global_token_limit, 1234, 'parsing continues after the rejected section');
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'passthrough'),
+      `expected an unknown-section warning naming [passthrough], got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses [models.passthrough] inline tables into config.passthrough without creating a models.passthrough category', () => {
+    let cfg!: ReturnType<typeof parseSimpleToml>;
+    const warns = captureWarns(() => {
+      cfg = parseSimpleToml(`
+        [models.passthrough]
+        openai = {base = "https://api.openai.com", mode = "openai-completions", share = 2}
+        gemini = {base = "https://generativelanguage.googleapis.com", mode = "gemini-generatecontent"}
+      `);
+    });
+    assert.deepEqual(cfg.passthrough, {
+      openai: { base: 'https://api.openai.com', mode: 'openai-completions', share: 2 },
+      gemini: { base: 'https://generativelanguage.googleapis.com', mode: 'gemini-generatecontent' },
+    });
+    assert.ok(
+      !warns.some((m) => m.includes('deprecated')),
+      `unexpected deprecation warning: ${JSON.stringify(warns)}`
+    );
+    // Intercepted before the generic [models.*] branch: no "passthrough" category.
+    assert.equal(cfg.models?.passthrough, undefined);
+    assert.deepEqual(getConfiguredModelIds(cfg), []);
+  });
+
+  it('serializeProxyConfigToml writes the canonical section headers', () => {
+    const toml = serializeProxyConfigToml({
+      tool_judge_sidecar: { judge_url: 'http://127.0.0.1:8081', threshold: 0.5 },
+      decision: { backend: 'laya', url: 'http://127.0.0.1:8081/decision' },
+      passthrough: { openai: { base: 'https://api.openai.com', mode: 'openai-completions' } },
+    });
+    assert.match(toml, /^\[tool_judge\]$/m);
+    assert.match(toml, /^\[models\.decision\]$/m);
+    assert.match(toml, /^\[models\.passthrough\]$/m);
+    assert.doesNotMatch(toml, /^\[tool_judge_sidecar\]$/m);
+    assert.doesNotMatch(toml, /^\[decision\]$/m);
+    assert.doesNotMatch(toml, /^\[passthrough\]$/m);
   });
 
   it('accepts an unknown section as the very first header without crashing', () => {
@@ -635,7 +789,7 @@ describe('parseSimpleToml', () => {
 
   it('parses transform_defaults section', () => {
     const cfg = parseSimpleToml(`
-      [transform_defaults]
+      [transforms.default]
       openai-completions = ["set_a", "set_b"]
     `);
     assert.deepEqual(cfg.transform_defaults?.['openai-completions'], ['set_a', 'set_b']);
