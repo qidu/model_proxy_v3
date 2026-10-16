@@ -44,7 +44,7 @@ import { googleGenerativeAIApi } from '@earendil-works/pi-ai/api/google-generati
 import { piMessagesApi } from '@earendil-works/pi-ai/api/pi-messages.lazy';
 import type { Env } from './types/shared.js';
 import type { ProxyConfig } from './utils/config-loader.js';
-import { getConfiguredModelIds } from './utils/config-loader.js';
+import { getConfiguredModelIds, getModelRouteConfig } from './utils/config-loader.js';
 import { PROXY_PROVIDER_ID, buildProxyPiModel, proxyBaseUrlForApi, type ProxyApiType } from './utils/pi-model-catalog.js';
 import { createAgentTools } from './agent-tools.js';
 
@@ -1630,24 +1630,38 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     return;
   }
 
-  // Resolve a key to auth the loopback /v1/messages call with, same
-  // precedence tui.ts's own model-test call already uses (PROXY_CLIENT_API_KEY
-  // override, else [models.default].api_key, else DEV_NO_KEY): without this,
+  // Resolve a key to auth the loopback /v1/messages call with. Without a key,
   // every verification attempt 401s from the proxy's own auth check
   // (src/index.ts) no matter which model is picked, which previously showed up
   // as an unexplained infinite "pick a different model" loop (Rule 8: fail loud
   // once, up front, instead of looping silently).
+  //
+  // The key must be resolved per selected alias, not once per session: outside
+  // the free section (and config_key mode) the proxy forwards the caller's
+  // credential upstream, so an alias whose upstream key differs from
+  // [models.default].api_key only authenticates when its own configured key is
+  // sent. This mirrors how the dashboard/TUI model tests build the call
+  // (route.apiKey || defaultApiKey) — a static session key is why a model can
+  // test green in the dashboard yet fail verification here.
   const devNoKey = env.DEV_NO_KEY === 'true' || env.DEV_NO_KEY === '1';
   const agentMode = env.AGENT === 'true' || env.AGENT === '1';
   const defaultAgentKey = agentMode ? 'sk-hi-agent-launched-in-proxy-v3' : undefined;
   const defaultCategory = config.models?.default;
   const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
-  const clientApiKey = env.PROXY_CLIENT_API_KEY || defaultAgentKey || defaultApiKey;
-  if (!clientApiKey && !devNoKey && !defaultAgentKey) {
+  // Composite aliases resolve per-target keys proxy-side, so like the
+  // dashboard test they fall back to [models.default].api_key here.
+  const routeApiKeyFor = (alias: string | null): string | undefined =>
+    alias && !config.composite?.[alias] ? getModelRouteConfig(alias, config).apiKey : undefined;
+  let activeAlias: string | null = null;
+  const resolveClientApiKey = (): string | undefined =>
+    env.PROXY_CLIENT_API_KEY || routeApiKeyFor(activeAlias) || defaultApiKey || defaultAgentKey;
+  const hasAnyKey = !!(env.PROXY_CLIENT_API_KEY || defaultApiKey || defaultAgentKey
+    || aliases.some((alias) => routeApiKeyFor(alias)));
+  if (!hasAnyKey && !devNoKey) {
     console.error(
       '[proxy] Cannot start an agent session: no client API key available to authenticate the loopback\n' +
-        dim(' /v1/messages call. Set PROXY_CLIENT_API_KEY, configure [models.default] api_key\n') +
-        dim(' in proxy_config.toml, or set DEV_NO_KEY=true. Aborting agent session.'),
+        dim(' /v1/messages call. Set PROXY_CLIENT_API_KEY, configure an api_key on the model or\n') +
+        dim(' [models.default] in proxy_config.toml, or set DEV_NO_KEY=true. Aborting agent session.'),
     );
     return;
   }
@@ -1667,8 +1681,14 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     id: PROXY_PROVIDER_ID,
     baseUrl: `http://127.0.0.1:${port}`,
     auth: {
-      apiKey: clientApiKey
-        ? { name: 'model_proxy_v3 client key', resolve: async () => ({ auth: { apiKey: clientApiKey } }) }
+      apiKey: hasAnyKey
+        ? {
+            name: 'model_proxy_v3 client key',
+            resolve: async () => {
+              const key = resolveClientApiKey();
+              return key ? { auth: { apiKey: key } } : { auth: {} };
+            },
+          }
         : { name: 'model_proxy_v3 (DEV_NO_KEY)', resolve: async () => ({ auth: {} }) },
     },
     models: aliases.map((alias) => buildSelfModel(alias, port)),
@@ -1705,6 +1725,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       console.log(dim('No model selected — exiting agent session.\nbye!'));
       return;
     }
+    activeAlias = choice;
     const model = models.getModel(PROVIDER_ID, choice);
     if (!model) {
       console.error(`[proxy] Internal error: model "${choice}" not found on provider after selection.`);

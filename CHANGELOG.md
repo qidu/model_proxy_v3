@@ -5,6 +5,14 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(agent): resolve the loopback client key per selected model alias
+
+`src/agent-session.ts` — agent-session model verification 401ed for any alias whose upstream key differs from `[models.default].api_key`, even when the same model tested green in the dashboard/TUI. Root cause: outside the `free` section (and `config_key` mode) the proxy forwards the *caller's* credential upstream, and the agent session authenticated every loopback `/v1/messages` call with one static key — `PROXY_CLIENT_API_KEY`, else the placeholder `sk-hi-agent-launched-in-proxy-v3`, else the default key — so upstreams received the placeholder and answered 401 (`Invalid API key` / `Missing Authentication header`). The dashboard and TUI model tests were never affected because they already send the model's own configured key.
+
+The client key is now resolved per selected alias with the same precedence those tests use: `PROXY_CLIENT_API_KEY` → the alias's configured `route.apiKey` (via `getModelRouteConfig`) → `[models.default].api_key` → agent-mode placeholder. Composite aliases keep the old fallback (per-target keys are applied proxy-side). The up-front "no client API key" abort now also recognizes per-alias keys as a valid key source.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1594 tests, 1594 pass, 0 fail** — executed on this tree; live-verified end-to-end through the local proxy (`/v1/messages` → `default-deepseek-v4.1-qn` → qnaigc upstream, real 200 response).
+
 ### fix(config): remove `[default_upstream]` section, use `[models.default]` as sole fallback
 
 `src/utils/config-loader.ts`, `src/utils/key-store.ts`, `src/utils/consul-loader.ts`, `src/index.ts`, `src/tui.ts`, `proxy_config.toml` — deprecated `[default_upstream]` and its `default_*` keys are fully removed. The single fallback is now `[models.default]` with the same fields (`api_key`, `url`, `model`, `weight`, `timeout_ms`, `max_retries`, `headers`). All config sources (TOML, keychain, Consul/Apollo) and consumers (composite resolution, TUI model test, config_key mode) updated.
