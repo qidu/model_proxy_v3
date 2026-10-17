@@ -494,6 +494,9 @@ export function handleDashboardPage(env: Env): Response {
       .test-btn.success-result { background: #e8f5e9; border-color: #a5d6a7; color: #2e7d32; }
       .danger { background: ##fff9c350; border: 1px solid #fff176; }
       .section-actions { margin-top: 8px; }
+      .alias-save-bar { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e0e0e0; }
+      .alias-save-bar[hidden] { display: none; }
+      .alias-save-status { font-size: 12px; color: #555; margin-right: auto; }
       /* Tool blocklist */
       tr.tool-row.blocked { background: #fff1f1; }
       tr.tool-row td.status-blocked { color: #c62828; font-weight: 700; }
@@ -812,6 +815,10 @@ export function handleDashboardPage(env: Env): Response {
       let modelStats = [];
       let configErrorsList = [];
       let compositeLimitWindowsSnapshot = {};
+      // Last server-loaded composite state — the baseline for per-alias
+      // Save/Discard bars; refreshed on every loadConfig().
+      let savedComposite = {};
+      const dirtyAliases = new Set();
       const dashboardApiKeyStorageKey = 'model-proxy-dashboard-api-key';
       const dashboardApiKeyMaxAgeMs = 7 * 24 * 60 * 60 * 1000;
 
@@ -2412,6 +2419,29 @@ export function handleDashboardPage(env: Env): Response {
         return '<button type="button" class="collapse-btn" data-action="toggle-collapse" title="Collapse / expand" aria-expanded="' + (collapsed ? 'false' : 'true') + '">' + (collapsed ? '▸' : '▾') + '</button>';
       }
 
+      function buildCompositeBlockHtml(aliasName, targets) {
+        const rows = compositeEntryRows(aliasName, targets, compositeLimitWindowsSnapshot[aliasName])
+          + '<div class="section-actions"><button type="button" class="test-btn mini-btn" data-action="test-composite" data-alias="' + escapeHtml(aliasName) + '">test it</button>'
+          + ' <button type="button" class="mini-btn" data-action="add-composite-target" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add target</button>'
+          + ' <button type="button" class="mini-btn danger" data-action="remove-composite-alias" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Remove alias</button></div>';
+        const hasError = configErrorsList.some((e) => e.path === 'composite.' + aliasName);
+        const errorMark = hasError ? ' <span style="color:#c62828;font-weight:bold;" title="Config error — see status bar">x</span>' : '';
+        const aliasKeys = Object.keys(targets || {}).filter((k) => k !== 'token_limit' && k !== 'fusion_options');
+        const isCoordHead = aliasKeys.some((k) => { const c = (targets || {})[k] || {}; return typeof c.coord === 'number' && c.coord > 0; });
+        const isFusionHead = !isCoordHead && !!targets.fusion_options;
+        const aliasTypeTag = isCoordHead ? ' <span style="font-size:13px;color:#555;"><b>Ö</b></span>' : isFusionHead ? ' <span style="font-size:13px;color:#555;"><b>Ƒ</b></span>' : ' <span style="font-size:13px;color:#555;"><b>ᙅ</b></span>';
+        const blockId = 'composite.' + aliasName;
+        const collapsed = collapsedBlockIds.has(blockId);
+        // Save/Discard bar: hidden until the alias's edited state diverges
+        // from savedComposite (see updateAliasDirtyState).
+        const saveBar = isReadOnly ? '' : '<div class="alias-save-bar" data-alias="' + escapeHtml(aliasName) + '" hidden>'
+          + '<span class="alias-save-status"></span>'
+          + '<button type="button" class="mini-btn" data-action="save-composite-alias" data-alias="' + escapeHtml(aliasName) + '">Save</button>'
+          + '<button type="button" class="mini-btn danger" data-action="discard-composite-alias" data-alias="' + escapeHtml(aliasName) + '">Discard</button>'
+          + '</div>';
+        return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">composite.' + escapeHtml(aliasName) + '</span>' + aliasTypeTag + errorMark + collapseButtonHtml(collapsed) + '</h3>' + rows + saveBar + '</div>';
+      }
+
       function renderConfigForm(config) {
         const modelBlocks = Object.entries(config.models || {}).map(([categoryName, category]) => {
           const disabledAttr = isReadOnly ? ' disabled' : '';
@@ -2431,21 +2461,7 @@ export function handleDashboardPage(env: Env): Response {
           return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">models.' + escapeHtml(categoryName) + '</span>' + collapseButtonHtml(collapsed) + '</h3>' + rows.join('') + '</div>';
         }).join('');
 
-        const compositeBlocks = Object.entries(config.composite || {}).map(([aliasName, targets]) => {
-          const rows = compositeEntryRows(aliasName, targets, compositeLimitWindowsSnapshot[aliasName])
-            + '<div class="section-actions"><button type="button" class="test-btn mini-btn" data-action="test-composite" data-alias="' + escapeHtml(aliasName) + '">test it</button>'
-            + ' <button type="button" class="mini-btn" data-action="add-composite-target" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Add target</button>'
-            + ' <button type="button" class="mini-btn danger" data-action="remove-composite-alias" data-alias="' + escapeHtml(aliasName) + '"' + (isReadOnly ? ' disabled' : '') + '>Remove alias</button></div>';
-          const hasError = configErrorsList.some((e) => e.path === 'composite.' + aliasName);
-          const errorMark = hasError ? ' <span style="color:#c62828;font-weight:bold;" title="Config error — see status bar">x</span>' : '';
-          const aliasKeys = Object.keys(targets || {}).filter((k) => k !== 'token_limit' && k !== 'fusion_options');
-          const isCoordHead = aliasKeys.some((k) => { const c = (targets || {})[k] || {}; return typeof c.coord === 'number' && c.coord > 0; });
-          const isFusionHead = !isCoordHead && !!targets.fusion_options;
-          const aliasTypeTag = isCoordHead ? ' <span style="font-size:13px;color:#555;"><b>Ö</b></span>' : isFusionHead ? ' <span style="font-size:13px;color:#555;"><b>Ƒ</b></span>' : ' <span style="font-size:13px;color:#555;"><b>ᙅ</b></span>';
-          const blockId = 'composite.' + aliasName;
-          const collapsed = collapsedBlockIds.has(blockId);
-          return '<div class="config-block' + (collapsed ? ' collapsed' : '') + '" data-block-id="' + escapeHtml(blockId) + '"><h3><span class="config-block-title">composite.' + escapeHtml(aliasName) + '</span>' + aliasTypeTag + errorMark + collapseButtonHtml(collapsed) + '</h3>' + rows + '</div>';
-        }).join('');
+        const compositeBlocks = Object.entries(config.composite || {}).map(([aliasName, targets]) => buildCompositeBlockHtml(aliasName, targets)).join('');
 
         const compositeGlobalActions = '<div class="section-actions"><button type="button" class="mini-btn" data-action="add-composite-alias"' + (isReadOnly ? ' disabled' : '') + '>Add composite alias</button></div>';
 
@@ -2467,23 +2483,27 @@ export function handleDashboardPage(env: Env): Response {
         configForm.innerHTML = modelTargetGlobalActions + modelBlocks
           + '<div class="config-divider"></div>' + compositeBlocks + compositeGlobalActions
           + '<div class="config-divider"></div>' + scheduleBlocks + scheduleGlobalActions;
+        refreshAliasDirtyStates();
       }
 
-      function collectConfigPayload() {
-        const payload = { models: {}, composite: {}, schedule: {} };
-
+      // Models section of collectConfigPayload(), extracted so per-alias Save
+      // can re-send it (the PUT endpoint requires a models object).
+      function collectModelsPayload() {
+        const models = {};
         Object.keys(currentConfig.models || {}).forEach((categoryName) => {
-          payload.models[categoryName] = {};
+          models[categoryName] = {};
         });
 
         document.querySelectorAll('[data-kind="cat-upstream"]').forEach((el) => {
           const category = el.dataset.category;
-          payload.models[category].upstream_mode = el.value;
+          if (!models[category]) models[category] = {};
+          models[category].upstream_mode = el.value;
         });
 
         document.querySelectorAll('[data-kind="cat-base"]').forEach((el) => {
           const category = el.dataset.category;
-          payload.models[category].base_url = el.value;
+          if (!models[category]) models[category] = {};
+          models[category].base_url = el.value;
         });
 
         document.querySelectorAll('[data-kind="model-alias"]').forEach((el) => {
@@ -2499,79 +2519,17 @@ export function handleDashboardPage(env: Env): Response {
           // TC1214. A bare 2-element array would be rejected as
           // "Invalid model entry for <category>.<key>". Index 2 carries the
           // per-model upstream_mode override ('' = inherit category).
-          payload.models[category][key] = (base || mode) ? [alias, base, mode] : [alias];
+          if (!models[category]) models[category] = {};
+          models[category][key] = (base || mode) ? [alias, base, mode] : [alias];
         });
+        return models;
+      }
 
-        Object.entries(currentConfig.composite || {}).forEach(([aliasName, targets]) => {
-          payload.composite[aliasName] = {};
-          const limitNumEl = document.querySelector('[data-kind="comp-limit-num"][data-alias="' + aliasName + '"]');
-          const limitDurEl = document.querySelector('[data-kind="comp-limit-duration"][data-alias="' + aliasName + '"]');
-          const numVal = limitNumEl ? limitNumEl.value.trim() : '';
-          const durVal = limitDurEl ? limitDurEl.value.trim() : '';
-          if (numVal !== '' && durVal !== '') {
-            // Parse human-readable format: "50K", "1.5M", "100000" etc.
-            const rawInput = numVal + ' ' + durVal;
-            const parsed = parseHumanTokenLimit(rawInput);
-            if (parsed) {
-              payload.composite[aliasName].token_limit = parsed;
-            }
-          }
+      function collectConfigPayload() {
+        const payload = { models: collectModelsPayload(), composite: {}, schedule: {} };
 
-          // Collect fusion_options if present in DOM (fusion alias)
-          const minPanelEl = document.querySelector('[data-kind="comp-fusion-min-panel"][data-alias="' + aliasName + '"]');
-          if (minPanelEl !== null) {
-            const fusionOpts = {};
-            if (minPanelEl.value !== '') fusionOpts.min_panel = Number(minPanelEl.value);
-            const timeoutEl = document.querySelector('[data-kind="comp-fusion-timeout"][data-alias="' + aliasName + '"]');
-            if (timeoutEl && timeoutEl.value !== '') fusionOpts.panel_timeout_ms = Number(timeoutEl.value);
-            const judgeReqEl = document.querySelector('[data-kind="comp-fusion-judge-req"][data-alias="' + aliasName + '"]');
-            if (judgeReqEl && judgeReqEl.value !== '') fusionOpts.judge_required = judgeReqEl.value === 'true';
-            const exposeMetaEl = document.querySelector('[data-kind="comp-fusion-expose-meta"][data-alias="' + aliasName + '"]');
-            if (exposeMetaEl && exposeMetaEl.value !== '') fusionOpts.expose_metadata = exposeMetaEl.value === 'true';
-            const maxConcEl = document.querySelector('[data-kind="comp-fusion-max-conc"][data-alias="' + aliasName + '"]');
-            if (maxConcEl && maxConcEl.value !== '') fusionOpts.max_concurrent = Number(maxConcEl.value);
-            if (Object.keys(fusionOpts).length > 0) {
-              payload.composite[aliasName].fusion_options = fusionOpts;
-            }
-          }
-
-          Object.keys(targets || {}).forEach((targetName) => {
-            if (targetName === 'token_limit' || targetName === 'fusion_options') return;
-            // Coordinator target fields
-            const coordEl = document.querySelector('[data-kind="comp-coord"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
-            if (coordEl !== null) {
-              const entry = {};
-              entry.coord = coordEl.value !== '' ? Number(coordEl.value) : 1;
-              const coordRoleEl = document.querySelector('[data-kind="comp-coord-role"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
-              if (coordRoleEl && coordRoleEl.value !== '') entry.role = coordRoleEl.value;
-              payload.composite[aliasName][targetName] = entry;
-              return;
-            }
-            // Fusion target fields
-            const fusionEl = document.querySelector('[data-kind="comp-fusion"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
-            if (fusionEl !== null) {
-              const entry = {};
-              if (fusionEl.value !== '') entry.fusion = Number(fusionEl.value);
-              const roleEl = document.querySelector('[data-kind="comp-role"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
-              if (roleEl && roleEl.value !== '') entry.role = roleEl.value;
-              payload.composite[aliasName][targetName] = entry;
-              return;
-            }
-            // Normal composite target fields
-            const shareEl = document.querySelector('[data-kind="comp-share"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
-            const routingEl = document.querySelector('[data-kind="comp-routing"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
-            const fallbackEl = document.querySelector('[data-kind="comp-fallback"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
-            const entry = {};
-            if (shareEl && shareEl.value !== '') entry.share = Number(shareEl.value);
-            const isPrimary = routingEl && routingEl.value === 'primary';
-            if (isPrimary) {
-              entry.primary = true;
-            } else if (fallbackEl && fallbackEl.value !== '') {
-              const fallbackValue = Number(fallbackEl.value);
-              if (fallbackValue !== 0) entry.fallback = fallbackValue;
-            }
-            payload.composite[aliasName][targetName] = entry;
-          });
+        Object.keys(currentConfig.composite || {}).forEach((aliasName) => {
+          payload.composite[aliasName] = collectAliasPayload(aliasName);
         });
 
         Object.entries(currentConfig.schedule || {}).forEach(([aliasName, targets]) => {
@@ -2607,6 +2565,184 @@ export function handleDashboardPage(env: Env): Response {
         return payload;
       }
 
+      // Per-alias twin of the composite loop in collectConfigPayload(): reads
+      // one alias's fields from the DOM. Used for dirty detection and the
+      // per-alias Save/Discard bar.
+      function collectAliasPayload(aliasName) {
+        const aliasCfg = {};
+        const targets = (currentConfig.composite || {})[aliasName] || {};
+        const limitNumEl = document.querySelector('[data-kind="comp-limit-num"][data-alias="' + aliasName + '"]');
+        const limitDurEl = document.querySelector('[data-kind="comp-limit-duration"][data-alias="' + aliasName + '"]');
+        const numVal = limitNumEl ? limitNumEl.value.trim() : '';
+        const durVal = limitDurEl ? limitDurEl.value.trim() : '';
+        if (numVal !== '' && durVal !== '') {
+          // Parse human-readable format: "50K", "1.5M", "100000" etc.
+          const rawInput = numVal + ' ' + durVal;
+          const parsed = parseHumanTokenLimit(rawInput);
+          if (parsed) {
+            aliasCfg.token_limit = parsed;
+          }
+        }
+
+        // Collect fusion_options if present in DOM (fusion alias)
+        const minPanelEl = document.querySelector('[data-kind="comp-fusion-min-panel"][data-alias="' + aliasName + '"]');
+        if (minPanelEl !== null) {
+          const fusionOpts = {};
+          if (minPanelEl.value !== '') fusionOpts.min_panel = Number(minPanelEl.value);
+          const timeoutEl = document.querySelector('[data-kind="comp-fusion-timeout"][data-alias="' + aliasName + '"]');
+          if (timeoutEl && timeoutEl.value !== '') fusionOpts.panel_timeout_ms = Number(timeoutEl.value);
+          const judgeReqEl = document.querySelector('[data-kind="comp-fusion-judge-req"][data-alias="' + aliasName + '"]');
+          if (judgeReqEl && judgeReqEl.value !== '') fusionOpts.judge_required = judgeReqEl.value === 'true';
+          const exposeMetaEl = document.querySelector('[data-kind="comp-fusion-expose-meta"][data-alias="' + aliasName + '"]');
+          if (exposeMetaEl && exposeMetaEl.value !== '') fusionOpts.expose_metadata = exposeMetaEl.value === 'true';
+          const maxConcEl = document.querySelector('[data-kind="comp-fusion-max-conc"][data-alias="' + aliasName + '"]');
+          if (maxConcEl && maxConcEl.value !== '') fusionOpts.max_concurrent = Number(maxConcEl.value);
+          if (Object.keys(fusionOpts).length > 0) {
+            aliasCfg.fusion_options = fusionOpts;
+          }
+        }
+
+        Object.keys(targets || {}).forEach((targetName) => {
+          if (targetName === 'token_limit' || targetName === 'fusion_options') return;
+          // Coordinator target fields
+          const coordEl = document.querySelector('[data-kind="comp-coord"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
+          if (coordEl !== null) {
+            const entry = {};
+            entry.coord = coordEl.value !== '' ? Number(coordEl.value) : 1;
+            const coordRoleEl = document.querySelector('[data-kind="comp-coord-role"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
+            if (coordRoleEl && coordRoleEl.value !== '') entry.role = coordRoleEl.value;
+            aliasCfg[targetName] = entry;
+            return;
+          }
+          // Fusion target fields
+          const fusionEl = document.querySelector('[data-kind="comp-fusion"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
+          if (fusionEl !== null) {
+            const entry = {};
+            if (fusionEl.value !== '') entry.fusion = Number(fusionEl.value);
+            const roleEl = document.querySelector('[data-kind="comp-role"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
+            if (roleEl && roleEl.value !== '') entry.role = roleEl.value;
+            aliasCfg[targetName] = entry;
+            return;
+          }
+          // Normal composite target fields
+          const shareEl = document.querySelector('[data-kind="comp-share"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
+          const routingEl = document.querySelector('[data-kind="comp-routing"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
+          const fallbackEl = document.querySelector('[data-kind="comp-fallback"][data-alias="' + aliasName + '"][data-target="' + targetName + '"]');
+          const entry = {};
+          if (shareEl && shareEl.value !== '') entry.share = Number(shareEl.value);
+          const isPrimary = routingEl && routingEl.value === 'primary';
+          if (isPrimary) {
+            entry.primary = true;
+          } else if (fallbackEl && fallbackEl.value !== '') {
+            const fallbackValue = Number(fallbackEl.value);
+            if (fallbackValue !== 0) entry.fallback = fallbackValue;
+          }
+          aliasCfg[targetName] = entry;
+        });
+        return aliasCfg;
+      }
+
+      function deepEqual(a, b) {
+        if (a === b) return true;
+        if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+        const keysA = Object.keys(a);
+        const keysB = Object.keys(b);
+        if (keysA.length !== keysB.length) return false;
+        return keysA.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k]));
+      }
+
+      // Toggle one alias's Save/Discard bar based on whether its DOM state
+      // diverges from the last-loaded (saved) state.
+      function updateAliasDirtyState(aliasName) {
+        const block = document.querySelector('.config-block[data-block-id="composite.' + aliasName + '"]');
+        if (!block) return;
+        const bar = block.querySelector('.alias-save-bar');
+        if (!bar) return;
+        const saved = Object.prototype.hasOwnProperty.call(savedComposite, aliasName) ? savedComposite[aliasName] : undefined;
+        const dirty = saved === undefined || !deepEqual(collectAliasPayload(aliasName), saved);
+        bar.hidden = !dirty;
+        if (dirty) dirtyAliases.add(aliasName);
+        else dirtyAliases.delete(aliasName);
+      }
+
+      function refreshAliasDirtyStates() {
+        dirtyAliases.clear();
+        Object.keys(currentConfig.composite || {}).forEach(updateAliasDirtyState);
+      }
+
+      // Re-render a single composite block in place (used after per-alias
+      // Save/Discard so other aliases' unsaved edits are not clobbered).
+      function renderAliasBlock(aliasName) {
+        const block = document.querySelector('.config-block[data-block-id="composite.' + aliasName + '"]');
+        if (!block) return;
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = buildCompositeBlockHtml(aliasName, (currentConfig.composite || {})[aliasName]);
+        const fresh = wrapper.firstElementChild;
+        if (!fresh) return;
+        block.replaceWith(fresh);
+        updateAliasDirtyState(aliasName);
+      }
+
+      // Save one alias. The PUT endpoint replaces the whole composite set, so
+      // the payload carries every alias: the edited one from the DOM, the
+      // others from their saved state. models must always be present in the
+      // payload (re-sent from the DOM, same as the global Save); schedule is
+      // omitted, which the backend treats as "keep unchanged".
+      async function saveCompositeAlias(aliasName) {
+        const block = document.querySelector('.config-block[data-block-id="composite.' + aliasName + '"]');
+        const statusEl = block ? block.querySelector('.alias-save-status') : null;
+        const setStatus = (text) => { if (statusEl) statusEl.textContent = text; };
+        if (isReadOnly) { setStatus('Read-only mode'); return; }
+        setStatus('Saving...');
+        try {
+          const composite = {};
+          Object.keys(currentConfig.composite || {}).forEach((name) => {
+            if (name === aliasName) {
+              composite[name] = collectAliasPayload(aliasName);
+            } else if (Object.prototype.hasOwnProperty.call(savedComposite, name)) {
+              composite[name] = JSON.parse(JSON.stringify(savedComposite[name]));
+            } else {
+              composite[name] = collectAliasPayload(name);
+            }
+          });
+          const res = await dashboardFetch('/dashboard/api/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ models: collectModelsPayload(), composite }),
+          });
+          const result = await res.json();
+          if (!res.ok) throw new Error(result.error || 'Save failed');
+          savedComposite = JSON.parse(JSON.stringify(result.config.composite || {}));
+          const persisted = savedComposite[aliasName];
+          if (persisted === undefined) {
+            if (block) block.remove();
+            delete currentConfig.composite[aliasName];
+            dirtyAliases.delete(aliasName);
+          } else {
+            currentConfig.composite[aliasName] = JSON.parse(JSON.stringify(persisted));
+            renderAliasBlock(aliasName);
+          }
+          configStatus.textContent = 'Saved composite.' + aliasName + configPathHint;
+          configStatus.className = '';
+        } catch (err) {
+          setStatus('Error: ' + err.message);
+        }
+      }
+
+      // Revert one alias to its last-loaded state. An alias that was never
+      // persisted is removed from the form instead.
+      function discardCompositeAlias(aliasName) {
+        const block = document.querySelector('.config-block[data-block-id="composite.' + aliasName + '"]');
+        if (!Object.prototype.hasOwnProperty.call(savedComposite, aliasName)) {
+          if (block) block.remove();
+          delete currentConfig.composite[aliasName];
+          dirtyAliases.delete(aliasName);
+          return;
+        }
+        currentConfig.composite[aliasName] = JSON.parse(JSON.stringify(savedComposite[aliasName]));
+        renderAliasBlock(aliasName);
+      }
+
       function ensureCategory(categoryName) {
         if (!currentConfig.models[categoryName]) {
           currentConfig.models[categoryName] = { upstream_mode: '', base_url: '' };
@@ -2620,8 +2756,15 @@ export function handleDashboardPage(env: Env): Response {
       }
 
       let testResultClearTimer = null;
+      // Concurrent tests share the status panel; it rotates through the
+      // in-flight tests at a 1s interval (never faster).
+      const activeTests = new Map(); // testId -> { modelId, startTime }
+      let testRotationTimer = null;
+      let testRotationIndex = 0;
+      let testPanelDismissed = false;
 
       function showTestResult(success, modelId, status, detail, usage, elapsedMs) {
+        testPanelDismissed = false;
         const panel = document.getElementById('testResultPanel');
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
         const elapsedStr = elapsedMs ? ' (' + status + ', ' + (elapsedMs / 1000).toFixed(1) + 's)' : ' (' + status + ')';
@@ -2648,6 +2791,28 @@ export function handleDashboardPage(env: Env): Response {
         const panel = document.getElementById('testResultPanel');
         panel.style.display = 'none';
         if (testResultClearTimer) { clearTimeout(testResultClearTimer); testResultClearTimer = null; }
+        if (activeTests.size > 0) testPanelDismissed = true;
+      }
+
+      function renderTestingStatus() {
+        if (activeTests.size === 0 || testPanelDismissed) return;
+        const entries = Array.from(activeTests.values());
+        const entry = entries[testRotationIndex % entries.length];
+        testRotationIndex = (testRotationIndex + 1) % entries.length;
+        const panel = document.getElementById('testResultPanel');
+        if (testResultClearTimer) clearTimeout(testResultClearTimer);
+        panel.className = 'testing';
+        panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(entry.modelId) + ' takes ' + ((Date.now() - entry.startTime) / 1000).toFixed(1) + 's …'
+          + (entries.length > 1 ? ' <span style="opacity:0.6">(' + entries.length + ' tests running)</span>' : '');
+        panel.style.display = 'block';
+      }
+
+      function stopTestRotationTimerIfIdle() {
+        if (activeTests.size === 0 && testRotationTimer) {
+          clearInterval(testRotationTimer);
+          testRotationTimer = null;
+          testRotationIndex = 0;
+        }
       }
 
       async function testModel(modelId, btn) {
@@ -2659,18 +2824,16 @@ export function handleDashboardPage(env: Env): Response {
           btn.className = 'test-btn mini-btn testing';
           btn.textContent = '…';
         }
-        const panel = document.getElementById('testResultPanel');
         if (testResultClearTimer) clearTimeout(testResultClearTimer);
-        panel.className = 'testing';
 
-        // Timer to show elapsed seconds during testing (0.1s resolution)
+        // Register this run in the shared pool; the panel rotates through the
+        // pool once per second while more than one test is in flight.
         const startTime = Date.now();
-        const testResultTimer = setInterval(() => {
-          const elapsedS = (Date.now() - startTime) / 1000;
-          panel.innerHTML = '<button class="result-clear" onclick="clearTestResult()">x</button> Testing ' + escapeHtml(modelId) + ' takes ' + elapsedS.toFixed(1) + 's …';
-        }, 100);
-
-        panel.style.display = 'block';
+        const testId = modelId + ':' + startTime + ':' + Math.random().toString(36).slice(2);
+        activeTests.set(testId, { modelId, startTime });
+        testPanelDismissed = false;
+        if (!testRotationTimer) testRotationTimer = setInterval(renderTestingStatus, 1000);
+        renderTestingStatus();
 
         try {
           const res = await dashboardFetch('/dashboard/api/test-model', {
@@ -2685,7 +2848,8 @@ export function handleDashboardPage(env: Env): Response {
           const elapsedMs = Date.now() - startTime;
           showTestResult(false, modelId, null, err.message, null, elapsedMs);
         } finally {
-          clearInterval(testResultTimer);
+          activeTests.delete(testId);
+          stopTestRotationTimerIfIdle();
           if (btn) {
             btn.disabled = false;
             btn.className = 'test-btn mini-btn';
@@ -2745,6 +2909,18 @@ export function handleDashboardPage(env: Env): Response {
 
         currentConfig = collectConfigPayload();
         const action = target.dataset.action;
+
+        if (action === 'save-composite-alias') {
+          const alias = target.dataset.alias;
+          if (alias) void saveCompositeAlias(alias);
+          return;
+        }
+
+        if (action === 'discard-composite-alias') {
+          const alias = target.dataset.alias;
+          if (alias) discardCompositeAlias(alias);
+          return;
+        }
 
         if (action === 'add-model') {
           const category = target.dataset.category;
@@ -2921,6 +3097,9 @@ export function handleDashboardPage(env: Env): Response {
           composite: json.config.composite || {},
           schedule: json.config.schedule || {},
         };
+        // Baseline for the per-alias Save/Discard bars, before the re-render
+        // recomputes dirty states against it.
+        savedComposite = JSON.parse(JSON.stringify(currentConfig.composite));
         compositeResolved = json.compositeResolved || [];
         modelStats = json.modelStats || [];
         compositeLimitWindowsSnapshot = json.compositeLimitWindows || {};
@@ -3231,6 +3410,18 @@ export function handleDashboardPage(env: Env): Response {
       wildcardModelInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') testWildcardModel(); });
       configForm.addEventListener('click', handleConfigAction);
 
+      // Track edits to composite-alias fields so each block can offer its own
+      // Save/Discard bar (see updateAliasDirtyState).
+      function handleConfigFormEdit(event) {
+        const t = event.target;
+        if (!t || !t.dataset || !t.dataset.alias) return;
+        const kind = t.dataset.kind || '';
+        if (kind.indexOf('comp-') !== 0) return;
+        updateAliasDirtyState(t.dataset.alias);
+      }
+      configForm.addEventListener('input', handleConfigFormEdit);
+      configForm.addEventListener('change', handleConfigFormEdit);
+
       async function refreshAll() {
         await loadConfig();
         await loadModelStats();
@@ -3251,9 +3442,10 @@ export function handleDashboardPage(env: Env): Response {
 
       setInterval(() => {
         // Skip config auto-reload while a config mutation is in progress
-        // (dirty flag is set when a wizard / prompt is open) so the wizard
-        // DOM is not torn down by a concurrent re-render.
-        if (configDirty) return;
+        // (dirty flag is set when a wizard / prompt is open) or any composite
+        // alias has unsaved edits, so neither the wizard DOM nor edited alias
+        // blocks are torn down by a concurrent re-render.
+        if (configDirty || dirtyAliases.size > 0) return;
         loadConfig();
       }, 30000);
 
