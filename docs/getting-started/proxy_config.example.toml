@@ -50,16 +50,19 @@ global_token_limit = "700M 1w"
 week_start_day = "monday"
 # Store config api_keys in the OS keychain (local/dev-host use only — not for
 # Docker or Cloudflare Workers). Applies only to configured api_keys of
-# [models.*] targets (and [default_upstream].default_api_key) in this local
-# file — ignored for Consul/Apollo config sources, N/A for composite aliases,
-# and caller/user keys from request headers are never stored. On the first
-# load every plaintext api_key is saved under the `model_proxy_v3` service
-# with account "<target_model_id>/<base_url>" and this file is rewritten
+# [models.*] targets, [models.default].api_key, and [models.passthrough] keys
+# in this local file — ignored for Consul/Apollo config sources, N/A for
+# composite aliases, and caller/user keys from request headers are never stored.
+# On the first load every plaintext api_key is saved in one JSON object under
+# the `model_proxy_v3` service and reserved `__api_keys_v1__` account, with
+# properties named "<target_model_id>/<base_url>"; this file is rewritten
 # (backup: .bak) with those keys replaced by the literal STORE_KEY_IN_SYSTEM
-# sentinel; every later load resolves the sentinels back from the keychain.
-# Startup fails loud when the keychain is unavailable. Requires the
-# @github/keytar native addon (optionalDependency, fetched from GitHub; npm
-# installs a prebuilt NAPI binary — see README "System & toolchain requirements")
+# sentinel. Every later load reads only that one item, avoiding one macOS
+# permission prompt per key. Migration from legacy per-account items can still
+# prompt once per old item on its first run. Startup fails loud when the
+# keychain is unavailable. Requires the
+# @github/keytar native addon (optionalDependency, pinned to the npm registry
+# release with prebuilt NAPI binaries — see README "System & toolchain requirements")
 # — if startup then fails with "Cannot find package '@github/keytar'", see README
 # ("OS keychain key storage") for recovery (prune-style npm runs can strip the
 # declaration from package.json; restore it before reinstalling).

@@ -1,10 +1,10 @@
 /**
  * Unit tests for key-store.ts (system keychain api-key store)
  *
- * Covers: store pass (keychain accounts per target/category),
+ * Covers: single-item bundled storage, one-time legacy per-account migration,
  * file rewrite (sentinel replacement + .bak backup + comment preservation),
- * resolve pass (sentinel → key; a missing entry is reported + slot cleared, not fatal),
- * no-op when flag off,
+ * resolve pass (one native read; a missing entry is reported + slot cleared, not fatal),
+ * bundle-aware account listing, no-op when flag off,
  * and withTimeout (the bound wrapped around findCredentials — see key-store.ts
  * comment above FIND_CREDENTIALS_TIMEOUT_MS: a real hang there was observed).
  *
@@ -18,11 +18,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  KEY_STORE_BUNDLE_ACCOUNT,
   KEY_STORE_SERVICE,
   STORE_KEY_IN_SYSTEM,
+  KeyStoreError,
   applySystemKeyStore,
   findSentinelApiKeys,
   keychainAccount,
+  listSystemKeychainAccounts,
   withTimeout,
   type KeytarLike,
 } from '../../src/utils/key-store.js';
@@ -106,7 +109,7 @@ describe('applySystemKeyStore', () => {
     assert.equal(result.models?.claude && !Array.isArray(result.models.claude) ? result.models.claude.api_key : '', 'sk-cat-111');
   });
 
-  it('stores every plaintext key under <target>/<base_url> accounts', async () => {
+  it('stores every plaintext key in one bundled keychain item', async () => {
     const keytar = makeMockKeytar();
     const { path } = writeTempConfig(SAMPLE_TOML);
     const config = parseSimpleToml(SAMPLE_TOML);
@@ -114,18 +117,17 @@ describe('applySystemKeyStore', () => {
     await applySystemKeyStore(config, { configPath: path, keytarImpl: keytar });
 
     const setCalls = keytar.calls.filter((c) => c.op === 'set');
-    assert.deepEqual(
-      setCalls.map((c) => `${c.account}=${c.password}`).sort(),
-      [
-        'claude-opus-4/https://override.gpt.dev=sk-entry-222',
-        'claude/https://api.claude.dev=sk-cat-111',
-        'default/https://api.default.dev=sk-default-000',
-      ],
-    );
-    for (const c of setCalls) assert.equal(c.service, KEY_STORE_SERVICE);
+    assert.equal(setCalls.length, 1);
+    assert.equal(setCalls[0].service, KEY_STORE_SERVICE);
+    assert.equal(setCalls[0].account, KEY_STORE_BUNDLE_ACCOUNT);
+    assert.deepEqual(JSON.parse(setCalls[0].password!), {
+      'claude/https://api.claude.dev': 'sk-cat-111',
+      'claude-opus-4/https://override.gpt.dev': 'sk-entry-222',
+      'default/https://api.default.dev': 'sk-default-000',
+    });
   });
 
-  it('stores a [models.passthrough] target key under a passthrough.<name> account', async () => {
+  it('stores a [models.passthrough] target key under a passthrough.<name> bundle entry', async () => {
     const passthroughToml = `${SAMPLE_TOML}
 [models.passthrough]
 openai = {base = "https://api.openai.example", mode = "openai-completions", key = "sk-pt-333"}
@@ -137,10 +139,9 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     await applySystemKeyStore(config, { configPath: path, keytarImpl: keytar });
 
     const setCalls = keytar.calls.filter((c) => c.op === 'set');
-    assert.ok(
-      setCalls.some((c) => c.account === 'passthrough.openai/https://api.openai.example' && c.password === 'sk-pt-333'),
-      `expected the passthrough slot stored, got accounts ${JSON.stringify(setCalls.map((c) => c.account))}`,
-    );
+    assert.equal(setCalls.length, 1);
+    const bundle = JSON.parse(setCalls[0].password!);
+    assert.equal(bundle['passthrough.openai/https://api.openai.example'], 'sk-pt-333');
 
     const rewritten = readFileSync(path, 'utf-8');
     assert.ok(!rewritten.includes('sk-pt-333'), 'plaintext passthrough key removed from file');
@@ -190,9 +191,11 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
       .replace('sk-cat-111', STORE_KEY_IN_SYSTEM)
       .replace('sk-entry-222', STORE_KEY_IN_SYSTEM);
     const keytar = makeMockKeytar(new Map([
-      [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
-      [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
-      [`${KEY_STORE_SERVICE}/default/https://api.default.dev`, 'sk-default-000'],
+      [`${KEY_STORE_SERVICE}/${KEY_STORE_BUNDLE_ACCOUNT}`, JSON.stringify({
+        'claude/https://api.claude.dev': 'sk-cat-111',
+        'claude-opus-4/https://override.gpt.dev': 'sk-entry-222',
+        'default/https://api.default.dev': 'sk-default-000',
+      })],
     ]));
     const { path } = writeTempConfig(sentinelToml);
     const config = parseSimpleToml(sentinelToml);
@@ -204,15 +207,17 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     assert.equal(keytar.calls.filter((c) => c.op === 'set').length, 0);
   });
 
-  it('resolves sentinel values in-memory from the keychain', async () => {
+  it('resolves every sentinel with one bundled keychain read', async () => {
     const sentinelToml = SAMPLE_TOML
       .replace('sk-default-000', STORE_KEY_IN_SYSTEM)
       .replace('sk-cat-111', STORE_KEY_IN_SYSTEM)
       .replace('sk-entry-222', STORE_KEY_IN_SYSTEM);
     const keytar = makeMockKeytar(new Map([
-      [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
-      [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
-      [`${KEY_STORE_SERVICE}/default/https://api.default.dev`, 'sk-default-000'],
+      [`${KEY_STORE_SERVICE}/${KEY_STORE_BUNDLE_ACCOUNT}`, JSON.stringify({
+        'claude/https://api.claude.dev': 'sk-cat-111',
+        'claude-opus-4/https://override.gpt.dev': 'sk-entry-222',
+        'default/https://api.default.dev': 'sk-default-000',
+      })],
     ]));
     const config = parseSimpleToml(sentinelToml);
 
@@ -224,6 +229,38 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     assert.equal(gpt['claude-opus']![2], 'sk-entry-222');
     const defaultCat = config.models!.default as { api_key?: string };
     assert.equal(defaultCat.api_key, 'sk-default-000');
+    assert.deepEqual(keytar.calls, [
+      { op: 'get', service: KEY_STORE_SERVICE, account: KEY_STORE_BUNDLE_ACCOUNT },
+    ]);
+  });
+
+  it('migrates legacy per-account items once, then uses only the bundle', async () => {
+    const sentinelToml = SAMPLE_TOML
+      .replace('sk-default-000', STORE_KEY_IN_SYSTEM)
+      .replace('sk-cat-111', STORE_KEY_IN_SYSTEM)
+      .replace('sk-entry-222', STORE_KEY_IN_SYSTEM);
+    const keytar = makeMockKeytar(new Map([
+      [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-cat-111'],
+      [`${KEY_STORE_SERVICE}/claude-opus-4/https://override.gpt.dev`, 'sk-entry-222'],
+      [`${KEY_STORE_SERVICE}/default/https://api.default.dev`, 'sk-default-000'],
+    ]));
+
+    await applySystemKeyStore(parseSimpleToml(sentinelToml), { keytarImpl: keytar });
+
+    const setCalls = keytar.calls.filter((c) => c.op === 'set');
+    assert.equal(setCalls.length, 1);
+    assert.equal(setCalls[0].account, KEY_STORE_BUNDLE_ACCOUNT);
+    assert.deepEqual(JSON.parse(setCalls[0].password!), {
+      'claude/https://api.claude.dev': 'sk-cat-111',
+      'claude-opus-4/https://override.gpt.dev': 'sk-entry-222',
+      'default/https://api.default.dev': 'sk-default-000',
+    });
+
+    keytar.calls.length = 0;
+    await applySystemKeyStore(parseSimpleToml(sentinelToml), { keytarImpl: keytar });
+    assert.deepEqual(keytar.calls, [
+      { op: 'get', service: KEY_STORE_SERVICE, account: KEY_STORE_BUNDLE_ACCOUNT },
+    ]);
   });
 
   it('falls back to a best-effort base_url match when the exact account is missing', async () => {
@@ -237,7 +274,9 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
 "glm-5.3-anth" = ["glm-5.3-anth", "", "${STORE_KEY_IN_SYSTEM}"]
 `;
     const keytar = makeMockKeytar(new Map([
-      [`${KEY_STORE_SERVICE}/glm-5.3/https://open.bigmodel.cn/api`, 'sk-glm-KEY'],
+      [`${KEY_STORE_SERVICE}/${KEY_STORE_BUNDLE_ACCOUNT}`, JSON.stringify({
+        'glm-5.3/https://open.bigmodel.cn/api': 'sk-glm-KEY',
+      })],
     ]));
     const config = parseSimpleToml(toml);
 
@@ -245,6 +284,9 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
 
     const glm = config.models!.glm as { 'glm-5.3-anth'?: string[] };
     assert.equal(glm['glm-5.3-anth']![2], 'sk-glm-KEY');
+    assert.deepEqual(keytar.calls, [
+      { op: 'get', service: KEY_STORE_SERVICE, account: KEY_STORE_BUNDLE_ACCOUNT },
+    ]);
   });
 
   it('prefers exact base_url and target when multiple best-effort candidates exist', async () => {
@@ -343,6 +385,50 @@ base_url = "https://open.bigmodel.cn/api/anthropic"
     const reloaded = parseSimpleToml(readFileSync(path, 'utf-8'));
     await applySystemKeyStore(reloaded, { configPath: path, keytarImpl: keytar });
     assert.equal((reloaded.models!.claude as { api_key?: string }).api_key, 'sk-cat-111');
+  });
+
+  it('fails loud when the bundled keychain item is malformed', async () => {
+    for (const payload of ['not json', '[]', '{"claude/https://api.claude.dev":42}']) {
+      const keytar = makeMockKeytar(new Map([
+        [`${KEY_STORE_SERVICE}/${KEY_STORE_BUNDLE_ACCOUNT}`, payload],
+      ]));
+      await assert.rejects(
+        () => applySystemKeyStore(parseSimpleToml(SAMPLE_TOML), { keytarImpl: keytar }),
+        (err) => err instanceof KeyStoreError && /keychain bundle/.test(err.message),
+      );
+    }
+  });
+});
+
+describe('listSystemKeychainAccounts', () => {
+  it('lists logical accounts from the bundle with one keychain read', async () => {
+    const keytar = makeMockKeytar(new Map([
+      [`${KEY_STORE_SERVICE}/${KEY_STORE_BUNDLE_ACCOUNT}`, JSON.stringify({
+        'gpt/https://api.gpt.dev': 'sk-gpt',
+        'claude/https://api.claude.dev': 'sk-claude',
+      })],
+    ]));
+
+    assert.deepEqual(await listSystemKeychainAccounts({ keytarImpl: keytar }), [
+      'claude/https://api.claude.dev',
+      'gpt/https://api.gpt.dev',
+    ]);
+    assert.deepEqual(keytar.calls, [
+      { op: 'get', service: KEY_STORE_SERVICE, account: KEY_STORE_BUNDLE_ACCOUNT },
+    ]);
+  });
+
+  it('falls back to legacy per-account enumeration when no bundle exists', async () => {
+    const keytar = makeMockKeytar(new Map([
+      [`${KEY_STORE_SERVICE}/gpt/https://api.gpt.dev`, 'sk-gpt'],
+      [`${KEY_STORE_SERVICE}/claude/https://api.claude.dev`, 'sk-claude'],
+    ]));
+
+    assert.deepEqual(await listSystemKeychainAccounts({ keytarImpl: keytar }), [
+      'claude/https://api.claude.dev',
+      'gpt/https://api.gpt.dev',
+    ]);
+    assert.deepEqual(keytar.calls.map((c) => c.op), ['get', 'find']);
   });
 });
 

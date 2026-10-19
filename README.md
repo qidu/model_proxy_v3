@@ -741,38 +741,55 @@ The full field-by-field reference lives in
   `[transforms.*]` / `[transforms.default]`, `[privacy_filter]`, `[models.decision]`,
   `[dashboard]`, `[models.passthrough]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
-  config `api_key` into the OS keychain (accounts `<target_model_id>/<base_url>` under
-  the `model_proxy_v3` service) and rewrites the config file to `STORE_KEY_IN_SYSTEM`
-  sentinels; sentinels are resolved from the keychain on every later load, silently, as
-  long as the same `node` binary/path keeps reading them — a Node upgrade or a different
-  binary path can trigger a one-time OS keychain prompt or a fatal `KeyStoreError` if
-  keychain *access* is denied. A single sentinel with no matching keychain entry is not
-  fatal: that slot is cleared (treated as unconfigured, so the normal api_key fallback
-  applies) and reported as a config error in the TUI/dashboard/console, letting the rest
-  of the models load and the proxy start. Scope:
+  config `api_key` into one JSON object stored as a single OS keychain item (service
+  `model_proxy_v3`, account `__api_keys_v1__`), with properties named by the logical
+  accounts `<target_model_id>/<base_url>`. The config file is rewritten to
+  `STORE_KEY_IN_SYSTEM` sentinels; every later load reads only that one item, so macOS
+  authorization is scoped to one item rather than prompting separately for every key.
+  Access remains silent as long as the same `node` binary/path keeps reading it — a Node
+  upgrade or a different binary path can trigger a one-time OS keychain prompt or a fatal
+  `KeyStoreError` if keychain *access* is denied. Existing per-account installs are
+  migrated automatically when no bundle exists; that one-time migration must read each
+  old item and can still prompt once per old item (click "Always Allow"). Old items are
+  left in place, and subsequent loads use only the bundle. A single sentinel with no
+  matching keychain entry is not fatal: that slot is cleared (treated as unconfigured, so
+  the normal api_key fallback applies) and reported as a config error in the
+  TUI/dashboard/console, letting the rest of the models load and the proxy start. Scope:
   configured api_keys of `[models.*]` targets, `[models.default].api_key`,
   and `[models.passthrough]` target `key`s
   in the local `proxy_config.toml` only — ignored for Consul/Apollo sources, N/A for
   composite aliases, and caller/user keys from request headers are never stored.
-  Local/dev-host feature only — fails loud when no OS keychain is available (Docker,
+  **Per-user isolation and `su` warning:** OS credential stores are isolated per OS
+  user. A bundle written by macOS user `chris` is not visible to `claw`; the same
+  `model_proxy_v3` / `__api_keys_v1__` names refer to separate items in each user's
+  Keychain. On macOS, `su claw` (or `su - claw`) changes the Unix UID but does not
+  create the target user's full GUI security session, so `claw` may have no default or
+  unlocked login Keychain and repeatedly report `__api_keys_v1__` as missing. Run the
+  proxy in the full login session of the user whose keys should be used, or store a
+  separate bundle for that user after logging in normally; do not copy Keychain database
+  files between users. Different binaries under the same user can each require a
+  one-time "Always Allow" authorization. Local/dev-host feature only — fails loud when
+  no OS keychain is available (Docker,
   Cloudflare Workers). Backed by the `@github/keytar` native addon, pinned in
-  `optionalDependencies` as `github:github/node-keytar#v7.10.6`: `npm install` fetches
-  it from GitHub and its install script downloads a prebuilt NAPI binary — no compiler
-  or Python needed (see the toolchain note below). A source copy is kept at
-  `submodules/node-keytar` for local development; it is not used by `npm install`.
-  If startup fails with `Cannot find package '@github/keytar'`, first check
-  `git diff package.json`: npm prune-style runs (`--dry-run --omit=dev`,
+  `optionalDependencies` as `@github/keytar@7.10.6` from the npm registry. The package
+  includes prebuilt NAPI binaries and its install script copies the current platform's
+  binary into place — no compiler or Python needed (see the toolchain note below). A
+  source copy is kept at `submodules/node-keytar` for local development; it is not used
+  by `npm install`. If startup fails with `Cannot find package '@github/keytar'`, first
+  check `git diff package.json`: npm prune-style runs (`--dry-run --omit=dev`,
   `--production` — see the warning in Quick Start) can strip the
   `optionalDependencies` block, after which no `npm install` ever re-fetches the
-  addon; restore it with `git checkout -- package.json && npm install`.
-  When a sentinel's exact `<target>/<base_url>` account isn't found, resolution
-  falls back to a best-effort search across every stored account for the service
-  (`keytar.findCredentials`) — on macOS this broader enumeration can trigger its
-  own Keychain Access permission prompt in a separate GUI window (not the
-  terminal); if startup appears to hang here, check for that dialog and click
-  "Always Allow". This fallback call is bounded to 60s — if it doesn't respond
-  in time (e.g. a stuck/dismissed dialog), it fails loud with a clear timeout
-  error instead of hanging the process indefinitely.
+  addon; restore it with `git checkout -- package.json && npm install`. If startup
+  instead fails with `Failed to load keytar native addon`, reinstall the registry
+  prebuild with `npm install @github/keytar@7.10.6 --save-optional --save-exact --force`;
+  a plain `npm install` can retain an older same-version Git checkout that has no binary.
+  When a sentinel's exact `<target>/<base_url>` property isn't found in the bundle,
+  resolution falls back to a best-effort match across the other bundled properties,
+  without another keychain read. Only one-time legacy migration still uses broad
+  enumeration (`keytar.findCredentials`) for old per-account items; on macOS that can
+  trigger Keychain Access permission prompts in a separate GUI window (not the terminal).
+  This legacy fallback is bounded to 60s and reports a clear timeout error instead of
+  hanging the process indefinitely.
 - **`store_key_in_system` in the win32 single-executable build** — `@github/keytar`
   needs too many dependencies on Windows (Visual Studio Build Tools with the "Desktop
   development with C++" workload + Python 3, via node-gyp — see the toolchain table
@@ -792,21 +809,21 @@ The full field-by-field reference lives in
   target a Node install. macOS and Linux keep the OS keychain via `@github/keytar`;
   the Docker image and macOS/Linux SEA binaries keep the fatal `KeyStoreError`.
 - **System & toolchain requirements for `store_key_in_system = true`** — the feature
-  needs an OS keychain backend at run time. On macOS/Linux the `@github/keytar` native
-  addon installs as a prebuilt NAPI binary (ABI 3 — works on any modern Node), so no
-  build toolchain is required; a native toolchain (Python 3 + a C++ compiler, via
-  node-gyp) is needed only when the prebuilt download fails (e.g. no network access to
-  GitHub releases) and npm falls back to compiling the addon from source. On Windows
-  the addon needs that toolchain in the normal case — Visual Studio Build Tools with
-  the "Desktop development with C++" workload + Python 3 — which is why the win32
-  **single-executable build** skips keytar entirely and stores the keys in the
-  executable's own file body instead (see the bullet above):
+  needs an OS keychain backend at run time. For regular Node installs on macOS, Linux,
+  and Windows, the npm registry's `@github/keytar` package includes a prebuilt NAPI
+  binary (ABI 3 — works on any modern Node), so no build toolchain is normally required.
+  A native toolchain (Python 3 + a C++ compiler, via node-gyp) is needed only when npm
+  falls back to compiling from source, such as on an unsupported platform/architecture.
+  The Windows source-build fallback requires Visual Studio Build Tools with the
+  "Desktop development with C++" workload + Python 3. The win32 **single-executable
+  build** still skips keytar entirely and stores the keys in the executable's own file
+  body instead (see the bullet above):
 
   | Platform | Runtime requirement (OS keychain) | Node build toolchain (node-gyp) |
   |---|---|---|
   | macOS | Keychain Services (built in) | Xcode Command Line Tools (`xcode-select --install`) + Python 3 — only for the source-build fallback |
   | Linux | a Secret Service provider — `gnome-keyring` (or KWallet) daemon running, with `libsecret-1` | `build-essential` (gcc/g++/make) + Python 3 + `libsecret-1-dev` headers — only for the source-build fallback |
-  | Windows — `node dist/server.js` | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 |
+  | Windows — `node dist/server.js` | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 — only for the source-build fallback |
   | Windows — single-executable build | **not used** — no OS keychain, keys go in the executable's own file body (see the bullet above) | **not needed** — keytar is not installed |
 
   Headless Linux servers need a keyring daemon unlocked in the session (e.g.

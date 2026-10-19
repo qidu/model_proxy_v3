@@ -9,8 +9,11 @@
  * back from the keychain into the in-memory config, so the synchronous
  * routing code keeps working with real keys.
  *
- * Keychain account format: `<target_model_id>/<base_url>` under the
- * `model_proxy_v3` service.
+ * Keychain format: one JSON object under the reserved `__api_keys_v1__`
+ * account in the `model_proxy_v3` service. Its properties map the logical
+ * `<target_model_id>/<base_url>` accounts to api_keys, so a normal load reads
+ * one keychain item regardless of key count. Legacy per-account items are
+ * migrated only when no bundle exists, then left untouched.
  *
  * This is a local/dev-host feature: the keytar native addon requires an OS
  * keychain (no Docker/distroless, no Cloudflare Workers). When the feature is
@@ -45,6 +48,7 @@ import { tryBodyKeyStore } from './body-key-store.js';
 import type { ModelCategoryConfig, ProxyConfig } from './config-loader.js';
 
 export const KEY_STORE_SERVICE = 'model_proxy_v3';
+export const KEY_STORE_BUNDLE_ACCOUNT = '__api_keys_v1__';
 export const STORE_KEY_IN_SYSTEM = 'STORE_KEY_IN_SYSTEM';
 
 /** Minimal keytar surface used here (subset of @github/keytar's API). */
@@ -58,6 +62,32 @@ export interface KeytarLike {
 /** Fatal error: loadProxyConfig must rethrow instead of degrading to `{}`. */
 export class KeyStoreError extends Error {
   fatal = true;
+}
+
+type KeyBundle = Map<string, string>;
+
+async function readKeyBundle(keytar: KeytarLike): Promise<KeyBundle | null> {
+  const serialized = await keytar.getPassword(KEY_STORE_SERVICE, KEY_STORE_BUNDLE_ACCOUNT);
+  if (serialized === null) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch (err) {
+    throw new KeyStoreError(`system keychain bundle "${KEY_STORE_BUNDLE_ACCOUNT}" is not valid JSON: ${(err as Error).message}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new KeyStoreError(`system keychain bundle "${KEY_STORE_BUNDLE_ACCOUNT}" must be a JSON object`);
+  }
+
+  const bundle: KeyBundle = new Map();
+  for (const [account, key] of Object.entries(parsed)) {
+    if (typeof key !== 'string') {
+      throw new KeyStoreError(`system keychain bundle "${KEY_STORE_BUNDLE_ACCOUNT}" has a non-string key for account "${account}"`);
+    }
+    bundle.set(account, key);
+  }
+  return bundle;
 }
 
 const isNodeEnvironment = typeof process !== 'undefined' && process.versions?.node;
@@ -202,20 +232,16 @@ export interface UnresolvedKeySentinel {
 /**
  * Apply the system key store to a freshly parsed config (mutates in place):
  *
- * 1. Store pass — every plaintext api_key is written to the keychain under
- *    `<target_model_id>/<base_url>`.
- * 2. File rewrite — when `configPath` is given and at least one key was
- *    stored, the file is backed up to `<configPath>.bak` and each quoted
- *    plaintext key literal is replaced with `"STORE_KEY_IN_SYSTEM"`
- *    (targeted text replacement; comments and layout are preserved).
- * 3. Resolve pass — every `STORE_KEY_IN_SYSTEM` sentinel is replaced
- *    in-memory with the key fetched from the keychain. A slot whose sentinel
- *    cannot be resolved is cleared to `''` (same as "not configured" — every
- *    consumer of these slots falls back to the next key in the chain, or to
- *    caller-supplied/user_key auth) and recorded in the returned
- *    `unresolved` list instead of failing the whole config load; the
- *    keychain itself being unavailable (`loadKeytar` failure) is still fatal,
- *    since that affects every sentinel, not just one.
+ * 1. Read the single JSON bundle once. Plaintext api_keys are added under
+ *    their logical `<target_model_id>/<base_url>` property.
+ * 2. Resolve every `STORE_KEY_IN_SYSTEM` sentinel from the bundle, using the
+ *    existing best-effort account match on an exact miss. If no bundle exists,
+ *    legacy per-account items are read and migrated into the bundle. A slot
+ *    whose sentinel cannot be resolved is cleared to `''` and reported without
+ *    blocking the rest of the config.
+ * 3. Write the bundle at most once, then rewrite plaintext file values to
+ *    sentinels (with a `<configPath>.bak` backup). Keeping the bundle in one
+ *    keychain item avoids one macOS permission prompt per logical api_key.
  *
  * No-op when `store_key_in_system` is not true or outside Node.js.
  */
@@ -229,18 +255,82 @@ export async function applySystemKeyStore(
 
   const keytar = await loadKeytar(opts);
   const slots = collectKeySlots(config);
+  const storedBundle = await readKeyBundle(keytar);
+  const bundle: KeyBundle = new Map(storedBundle ?? []);
+  let bundleDirty = false;
 
-  // 1. Store pass: plaintext keys → keychain.
   const storedRawKeys: string[] = [];
+  const storedSlots: KeySlot[] = [];
   for (const slot of slots) {
     const raw = slot.get();
     if (!raw || raw === STORE_KEY_IN_SYSTEM) continue;
-    await keytar.setPassword(KEY_STORE_SERVICE, slot.account, raw);
+    bundle.set(slot.account, raw);
+    bundleDirty = true;
     storedRawKeys.push(raw);
-    console.info(`[key-store] stored ${slot.location} → keychain account "${slot.account}"`);
+    storedSlots.push(slot);
   }
 
-  // 2. File rewrite: quoted plaintext literals → sentinel.
+  let resolvedCount = 0;
+  const unresolved: UnresolvedKeySentinel[] = [];
+  for (const slot of slots) {
+    if (slot.get() !== STORE_KEY_IN_SYSTEM) continue;
+
+    const bundled = bundle.get(slot.account);
+    let resolved: { key: string; account: string } | null = bundled === undefined
+      ? null
+      : { key: bundled, account: slot.account };
+
+    if (!resolved && storedBundle === null) {
+      const exact = await keytar.getPassword(KEY_STORE_SERVICE, slot.account);
+      if (exact !== null) resolved = { key: exact, account: slot.account };
+    }
+
+    if (!resolved) {
+      resolved = findBestCredential(
+        [...bundle].map(([account, password]) => ({ account, password })),
+        slot.account,
+      );
+    }
+
+    if (!resolved && storedBundle === null) {
+      // Legacy migration only. findCredentials reads every old item's data and
+      // can therefore produce one macOS permission dialog per legacy item.
+      console.log(`[key-store] no exact keychain match for "${slot.account}" — searching all stored keys` +
+        ' (if this pauses, check for a macOS Keychain Access permission dialog and click "Always Allow")');
+      resolved = await findBestEffortKey(keytar, slot.account);
+    }
+
+    if (!resolved) {
+      const message = `${slot.location} is "${STORE_KEY_IN_SYSTEM}" but no key was found in the system keychain` +
+        ` (service "${KEY_STORE_SERVICE}", account "${slot.account}" — exact and best-effort base_url match)`;
+      console.error(`[key-store] ${message}`);
+      slot.set('');
+      unresolved.push({ location: slot.location, message });
+      continue;
+    }
+
+    if (storedBundle === null && bundle.get(slot.account) !== resolved.key) {
+      bundle.set(slot.account, resolved.key);
+      bundleDirty = true;
+    }
+    if (resolved.account !== slot.account) {
+      console.warn(`[key-store] exact keychain account "${slot.account}" not found — using best-effort match "${resolved.account}"`);
+    }
+    slot.set(resolved.key);
+    resolvedCount++;
+  }
+
+  if (bundleDirty) {
+    await keytar.setPassword(
+      KEY_STORE_SERVICE,
+      KEY_STORE_BUNDLE_ACCOUNT,
+      JSON.stringify(Object.fromEntries(bundle)),
+    );
+    for (const slot of storedSlots) {
+      console.info(`[key-store] stored ${slot.location} → keychain bundle entry "${slot.account}"`);
+    }
+  }
+
   if (opts.configPath && storedRawKeys.length > 0) {
     const content = readFileSync(opts.configPath, 'utf-8');
     copyFileSync(opts.configPath, `${opts.configPath}.bak`);
@@ -250,48 +340,6 @@ export async function applySystemKeyStore(
     }
     writeFileSync(opts.configPath, rewritten);
     console.info(`[key-store] replaced ${storedRawKeys.length} api_key(s) with "${STORE_KEY_IN_SYSTEM}" in ${opts.configPath} (backup: ${opts.configPath}.bak)`);
-  }
-
-  // 3. Resolve pass: sentinel → real key from keychain. Exact account match
-  // first; on miss, best-effort fallback over every account under the
-  // service, scored by base_url similarity (prefix relation) with target-name
-  // similarity as tiebreaker — e.g. wanted "glm-5.3-anth/https://…/api/anthropic"
-  // can fall back to "glm-5.3/https://…/api". Every fallback use is warned.
-  let resolvedCount = 0;
-  const unresolved: UnresolvedKeySentinel[] = [];
-  for (const slot of slots) {
-    if (slot.get() !== STORE_KEY_IN_SYSTEM) continue;
-    const exact = await keytar.getPassword(KEY_STORE_SERVICE, slot.account);
-    let resolved: { key: string; account: string } | null;
-    if (exact !== null) {
-      resolved = { key: exact, account: slot.account };
-    } else {
-      // No exact match — falls back to findCredentials, which enumerates every
-      // keychain item for this service. Unlike the scoped getPassword lookup
-      // above, this broader call can trigger a macOS Keychain Access GUI
-      // prompt ("model_proxy_v3 wants to access your keychain...") that
-      // renders in its own window, not this terminal — print a notice first
-      // so a silent wait here isn't mistaken for a genuine hang (Rule 8).
-      console.log(`[key-store] no exact keychain match for "${slot.account}" — searching all stored keys` +
-        ' (if this pauses, check for a macOS Keychain Access permission dialog and click "Always Allow")');
-      resolved = await findBestEffortKey(keytar, slot.account);
-    }
-    if (!resolved) {
-      // Unresolvable sentinel: clear this one slot (same as "not configured"
-      // — downstream `||` fallback chains treat '' like undefined) and record
-      // it instead of throwing, so the rest of the config still loads.
-      const message = `${slot.location} is "${STORE_KEY_IN_SYSTEM}" but no key was found in the system keychain` +
-        ` (service "${KEY_STORE_SERVICE}", account "${slot.account}" — exact and best-effort base_url match)`;
-      console.error(`[key-store] ${message}`);
-      slot.set('');
-      unresolved.push({ location: slot.location, message });
-      continue;
-    }
-    if (resolved.account !== slot.account) {
-      console.warn(`[key-store] exact keychain account "${slot.account}" not found — using best-effort match "${resolved.account}"`);
-    }
-    slot.set(resolved.key);
-    resolvedCount++;
   }
 
   // Internal marker (underscore-prefixed, like _validationErrors) consumed by
@@ -306,13 +354,19 @@ export async function applySystemKeyStore(
 }
 
 /**
- * List every keychain account (`<target_model_id>/<base_url>`) stored under
- * the proxy's service — used by the TUI 'K' overlay. Throws with a clear
- * message when the system keychain / native addon is unavailable.
+ * List every logical account (`<target_model_id>/<base_url>`) stored under the
+ * proxy's service — used by the TUI 'K' overlay. A bundled store needs only
+ * the single bundle read; findCredentials is just the legacy fallback.
  */
-export async function listSystemKeychainAccounts(): Promise<string[]> {
+export async function listSystemKeychainAccounts(
+  opts: { keytarImpl?: KeytarLike } = {},
+): Promise<string[]> {
   try {
-    const keytar = await loadKeytar({});
+    const keytar = await loadKeytar(opts);
+    const bundle = await readKeyBundle(keytar);
+    if (bundle !== null) {
+      return [...bundle.keys()].sort((a, b) => a.localeCompare(b));
+    }
     if (!keytar.findCredentials) {
       throw new Error('keytar build does not support findCredentials');
     }
@@ -322,7 +376,10 @@ export async function listSystemKeychainAccounts(): Promise<string[]> {
       `keytar.findCredentials("${KEY_STORE_SERVICE}") did not respond within ${FIND_CREDENTIALS_TIMEOUT_MS / 1000}s` +
         ' (check for a stuck macOS Keychain Access permission dialog)',
     );
-    return credentials.map((c) => c.account).sort((a, b) => a.localeCompare(b));
+    return credentials
+      .filter((c) => c.account !== KEY_STORE_BUNDLE_ACCOUNT)
+      .map((c) => c.account)
+      .sort((a, b) => a.localeCompare(b));
   } catch (err) {
     throw new Error(`Cannot list system keychain keys: ${(err as Error).message}`);
   }
@@ -382,7 +439,22 @@ function scoreAccountMatch(wanted: string, candidate: string): number {
   return baseScore + targetScore;
 }
 
-/** Best-effort key lookup: enumerate all accounts under the service. */
+function findBestCredential(
+  credentials: Array<{ account: string; password: string }>,
+  wantedAccount: string,
+): { key: string; account: string } | null {
+  let best: { key: string; account: string; score: number } | null = null;
+  for (const { account, password } of credentials) {
+    const score = scoreAccountMatch(wantedAccount, account);
+    if (score < 0) continue;
+    if (!best || score > best.score || (score === best.score && account < best.account)) {
+      best = { key: password, account, score };
+    }
+  }
+  return best ? { key: best.key, account: best.account } : null;
+}
+
+/** Legacy best-effort key lookup: enumerate all per-account items. */
 async function findBestEffortKey(keytar: KeytarLike, wantedAccount: string): Promise<{ key: string; account: string } | null> {
   if (!keytar.findCredentials) return null;
   let credentials: Array<{ account: string; password: string }>;
@@ -397,13 +469,8 @@ async function findBestEffortKey(keytar: KeytarLike, wantedAccount: string): Pro
     console.warn(`[key-store] best-effort lookup for "${wantedAccount}" failed: ${(err as Error).message}`);
     return null;
   }
-  let best: { key: string; account: string; score: number } | null = null;
-  for (const { account, password } of credentials) {
-    const score = scoreAccountMatch(wantedAccount, account);
-    if (score < 0) continue;
-    if (!best || score > best.score || (score === best.score && account < best.account)) {
-      best = { key: password, account, score };
-    }
-  }
-  return best ? { key: best.key, account: best.account } : null;
+  return findBestCredential(
+    credentials.filter((c) => c.account !== KEY_STORE_BUNDLE_ACCOUNT),
+    wantedAccount,
+  );
 }

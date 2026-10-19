@@ -47,7 +47,7 @@
     "typescript": "^5.9.3"
   },
   "optionalDependencies": {
-    "@github/keytar": "github:github/node-keytar#v7.10.6"
+    "@github/keytar": "7.10.6"
   },
   "peerDependencies": {
     "wrangler": "^4.60.0"
