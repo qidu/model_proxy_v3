@@ -5,6 +5,23 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### docs(api): gap analysis of `/v1/responses` against the Open Responses specification (2026-04-24)
+
+`docs/api/review-for-gaps-to-the-open-responses-spec.md` — new review document comparing the `/v1/responses` implementation against `docs/api/spec-of-open-responses-2026-04-24.mdx.txt`. Sixteen items, each with the spec quote (line-cited), current behavior with `file:line` evidence, the minimal fix, and a status; plus a scope rule, a verified-compliant list, a status summary table, and an implementation order.
+Analysis only; no code changed. 
+
+### fix(deps): install Keytar's platform prebuilds from the npm registry
+
+`package.json`, `README.md`, `docs/reference/configuration-reference.md`, `docs/getting-started/proxy_config.example.toml` — the optional `@github/keytar` dependency is now pinned to the exact npm registry release `7.10.6` instead of the same-version GitHub tag. The Git checkout contains no `prebuilds/` or `build/Release/keytar.node`, so macOS failed at startup with `Failed to load keytar native addon`; the registry tarball includes `darwin-arm64` and the other platform binaries, and its install script copies the active one into `build/Release`. Existing same-version Git checkouts may need the documented explicit reinstall once because a plain `npm install` can consider them up to date.
+
+**Verification status**: registry `darwin-arm64` prebuild installed successfully, `import('@github/keytar')` passed, a read-only native macOS lookup of a deliberately missing item returned `null`, `npm run typecheck` (pass), `npm run build` (pass), and `npm run test:unit` — **1608 tests, 1608 pass, 0 fail** — executed on this tree.
+
+### fix(config): consolidate system keychain keys into one item
+
+`src/utils/key-store.ts`, `tests/unit/key-store.test.ts`, `README.md`, `docs/reference/configuration-reference.md`, `docs/getting-started/proxy_config.example.toml` — all logical `<target_model_id>/<base_url>` api_keys now live in one JSON object under the reserved `__api_keys_v1__` account in the existing `model_proxy_v3` service. Normal sentinel resolution performs one native keychain read regardless of key count, so macOS item authorization no longer prompts separately for every key; best-effort fallback and the TUI account list read the same bundle. Existing per-account items are migrated automatically when no bundle exists and left in place afterward. The one-time migration still has to read each legacy item and can therefore produce one prompt per old item.
+
+**Verification status**: focused key-store/body-key-store tests (**31 tests, 31 pass, 0 fail**), `npm run typecheck` (pass), `npm run build` (pass), and `npm run test:unit` — **1608 tests, 1608 pass, 0 fail** — executed on this tree. The real macOS GUI permission dialog was not exercised by automated tests.
+
 ### fix(config): remove deprecated `[tool_judge_sidecar]`, `[transform_defaults]`, `[decision]`, `[passthrough]` section headers
 
 `src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `tests/unit/transforms-config.test.ts`, `docs/getting-started/validating_tool_judge_sidecar.md` — the back-compat branches for the four old section headers are deleted. They now fall through to the generic unknown-section branch like any unsupported header: their keys are ignored, the config field stays unset, and an "unknown section header … keys under it are ignored" warning is recorded in `_validationWarnings` (surfaced in the TUI/dashboard status). The canonical headers `[tool_judge]`, `[transforms.default]`, `[models.decision]`, `[models.passthrough]` are unchanged, as are the `[models.decision.x]` / `[models.passthrough.x]` / `[transforms.default.x]` third-part guards.

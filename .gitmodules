@@ -10,3 +10,6 @@
 [submodule "submodules/laya-mlx"]
 	path = submodules/laya-mlx
 	url = git@github.com:qidu/laya-mlx.git
+[submodule "submodules/openresponses"]
+	path = submodules/openresponses
+	url = git@github.com:openresponses/openresponses.git
