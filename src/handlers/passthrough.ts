@@ -8,6 +8,7 @@
 import type { Env, Logger } from '../types/shared.js';
 import { logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import { addForwardedHeaders, sanitizeUpstreamResponseHeaders, formatApiKeyForUpstream } from '../utils/routing.js';
+import { extractRawCredential } from '../utils/auth-headers.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount, extractUsageFromResponsePayload, recordModelUsage, createUsageTrackingTransformStream, UsageStats } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
@@ -93,11 +94,7 @@ function buildPlainJoinUrl(base: string, upstreamPath: string, queryString: stri
  * explicit Gemini key when present, otherwise unwrap the Bearer token.
  */
 function extractCallerKey(authHeaders: Record<string, string>): string | undefined {
-  const goog = authHeaders['x-goog-api-key'];
-  if (goog) return goog.startsWith('Bearer ') ? goog.slice(7) : goog;
-  const auth = authHeaders['Authorization'];
-  if (auth) return auth.startsWith('Bearer ') ? auth.slice(7) : auth;
-  return undefined;
+  return extractRawCredential(authHeaders, 'goog-api-key-first');
 }
 
 export async function handlePassthroughRequest(

@@ -13,7 +13,7 @@ environment.
 | `budget_to_effort_low` | `32768` | Thinking-budget threshold (tokens) below which `reasoning_effort: "low"` is emitted for upstreams that use effort levels instead of token budgets. |
 | `budget_to_effort_medium` | `65536` | Threshold above `low` and below this → `reasoning_effort: "medium"`. |
 | `budget_to_effort_high` | `128000` | Threshold above `medium` → `reasoning_effort: "high"`. Set to `0` to always emit `"high"`. |
-| `store_key_in_system` | `true` | Store config `api_key` values in the OS keychain (macOS Keychain / Windows Credential Vault / Linux Secret Service). Applies ONLY to configured api_keys of `[models.*]` targets, `[default_upstream].default_api_key`, and `[passthrough]` target `key`s in the local `proxy_config.toml` file — not to Consul/Apollo config-center sources (flag ignored there; a `STORE_KEY_IN_SYSTEM` sentinel in a Consul/Apollo config is a fatal load error), not to composite/schedule aliases (they carry no api_key), and never to caller/user keys from request headers (empty api_key = auth passthrough is skipped). On config load, plaintext keys are saved under the `model_proxy_v3` service with account `<target_model_id>/<base_url>` (a `[passthrough]` target has no model id, so its account is `passthrough.<name>/<base>`), and the config file is rewritten (backup: `<config>.bak`) replacing each key with the literal `STORE_KEY_IN_SYSTEM` sentinel; sentinels are resolved back from the keychain on every later load. On an exact-account miss the resolve pass falls back to a best-effort match over all accounts under the service, scored by base_url similarity (prefix relation, e.g. `glm-5.3/https://…/api` can serve a wanted `glm-5.3-anth/https://…/api/anthropic`; base_url dominates, target-name similarity tiebreaks) and logs a warning per fallback; when nothing matches, that one slot is cleared (treated as unconfigured, so the normal api_key fallback chain applies) and reported as a config error in the TUI/dashboard/console — it is NOT fatal, so the remaining models still load and the proxy still starts. (The keychain itself being unavailable, or per-item access being denied, is still a fatal `KeyStoreError`.) Local/dev-host feature only — requires the `@github/keytar` native addon, pinned in `optionalDependencies` as `github:github/node-keytar#v7.10.6`: `npm install` fetches it from GitHub and its install script downloads a prebuilt NAPI binary (ABI 3 — works on any modern Node, no compiler or Python needed; node-gyp compiles from source only as the fallback when the prebuilt download fails, e.g. no network access to GitHub releases); if startup fails with `Cannot find package '@github/keytar'`, first check `git diff package.json` — npm prune-style runs (`--dry-run --omit=dev`, `--production`) can strip the `optionalDependencies` block, after which no `npm install` ever re-fetches the addon; restore with `git checkout -- package.json && npm install`. A source copy of the addon is kept at `submodules/node-keytar` for local development — it is NOT used by `npm install`. Fails loud (refuses to start) when the keychain is unavailable, e.g. in Docker or Cloudflare Workers (the Dockerfile installs with `--omit=optional --ignore-scripts`). Exception — the **win32 single-executable (SEA) build**: `@github/keytar` needs too many dependencies on Windows (Visual Studio Build Tools with the C++ workload + Python 3, via node-gyp), so there the executable instead stores the keys **in its own file body** (`process.execPath`) as plaintext records appended at EOF — that is portability (a self-contained single file), not secrecy; it needs a writable directory next to the exe and is wiped by a rebuild. macOS and Linux keep the OS keychain via `@github/keytar`; macOS/Linux SEA binaries and Docker/Workers keep the fatal error. Keychain access itself is silent — macOS grants read access per-item to whichever binary wrote it, so the same `node` binary/path resolves sentinels without a password prompt on every run. Upgrading Node (or invoking through a different binary path, e.g. `npx` vs. a global install) changes that code identity: macOS may show a one-time keychain access prompt for the new binary, or in stricter setups silently deny access — surfacing here as a fatal `KeyStoreError` rather than a prompt. |
+| `store_key_in_system` | `true` | Store config `api_key` values in the OS keychain (macOS Keychain / Windows Credential Vault / Linux Secret Service). Applies ONLY to configured api_keys of `[models.*]` targets, `[models.default].api_key`, and `[models.passthrough]` target `key`s in the local `proxy_config.toml` file — not to Consul/Apollo config-center sources (flag ignored there; a `STORE_KEY_IN_SYSTEM` sentinel in a Consul/Apollo config is a fatal load error), not to composite/schedule aliases (they carry no api_key), and never to caller/user keys from request headers (empty api_key = auth passthrough is skipped). On config load, plaintext keys are saved as properties of one JSON object under the `model_proxy_v3` service and reserved `__api_keys_v1__` account. Property names use the logical account `<target_model_id>/<base_url>` (a `[models.passthrough]` target has no model id, so its property is `passthrough.<name>/<base>`), and the config file is rewritten (backup: `<config>.bak`) replacing each key with the literal `STORE_KEY_IN_SYSTEM` sentinel. Every later load reads only that one bundle, avoiding one macOS item-authorization prompt per key. On an exact-property miss the resolve pass falls back to a best-effort match over the other bundled properties, scored by base_url similarity (prefix relation, e.g. `glm-5.3/https://…/api` can serve a wanted `glm-5.3-anth/https://…/api/anthropic`; base_url dominates, target-name similarity tiebreaks) and logs a warning per fallback; when nothing matches, that one slot is cleared (treated as unconfigured, so the normal api_key fallback chain applies) and reported as a config error in the TUI/dashboard/console — it is NOT fatal, so the remaining models still load and the proxy still starts. Existing per-account keychain items are migrated automatically when no bundle exists; that one-time compatibility pass must read the old items and can still prompt once per old item on macOS. Old items are left in place and are not read after the bundle exists. (The keychain itself being unavailable, bundle access being denied, or malformed bundle content is still a fatal `KeyStoreError`.) Local/dev-host feature only — requires the `@github/keytar` native addon, pinned in `optionalDependencies` as `@github/keytar@7.10.6` from the npm registry: the package includes prebuilt NAPI binaries and its install script copies the current platform's binary into place (ABI 3 — works on any modern Node, no compiler or Python needed; node-gyp compiles from source only as the fallback for an unsupported platform/architecture); if startup fails with `Cannot find package '@github/keytar'`, first check `git diff package.json` — npm prune-style runs (`--dry-run --omit=dev`, `--production`) can strip the `optionalDependencies` block, after which no `npm install` ever re-fetches the addon; restore with `git checkout -- package.json && npm install`. A source copy of the addon is kept at `submodules/node-keytar` for local development — it is NOT used by `npm install`. Fails loud (refuses to start) when the keychain is unavailable, e.g. in Docker or Cloudflare Workers (the Dockerfile installs with `--omit=optional --ignore-scripts`). Exception — the **win32 single-executable (SEA) build**: `@github/keytar` needs too many dependencies on Windows (Visual Studio Build Tools with the C++ workload + Python 3, via node-gyp), so there the executable instead stores the keys **in its own file body** (`process.execPath`) as plaintext records appended at EOF — that is portability (a self-contained single file), not secrecy; it needs a writable directory next to the exe and is wiped by a rebuild. macOS and Linux keep the OS keychain via `@github/keytar`; macOS/Linux SEA binaries and Docker/Workers keep the fatal error. Keychain access itself is silent — macOS grants read access to the bundle for whichever binary wrote it, so the same `node` binary/path resolves all sentinels without a password prompt on every run. Upgrading Node (or invoking through a different binary path, e.g. `npx` vs. a global install) changes that code identity: macOS may show a one-time keychain access prompt for the new binary, or in stricter setups silently deny access — surfacing here as a fatal `KeyStoreError` rather than a prompt. |
 
 ## `[default_upstream]` config fields
 
@@ -60,7 +60,7 @@ on-failure dispatch path is **not implemented** — they currently have no effec
 | `dispatch_timeout_ms` | `2000` | Reserved: bound on the oracle call so a hung sidecar can't stall. |
 | `buffer_non_sse` | `false` | Reserved: buffer non-SSE bodies so mid-body failures retry. |
 
-## `[transforms.*]` and `[transform_defaults]` config fields
+## `[transforms.*]` and `[transforms.default]` config fields
 
 Per-model/per-upstream request and response rewriting. Each named set is declared as
 `[transforms.<name>]` and referenced from model entries via `transforms = "set_name"` (CSV
@@ -102,12 +102,12 @@ strictly-conformant Anthropic upstream will reject it with HTTP 400). The old
 `DEFAULT_MAX_TOKENS` env var (fill `8192` when omitted) was removed.
 
 **Default transforms** — the example config (`proxy_config.example.toml`) ships a
-`[transform_defaults]` block that wires `max_tokens_rename` as a mode-level default for
+`[transforms.default]` block that wires `max_tokens_rename` as a mode-level default for
 `openai-completions` and `openai-responses`. This renames `max_tokens` →
 `max_completion_tokens` automatically for every route on those modes, which is required by
 most modern OpenAI-compatible upstreams (DeepSeek, MiniMax, etc.). There is **no code-level
 default** — the wiring only takes effect when your `proxy_config.toml` contains the
-`[transform_defaults]` block (copy it from the example file).
+`[transforms.default]` block (copy it from the example file).
 To opt a specific model entry out, attach `transforms = "no_max_completion_tokens"` to that
 entry (renames `max_completion_tokens` back to `max_tokens`).
 
@@ -255,9 +255,9 @@ is rewritten before the upstream fetch to append a placeholder `tool_result`:
 ]}
 ```
 
-## `[passthrough]` config fields
+## `[models.passthrough]` config fields
 
-One **inline table per target** under a single `[passthrough]` section, keyed by
+One **inline table per target** under a single `[models.passthrough]` section, keyed by
 an arbitrary name. A request to `/passthrough/<path>` is forwarded verbatim to a
 target whose `mode` matches the path, bypassing model routing,
 composite/schedule, transforms, privacy filtering, and kompress. See
@@ -265,7 +265,7 @@ composite/schedule, transforms, privacy filtering, and kompress. See
 the schema gate.
 
 ```toml
-[passthrough]
+[models.passthrough]
 openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
 gemini = {base = "https://generativelanguage.googleapis.com", mode = "gemini-generatecontent"}
 ```
@@ -337,12 +337,12 @@ key = "sk-..."                         # ✗ REJECTED at load time
 
 **Reason**: Section-level defaults must be explicit; short aliases are reserved for inline tables only.
 
-### `[passthrough]` inline tables
+### `[models.passthrough]` inline tables
 
-One inline table per target under a single `[passthrough]` section:
+One inline table per target under a single `[models.passthrough]` section:
 
 ```toml
-[passthrough]
+[models.passthrough]
 openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
 gemini = {base = "https://generativelanguage.googleapis.com", mode = "gemini-generatecontent"}
 ```
@@ -355,7 +355,7 @@ gemini = {base = "https://generativelanguage.googleapis.com", mode = "gemini-gen
 | `share` | — | Weight for weighted random selection. Default `1`. |
 | `timeout` | — | Per-target upstream timeout in ms. Optional. |
 
-**No `target` field**: The inline table key (e.g., `openai`, `gemini`) *is* the target identifier. There is no `target` field inside `[passthrough]` entries.
+**No `target` field**: The inline table key (e.g., `openai`, `gemini`) *is* the target identifier. There is no `target` field inside `[models.passthrough]` entries.
 
 ### Legacy array format (deprecated but supported)
 

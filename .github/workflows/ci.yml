@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [feature/targeting_failover]
+  pull_request:
+    branches: [feature/targeting_failover]
+  # Fires on Publish — the web UI's "Create a new release" button, `gh release
+  # create`, and the REST API alike. A tag-push trigger would miss a release
+  # pointed at a tag that already existed, since nothing is pushed in that case.
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck, build, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+  # One leg per target, because `npm run build:native` cannot cross-compile: the
+  # output is a copy of the Node that built it, so each target needs the runner
+  # whose host triple it names (see the CROSS-COMPILATION note in
+  # scripts/build-sea.js). The linux leg replaces the single build:native step
+  # that used to sit in the test job above; it moved here so every binary comes
+  # from the same place.
+  native:
+    name: Native binary (${{ matrix.triple }})
+    # Skipped on pull requests: six ~124 MB builds per PR buys little over the
+    # one linux binary the old workflow produced, and the test job above is the
+    # gate that has to stay fast.
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        # runner is the standard GitHub-hosted image for that architecture, and
+        # triple is what build-sea.js names its output after — the "Locate the
+        # binary" step below fails the leg if the runner does not actually match
+        # the triple it claims. macos-latest is arm64 and macos-15-intel is the
+        # Intel image, so both macOS arches are covered; there is deliberately no
+        # universal binary, since SEA cannot merge two Nodes into one file.
+        include:
+          - runner: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+          - runner: macos-latest
+            triple: aarch64-apple-darwin
+          - runner: macos-15-intel
+            triple: x86_64-apple-darwin
+          - runner: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            triple: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    # Only this job writes: `gh release upload` needs contents: write, and it is
+    # the only step in the workflow that touches anything outside the run.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Plain `npm install`, without --ignore-scripts: @github/keytar ships its
+      # prebuilt NAPI binaries for all six targets here (prebuilds/darwin-x64,
+      # darwin-arm64, linux-x64, linux-arm64, win32-x64, win32-arm64), so its
+      # install script needs no toolchain and never falls back to node-gyp. The
+      # addon is --external in the bundle and absent from the result either way.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      # Runs tsc --noEmit, the esbuild bundle, the SEA blob, and the postject
+      # injection; on macOS it also strips and re-applies the code signature.
+      - name: Build native binary
+        run: npm run build:native
+
+      # build-sea.js names the output after the host triple, so looking for that
+      # exact name is also what proves the runner really is the architecture the
+      # matrix claims. On Windows the name carries a .exe suffix — Tauri's
+      # externalBin resolves the sidecar to `<name>.exe` — so a missing suffix
+      # fails here, at the build, rather than when the sidecar is staged.
+      - name: Locate the binary
+        id: binary
+        shell: bash
+        run: |
+          expected="dist/model-proxy-v3-${{ matrix.triple }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            expected="$expected.exe"
+          fi
+          if [ ! -f "$expected" ]; then
+            echo "::error::expected $expected; dist/ holds:"
+            ls -l dist/ 2>&1 || true
+            exit 1
+          fi
+          echo "path=$expected" >> "$GITHUB_OUTPUT"
+          echo "$expected"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-proxy-v3-${{ matrix.triple }}
+          path: ${{ steps.binary.outputs.path }}
+          if-no-files-found: error
+
+      # Every leg uploads its own binary, so a published release collects all six
+      # without one job having to download the others' artifacts.
+      - name: Attach the binary to the release
+        if: github.event_name == 'release'
+        # Pinned: the default shell on Windows is pwsh, and the path was resolved
+        # in the bash step above.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "${{ steps.binary.outputs.path }}" --clobber

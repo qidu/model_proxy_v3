@@ -61,7 +61,7 @@ inheritance chain — anything left empty falls back to the level above:
 
 > **Section-level keys take only the long names.** A `[models.<category>]` section accepts
 > `upstream_mode` / `base_url` / `api_key`. The short aliases (`mode` / `url` / `key`) belong
-> to inline entries and to `[passthrough]` targets; at section level they are reported as a
+> to inline entries and to `[models.passthrough]` targets; at section level they are reported as a
 > config error (shown in the TUI/dashboard status) and are not applied.
 
 > **What `[default_upstream] default_base_url` is for:** it is the global upstream endpoint used

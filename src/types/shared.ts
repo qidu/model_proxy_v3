@@ -157,7 +157,7 @@ export interface Env {
     /**
      * Client API key the AGENT=true interactive session (agent-session.ts)
      * uses to authenticate its own loopback /v1/messages calls. Falls back to
-     * [default_upstream] default_api_key from proxy_config.toml, then to
+     * [models.default].api_key from proxy_config.toml, then to
      * DEV_NO_KEY, if unset.
      */
     PROXY_CLIENT_API_KEY?: string;

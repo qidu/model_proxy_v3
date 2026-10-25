@@ -16,6 +16,7 @@ import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
 import { createLogger } from './logger.js';
 import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
 import { UPSTREAM_MODES } from './upstream-modes.js';
+import { callDecisionApi, adaptToClefRequest, adaptFromClefResponse, type ClefRequest, type ClefChoiceQuestion } from './tool-judge-sidecar.js';
 
 // Check if we're running in Node.js environment
 const isNodeEnvironment = (typeof process !== 'undefined' && process.versions?.node) ||
@@ -48,11 +49,7 @@ export interface ProxyConfig {
     dispatch_timeout_ms?: number;
     buffer_non_sse?: boolean;
   };
-  default_upstream?: {
-    upstream_mode?: string;
-    default_base_url?: string;
-    default_api_key?: string;
-  };
+  // [default_upstream] removed — use [models.default] for defaults
   models?: Record<string, ModelCategoryConfig | ModelArrayConfig>;
   composite?: Record<string, CompositeModelConfig>;
   schedule?: Record<string, ScheduleConfig>;
@@ -134,9 +131,17 @@ export interface ProxyConfig {
    * `mode`:
    *   - "choice": per-tool decision (default, uses "decision" question with "keep"/"discard" criteria)
    *   - "noul": batch scoring (uses "keep" question, returns score per tool)
+   *
+   * `use_decision_api` (optional): when true, tool judging is delegated to the
+   * `/decision` endpoint (Clef protocol) instead of a dedicated sidecar at
+   * `judge_url`. This reuses the same upstream (Laya/Cloudflare) as model
+   * selection. Requires `decision` config to be enabled.
+   *
+   * `model` (optional): which Clef model to use when `use_decision_api` is
+   * true. Defaults to "clef". Valid values: "clef", "clef-flash".
    */
   tool_judge_sidecar?: {
-    /** Sidecar base URL (e.g., "http://localhost:8765"). Required to enable. */
+    /** Sidecar base URL (e.g., "http://localhost:8765"). Required to enable (unless use_decision_api is true). */
     judge_url?: string;
     /** Timeout in milliseconds (default: 50) */
     timeout_ms?: number;
@@ -148,6 +153,10 @@ export interface ProxyConfig {
     api_key?: string;
     /** Maximum number of tools to send in a single batch request (default: 50) */
     max_batch_tools?: number;
+    /** Use the /decision API (Clef protocol) instead of a dedicated sidecar. Requires [models.decision] config. Default: false. */
+    use_decision_api?: boolean;
+    /** Clef model to use when use_decision_api is true: "clef" | "clef-flash". Default: "clef". */
+    model?: 'clef' | 'clef-flash';
   };
 
   /**
@@ -178,9 +187,9 @@ export interface ProxyConfig {
 
 /**
  * Configuration for a single passthrough target, declared as an inline table
- * under `[passthrough]`:
+ * under `[models.passthrough]`:
  *
- *   [passthrough]
+ *   [models.passthrough]
  *   openai = {base = "https://api.openai.com", key = "sk-...", mode = "openai-completions", share = 1}
  *
  * Short names are canonical here (targets are terse); the long aliases
@@ -532,13 +541,24 @@ export interface CompositeTargetConfig {
   fusion?: number;           // > 0 marks target as panel member (weight reserved for future use)
   coord?: number;            // > 0 marks target as coordinator participant (planner or executor)
   role?: FusionRole;         // explicit stage: 'panel' | 'judge' | 'synth' | 'planner' | 'executor'
+  ability?: string;          // comma-separated abilities, e.g. "coding,reasoning,analysis"
+}
+
+export interface DecisionConfig {
+  model: string;                 // "laya" | "clef" | "clef-flash" (decision backend model name)
+  url?: string;                  // full /decision endpoint URL (e.g., "http://localhost:8765/decision")
+  api_key?: string;              // optional Authorization header
+  threshold?: number;            // confidence threshold (default: 0.5)
+  timeout_ms?: number;           // per-request budget (default: 50ms)
+  context_prompts?: number;      // number of recent prompts to include (default: 1)
 }
 
 export interface CompositeModelConfig {
   token_limit?: TokenLimitConfig;
   fusion_options?: FusionOptions;
   toolset?: string[];        // coordinator trigger tool names; absent = default set; [] = any tool
-  [modelName: string]: CompositeTargetConfig | TokenLimitConfig | FusionOptions | string[] | undefined;
+  decision?: DecisionConfig; // decision API config for ability-based target selection
+  [modelName: string]: CompositeTargetConfig | TokenLimitConfig | FusionOptions | string[] | DecisionConfig | undefined;
 }
 
 export interface CoordinatorPlan {
@@ -582,7 +602,7 @@ export interface ScheduleWindow {
 // (always eligible, used when no other target's windows match "now").
 export type ScheduleConfig = Record<string, ScheduleWindow[]>;
 
-const COMPOSITE_META_KEYS = new Set(['token_limit', 'fusion_options', 'toolset']);
+const COMPOSITE_META_KEYS = new Set(['token_limit', 'fusion_options', 'toolset', 'decision']);
 
 function getCompositeTargetEntries(config: CompositeModelConfig | undefined): Array<[string, CompositeTargetConfig]> {
   return Object.entries(config || {}).filter(([key]) => !COMPOSITE_META_KEYS.has(key)) as Array<[string, CompositeTargetConfig]>;
@@ -655,6 +675,27 @@ export function resolveTransforms(
   return [...modeSets, ...lookup(categoryTransforms), ...lookup(entryTransforms)];
 }
 
+/**
+ * Resolve the default upstream config from [models.default] category.
+ * Returns undefined for baseUrl/apiKey when nothing is configured; callers
+ * that need a literal fallback (e.g. 'http://localhost') apply it to the result.
+ */
+export function getDefaultUpstreamConfig(
+  proxyConfig: ProxyConfig,
+  primary?: Pick<ModelCategoryConfig, 'upstream_mode' | 'base_url' | 'api_key'>,
+): { upstreamMode: string; baseUrl: string | undefined; apiKey: string | undefined } {
+  const defaultCategory = proxyConfig.models?.default;
+  const defaultConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
+
+  // Merge primary with defaultConfig: primary values take precedence, defaultConfig fills in missing keys
+  // Treat empty strings as "unset" so they fall through to defaults
+  const upstreamMode = (primary?.upstream_mode && primary.upstream_mode !== '' ? primary.upstream_mode : undefined) ?? defaultConfig?.upstream_mode ?? 'openai-completions';
+  const baseUrl = (primary?.base_url && primary.base_url !== '' ? primary.base_url : undefined) ?? defaultConfig?.base_url;
+  const apiKey = (primary?.api_key && primary.api_key !== '' ? primary.api_key : undefined) ?? defaultConfig?.api_key;
+
+  return { upstreamMode, baseUrl, apiKey };
+}
+
 function resolveModelRouteFromEntry(
   modelEntry: string | string[],
   categoryConfig: ModelCategoryConfig,
@@ -662,15 +703,8 @@ function resolveModelRouteFromEntry(
   modelName?: string,
   sectionName?: string,
 ): ModelRouteConfig {
-  const categoryUpstreamMode = categoryConfig.upstream_mode ||
-                               proxyConfig.default_upstream?.upstream_mode ||
-                               'openai-completions';
-  const categoryBaseUrl = categoryConfig.base_url ||
-                          proxyConfig.default_upstream?.default_base_url ||
-                          'http://localhost';
-
-  const categoryApiKey = categoryConfig.api_key ||
-                        proxyConfig.default_upstream?.default_api_key;
+  const { upstreamMode: categoryUpstreamMode, baseUrl, apiKey: categoryApiKey } = getDefaultUpstreamConfig(proxyConfig, categoryConfig);
+  const categoryBaseUrl = baseUrl || 'http://localhost';
 
   if (Array.isArray(modelEntry)) {
     const [modelAlias, modelBaseUrl, modelApiKey, modelMode] = modelEntry;
@@ -871,23 +905,13 @@ function selectWeightedCompositeCandidate<T extends { targetConfig: CompositeTar
  * Get model-specific routing config with category inheritance
  */
 function getDefaultModelRoute(proxyConfig: ProxyConfig): ModelRouteConfig {
-  const defaultCategory = proxyConfig.models?.default;
-  const defaultCategoryConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
-  const defaultMode = defaultCategoryConfig?.upstream_mode ||
-                     proxyConfig.default_upstream?.upstream_mode ||
-                     'openai-completions';
-  const defaultBaseUrl = defaultCategoryConfig?.base_url ||
-                        proxyConfig.default_upstream?.default_base_url ||
-                        'http://localhost';
-
-  const defaultApiKey = defaultCategoryConfig?.api_key ||
-                       proxyConfig.default_upstream?.default_api_key;
+  const { upstreamMode, baseUrl, apiKey } = getDefaultUpstreamConfig(proxyConfig);
 
   return {
-    targetUrl: defaultBaseUrl,
-    apiKey: parseApiKey(defaultApiKey),
-    upstreamMode: defaultMode,
-    transforms: resolveTransforms(defaultMode, undefined, undefined, proxyConfig),
+    targetUrl: baseUrl || 'http://localhost',
+    apiKey: parseApiKey(apiKey),
+    upstreamMode,
+    transforms: resolveTransforms(upstreamMode, undefined, undefined, proxyConfig),
   };
 }
 
@@ -926,7 +950,185 @@ export function getCompositeRouteCandidates(
   }));
 }
 
-export type CompositeAliasMode = 'coordinator' | 'fusion' | 'fallback' | 'share';
+/**
+ * Interface for request context passed to decision-aware resolution
+ */
+export interface DecisionRequestContext {
+  /** The user's current prompt (most recent user message) */
+  prompt: string;
+  /** Recent user messages for context (excluding the current prompt) */
+  recentUserMessages?: string[];
+  /** Recent tool calls for context */
+  recentToolCalls?: Array<{ name: string; args: unknown }>;
+  /** Available tools in the request */
+  tools?: Array<{ name: string; description?: string }>;
+  /** Request ID for logging */
+  requestId?: string;
+}
+
+/**
+ * Resolve composite alias with decision API for ability-based target selection.
+ * Returns reordered candidates if decision API succeeds, otherwise falls back to default ordering (fail-open).
+ * This function is async and should be called before the retry loop in the request handler.
+ */
+export async function resolveCompositeWithDecision(
+  modelName: string,
+  proxyConfig: ProxyConfig,
+  context: DecisionRequestContext,
+): Promise<CompositeRouteCandidate[]> {
+  // Get composite candidates from config
+  const candidates = getCompositeRouteCandidates(modelName, proxyConfig);
+
+  // Get decision config from composite model config
+  const compositeConfig = proxyConfig.composite?.[modelName];
+  const decisionConfig = compositeConfig?.decision ?? null;
+
+  // No decision config, use default candidates (fail-open)
+  if (!decisionConfig) {
+    return candidates;
+  }
+
+  // Check if any candidate has ability - if not, use default candidates (fail-open)
+  const hasAbility = candidates.some(c => c.targetConfig?.ability?.trim());
+  if (!hasAbility) {
+    return candidates;
+  }
+
+  // Build state for Clef request - convert candidates to entries format
+  const entries: Array<[string, CompositeTargetConfig]> = candidates.map(c => [
+    c.modelName,
+    c.targetConfig as CompositeTargetConfig,
+  ]);
+
+  // Build state and questions
+  const state = buildDecisionState(context, entries);
+  const questions = buildDecisionQuestions(entries);
+
+  // Prepare config for callDecisionApi (reuses JudgeSidecarConfig shape)
+  const judgeConfig = {
+    judge_url: decisionConfig.url,
+    model: decisionConfig.model,
+    apiKey: decisionConfig.api_key,
+    threshold: decisionConfig.threshold ?? 0.5,
+    timeoutMs: decisionConfig.timeout_ms ?? 50,
+    mode: 'choice' as const,
+    useDecisionApi: true,
+    maxBatchTools: 1,
+  };
+
+  // Build Clef request
+  const request: ClefRequest = {
+    model: decisionConfig.model,
+    state,
+    questions,
+  };
+
+  const requestId = context.requestId || `composite-${candidates[0]?.modelName || 'unknown'}`;
+
+  try {
+    const response = await callDecisionApi(judgeConfig as any, { state, questions } as any, requestId);
+
+    if (!response || !response.target_selection || response.target_selection.type !== 'choice') {
+      return candidates; // Invalid response, fallback to default (fail-open)
+    }
+
+    const selectedModel = response.target_selection.choice;
+    const confidence = response.target_selection.confidence ?? 0;
+    const threshold = decisionConfig.threshold ?? 0.5;
+
+    if (!selectedModel || confidence < threshold) {
+      return candidates; // No clear winner or low confidence, fallback to default (fail-open)
+    }
+
+    // Verify selected model exists in candidates
+    const selectedCandidate = candidates.find(c => c.modelName === selectedModel);
+    if (!selectedCandidate) {
+      return candidates; // Selected model not found, fallback to default (fail-open)
+    }
+
+    // Reorder: selected model first, rest in declaration order (preserving their relative order)
+    const otherCandidates = candidates.filter(c => c.modelName !== selectedModel);
+    return [selectedCandidate, ...otherCandidates];
+  } catch (err) {
+    // Any error (timeout, network, etc.) -> fail open to default ordering
+    return candidates;
+  }
+}
+
+/**
+ * Build the state text for the decision API request.
+ * Includes user prompt, recent context, available models with abilities, and tools.
+ */
+export function buildDecisionState(
+  context: DecisionRequestContext,
+  entries: Array<[string, CompositeTargetConfig]>,
+): string {
+  const lines: string[] = [];
+
+  // Current user prompt
+  if (context.prompt) {
+    lines.push(`User prompt: "${context.prompt}"`);
+  }
+
+  // Available models with their abilities
+  lines.push('Available models:');
+  for (const [name, cfg] of entries) {
+    if (cfg.ability?.trim()) {
+      lines.push(`- ${name}: ${cfg.ability}`);
+    } else {
+      lines.push(`- ${name}: (no abilities declared)`);
+    }
+  }
+
+  // Tools
+  if (context.tools && context.tools.length > 0) {
+    const toolNames = context.tools.map(t => t.name).join(', ');
+    lines.push(`Tools: [${toolNames}]`);
+  }
+
+  // Recent user messages (context)
+  if (context.recentUserMessages && context.recentUserMessages.length > 0) {
+    lines.push('Recent context:');
+    for (const msg of context.recentUserMessages.slice(-3)) {
+      lines.push(`- User: "${msg}"`);
+    }
+  }
+
+  // Recent tool calls
+  if (context.recentToolCalls && context.recentToolCalls.length > 0) {
+    for (const call of context.recentToolCalls.slice(-5)) {
+      lines.push(`- Assistant called: ${call.name}(${JSON.stringify(call.args)})`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Build the Clef choice question for target selection.
+ * Criteria are derived from each target's ability field.
+ */
+export function buildDecisionQuestions(
+  entries: Array<[string, CompositeTargetConfig]>,
+): Record<string, ClefChoiceQuestion> {
+  const criteria: Record<string, string> = {};
+  for (const [name, cfg] of entries) {
+    if (cfg.ability?.trim()) {
+      criteria[name] = `Abilities: ${cfg.ability}`;
+    } else {
+      criteria[name] = 'No specific abilities declared';
+    }
+  }
+  return {
+    target_selection: {
+      type: 'choice',
+      instructions: 'Select the best model for this task based on the user\'s prompt and each model\'s declared abilities.',
+      criteria,
+    },
+  };
+}
+
+export type CompositeAliasMode = 'coordinator' | 'fusion' | 'fallback' | 'share' | 'decision';
 
 export function getCompositeAliasMode(
   modelName: string,
@@ -951,6 +1153,13 @@ export function getCompositeAliasMode(
     cfg.primary === true || (typeof cfg.fallback === 'number' && cfg.fallback > 0)
   );
   if (hasPriority) return 'fallback';
+
+  // Decision mode: no primary/fallback/share configured, at least one target has ability, and composite has decision config
+  const hasDecisionConfig = compositeConfig.decision && compositeConfig.decision.model && compositeConfig.decision.url;
+  const hasAbility = entries.some(([, cfg]) => cfg.ability && cfg.ability.trim().length > 0);
+  if (hasDecisionConfig && hasAbility && !hasPriority) {
+    return 'decision';
+  }
 
   return 'share';
 }
@@ -1212,7 +1421,29 @@ function normalizeUpstreamThresholdValue(key: string, rawValue: string | number)
 function parseCompositeTargetConfig(value: string): CompositeTargetConfig {
   const config: CompositeTargetConfig = {};
   const cleaned = value.replace(/[{}]/g, '');
-  const fields = cleaned.split(',');
+  // Split on commas that are not inside quotes
+  const fields: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < cleaned.length; i++) {
+    const char = cleaned[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      current += char;
+      continue;
+    }
+    if (!inQuotes && char === ',') {
+      if (current.trim()) {
+        fields.push(current.trim());
+      }
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) {
+    fields.push(current.trim());
+  }
 
   for (const field of fields) {
     const trimmed = field.trim().replace(/^,/, '').replace(/,$/, '');
@@ -1286,6 +1517,12 @@ function parseCompositeTargetConfig(value: string): CompositeTargetConfig {
       } else {
         (config as any)._invalidRole = true;
       }
+      continue;
+    }
+
+    if (key === 'ability') {
+      const v = rawValue.replace(/^"|"$/g, '');
+      config.ability = v;
       continue;
     }
   }
@@ -1458,6 +1695,40 @@ function parseCompositeModelConfig(rawValue: string): CompositeModelConfig {
           }
           config.fusion_options = opts;
         } catch { /* ignore malformed fusion_options */ }
+      } else if (match[1].trim() === 'decision') {
+        // Parse decision object: {model = "...", url = "...", api_key = "...", threshold = ..., timeout_ms = ..., context_prompts = ...}
+        try {
+          const inner = match[2].trim().slice(1, -1);
+          const decision: DecisionConfig = { model: '' };
+          const fields: string[] = [];
+          let cur = ''; let d = 0; let iq = false;
+          for (let i = 0; i < inner.length; i++) {
+            const c = inner[i];
+            if (c === '"') { iq = !iq; cur += c; continue; }
+            if (!iq) { if (c === '{') d++; else if (c === '}') d--; else if (c === ',' && d === 0) { if (cur.trim()) fields.push(cur.trim()); cur = ''; continue; } }
+            cur += c;
+          }
+          if (cur.trim()) fields.push(cur.trim());
+          for (const f of fields) {
+            const kv = f.match(/^"?(\w+)"?\s*[=:]\s*(.+)$/);
+            if (!kv) continue;
+            const k = kv[1]; const rv = kv[2].trim().replace(/,$/, '').replace(/^"|"$/g, '');
+            if (k === 'model' || k === 'url' || k === 'api_key') {
+              (decision as any)[k] = rv;
+            } else if (k === 'threshold') {
+              const n = Number(rv); if (Number.isFinite(n) && n >= 0 && n <= 1) (decision as any).threshold = n;
+            } else if (k === 'timeout_ms' || k === 'context_prompts') {
+              const n = Number(rv); if (Number.isFinite(n) && n >= 0) (decision as any)[k] = n;
+            }
+          }
+          // Validate model is one of allowed values
+          const allowedModels = ['clef', 'clef-flash', 'laya'];
+          if (decision.model && allowedModels.includes(decision.model)) {
+            config.decision = decision;
+          } else {
+            (config as any)._invalidDecision = true;
+          }
+        } catch { /* ignore malformed decision */ }
       } else if (match[1].trim() === 'token_limit') {
         // Parse the nested token_limit object: {num = ..., duration = "..."} or {"num": ..., "duration": "..."}
         const inner = match[2].trim().slice(1, -1);
@@ -1741,6 +2012,9 @@ function serializeCompositeTargetConfig(config: CompositeTargetConfig): string {
   if (config.role !== undefined) {
     fields.push(`role = "${config.role}"`);
   }
+  if (config.ability !== undefined) {
+    fields.push(`ability = "${config.ability}"`);
+  }
   return `{${fields.join(', ')}}`;
 }
 
@@ -1764,6 +2038,18 @@ function serializeCompositeModelConfig(config: CompositeModelConfig): string {
   }
   if (Array.isArray(config.toolset)) {
     entries.push(`toolset = [${config.toolset.map(t => JSON.stringify(t)).join(', ')}]`);
+  }
+  if (config.decision) {
+    const d = config.decision;
+    const fields: string[] = [
+      `model = ${JSON.stringify(d.model)}`,
+    ];
+    if (d.url && d.url.length > 0) fields.push(`url = ${JSON.stringify(d.url)}`);
+    if (d.api_key) fields.push(`api_key = ${JSON.stringify(d.api_key)}`);
+    if (d.threshold !== undefined) fields.push(`threshold = ${d.threshold}`);
+    if (d.timeout_ms !== undefined) fields.push(`timeout_ms = ${d.timeout_ms}`);
+    if (d.context_prompts !== undefined) fields.push(`context_prompts = ${d.context_prompts}`);
+    entries.push(`decision = {${fields.join(', ')}}`);
   }
   for (const [modelName, targetConfig] of getCompositeTargetEntries(config)) {
     const serializedTarget = serializeCompositeTargetConfig((targetConfig || {}) as CompositeTargetConfig);
@@ -1970,7 +2256,14 @@ export function stripSelfReferencingCompositeTargets(
 export function validateProxyConfig(config: ProxyConfig): ValidationResult {
   const errors: ConfigValidationError[] = [];
   const warnings: ConfigValidationError[] = [];
-  const reservedKeys = new Set(['upstream_mode', 'base_url', 'api_key']);
+  const reservedKeys = new Set([
+    'upstream_mode',
+    'base_url',
+    'api_key',
+    'budget_to_effort_low',
+    'budget_to_effort_medium',
+    'budget_to_effort_high',
+  ]);
 
   if (config.models) {
     for (const [categoryName, categoryConfig] of Object.entries(config.models)) {
@@ -2267,13 +2560,123 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
     }
   }
 
+  // Validate tool_judge_sidecar config
+  if (config.tool_judge_sidecar) {
+    const tjs = config.tool_judge_sidecar;
+    if (!tjs.use_decision_api) {
+      // When not using decision API, judge_url is required
+      if (!tjs.judge_url || typeof tjs.judge_url !== 'string') {
+        errors.push({ path: 'tool_judge_sidecar.judge_url', message: 'judge_url is required when use_decision_api is false' });
+      } else {
+        try {
+          new URL(tjs.judge_url);
+        } catch {
+          errors.push({ path: 'tool_judge_sidecar.judge_url', message: 'judge_url must be a valid URL' });
+        }
+      }
+    } else {
+      // When using decision API, decision config must be enabled
+      if (!config.decision || !config.decision.url) {
+        errors.push({ path: 'tool_judge_sidecar.use_decision_api', message: 'decision config must be enabled with a valid url when use_decision_api is true' });
+      }
+    }
+    if (tjs.timeout_ms !== undefined && (typeof tjs.timeout_ms !== 'number' || tjs.timeout_ms <= 0)) {
+      errors.push({ path: 'tool_judge_sidecar.timeout_ms', message: 'timeout_ms must be a positive number (ms)' });
+    }
+    if (tjs.threshold !== undefined && (typeof tjs.threshold !== 'number' || tjs.threshold < 0 || tjs.threshold > 1)) {
+      errors.push({ path: 'tool_judge_sidecar.threshold', message: 'threshold must be a number between 0.0 and 1.0' });
+    }
+    if (tjs.mode !== undefined && tjs.mode !== 'choice' && tjs.mode !== 'noul') {
+      errors.push({ path: 'tool_judge_sidecar.mode', message: 'mode must be "choice" or "noul"' });
+    }
+    if (tjs.max_batch_tools !== undefined && (typeof tjs.max_batch_tools !== 'number' || tjs.max_batch_tools <= 0)) {
+      errors.push({ path: 'tool_judge_sidecar.max_batch_tools', message: 'max_batch_tools must be a positive number' });
+    }
+    if (tjs.model !== undefined && tjs.model !== 'clef' && tjs.model !== 'clef-flash' && tjs.model !== 'laya') {
+      errors.push({ path: 'tool_judge_sidecar.model', message: 'model must be "clef", "clef-flash", or "laya"' });
+    }
+    if (tjs.api_key !== undefined && typeof tjs.api_key !== 'string') {
+      errors.push({ path: 'tool_judge_sidecar.api_key', message: 'api_key must be a string' });
+    }
+  }
+
+  // Validate decision config
+  if (config.decision) {
+    const d = config.decision;
+    if (!d.backend || !['laya', 'cloudflare', 'clef'].includes(d.backend)) {
+      errors.push({ path: 'decision.backend', message: 'backend must be "laya", "cloudflare", or "clef"' });
+    }
+    if (!d.url || typeof d.url !== 'string') {
+      errors.push({ path: 'decision.url', message: 'url is required' });
+    } else {
+      try {
+        new URL(d.url);
+      } catch {
+        errors.push({ path: 'decision.url', message: 'url must be a valid URL' });
+      }
+    }
+    if (d.api_key !== undefined && typeof d.api_key !== 'string') {
+      errors.push({ path: 'decision.api_key', message: 'api_key must be a string' });
+    }
+    if (d.timeout_ms !== undefined && (typeof d.timeout_ms !== 'number' || d.timeout_ms <= 0)) {
+      errors.push({ path: 'decision.timeout_ms', message: 'timeout_ms must be a positive number (ms)' });
+    }
+  }
+
+  // Validate composite-level decision configs
+  if (config.composite) {
+    for (const [alias, compositeConfig] of Object.entries(config.composite)) {
+      if (compositeConfig && compositeConfig.decision) {
+        const d = compositeConfig.decision;
+        const basePath = `composite.${alias}.decision`;
+        if (!d.model || typeof d.model !== 'string') {
+          errors.push({ path: `${basePath}.model`, message: 'model is required' });
+        }
+        if (!d.url || typeof d.url !== 'string') {
+          errors.push({ path: `${basePath}.url`, message: 'url is required' });
+        } else {
+          try {
+            new URL(d.url);
+          } catch {
+            errors.push({ path: `${basePath}.url`, message: 'url must be a valid URL' });
+          }
+        }
+        if (d.api_key !== undefined && typeof d.api_key !== 'string') {
+          errors.push({ path: `${basePath}.api_key`, message: 'api_key must be a string' });
+        }
+        if (d.threshold !== undefined && (typeof d.threshold !== 'number' || d.threshold < 0 || d.threshold > 1)) {
+          errors.push({ path: `${basePath}.threshold`, message: 'threshold must be a number between 0.0 and 1.0' });
+        }
+        if (d.timeout_ms !== undefined && (typeof d.timeout_ms !== 'number' || d.timeout_ms <= 0)) {
+          errors.push({ path: `${basePath}.timeout_ms`, message: 'timeout_ms must be a positive number (ms)' });
+        }
+        if (d.context_prompts !== undefined && (typeof d.context_prompts !== 'number' || d.context_prompts < 1)) {
+          errors.push({ path: `${basePath}.context_prompts`, message: 'context_prompts must be a positive integer' });
+        }
+        // Error if decision config is present but no target has ability
+        const hasAbility = Object.values(compositeConfig).some(
+          (cfg: any) => cfg && cfg.ability && cfg.ability.trim().length > 0
+        );
+        if (!hasAbility) {
+          errors.push({ path: basePath, message: 'decision config requires at least one target with ability declared' });
+        }
+        // Warn if decision config coexists with primary/fallback/share on any target
+        const hasStaticSelection = Object.values(compositeConfig).some(
+          (cfg: any) => cfg && (cfg.primary === true || (cfg.fallback ?? 0) > 0 || (cfg.share ?? 0) > 0)
+        );
+        if (hasStaticSelection) {
+          warnings.push({ path: basePath, message: 'decision config is ignored when any target has primary/fallback/share configured' });
+        }
+      }
+    }
+  }
+
   return { errors, warnings, valid: errors.length === 0 };
 }
 
 /**
  * Validate every `base_url` value that ends up in a `targetUrl` passed to
  * `fetch()`. Mirrors the sources covered by `getAllowedHostsFromConfig`:
- *   - `[default_upstream].default_base_url`
  *   - `[models.*].base_url` (category level)
  *   - per-model `base_url` overrides (array element at index 1)
  *
@@ -2297,10 +2700,6 @@ function validateBaseUrls(config: ProxyConfig, errors: ConfigValidationError[]):
       errors.push({ path, message: `base_url is not a valid URL: ${trimmed}` });
     }
   };
-
-  if (config.default_upstream?.default_base_url) {
-    check(config.default_upstream.default_base_url, 'default_upstream.default_base_url');
-  }
 
   if (config.models) {
     for (const [categoryName, categoryConfig] of Object.entries(config.models)) {
@@ -2413,12 +2812,6 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
     lines.push('');
   }
 
-  if (config.default_upstream) {
-    lines.push('[default_upstream]');
-    lines.push(...serializeTomlSection(config.default_upstream as Record<string, unknown>));
-    lines.push('');
-  }
-
   if (config.dashboard) {
     lines.push('[dashboard]');
     lines.push(...serializeTomlSection(config.dashboard as Record<string, unknown>));
@@ -2476,7 +2869,7 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
   if (config.transform_defaults) {
     const entries = Object.entries(config.transform_defaults);
     if (entries.length) {
-      lines.push('[transform_defaults]');
+      lines.push('[transforms.default]');
       for (const [mode, names] of entries) {
         lines.push(`${tomlKey(mode)} = [${names.map((n) => JSON.stringify(n)).join(', ')}]`);
       }
@@ -2508,8 +2901,32 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
   }
 
   if (config.passthrough) {
-    lines.push('[passthrough]');
+    lines.push('[models.passthrough]');
     lines.push(...Object.entries(config.passthrough).map(([name, target]) => `${tomlKey(name)} = ${serializePassthroughTarget(target)}`));
+    lines.push('');
+  }
+
+  if (config.tool_judge_sidecar) {
+    const tjs = config.tool_judge_sidecar;
+    lines.push('[tool_judge]');
+    if (tjs.judge_url !== undefined) lines.push(`judge_url = ${JSON.stringify(tjs.judge_url)}`);
+    if (tjs.timeout_ms !== undefined) lines.push(`timeout_ms = ${tjs.timeout_ms}`);
+    if (tjs.threshold !== undefined) lines.push(`threshold = ${tjs.threshold}`);
+    if (tjs.mode !== undefined) lines.push(`mode = ${JSON.stringify(tjs.mode)}`);
+    if (tjs.api_key !== undefined) lines.push(`api_key = ${JSON.stringify(tjs.api_key)}`);
+    if (tjs.max_batch_tools !== undefined) lines.push(`max_batch_tools = ${tjs.max_batch_tools}`);
+    if (tjs.use_decision_api !== undefined) lines.push(`use_decision_api = ${tjs.use_decision_api}`);
+    if (tjs.model !== undefined) lines.push(`model = ${JSON.stringify(tjs.model)}`);
+    lines.push('');
+  }
+
+  if (config.decision) {
+    const d = config.decision;
+    lines.push('[models.decision]');
+    if (d.backend !== undefined) lines.push(`backend = ${JSON.stringify(d.backend)}`);
+    if (d.url !== undefined) lines.push(`url = ${JSON.stringify(d.url)}`);
+    if (d.api_key !== undefined) lines.push(`api_key = ${JSON.stringify(d.api_key)}`);
+    if (d.timeout_ms !== undefined) lines.push(`timeout_ms = ${d.timeout_ms}`);
     lines.push('');
   }
 
@@ -2564,11 +2981,6 @@ export function getConfiguredModelIds(config: ProxyConfig): string[] {
 export function getAllowedHostsFromConfig(config: ProxyConfig): string[] {
   const hosts = new Set<string>();
 
-  // [upstream].default_base_url
-  if (config.default_upstream?.default_base_url) {
-    try { hosts.add(new URL(config.default_upstream.default_base_url).host); } catch { /* ignore */ }
-  }
-
   // [models.*].base_url and per-model base_url overrides in array entries
   if (config.models) {
     for (const categoryConfig of Object.values(config.models)) {
@@ -2586,7 +2998,7 @@ export function getAllowedHostsFromConfig(config: ProxyConfig): string[] {
     }
   }
 
-  // [passthrough] target base
+  // [models.passthrough] target base
   if (config.passthrough) {
     for (const target of Object.values(config.passthrough)) {
       if (target.base) {
@@ -2848,10 +3260,24 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'general';
         currentCategory = null;
         config.general = {};
-      } else if (parts[0] === 'default_upstream') {
-        currentSection = 'default_upstream';
+      } else if (parts[0] === 'models' && parts[1] === 'decision') {
+        // Canonical home of the decision config. Intercept before the generic
+        // [models.*] branch so "decision" is not created as a model category.
+        currentSection = 'decision';
         currentCategory = null;
-        config.default_upstream = {};
+        config.decision = {};
+        if (parts.length > 2) {
+          console.warn(`[config] [models.decision.${parts.slice(2).join('.')}] sections are not supported at line ${i + 1} — declare keys directly under [models.decision]`);
+        }
+      } else if (parts[0] === 'models' && parts[1] === 'passthrough') {
+        // Canonical home of passthrough targets. Intercept before the generic
+        // [models.*] branch so "passthrough" is not created as a model category.
+        currentSection = 'passthrough';
+        currentCategory = null;
+        if (!config.passthrough) config.passthrough = {};
+        if (parts.length > 2) {
+          console.warn(`[config] [models.passthrough.${parts.slice(2).join('.')}] sections are not supported at line ${i + 1} — declare targets as inline tables under [models.passthrough]: ${parts.slice(2).join('.')} = {base = "...", mode = "..."}`);
+        }
       } else if (parts[0] === 'models') {
         currentSection = 'models';
         currentCategory = parts[1] || null;
@@ -2889,18 +3315,24 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'privacy_filter';
         currentCategory = null;
         config.privacy_filter = {};
-      } else if (parts[0] === 'tool_judge_sidecar') {
+      } else if (parts[0] === 'tool_judge') {
         currentSection = 'tool_judge_sidecar';
         currentCategory = null;
         config.tool_judge_sidecar = {};
-      } else if (parts[0] === 'decision') {
-        currentSection = 'decision';
-        currentCategory = null;
-        config.decision = {};
       } else if (parts[0] === 'fetch') {
         currentSection = 'fetch';
         currentCategory = null;
         config.fetch = {};
+      } else if (parts[0] === 'transforms' && parts[1] === 'default') {
+        // Canonical home of transform defaults. Intercept before the generic
+        // [transforms.<name>] branch so "default" is not created as a transform
+        // set (this reserves "default" as a set name).
+        currentSection = 'transform_defaults';
+        currentCategory = null;
+        if (!config.transform_defaults) config.transform_defaults = {};
+        if (parts.length > 2) {
+          console.warn(`[config] [transforms.default.${parts.slice(2).join('.')}] sections are not supported at line ${i + 1} — declare keys directly under [transforms.default]`);
+        }
       } else if (parts[0] === 'transforms') {
         if (!parts[1]) {
           // A bare [transforms] names no transform set, so it matches no branch
@@ -2917,17 +3349,6 @@ export function parseSimpleToml(content: string): ProxyConfig {
           currentCategory = parts[1];
           if (!config.transforms) config.transforms = {};
           config.transforms[currentCategory] = { name: currentCategory, schema: 'openai-completions' };
-        }
-      } else if (parts[0] === 'transform_defaults') {
-        currentSection = 'transform_defaults';
-        currentCategory = null;
-        if (!config.transform_defaults) config.transform_defaults = {};
-      } else if (parts[0] === 'passthrough') {
-        currentSection = 'passthrough';
-        currentCategory = null;
-        if (!config.passthrough) config.passthrough = {};
-        if (parts[1]) {
-          console.warn(`[config] [passthrough.${parts[1]}] sections are not supported at line ${i + 1} — declare targets as inline tables under [passthrough]: ${parts[1]} = {base = "...", mode = "..."}`);
         }
       } else {
         // No branch claims this header. Leaving currentSection as it was would
@@ -2968,6 +3389,8 @@ export function parseSimpleToml(content: string): ProxyConfig {
           (config.general as any)[cleanKey] = value;
         } else if (cleanKey === 'week_start_day') {
           (config.general as any)[cleanKey] = value === 'sunday' ? 'sunday' : 'monday';
+        } else if (cleanKey === 'budget_to_effort_low' || cleanKey === 'budget_to_effort_medium' || cleanKey === 'budget_to_effort_high') {
+          (config.general as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, value);
         }
       } else if (currentSection === 'remote' && config.remote) {
         if (cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with'
@@ -2981,15 +3404,13 @@ export function parseSimpleToml(content: string): ProxyConfig {
           const n = Number(value);
           if (Number.isFinite(n) && n >= 0) (config.remote as any)[cleanKey] = n;
         }
-      } else if (currentSection === 'default_upstream' && config.default_upstream) {
-        (config.default_upstream as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, value);
       } else if (currentSection === 'models' && currentCategory && config.models) {
         const category = config.models[currentCategory] as ModelCategoryConfig;
         if (cleanKey === 'upstream_mode' || cleanKey === 'base_url' || cleanKey === 'api_key') {
           category[cleanKey] = value;
         } else if (cleanKey === 'mode' || cleanKey === 'url' || cleanKey === 'key') {
           // A [models.*] section takes ONLY the long names; the short aliases
-          // belong to inline entries and [passthrough] targets. Silently
+          // belong to inline entries and [models.passthrough] targets. Silently
           // dropping the key would lose base_url/mode/key with no message, so
           // report it (surfaced in the TUI/dashboard status).
           const longName = cleanKey === 'mode' ? 'upstream_mode' : cleanKey === 'url' ? 'base_url' : 'api_key';
@@ -3011,10 +3432,18 @@ export function parseSimpleToml(content: string): ProxyConfig {
           (config.privacy_filter as any)[cleanKey] = value;
         }
       } else if (currentSection === 'tool_judge_sidecar' && config.tool_judge_sidecar) {
-        // judge_url, mode and api_key are stored as strings; the numeric keys
+        // judge_url, mode, api_key, use_decision_api, model are stored as strings/booleans; the numeric keys
         // are coerced in the unquoted branch below.
         if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
           (config.tool_judge_sidecar as any)[cleanKey] = value;
+        } else if (cleanKey === 'model') {
+          // Only accept valid model values; drop invalid ones silently
+          if (value === 'clef' || value === 'clef-flash' || value === 'laya') {
+            (config.tool_judge_sidecar as any)[cleanKey] = value;
+          }
+          // invalid model values are ignored (not stored)
+        } else if (cleanKey === 'use_decision_api') {
+          (config.tool_judge_sidecar as any)[cleanKey] = value === 'true' || value === '1';
         }
       } else if (currentSection === 'decision' && config.decision) {
         // backend, url and api_key are stored as strings; timeout_ms is coerced
@@ -3100,7 +3529,7 @@ export function parseSimpleToml(content: string): ProxyConfig {
         const cleanKey = ptTableMatch[1].trim().replace(/^"|"$/g, '');
         const seenKeyIdTable = `${currentSection}/${cleanKey}`;
         if (seenKeys.has(seenKeyIdTable)) {
-          console.warn(`[config] duplicate key "${cleanKey}" in [passthrough] at line ${i + 1} — earlier value is overwritten`);
+          console.warn(`[config] duplicate key "${cleanKey}" in [models.passthrough] at line ${i + 1} — earlier value is overwritten`);
         }
         seenKeys.add(seenKeyIdTable);
         const tableBody = ptTableMatch[2].slice(1, -1); // strip outer braces
@@ -3296,7 +3725,7 @@ export function parseSimpleToml(content: string): ProxyConfig {
           (config.privacy_filter as any)[cleanKey] = elements;
         }
       } else if (currentSection === 'transform_defaults' && config.transform_defaults) {
-        // transform_defaults: openai-completions = ["set_a", "set_b"]
+        // [transforms.default]: openai-completions = ["set_a", "set_b"]
         config.transform_defaults[cleanKey] = elements;
       } else if (currentSection === 'transforms' && currentCategory && config.transforms) {
         // transforms.<name>: builtins = ["lowercase_tool_schema_types"]
@@ -3330,8 +3759,6 @@ export function parseSimpleToml(content: string): ProxyConfig {
 
       if (currentSection === 'general' && config.general) {
         (config.general as any)[cleanKey] = typeof cleanValueAny === 'boolean' ? cleanValueAny : normalizeUpstreamThresholdValue(cleanKey, cleanValueAny as string | number);
-      } else if (currentSection === 'default_upstream' && config.default_upstream) {
-        (config.default_upstream as any)[cleanKey] = normalizeUpstreamThresholdValue(cleanKey, cleanValue);
       } else if (currentSection === 'defaults' && config.defaults) {
         (config.defaults as any)[cleanKey] = cleanValue;
       } else if (currentSection === 'privacy_filter' && config.privacy_filter) {
@@ -3351,6 +3778,10 @@ export function parseSimpleToml(content: string): ProxyConfig {
           }
         } else if (typeof cleanValueAny === 'string') {
           if (cleanKey === 'judge_url' || cleanKey === 'mode' || cleanKey === 'api_key') {
+            (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
+          }
+        } else if (typeof cleanValueAny === 'boolean') {
+          if (cleanKey === 'use_decision_api') {
             (config.tool_judge_sidecar as any)[cleanKey] = cleanValueAny;
           }
         }

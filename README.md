@@ -82,7 +82,7 @@ next rung on a retryable upstream failure, and skips resolving the model from
 |---|---|---|
 | `target` | string **required** | Real upstream model id to send (like an alias `target`). |
 | `base` / `base_url` | string **required** | Upstream base URL. |
-| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[default_upstream].upstream_mode`, else `openai-completions`. |
+| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[models.default].upstream_mode`, else `openai-completions`. |
 | `key` / `api_key` | string *(optional)* | Upstream API key for this rung only. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (subject to `auth_passthrough_with`). |
 | `otac` | string *(optional)* | Per-rung value replacing the `one_time_auth_code` header for the upstream call and the stats record. Overrides the auth response's OTAC header for this rung. |
 | `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached. |
@@ -91,7 +91,7 @@ next rung on a retryable upstream failure, and skips resolving the model from
 | `retry` | number *(optional)* | Max same-rung retries for **this rung** only, overriding `[remote] max_target_retries` (axis 2). `retry_on` still gates which statuses trigger it; `0` disables same-rung retry for the rung. |
 
 **Descriptors are self-contained — `target` and `base` are required.** A
-descriptor is not merged onto `[default_upstream]` / section / entry; the only
+descriptor is not merged onto `[models.default]` / section / entry; the only
 inherited field is `mode`. A missing `target`/`base` would fall back to
 `http://localhost` with no key, so entries that omit them are rejected (dropped
 with an error) rather than silently mis-routed.
@@ -150,6 +150,13 @@ full wire-level contract.
 - **Composite aliases** — group several models under one name with weighted-random,
   primary/fallback (with runtime share decay on failure), fusion fan-out, or a
   planner→executor coordinator that hands off once a trigger tool appears.
+  - **Decision mode** — ability-based target selection via the Clef `/decision` API.
+    Targets declare comma-separated `ability` strings (e.g., `ability = "coding,reasoning,analysis"`).
+    When no static targeting (`primary`/`fallback`/`share`) is configured and at least one target has an
+    `ability` field, the proxy calls the Clef `/decision` endpoint with the request state and
+    receives a probabilistic choice. Fail-open: any decision API failure falls back to
+    declaration order. Config mirrors `JudgeSidecarConfig`: `decision = { model = "clef",
+    url = "https://…", api_key = "…", threshold = 0.5, timeout_ms = 3000, context_prompts = 1 }`.
 - **Schedule aliases** — timetable-based routing: pick which model (or composite)
   serves a request based on server-local hour-of-day and day-of-week, with a
   fallback target for any time outside the configured windows.
@@ -360,11 +367,11 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /dashboard` | Web dashboard for config + stats |
 | `GET /dashboard/api/quota?model=<id>` | Remaining usage/credits for a model's route (minimax, deepseek, kimi, openrouter, zhipu, qnaigc coding plans; provider detected from the route host). `?base_url=<origin>` variant serves the web dashboard's per-URL "Usage Left" column, falling back to the recorded anthropic 5h percent. Dashboard `api_key` auth. |
 | `GET /config-reload` | Reload config from `PROXY_CONFIG_CONSUL` or `PROXY_CONFIG_APOLLO`. Only meaningful when a remote config source is set; returns `400`/`500` otherwise. Clears the config cache and re-fetches. |
-| `GET /health` (also `GET /`) | Health check. Probes the resolved default-category / `[default_upstream]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
+| `GET /health` (also `GET /`) | Health check. Probes the resolved `[models.default]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
 | `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar or Cloudflare Clef). See [Decision endpoint](#decision-endpoint-post-decision). |
 | `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
-| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
+| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[models.passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
 
 A Gemini `/v1/models/{model}:...` variant exists for each `/v1beta/models/{model}:...`
 endpoint. `:countTokens` is supported too: native Gemini routes forward to Gemini
@@ -393,6 +400,33 @@ Notes:
 - **Direct transform via Claude Messages** means Responses uses Claude Messages as its internal bridge before calling Gemini; it does not go through `openai-completions`.
 - **Indirect transform via `openai-completions`** means the request body is routed through OpenAI Chat Completions as an intermediate shape before reaching the target upstream family. This covers two cases: (a) Gemini endpoint input becomes Chat Completions, then becomes Claude Messages or OpenAI Responses; (b) `/v1/messages` routed to an `openai-responses` upstream becomes Chat Completions, then Responses `input`. This reuses the Chat Completions middle mode for code reuse while preserving the original client endpoint response shape.
 - Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/architecture/routing-review.md) for tradeoffs and recommendations.
+
+### Code map: endpoints → handlers → converters
+
+**Handlers** (`src/handlers/`) own the HTTP pipeline for one route shape — URL building, auth headers, hooks, the upstream `fetch`, streaming mechanics, and observability.
+**Converters** (`src/converters/`) are pure schema translations between API dialects (request, response, and SSE event shapes) — no network, routing, or logging.
+
+| Client endpoint | Handler | Cross-format converters used |
+|---|---|---|
+| `POST /v1/messages` | `claude.ts` (anthropic upstream), `gemini.ts` (gemini upstream), `messages.ts` (openai upstreams) | `claude-to-gemini`, `gemini-to-claude`, `gemini-streaming`, `claude-to-openai`, `openai-to-claude`, `streaming` |
+| `POST /v1/chat/completions` | `chat-completions.ts` | `claude-to-gemini` (`convertCompletionsToGeminiGenerateContentBody`), `openai-to-claude`, `streaming` |
+| `POST /v1/responses`, `/v1/responses/input_tokens`, `/v1/responses/compact` | `responses.ts` | `responses-to-completions`, `completions-to-responses`, `openai-to-claude` |
+| `POST /v1/interactions` | `gemini.ts` (gemini upstream), `openai.ts` (other upstreams) | `gemini-to-claude`, `openai-to-gemini` (`convertOpenAIToGeminiInteractions`) |
+| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` / `:countTokens` | `gemini.ts` (gemini upstream), `openai.ts` (other upstreams) | `openai-to-gemini` (`convertOpenAIToGeminiGenerateContent`), `gemini-streaming` |
+| `POST /v1/messages/count_tokens` | `token-counting.ts` | `utils/token-counting` (local tiktoken counting) |
+| `GET /v1/models` | `models.ts` | — (passthrough listing) |
+| `POST /v1/embeddings` | `embeddings.ts` | — (passthrough) |
+| `GET /dashboard`, `POST /decision`, `POST /passthrough/v1/...` | `dashboard.ts`, `decision.ts`, `passthrough.ts` | — |
+
+Upstream modes a route can select (full transform matrix in [Supported `upstream_mode`](#supported-upstream_mode) above):
+
+| `upstream_mode` | Upstream API family |
+|---|---|
+| `anthropic-messages` | Claude Messages (`/v1/messages`) |
+| `openai-completions` | OpenAI Chat Completions (`/v1/chat/completions`) |
+| `openai-responses` | OpenAI Responses (`/v1/responses`) |
+| `gemini-generatecontent` | Gemini generateContent (`/v1beta/models/{model}:generateContent`) |
+| `gemini-interactions` | Gemini Interactions (served through the generateContent endpoint) |
 
 
 ### Token usage statistics columns
@@ -467,7 +501,7 @@ it verbatim, so include the path). Setting both `backend` and `url` is what enab
 the route; without them `/decision` answers `503`.
 
 ```toml
-[decision]
+[models.decision]
 backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed)
 url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim
 # api_key = "optional-bearer-token"         # sent as Authorization: Bearer
@@ -512,7 +546,7 @@ Incoming model names resolve through three stacked logic levels (see the
 
 - **Level 1 — `[models.*]`** — exact key → `prefix-*` wildcard → `*` catch-all lookup,
   with `base_url` / `api_key` / `upstream_mode` inherited per-entry → section →
-  `[default_upstream]`. An optional per-entry `max_tokens` (e.g.
+  `[models.default]`. An optional per-entry `max_tokens` (e.g.
   `"m" = {target = "...", max_tokens = 8192}`) fills the value when the request omits
   `max_tokens` (`anthropic-messages`) and caps larger client values at the
   `before_upstream` hook (all modes); when unset, the field is strict passthrough —
@@ -529,6 +563,18 @@ Incoming model names resolve through three stacked logic levels (see the
   - **fusion** — fan-out to parallel panel models with an optional judge and synth.
   - **coordinator** — planner → executor hand-off: routes to the planner until a trigger
     tool call (`ExitPlanMode`, `Edit`, `Write`, …) appears in the conversation history.
+  - **decision** — ability-based target selection via the Clef `/decision` API. Activates
+    **only** when no `primary`/`fallback`/`share` targeting is configured **and** at least
+    one target declares an `ability` field (comma-separated skills like
+    `ability = "coding,reasoning,analysis"`). The proxy POSTs `{model, state, questions}`
+    to the Clef `/decision` endpoint and receives `{answers: {target_selection:
+    {choice, probabilities, confidence}}}`. Fail-open: any decision API failure (network,
+    timeout, invalid response) falls back to declaration order. Config mirrors
+    `JudgeSidecarConfig`:
+    `decision = { model = "clef", url = "https://…", api_key = "…", threshold = 0.5,
+    timeout_ms = 3000, context_prompts = 1 }` — all fields optional except `model` and
+    `url` when the block is present. Static precedence: `primary` → `fallback` (ascending)
+    → `share` (weighted random) → `decision` (ability-based) → declaration order.
 - **Level 3 — `[schedule]`** aliases — pick one target by server-local hour-of-day /
   day-of-week windows, with an empty-window fallback target.
 - **Token limits** — global (`general.global_token_limit`) and per-alias caps over
@@ -573,6 +619,7 @@ level below* gets to serve this request:
 | 2 | `[composite]` (share / primary+fallback) | Weighted random or fallback order | 1 → 1 | Level 1 |
 | 2 | `[composite]` (fusion) | Role + `fusion_options` | 1 → N → 1 (panel×N + judge + synth) | Level 1 |
 | 2 | `[composite]` (coordinator) | Stage detection via `toolset` in messages history | 1 → 1 (planner → executor, one-way) | Level 1 |
+| 2 | `[composite]` (decision) | Ability-based via Clef `/decision` API | 1 → 1 | Level 1 |
 | 1 | `[models.*]` | Exact / `prefix-*` / `*` catch-all | 1 → 1 (one upstream) | — (sends) |
 
 
@@ -640,6 +687,10 @@ npm run build:native     # -> dist/model-proxy-v3-<host-triple>
 The output is named `<name>-<host target triple>` (e.g.
 `model-proxy-v3-x86_64-apple-darwin`), the same name the Tauri tray's
 `externalBin` stages the sidecar under, so it can be copied across unchanged.
+On Windows the name carries a `.exe` suffix
+(`model-proxy-v3-x86_64-pc-windows-msvc.exe`), appended by `scripts/build-sea.js`
+because that is the name Tauri resolves an `externalBin` sidecar to on Windows —
+worth knowing before you rename or hand-copy an artifact.
 A ready-to-use system tray for this proxy lives in
 `git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
 its sidecar and supervises it over the `--rpc` JSON-RPC control channel
@@ -657,6 +708,41 @@ without touching the system install:
 ```bash
 npx --yes --package=node@22 node scripts/build-sea.js
 ```
+
+#### Targets built by CI
+
+`.github/workflows/ci.yml` builds one binary per target, each on the standard
+GitHub-hosted runner whose host triple it names — a SEA output embeds the Node
+that produced it, so no leg can be cross-compiled. The matrix runs on push and on
+release; pull requests keep only the ubuntu typecheck/build/test job.
+
+| Runner | Target triple |
+| --- | --- |
+| `ubuntu-latest` | `x86_64-unknown-linux-gnu` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `macos-latest` | `aarch64-apple-darwin` |
+| `macos-15-intel` | `x86_64-apple-darwin` |
+| `windows-latest` | `x86_64-pc-windows-msvc` |
+| `windows-11-arm` | `aarch64-pc-windows-msvc` |
+
+The two Windows outputs end in `.exe`
+(`model-proxy-v3-x86_64-pc-windows-msvc.exe`, `model-proxy-v3-aarch64-pc-windows-msvc.exe`),
+and the workflow fails the leg if the `model-proxy-v3-<triple>.exe` file it expects
+is absent — the same name check also proves each runner is the architecture its
+matrix entry claims. Every binary is uploaded as the artifact
+`model-proxy-v3-<target triple>`, and publishing a GitHub release attaches all six
+to it.
+
+These targets are deliberately not built. All three come down to "no runner
+produces them, and SEA cannot stand in for one":
+
+- **Universal macOS** (a `lipo` of the two macOS binaries). SEA cannot merge two
+  Nodes into one executable.
+- **musl Linux** (`x86_64-unknown-linux-musl`, for Alpine). The embedded Node is
+  an official glibc build.
+- **32-bit** (`linux-armv7l`, `linux-ia32`, `win32-ia32`). `outputName()` in
+  `scripts/build-sea.js` maps every non-`arm64` architecture to the 64-bit name,
+  so it cannot name these outputs correctly.
 
 ### Node response compression headers
 
@@ -690,42 +776,59 @@ Most users only need `proxy_config.toml`; optional environment variables tune be
 The full field-by-field reference lives in
 [`docs/reference/configuration-reference.md`](./docs/reference/configuration-reference.md):
 
-- **TOML sections** — `[general]`, `[default_upstream]`, `[remote]`,
-  `[transforms.*]` / `[transform_defaults]`, `[privacy_filter]`, `[decision]`,
-  `[dashboard]`, `[passthrough]`.
+- **TOML sections** — `[general]`, `[models.default]`, `[remote]`,
+  `[transforms.*]` / `[transforms.default]`, `[privacy_filter]`, `[models.decision]`,
+  `[dashboard]`, `[models.passthrough]`.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
-  config `api_key` into the OS keychain (accounts `<target_model_id>/<base_url>` under
-  the `model_proxy_v3` service) and rewrites the config file to `STORE_KEY_IN_SYSTEM`
-  sentinels; sentinels are resolved from the keychain on every later load, silently, as
-  long as the same `node` binary/path keeps reading them — a Node upgrade or a different
-  binary path can trigger a one-time OS keychain prompt or a fatal `KeyStoreError` if
-  keychain *access* is denied. A single sentinel with no matching keychain entry is not
-  fatal: that slot is cleared (treated as unconfigured, so the normal api_key fallback
-  applies) and reported as a config error in the TUI/dashboard/console, letting the rest
-  of the models load and the proxy start. Scope:
-  configured api_keys of `[models.*]` targets, `default_upstream.default_api_key`,
-  and `[passthrough]` target `key`s
+  config `api_key` into one JSON object stored as a single OS keychain item (service
+  `model_proxy_v3`, account `__api_keys_v1__`), with properties named by the logical
+  accounts `<target_model_id>/<base_url>`. The config file is rewritten to
+  `STORE_KEY_IN_SYSTEM` sentinels; every later load reads only that one item, so macOS
+  authorization is scoped to one item rather than prompting separately for every key.
+  Access remains silent as long as the same `node` binary/path keeps reading it — a Node
+  upgrade or a different binary path can trigger a one-time OS keychain prompt or a fatal
+  `KeyStoreError` if keychain *access* is denied. Existing per-account installs are
+  migrated automatically when no bundle exists; that one-time migration must read each
+  old item and can still prompt once per old item (click "Always Allow"). Old items are
+  left in place, and subsequent loads use only the bundle. A single sentinel with no
+  matching keychain entry is not fatal: that slot is cleared (treated as unconfigured, so
+  the normal api_key fallback applies) and reported as a config error in the
+  TUI/dashboard/console, letting the rest of the models load and the proxy start. Scope:
+  configured api_keys of `[models.*]` targets, `[models.default].api_key`,
+  and `[models.passthrough]` target `key`s
   in the local `proxy_config.toml` only — ignored for Consul/Apollo sources, N/A for
   composite aliases, and caller/user keys from request headers are never stored.
-  Local/dev-host feature only — fails loud when no OS keychain is available (Docker,
+  **Per-user isolation and `su` warning:** OS credential stores are isolated per OS
+  user. A bundle written by macOS user `chris` is not visible to `claw`; the same
+  `model_proxy_v3` / `__api_keys_v1__` names refer to separate items in each user's
+  Keychain. On macOS, `su claw` (or `su - claw`) changes the Unix UID but does not
+  create the target user's full GUI security session, so `claw` may have no default or
+  unlocked login Keychain and repeatedly report `__api_keys_v1__` as missing. Run the
+  proxy in the full login session of the user whose keys should be used, or store a
+  separate bundle for that user after logging in normally; do not copy Keychain database
+  files between users. Different binaries under the same user can each require a
+  one-time "Always Allow" authorization. Local/dev-host feature only — fails loud when
+  no OS keychain is available (Docker,
   Cloudflare Workers). Backed by the `@github/keytar` native addon, pinned in
-  `optionalDependencies` as `github:github/node-keytar#v7.10.6`: `npm install` fetches
-  it from GitHub and its install script downloads a prebuilt NAPI binary — no compiler
-  or Python needed (see the toolchain note below). A source copy is kept at
-  `submodules/node-keytar` for local development; it is not used by `npm install`.
-  If startup fails with `Cannot find package '@github/keytar'`, first check
-  `git diff package.json`: npm prune-style runs (`--dry-run --omit=dev`,
+  `optionalDependencies` as `@github/keytar@7.10.6` from the npm registry. The package
+  includes prebuilt NAPI binaries and its install script copies the current platform's
+  binary into place — no compiler or Python needed (see the toolchain note below). A
+  source copy is kept at `submodules/node-keytar` for local development; it is not used
+  by `npm install`. If startup fails with `Cannot find package '@github/keytar'`, first
+  check `git diff package.json`: npm prune-style runs (`--dry-run --omit=dev`,
   `--production` — see the warning in Quick Start) can strip the
   `optionalDependencies` block, after which no `npm install` ever re-fetches the
-  addon; restore it with `git checkout -- package.json && npm install`.
-  When a sentinel's exact `<target>/<base_url>` account isn't found, resolution
-  falls back to a best-effort search across every stored account for the service
-  (`keytar.findCredentials`) — on macOS this broader enumeration can trigger its
-  own Keychain Access permission prompt in a separate GUI window (not the
-  terminal); if startup appears to hang here, check for that dialog and click
-  "Always Allow". This fallback call is bounded to 60s — if it doesn't respond
-  in time (e.g. a stuck/dismissed dialog), it fails loud with a clear timeout
-  error instead of hanging the process indefinitely.
+  addon; restore it with `git checkout -- package.json && npm install`. If startup
+  instead fails with `Failed to load keytar native addon`, reinstall the registry
+  prebuild with `npm install @github/keytar@7.10.6 --save-optional --save-exact --force`;
+  a plain `npm install` can retain an older same-version Git checkout that has no binary.
+  When a sentinel's exact `<target>/<base_url>` property isn't found in the bundle,
+  resolution falls back to a best-effort match across the other bundled properties,
+  without another keychain read. Only one-time legacy migration still uses broad
+  enumeration (`keytar.findCredentials`) for old per-account items; on macOS that can
+  trigger Keychain Access permission prompts in a separate GUI window (not the terminal).
+  This legacy fallback is bounded to 60s and reports a clear timeout error instead of
+  hanging the process indefinitely.
 - **`store_key_in_system` in the win32 single-executable build** — `@github/keytar`
   needs too many dependencies on Windows (Visual Studio Build Tools with the "Desktop
   development with C++" workload + Python 3, via node-gyp — see the toolchain table
@@ -745,21 +848,21 @@ The full field-by-field reference lives in
   target a Node install. macOS and Linux keep the OS keychain via `@github/keytar`;
   the Docker image and macOS/Linux SEA binaries keep the fatal `KeyStoreError`.
 - **System & toolchain requirements for `store_key_in_system = true`** — the feature
-  needs an OS keychain backend at run time. On macOS/Linux the `@github/keytar` native
-  addon installs as a prebuilt NAPI binary (ABI 3 — works on any modern Node), so no
-  build toolchain is required; a native toolchain (Python 3 + a C++ compiler, via
-  node-gyp) is needed only when the prebuilt download fails (e.g. no network access to
-  GitHub releases) and npm falls back to compiling the addon from source. On Windows
-  the addon needs that toolchain in the normal case — Visual Studio Build Tools with
-  the "Desktop development with C++" workload + Python 3 — which is why the win32
-  **single-executable build** skips keytar entirely and stores the keys in the
-  executable's own file body instead (see the bullet above):
+  needs an OS keychain backend at run time. For regular Node installs on macOS, Linux,
+  and Windows, the npm registry's `@github/keytar` package includes a prebuilt NAPI
+  binary (ABI 3 — works on any modern Node), so no build toolchain is normally required.
+  A native toolchain (Python 3 + a C++ compiler, via node-gyp) is needed only when npm
+  falls back to compiling from source, such as on an unsupported platform/architecture.
+  The Windows source-build fallback requires Visual Studio Build Tools with the
+  "Desktop development with C++" workload + Python 3. The win32 **single-executable
+  build** still skips keytar entirely and stores the keys in the executable's own file
+  body instead (see the bullet above):
 
   | Platform | Runtime requirement (OS keychain) | Node build toolchain (node-gyp) |
   |---|---|---|
   | macOS | Keychain Services (built in) | Xcode Command Line Tools (`xcode-select --install`) + Python 3 — only for the source-build fallback |
   | Linux | a Secret Service provider — `gnome-keyring` (or KWallet) daemon running, with `libsecret-1` | `build-essential` (gcc/g++/make) + Python 3 + `libsecret-1-dev` headers — only for the source-build fallback |
-  | Windows — `node dist/server.js` | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 |
+  | Windows — `node dist/server.js` | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 — only for the source-build fallback |
   | Windows — single-executable build | **not used** — no OS keychain, keys go in the executable's own file body (see the bullet above) | **not needed** — keytar is not installed |
 
   Headless Linux servers need a keyring daemon unlocked in the session (e.g.
@@ -778,11 +881,13 @@ Also see [`proxy_config.example.toml`](./docs/getting-started/proxy_config.examp
 **Config field aliases** — The proxy accepts both canonical and short field names
 in different config contexts (e.g., `base_url`/`base`, `upstream_mode`/`mode`,
 `api_key`/`key`). The rules differ between `[models.*]` inline tables,
-section-level defaults, and `[passthrough]` entries. See
+section-level defaults, and `[models.passthrough]` entries. See
 [**Config field aliases**](./docs/reference/configuration-reference.md#config-field-aliases)
 in the configuration reference for the full mapping tables.
 
 ## Testing
+
+The [CI workflow](./.github/workflows/ci.yml) runs dependency installation, typechecking, server and native builds, and unit tests on pushes to `feature/targeting_failover` and pull requests targeting that branch. The build does not check out submodules.
 
 ```bash
 # Coverage testcases: run from the project root; the runner builds an isolated test config.
@@ -805,7 +910,7 @@ PROXY_URL=http://localhost:8788 API_KEY=sk-test node tests/run-integration-tests
 The [`docs/`](./docs/) folder has deep-dives on specific topics:
 
 - **Sidecar status & config** — `docs/architecture/status_of_sidecars_of_proxy.md` (summary of all sidecars: remote auth, privacy filter, image fetch, tool judge, kompress, coordinator, fusion, composite, schedule, transforms)
-- **Tool-judge sidecar (Laya) context limit** — Laya runs with a per-checkpoint token budget (`max_len`: 512 for `convaiinnovations/laya`, 1,024 for multilingual/typed-decisions) shared by question prefix + state. The proxy uses character caps (2000/600/50) that don't map to tokens; exceeding the budget silently truncates the tool list — later tools vanish from the judge's view. See `docs/architecture/design_tool_judge_sidecar_protocol.md` and `submodules/laya-mlx/README.md`.
+- **Tool-judge sidecar** — supports two protocols: legacy sidecar (`/judge`) and Clef decision API (`/decision`, enabled via `use_decision_api = true` in `[tool_judge]`). Two modes: `choice` (per-tool) and `noul` (batch). Laya context limit: per-checkpoint token budget (`max_len`: 512 for `convaiinnovations/laya`, 1,024 for multilingual/typed-decisions) shared by question prefix + state. The proxy uses character caps (2000/600/50) that don't map to tokens; exceeding the budget silently truncates the tool list — later tools vanish from the judge's view. See `docs/architecture/design_tool_judge_sidecar_protocol.md`, Clef schemas at `docs/api/decision/clef-schema-input.json` and `clef-schema-output.json`, and `submodules/laya-mlx/README.md`.
 - **Routing & aliases** — `docs/reference/routing-and-aliases.md` (full `[models.*]` / `[composite]` / `[schedule]` / token-limit reference), plus `docs/getting-started/proxy_config.example.toml`, `docs/architecture/routing_refactor.md`, `docs/architecture/routing_config_revision.md`
 - **API endpoint details** — `docs/api/api-endpoints.md` (dynamic routing, image I/O across formats, prompt-caching fields, Dashboard JSON API)
 - **Configuration guide** — `docs/getting-started/configuration-guide.md` (minimal `proxy_config.toml` walkthrough + thinking/reasoning notes)
@@ -816,7 +921,7 @@ The [`docs/`](./docs/) folder has deep-dives on specific topics:
 - **Thinking / reasoning** — `docs/guides/claude-extended-thinking.md`, `docs/guides/claude-adaptive-thinking.md`
 - **API formats** — `docs/api/claude-api-reference.md`, `docs/api/gemini-api-reference.md`, `docs/api/openai-api-reference.md`
 - **Fusion & composite design** — `docs/architecture/design_fusion_composite_alias.md`
-- **Request/response transform hooks** — `docs/reference/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transform_defaults]` config) — plus `docs/architecture/design_request_transform_hooks.md` (original design) and `docs/contributing/implementation_of_request_transform_hooks.md` (implementation log)
+- **Request/response transform hooks** — `docs/reference/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transforms.default]` config) — plus `docs/architecture/design_request_transform_hooks.md` (original design) and `docs/contributing/implementation_of_request_transform_hooks.md` (implementation log)
 - **Agent harness integrations** — [`docs/guides/agents/`](./docs/guides/agents/) (per-agent guides; e.g. [using this proxy as an LLM provider for deepseek-harness](./docs/guides/agents/proxy-as-provider-for-deepseek-harness.md))
 
 ## Interactive agent session (optional)
@@ -879,7 +984,7 @@ models you trust. See `src/agent-tools.ts` for the exact checks.
 ### Models Involved
 1. `DeepSeek-R1`, `V3.2`, `V4-Flash`, `V4-Pro`, `V4.1-Flash`
 2. `Minimax-M2.6`, `M2.7-highspeed`, `M3`
-3. `Kimi-K2.6`, `K2.7-Code`, `K3`
+3. `Kimi-K2.6`, `K2.7-Code`, `K2.8`, `K3`, `K3.1-Pro`
 4. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`, `GPT-5.6`
 5. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
 6. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`
@@ -894,8 +999,9 @@ models you trust. See `src/agent-tools.ts` for the exact checks.
 3. `Gemini-Cli`
 4. `Pi-Coding-Agent`
 5. `Codex`
-6. `opencode`
-7. `model_proxy_v3` (For over 90% of its lifecycle, it functions as a local LLM gateway and continuously improves itself with CC and models.)
+6. `Kimi-Code`
+7. `opencode`
+8. `model_proxy_v3` (For over 90% of its lifecycle, it functions as a local LLM gateway and continuously improves itself with CC and models.)
 
 ## License
 

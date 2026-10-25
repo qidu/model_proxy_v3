@@ -196,7 +196,7 @@ Environment variables honored by the runner:
 
 ### 18_passthrough
 
-- `passthrough.test.js` — Live passthrough mode tests. Verifies `/passthrough/v1/*` endpoints forward requests verbatim to configured upstreams. TC5101 non-streaming `/passthrough/v1/messages`, TC5102 streaming `/passthrough/v1/messages`, TC5103 streaming `/passthrough/v1/chat/completions`, TC5104 `/passthrough/v1/responses`, TC5105 `/passthrough/v1beta/models/x:streamGenerateContent`, TC5106 unknown endpoint → 404, TC5107 schema gate failure → 400, TC5108 weighted selection config, TC5109 auth server gating, TC5110 record server recording, TC5111 plain-join URL construction (no double version segment). Requires `[passthrough]` section in test config.
+- `passthrough.test.js` — Live passthrough mode tests. Verifies `/passthrough/v1/*` endpoints forward requests verbatim to configured upstreams. TC5101 non-streaming `/passthrough/v1/messages`, TC5102 streaming `/passthrough/v1/messages`, TC5103 streaming `/passthrough/v1/chat/completions`, TC5104 `/passthrough/v1/responses`, TC5105 `/passthrough/v1beta/models/x:streamGenerateContent`, TC5106 unknown endpoint → 404, TC5107 schema gate failure → 400, TC5108 weighted selection config, TC5109 auth server gating, TC5110 record server recording, TC5111 plain-join URL construction (no double version segment). Requires `[models.passthrough]` section in test config.
 
 ## Prerequisites
 

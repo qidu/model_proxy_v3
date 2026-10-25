@@ -2,8 +2,8 @@
  * Converter from OpenAI API format to Claude API format
  */
 
-import { ClaudeMessagesResponse, ClaudeContentBlock, ClaudeTokenCountingResponse, ClaudeModelsResponse, ClaudeModel } from '../types/claude.js';
-import { OpenAIResponse, OpenAITokenCountingResponse, OpenAIModelsResponse, OpenAIModel, OpenAITextPart, OpenAIThinkingPart } from '../types/openai.js';
+import { ClaudeMessagesResponse, ClaudeContentBlock, ClaudeTokenCountingResponse } from '../types/claude.js';
+import { OpenAIResponse, OpenAITokenCountingResponse, OpenAIModelsResponse, OpenAITextPart, OpenAIThinkingPart } from '../types/openai.js';
 import { countClaudeRequestTokens, getTiktokenTokenizer, TokenCountingOptions } from '../utils/token-counting.js';
 
 /**
@@ -301,14 +301,6 @@ export function convertOpenAITokenCountingToClaude(
     };
 }
 
-/**
- * Convert Unix timestamp to RFC 3339 string
- */
-function unixToRFC3339(timestamp: number): string {
-    const date = new Date(timestamp * 1000);
-    return date.toISOString();
-}
-
 const DEFAULT_CONTEXT_LENGTH = 262144;
 const DEFAULT_MAX_TOKENS = 65536;
 
@@ -338,68 +330,5 @@ export function mergeOpenAIModelsResponse(
     return {
         object: "list",
         data: [...modelsMap.values()],
-    };
-}
-
-/**
- * Convert OpenAI models response to Claude format (legacy, for backwards compatibility)
- */
-export function convertOpenAIModelsToClaude(
-    openaiResponse: OpenAIModelsResponse,
-    extraModelIds: string[] = []
-): import('../types/claude.js').ClaudeModelsResponse {
-    const merged = mergeOpenAIModelsResponse(openaiResponse, extraModelIds);
-    const models: import('../types/claude.js').ClaudeModel[] = merged.data.map(model => ({
-        id: model.id,
-        type: "model" as const,
-        created_at: unixToRFC3339(model.created),
-        display_name: model.id,
-        context_length: model.context_length ?? DEFAULT_CONTEXT_LENGTH,
-        max_tokens: model.max_tokens ?? DEFAULT_MAX_TOKENS,
-    }));
-
-    return {
-        data: models,
-        first_id: models.length > 0 ? models[0].id : null,
-        has_more: false,
-        last_id: models.length > 0 ? models[models.length - 1].id : null,
-    };
-}
-
-/**
- * Merge extra model IDs into a Claude models response
- */
-export function mergeClaudeModelsResponse(
-    claudeResponse: import('../types/claude.js').ClaudeModelsResponse,
-    extraModelIds: string[] = []
-): import('../types/claude.js').ClaudeModelsResponse {
-    const modelsMap = new Map<string, import('../types/claude.js').ClaudeModel>(
-        claudeResponse.data.map((model) => [model.id, model] as const)
-    );
-
-    const now = new Date().toISOString();
-    const DEFAULT_CONTEXT_LENGTH = 262144;
-    const DEFAULT_MAX_TOKENS = 65536;
-
-    for (const modelId of extraModelIds) {
-        if (!modelsMap.has(modelId)) {
-            modelsMap.set(modelId, {
-                id: modelId,
-                type: "model",
-                created_at: now,
-                display_name: modelId,
-                context_length: DEFAULT_CONTEXT_LENGTH,
-                max_tokens: DEFAULT_MAX_TOKENS,
-            });
-        }
-    }
-
-    const mergedModels = [...modelsMap.values()];
-
-    return {
-        data: mergedModels,
-        first_id: mergedModels.length > 0 ? mergedModels[0].id : null,
-        has_more: false,
-        last_id: mergedModels.length > 0 ? mergedModels[mergedModels.length - 1].id : null,
     };
 }

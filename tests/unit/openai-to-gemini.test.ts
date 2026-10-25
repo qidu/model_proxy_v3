@@ -30,7 +30,7 @@ describe('convertOpenAIToGeminiGenerateContent', () => {
     assert.equal(out.candidates.length, 1);
     assert.deepEqual(out.candidates[0].content.parts, [{ text: 'hello' }]);
     assert.equal(out.candidates[0].content.role, 'model');
-    assert.equal(out.candidates[0].finishReason, 'stop');
+    assert.equal(out.candidates[0].finishReason, 'STOP');
     assert.deepEqual(out.usageMetadata, {
       promptTokenCount: 5,
       candidatesTokenCount: 3,
@@ -58,6 +58,59 @@ describe('convertOpenAIToGeminiGenerateContent', () => {
 
     assert.equal(out.candidates, undefined, 'candidates must be absent');
     assert.ok(out.usageMetadata, 'usageMetadata is still present');
+  });
+
+  it('maps lowercase OpenAI finish_reason values to the uppercase Gemini enum', () => {
+    const cases: Array<[string, string]> = [
+      ['stop', 'STOP'],
+      ['tool_calls', 'STOP'],
+      ['function_call', 'STOP'],
+      ['length', 'MAX_TOKENS'],
+      ['content_filter', 'SAFETY'],
+    ];
+    for (const [openaiReason, geminiReason] of cases) {
+      const out = convertOpenAIToGeminiGenerateContent(
+        { choices: [{ message: { content: 'x' }, finish_reason: openaiReason, index: 0 }] },
+        'm',
+        'r',
+      ) as any;
+      assert.equal(out.candidates[0].finishReason, geminiReason, `${openaiReason} -> ${geminiReason}`);
+    }
+  });
+
+  it('passes through finish_reason values that already use the Gemini enum', () => {
+    const out = convertOpenAIToGeminiGenerateContent(
+      { choices: [{ message: { content: 'x' }, finish_reason: 'RECITATION', index: 0 }] },
+      'm',
+      'r',
+    ) as any;
+
+    assert.equal(out.candidates[0].finishReason, 'RECITATION');
+  });
+
+  it('maps an unknown lowercase finish_reason to OTHER instead of leaking it', () => {
+    const out = convertOpenAIToGeminiGenerateContent(
+      { choices: [{ message: { content: 'x' }, finish_reason: 'some_new_reason', index: 0 }] },
+      'm',
+      'r',
+    ) as any;
+
+    assert.equal(out.candidates[0].finishReason, 'OTHER');
+  });
+
+  it('emits a finish-only chunk as a candidate with finishReason instead of dropping it', () => {
+    // OpenAI upstreams end streams with an empty-delta chunk carrying only
+    // finish_reason. Dropping it leaves strict Gemini clients (@google/genai)
+    // without any finishReason — they throw "stream ended without a finish reason".
+    const out = convertOpenAIToGeminiGenerateContent(
+      { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }] },
+      'm',
+      'r',
+    ) as any;
+
+    assert.equal(out.candidates.length, 1, 'finish-only chunk must keep candidates');
+    assert.deepEqual(out.candidates[0].content.parts, []);
+    assert.equal(out.candidates[0].finishReason, 'STOP');
   });
 
   it('extracts <thinking> tags into thought parts', () => {

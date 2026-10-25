@@ -5,6 +5,286 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### build(ci): build the native binary for every supported target
+
+`.github/workflows/ci.yml` — `npm run build:native` moved out of the ubuntu
+`test` job into one leg per target, because a SEA binary embeds the Node that
+built it and cannot be cross-compiled. The matrix covers all six targets
+(`x86_64` and `aarch64` on Linux, macOS, and Windows, via `ubuntu-latest`,
+`ubuntu-24.04-arm`, `macos-latest`, `macos-15-intel`, `windows-latest`, and
+`windows-11-arm`), instead of the three an OS-only matrix reached. Each leg looks
+for `dist/model-proxy-v3-<triple>` and fails if it is missing, which also proves
+the runner is the architecture the matrix claims; on Windows the expected name
+additionally ends in `.exe`, the suffix Tauri resolves an `externalBin` sidecar
+to. Binaries upload as artifacts named after their triple, and a new
+`release: [published]` trigger attaches all six to that release. The matrix is
+skipped on pull requests, which keep the ubuntu typecheck/build/test gate.
+README.md gains a target table and lists the targets that are deliberately not
+built (universal macOS, musl Linux, 32-bit).
+
+### test(unit): increase interactive function coverage
+
+`tests/unit/` — exercise populated dashboard composite/schedule/statistics/tool overlays, monthly heatmap rendering, and agent working-directory submission through mocked terminal and local skills-CLI dependencies. The agent startup test also verifies clean abort with an empty model configuration and no upstream requests.
+
+### test(unit): cover streamed bodies and defensive response extraction
+
+`tests/unit/` — add seven tests for content-length-free request buffering, OpenAI reasoning/tool history conversion to Responses input, dashboard malformed JSON and OpenAI tool/error formatting, and dashboard-stat malformed-node handling, response-tool deduplication, and duplicate-tool request-size aggregation.
+
+### test(unit): cover interactive TUI and agent startup lifecycles
+
+`tests/unit/` — drive the real dashboard renderer and help overlay through mocked TTY streams, verifying refresh/timer and terminal cleanup; cancel the agent's first prompt through its real input handler, verifying early exit, ANSI-free trajectory logging, and console/stream restoration without network access.
+
+### test(unit): cover dashboard route tables and request guards
+
+`tests/unit/` — add five tests for dashboard stats/tools/quota/mutation dispatch, malformed model JSON, global token-limit enforcement, OpenAI-style thinking normalization, and nested Responses tool/usage extraction.
+
+### test(unit): cover dashboard tracking and dispatch paths
+
+`tests/unit/`, `src/utils/dashboard-stats.ts` — add 12 tests for dashboard model-test variants and quota validation, timing/response-tool tracking and fragmented SSE, Messages upstream errors, and Decision/passthrough dispatch. Timing recorders now ignore non-finite samples, and response tool-name collection deduplicates repeated names.
+
+### test(unit): cover persistence and remaining routing branches
+
+`tests/unit/` — add 10 tests for dashboard composite/schedule mutations, JSONL stats restore/dump, Messages reasoning/options/stream conversion, dashboard API authentication, request-size limits, and plain Messages routing.
+
+### test(unit): cover low-coverage routing, dashboard, and utility paths
+
+`tests/unit/` — add 47 tests for dashboard page/stats/model-test endpoints, TUI startup and model defaults, Consul KV parsing and URL guards, tool blocklist filtering, agent-session filesystem/skill edges, Messages reasoning/tool streaming, dashboard-stat lifecycle and extraction helpers, and top-level CORS/admin/health/auth/model routing.
+
+### test(unit): broaden source function and handler coverage
+
+`tests/unit/` — add 82 tests for heatmap aggregation/rendering, model caching/discovery, embeddings, token-counting handlers, Messages/Responses conversion and passthrough, TUI request builders/model resolution, and dashboard config sanitization/persistence/validation. Upstream requests are mocked and mutable global/config state is restored between tests.
+
+### test(server): cover the Node HTTP adapter
+
+`src/server.ts`, `tests/unit/server.test.ts` — environment construction, response-header filtering, and request adaptation are now exported and startup runs only for direct execution. Unit tests cover GET/POST forwarding, non-streaming and SSE responses, request-counter release, and handler failures through an ephemeral local HTTP server.
+
+### docs(api): gap analysis of `/v1/responses` against the Open Responses specification (2026-04-24)
+
+`docs/api/review-for-gaps-to-the-open-responses-spec.md` — new review document comparing the `/v1/responses` implementation against `docs/api/spec-of-open-responses-2026-04-24.mdx.txt`. Sixteen items, each with the spec quote (line-cited), current behavior with `file:line` evidence, the minimal fix, and a status; plus a scope rule, a verified-compliant list, a status summary table, and an implementation order.
+Analysis only; no code changed. 
+
+### fix(deps): install Keytar's platform prebuilds from the npm registry
+
+`package.json`, `README.md`, `docs/reference/configuration-reference.md`, `docs/getting-started/proxy_config.example.toml` — the optional `@github/keytar` dependency is now pinned to the exact npm registry release `7.10.6` instead of the same-version GitHub tag. The Git checkout contains no `prebuilds/` or `build/Release/keytar.node`, so macOS failed at startup with `Failed to load keytar native addon`; the registry tarball includes `darwin-arm64` and the other platform binaries, and its install script copies the active one into `build/Release`. Existing same-version Git checkouts may need the documented explicit reinstall once because a plain `npm install` can consider them up to date.
+
+**Verification status**: registry `darwin-arm64` prebuild installed successfully, `import('@github/keytar')` passed, a read-only native macOS lookup of a deliberately missing item returned `null`, `npm run typecheck` (pass), `npm run build` (pass), and `npm run test:unit` — **1608 tests, 1608 pass, 0 fail** — executed on this tree.
+
+### fix(config): consolidate system keychain keys into one item
+
+`src/utils/key-store.ts`, `tests/unit/key-store.test.ts`, `README.md`, `docs/reference/configuration-reference.md`, `docs/getting-started/proxy_config.example.toml` — all logical `<target_model_id>/<base_url>` api_keys now live in one JSON object under the reserved `__api_keys_v1__` account in the existing `model_proxy_v3` service. Normal sentinel resolution performs one native keychain read regardless of key count, so macOS item authorization no longer prompts separately for every key; best-effort fallback and the TUI account list read the same bundle. Existing per-account items are migrated automatically when no bundle exists and left in place afterward. The one-time migration still has to read each legacy item and can therefore produce one prompt per old item.
+
+**Verification status**: focused key-store/body-key-store tests (**31 tests, 31 pass, 0 fail**), `npm run typecheck` (pass), `npm run build` (pass), and `npm run test:unit` — **1608 tests, 1608 pass, 0 fail** — executed on this tree. The real macOS GUI permission dialog was not exercised by automated tests.
+
+### fix(config): remove deprecated `[tool_judge_sidecar]`, `[transform_defaults]`, `[decision]`, `[passthrough]` section headers
+
+`src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `tests/unit/transforms-config.test.ts`, `docs/getting-started/validating_tool_judge_sidecar.md` — the back-compat branches for the four old section headers are deleted. They now fall through to the generic unknown-section branch like any unsupported header: their keys are ignored, the config field stays unset, and an "unknown section header … keys under it are ignored" warning is recorded in `_validationWarnings` (surfaced in the TUI/dashboard status). The canonical headers `[tool_judge]`, `[transforms.default]`, `[models.decision]`, `[models.passthrough]` are unchanged, as are the `[models.decision.x]` / `[models.passthrough.x]` / `[transforms.default.x]` third-part guards.
+
+**Breaking change**: configs still using `[tool_judge_sidecar]`, `[transform_defaults]`, `[decision]`, or `[passthrough]` must rename them to `[tool_judge]`, `[transforms.default]`, `[models.decision]`, `[models.passthrough]` — until renamed, those sections silently stop applying (tool judging disabled, decision endpoint disabled, passthrough targets gone, transform mode-defaults unwired).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1604 tests, 1604 pass, 0 fail** — executed on this tree.
+
+### fix(config): rename section header — `[transform_defaults]` → `[transforms.default]`
+
+`src/utils/config-loader.ts`, `README.md`, `docs/getting-started/proxy_config.example.toml`, `docs/getting-started/proxy_config.transforms.example.toml`, `docs/reference/configuration-reference.md`, `docs/reference/transforms-reference.md`, `docs/reference/index.md`, `docs/api/list_of_api_and_schema.md`, `tests/unit/transforms-config.test.ts`, `tests/unit/config-loader.test.ts` — the transform-defaults section header gets a canonical name:
+
+- `[transform_defaults]` → `[transforms.default]`
+
+The parser intercepts `[transforms.default]` **before** the generic `[transforms.<name>]` branch (which would otherwise treat the second dotted part as a transform-set name), mapping it to the existing internal section `transform_defaults` with `currentCategory = null` — so it never creates a transform set named `default`, and all key parsing, validation, and the `config.transform_defaults` field are unchanged. **This reserves `default` as a transform-set name**: a config that declares `[transforms.default]` with actual transform-set keys (`schema`/ops) will now have those keys parsed as transform-defaults entries instead — rename such a set if you have one. The old `[transform_defaults]` header still parses but emits a deprecation `console.warn`, following the existing `[remote.authentication]` pattern; when both headers appear in one file, the later section wins (unchanged pre-existing behavior). `serializeProxyConfigToml` now writes `[transforms.default]`, so configs saved from the dashboard/TUI migrate on save. Docs, comments, and example configs updated; historical documents (prior `CHANGELOG.md` entries, `docs/architecture/`, `docs/contributing/`, `docs/plan-*.md`, `docs/review-*.md`) intentionally untouched.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1608 tests, 1608 pass, 0 fail** — executed on this tree.
+
+### fix(config): rename section headers — `[tool_judge]`, `[models.decision]`, `[models.passthrough]`
+
+`src/utils/config-loader.ts`, `src/handlers/decision.ts`, `src/handlers/dashboard.ts`, `src/tui.ts`, `src/utils/key-store.ts`, `proxy_config.toml`, `README.md`, `docs/getting-started/proxy_config.example.toml`, `docs/getting-started/validating_tool_judge_sidecar.md`, `docs/reference/configuration-reference.md`, `docs/reference/routing-and-aliases.md`, `tests/unit/config-loader.test.ts`, `tests/unit/key-store.test.ts`, `tests/unit/decision.test.ts`, `tests/manual/proxy_decision_config.toml`, `tests/manual/proxy_laya_real.toml`, `tests/manual/verify_decision_e2e.sh`, `tests/integration/README.md` — three TOML section headers get canonical names:
+
+- `[tool_judge_sidecar]` → `[tool_judge]`
+- `[decision]` → `[models.decision]`
+- `[passthrough]` → `[models.passthrough]`
+
+The parser's section dispatch maps each new header onto the existing internal section (`tool_judge_sidecar` / `decision` / `passthrough`), so all key parsing, validation, and the `ProxyConfig` fields are unchanged. `[models.decision]` and `[models.passthrough]` are intercepted **before** the generic `[models.*]` branch, so they never create `decision`/`passthrough` model categories. The old headers still parse but emit a deprecation `console.warn`, following the existing `[remote.authentication]` deprecation pattern; when both old and new headers appear in one file, the later section wins (unchanged pre-existing behavior). `serializeProxyConfigToml` now writes the canonical headers, so configs saved from the dashboard/TUI migrate on save. Docs, comments, and UI strings updated to the canonical names; historical documents (`CHANGELOG.md` prior entries, `docs/architecture/`, `docs/plan-*.md`, `docs/review-*.md`) intentionally untouched.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1604 tests, 1604 pass, 0 fail** — executed on this tree.
+
+### fix(agent): resolve the loopback client key per selected model alias
+
+`src/agent-session.ts` — agent-session model verification 401ed for any alias whose upstream key differs from `[models.default].api_key`, even when the same model tested green in the dashboard/TUI. Root cause: outside the `free` section (and `config_key` mode) the proxy forwards the *caller's* credential upstream, and the agent session authenticated every loopback `/v1/messages` call with one static key — `PROXY_CLIENT_API_KEY`, else the placeholder `sk-hi-agent-launched-in-proxy-v3`, else the default key — so upstreams received the placeholder and answered 401 (`Invalid API key` / `Missing Authentication header`). The dashboard and TUI model tests were never affected because they already send the model's own configured key.
+
+The client key is now resolved per selected alias with the same precedence those tests use: `PROXY_CLIENT_API_KEY` → the alias's configured `route.apiKey` (via `getModelRouteConfig`) → `[models.default].api_key` → agent-mode placeholder. Composite aliases keep the old fallback (per-target keys are applied proxy-side). The up-front "no client API key" abort now also recognizes per-alias keys as a valid key source.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1594 tests, 1594 pass, 0 fail** — executed on this tree; live-verified end-to-end through the local proxy (`/v1/messages` → `default-deepseek-v4.1-qn` → qnaigc upstream, real 200 response).
+
+### fix(config): remove `[default_upstream]` section, use `[models.default]` as sole fallback
+
+`src/utils/config-loader.ts`, `src/utils/key-store.ts`, `src/utils/consul-loader.ts`, `src/index.ts`, `src/tui.ts`, `proxy_config.toml` — deprecated `[default_upstream]` and its `default_*` keys are fully removed. The single fallback is now `[models.default]` with the same fields (`api_key`, `url`, `model`, `weight`, `timeout_ms`, `max_retries`, `headers`). All config sources (TOML, keychain, Consul/Apollo) and consumers (composite resolution, TUI model test, config_key mode) updated.
+
+**Breaking change**: configs with `[default_upstream]` must migrate to `[models.default]`.
+
+### feat(composite): decision mode — Clef `/decision` API for ability-based target selection
+
+`src/utils/config-loader.ts`, `src/index.ts`, `tests/unit/config-loader.test.ts`, `docs/architecture/design_decision_composite_targeting.md` — new **decision mode** for `[composite]` aliases that uses the Clef `/decision` protocol to intelligently select a target model based on declared abilities.
+
+- **Trigger condition**: activates **only** when **no** static targeting (`primary`/`fallback`/`share`) is configured **and** at least one target has an `ability` field (comma-separated skills like `ability = "coding,reasoning,analysis"`).
+- **Protocol**: POST `{model, state, questions}` to the Clef `/decision` endpoint → returns `{answers: {target_selection: {choice, probabilities, confidence}}}`.
+- **Fail-open**: any decision API failure (network, timeout, invalid response) falls back to declaration order — same pattern as the tool judge sidecar.
+- **Config mirrors `JudgeSidecarConfig`**: `decision = { model = "clef", url = "https://…", api_key = "…", threshold = 0.5, timeout_ms = 3000, context_prompts = 1 }` — all fields optional except `model` and `url` when the block is present.
+- **Static precedence**: `primary` → `fallback` (ascending) → `share` (weighted random) → `decision` (ability-based) → declaration order.
+- **Quote-aware comma splitting** for `ability` field parsing (e.g., `"coding, reasoning, analysis"`).
+- **Integration**: `resolveCompositeWithDecision()` called from `src/index.ts` during composite alias resolution; uses existing `callDecisionApi()` to avoid duplication.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **all 201 config-loader tests pass** — executed on this tree.
+
+### docs(readme): add Tool Judge Sidecar section with Clef decision API support
+
+`README.md` — added dedicated documentation for the `[tool_judge_sidecar]` section
+after the Decision endpoint, covering:
+- Two protocols: legacy sidecar (`/judge`) and Clef decision API (`/decision`, enabled
+  via `use_decision_api = true`)
+- Two modes: `choice` (per-tool) and `noul` (batch)
+- Fail-open behavior, response time expectations
+- Reference sidecar server commands for both protocols
+- Full configuration reference including new `use_decision_api` and `model` fields
+
+### fix(config): drop invalid tool_judge_sidecar.model values during parsing
+
+`src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts` — invalid `model` values in `[tool_judge_sidecar]` (e.g., `model = "invalid-model"`) are now silently dropped during TOML parsing instead of being stored and then flagged by `validateProxyConfig`. Valid values (`laya`, `clef`, `clef-flash`) are accepted; unrecognized values leave `model` as `undefined`, matching the behavior of other fields like `use_decision_api` that coerce/validate during parsing.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — all config-loader tests pass.
+
+### feat(judge): judge state carries only tool name + description; noul mode chunks to cover every tool
+
+`src/utils/tool-judge-sidecar.ts`, `src/utils/tool-shapes.ts`, `tests/unit/tool-judge-sidecar.test.ts`, `docs/architecture/design_tool_judge_sidecar_protocol.md`, `docs/getting-started/proxy_config.example.toml`, `docs/getting-started/validating_tool_judge_sidecar.md` — two changes to what the judge is shown and how many tools reach it.
+
+- **Tool context is name + description, not schema.** `buildStateText` serialized each tool's full parameter schema into the state (`1. Read: {"type":"object",…}`), which burned the sidecar encoder's small token budget. `ToolRecord` now carries an optional `description` extracted from all three wire shapes (Claude `description`, OpenAI `function.description`, Gemini `functionDeclarations[].description`; omitted entirely when absent so record shape is unchanged), and the state line is `N. name: description` (600-char cap, `MAX_SCHEMA_CHARS` renamed `MAX_TOOL_DESCRIPTION_CHARS`). Tools without a description render as just `N. name` and are judged on the name alone.
+- **noul mode chunks instead of skipping.** Tools past `max_batch_tools` used to be silently kept (`skippedNames`); now the tool list is judged in sequential chunks of `max_batch_tools` per request, each chunk's state carrying only its own tools. Per-request timeout is unchanged: `N questions × timeout_ms`, hard-capped at 2000ms. A failed chunk fails open for just its tools; other chunks still judge. `skippedNames` stays in the `JudgeResult` shape but is always empty; the "over max_batch_tools" log text is gone.
+- **Tests**: the old "caps the batch at max_batch_tools" test became a chunking test (4 tools at `max_batch_tools = 2` → 2 requests, disjoint question sets, per-chunk state isolation, all 4 judged); the §4.1-sections and truncation tests now pin the name+description line and the schema's absence; the choice-mode isolation test matches the description-less line format.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree.
+
+### feat(judge): strip client-injected content from the judged prompt
+
+`src/utils/tool-judge-sidecar.ts`, `tests/unit/tool-judge-sidecar.test.ts` — the judged `User prompt` line carried whatever client harnesses embedded in the user message (a Claude Code `<system-reminder>` date block is ~60 tokens of the sidecar's 512-token budget and says nothing about tool relevance). `stripClientInjectedContent` now cleans the prompt line in three layers; the upstream request body is never touched.
+
+- **Layer 1, known tags.** Blocks stripped with contents and surrounding whitespace (`\s*`, so Claude Code's newline+indentation separators between adjacent blocks are handled): `system-reminder` (Claude Code), `environment_context` (Codex), `local-command-stdout`/`-stderr` (Claude Code `! cmd`), `ide_opened_file`/`ide_selection` (Claude Code IDE integration), `command-message` (slash-command boilerplate). Open/close names must match via a `\1` backreference — unclosed or mismatched tags pass through. The Claude Code local-command `Caveat: The messages below were generated…` paragraph is matched to end-of-line.
+- **Slash-command unwrapping.** `<command-name>` and `<command-args>` hold what the user actually typed, so their tags are removed but the inner text is kept (`<command-name>/mcp</command-name>…hi` → `/mcp\n\nhi`).
+- **Layer 2, generalized leading tag blocks.** Any leading paragraph wholly wrapped in a matched tag pair and followed by a blank line is stripped regardless of tag name, covering clients whose tags we don't know. The blank-line requirement is the safety rail: `<div>x</div> what does this HTML render?` is untouched.
+- **Layer 3, heuristic fallback.** Only when no tag matched at all: blank-line-separated leading paragraphs made *entirely* of machine-looking lines (`key: value`, ISO dates, bare paths, single-line tag pairs) are dropped, keeping from the first human-looking paragraph on. Genuine multi-paragraph prompts (`here is the error:\n\nTypeError: boom\n\nhow do I fix it?`) survive because one prose line keeps a paragraph.
+- **Tests**: 12 buildStateText cases cover each layer — per-tag stripping, command unwrap, mid-message blocks, unclosed-tag passthrough, unknown-tag generalized stripping, blank-line gating, machine-paragraph dropping, prose preservation.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree.
+
+### feat(judge): debug trail for sidecar request, response, decisions, and erasures
+
+`src/utils/tool-judge-sidecar.ts`, `src/utils/tool-blocklist.ts`, `src/index.ts` — at `LOG_LEVEL=debug` a judged request now leaves a complete trail: the exact request payload (`Tool judge sidecar request to <url> (<mode> mode, N question(s), timeout Xms): <json>`, truncated at 4000 chars, logged from the same serialized string that goes on the wire), the raw sidecar response body, one line per tool decision with its factor (`Bash -> erase (confidence=0.1203, noul=0.12)`), per-tool unjudged markers, the existing summary, a pre-erase notice, and per-tool erase lines that name the source — `static blocklist` vs `judge sidecar, confidence=X.XXXX` — via a new `eraseFactors` map on `JudgeResult` threaded into `eraseBlockedTools` (new optional parameter).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree; live-verified against a remote laya-mlx sidecar (request → raw response → decisions → summary → erasures all present in one request id's log).
+
+### fix(logger): `createLogger` falls back to `process.env.LOG_LEVEL`
+
+`src/utils/logger.ts` — `createLogger` read the level only from its argument, so every module-scope `createLogger({})` (the tool-judge sidecar client among them) was pinned to `info` and its debug output was silently dropped even with `LOG_LEVEL=debug` — the symptom was a request-scoped debug line appearing while the same request's judge-side debug lines vanished. The level now resolves as `env.LOG_LEVEL ?? process.env.LOG_LEVEL ?? 'info'`. `process` access was already assumed in this module (the `AGENT` check at load time), and the fallback also unsticks the other `createLogger({})` call sites.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree.
+
+### fix(health): warn and skip the model count when no default upstream is configured
+
+`src/index.ts` — the `/health` handler interpolated `getDefaultUpstreamConfig`'s possibly-undefined `baseUrl` straight into `` `${baseUrl}/v1/models` ``, producing a fetch of `undefined/v1/models` and a confusing `Failed to parse URL` error on any config without a `[models.default]` table or `[default_upstream].default_base_url`. The handler now logs `Health check: no default upstream configured … — skipping upstream model count` at warn level and falls through to the existing `404 No models Found.` response without attempting the fetch.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1550 tests, 1550 pass, 0 fail** — executed on this tree, plus a live check: `GET /health` on a config without a default upstream now emits the warning and the 404, with no parse error.
+
+### fix(converters): emit Gemini-enum `finishReason` and keep finish-only chunks in the OpenAI→generateContent conversion
+
+`src/converters/openai-to-gemini.ts`, `tests/unit/openai-to-gemini.test.ts` — an OpenAI-upstream model tested through the proxy's Gemini endpoint (`/v1beta/models/{alias}:streamGenerateContent`, e.g. from the agent-session endpoint-schema picker via pi-ai / `@google/genai`) failed verification even though the reply arrived fine, because the egress conversion violated the Gemini finish-reason contract twice.
+
+- **Lowercase `finishReason` leaked through.** The converter copied OpenAI's `finish_reason` verbatim (`"stop"`), but the Gemini API uses the uppercase enum (`"STOP"`, `"MAX_TOKENS"`, …) and strict SDKs switch on it — `@google/genai`'s `mapStopReason` throws `Unhandled stop reason: stop`. A new `toGeminiFinishReason()` helper maps `stop`/`tool_calls`/`function_call` → `STOP`, `length` → `MAX_TOKENS`, `content_filter` → `SAFETY`, passes through values that are already uppercase enum members, and maps unknown lowercase values to `OTHER`.
+- **Finish-only chunks were dropped.** OpenAI upstreams end streams with an empty-delta chunk carrying only `finish_reason`; with zero convertible parts the converter deleted `candidates`, the SSE loop in `src/handlers/openai.ts` skipped the chunk, and the stream ended with no `finishReason` anywhere — `@google/genai` then throws `Google stream ended without a finish reason`. Such chunks now emit a candidate with empty `parts` and the mapped `finishReason`; genuinely empty keepalive chunks (no finish reason) are still dropped.
+- pi-ai catches either throw and marks the assistant message `stopReason: "error"`, which is why agent-session's verification reported "verifying failed" on a healthy round-trip. The Interactions sibling converter carries no `finishReason` field and needed no change.
+- **Tests**: `tests/unit/openai-to-gemini.test.ts` — existing lowercase assertion updated to `STOP`, plus 4 new cases: the 5-entry lowercase→uppercase mapping table, uppercase passthrough (`RECITATION`), unknown lowercase → `OTHER`, and the finish-only chunk (empty delta + `finish_reason: 'stop'` → candidate with empty parts + `STOP`, not dropped).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1538 tests, 1538 pass, 0 fail** — executed on this tree, plus a live end-to-end check against `tsx src/server.ts` with an OpenRouter-backed alias: `:streamGenerateContent?alt=sse` now terminates with `finishReason: "STOP"` and non-streaming `:generateContent` returns `"STOP"` (both previously lowercase/absent).
+
+### chore(handlers,converters): delete verified-dead gemini code paths
+
+`src/handlers/gemini.ts`, `src/converters/claude-to-gemini.ts`, `src/converters/gemini-streaming.ts`, `docs/dead-duplicate-code-review.md` — dead-code removals from the repo-wide review (findings and per-item fix status live in the review doc).
+
+- **`gemini.ts`**: the unused `GeminiConfig`/`DEFAULT_GEMINI_CONFIG`/`getGeminiConfig()` block, the never-called `extractInteractionId()`, and the unreachable `'openai-compatible'` `endpointType` branches — unreachable because the router dispatches only `'interactions'`/`'native-gemini'` into this handler (openai-compatible clients bound for a Gemini upstream go through `chat-completions.ts`/`responses.ts`), and a Gemini `generateContent` upstream can never return an OpenAI-shaped body. Both `endpointType` unions narrowed accordingly; the consequentially-unused imports (`convertGeminiToClaudeResponse`, `convertOpenAIToClaudeResponse`, `createStreamTransformer`) removed. `convertGeminiToClaudeResponse` is now production-dead (test-only) and flagged as such in the review doc.
+- **`claude-to-gemini.ts`**: the ~240-line dead island of six internal converters (`convertClaudeMessagesToGeminiInput`, `convertClaudeContentToGemini`, `mapClaudeImageMimeToGemini`, `convertClaudeToolToGemini`, `convertClaudeConfigToGemini`, `convertClaudeToolChoiceToGemini`) that only ever called each other, plus the imports only they used; the live `decodeDataUri` and both exported entry points are untouched.
+- **`gemini-streaming.ts`**: `processContentDelta`, never called (the live handlers inline the same event construction).
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1538 tests, 1538 pass, 0 fail** — executed on this tree. No test changes were needed: existing suites only import the live exports.
+
+### fix(agent): hide the shell `!` in the input, reset the prompt after submit
+
+`src/agent-session.ts` — typing a leading `!` swapped the input prompt from `>` to `!`, but the value still carried its own `!`, so the line rendered doubled (`! !ls`). `render` is now wrapped while idle to drop the value's leading `!` from the display (the value keeps it for the task loops' `startsWith('!')` check and the history entry), and `handleInputSubmit` clears the indicator back to `>` as soon as a command is emitted rather than relying on the next keystroke.
+
+### fix(agent): compact million/billion-scale usage in task status
+
+`formatUsage` now renders million/billion-scale used-token counts with up to two decimal places, so the task status reads `usage: 1.93m tokens / 50m limit and 1 / 100 turns` (`2.5b` once past a billion); values below one million and existing budget-limit formatting are unchanged. Unit coverage pins fractional (`1.93m`, `2.5b`) and whole (`2m`, `3b`) forms.
+
+### feat(agent-tui): ctrl-s steers mid-run input, one status line for both renderers, and diff-aware shell output
+
+`src/agent-session.ts`, `tests/unit/agent-session.test.ts`, `docs/architecture/design_of_persistent_tui_of_agent_with_followup_for_task.md` — four passes over the interactive session: mid-run input can be steered into the running task instead of queued as a follow-up, the TUI status bar and the raw stderr process-log now render the same line from one helper (the shadowing that pinned the status bar at zeros is gone), `!` shell output that reads as a unified diff renders green/red instead of through Markdown, and the tab-title glyph cycle holds each letter long enough to read.
+
+- **Steer mode (ctrl-s).** `handleInputSubmit`'s mid-run branch was a hard-coded `followUp()`; it now routes to `runningAgent.steer(message)` when the new module-scope `steerMode` is set and `followUp()` otherwise, with both queues left on pi-agent-core's default `"one-at-a-time"` drain (`steer()` lands at the next turn boundary *inside* the running task; `followUp()` waits until the agent would otherwise stop). The mode is a sticky toggle, not a per-message prefix, and the prompt shows it: the new `agentInputPrompt(steer, busyFrame, shell)` composes `⚡> ` idle / `⚡⠇ ` while the spinner runs, and the echoed user line is badged `⚡ ` to match. Toggle feedback goes to the transient proxy-log row (one row, replacement semantics) rather than the transcript. `ctrl+s` is unbound in pi-tui's `TUI_KEYBINDINGS` defaults and is consumed by the `persistentTui.addInputListener` registered in `startPersistentTui`, so the focused `Input` never sees the byte.
+- **One status line, one set of counters.** The `(π …)` line was built inline in two places — `updateStatusBar` (TUI) and `printProcessLog` (stderr) — reading *different* variables: the process-log copy read `runAgentSession`'s locals while `updateStatusBar` read the module-scope names, which at HEAD were only ever declared (`let skillsUsed = 0` etc., assigned nowhere at module scope). Under the persistent TUI every counter in the status bar therefore read 0 and the trailing dots never advanced past a single `.`. `buildStatusLine()` now owns the line (both callers, plus `progressTick` now module-scope), `skillsUsed`/`selected`/`toolsUsed`/`tokensUsed`/`turnsUsed`/`resultsReceived`/`progressTick` are assigned and reset by `runAgentSession` instead of being shadowed by locals of the same name, and filtering the empty parts drops a stray ` | ` the old template emitted when there were tools but no skills.
+- **Two renderers, no double-write.** `printProcessLog` returns immediately while `persistentTui` owns the screen: the TUI parks the cursor on the input row, so the raw stderr carriage-return line would land on it and blink against the TUI's own redraws. The 400ms ticker's gate changed from `isStderrTty` to `!isStderrTty && !persistentTui` — a TUI gets animated dots from `updateStatusBar` even when stderr is a pipe, and a piped log still gets no interval at all.
+- **Dead module state deleted.** `let budget: Budget | null = null` with its `budget = budget` self-assignment is gone (every read of `budget` is the local declared at 1815), as is `const skillsUsedNames: string[] = []` — declared with a comment describing a population that never happened and referenced nowhere.
+- **Title glyph cadence.** `agentTitleGlyph`'s cycle went 20 ticks → 23: after `π`×14, `o`/`u`/`n` are held 3 ticks each (`o,o,o,u,u,u,n,n,n`) instead of one, so each letter stays on screen ~0.45s instead of ~0.15s (cycle 3s → 3.45s at 150ms/tick).
+- **Diff-aware shell output.** New `looksLikeDiff(output)` — true only when the text has at least one `+`-leading *and* one `-`-leading line, so `--help` listings and other `-`-only output stay where they were — and `DiffText`, a literal renderer that keeps each line's exact characters (indentation included, which Markdown's bullet path mangled) and paints `-` lines green / `+` lines red / the rest dim: the session's convention, inverted from git's, held in two swappable constants. Wrapping goes through `wrapTextWithAnsi` per line so every wrapped row keeps its line's colour. `shellOutputComponent` picks between `DiffText` and the previous `Markdown(output, 0, 1, …)` at the two `!`-shell call sites; `shellOutputs.push(output)` still gets the raw text, so the model's view is unchanged.
+- **Shell prompt indicator.** A leading `!` swaps the idle `> ` for `! ` (via `agentInputPrompt`'s third argument), resynced by wrapping `bottomInput.handleInput` — pi-tui's `Input` has no change callback, and this is the one place a keystroke is observable.
+- **Tests**: `tests/unit/agent-session.test.ts` 73 → 84 — `agentInputPrompt` (3: plain, ⚡ badge, busy frame beating both), `looksLikeDiff` (3: real unified diff, prose/empty, single-marker output), `DiffText` (5: per-line colour with exact characters preserved, indentation intact, rows unpadded and reset-terminated, every wrapped row keeping its foreground with no character lost, empty render at width 0) — plus the `agentTitleGlyph` cases rewritten for the 23-tick sequence and cycle.
+
+**Verification status**: `npm run typecheck` (pass), `npm run build` (pass, exit 0) and `npm run test:unit` — **1531 tests, 1531 pass, 0 fail, 290 suites** (+11 for the new helpers) — executed on this tree. Not covered: the ticker wiring, the ctrl-s listener and the `!`-shell call sites are module-private or PTY-bound, so they are verified by inspection only — `steer()`'s existence, the `"one-at-a-time"` queue defaults and `ctrl+s`'s absence from the default keymap were read out of `@earendil-works/pi-agent-core@0.99.2` (`agent.js`, `agent.d.ts`) and `@earendil-works/pi-tui@0.99.2` (`keybindings.js`). Two doc comments are wrong and were left as-is (rule 8): `startPersistentTui` says `RuledInput` delegates to the wrapped `handleInput` "after history navigation", but both arrow branches return before delegating, so recalling a `!cmd` from history leaves the `!` indicator until the next keystroke; and `syncShellPrompt` says it is called "after submissions", for which no call exists — the post-submit prompt comes from `startTuiSpinner`/`stopTuiSpinner` recomputing it. The design doc's section 2 was rewritten for steer mode, but its `progressTick` "Known shadowing" note (~line 125) and the test-coverage inventory's "20-tick cycle" (~line 509) still describe what this change removed and were not corrected.
+### refactor(config-loader): extract `getDefaultUpstreamConfig` for the default-upstream lookup chain
+
+`src/utils/config-loader.ts`, `src/index.ts`, `src/utils/target-retry.ts`, `tests/unit/config-loader.test.ts` — five copies of the same three-rung config chain (`[models.default]` table → `[default_upstream]` → literal default) now resolve through one exported helper.
+
+- **The chain had five members.** `parseFixedRoute` and the `/health` handler (`src/index.ts`) each inlined it for raw `upstream_mode`/`base_url` values; `getDefaultModelRoute` and `resolveModelRouteFromEntry` (`config-loader.ts`) ran the same chain with their own `'http://localhost'` base-url literal; `descriptorToRoute` (`target-retry.ts`) ran a mode-only stub of it. All five now call `getDefaultUpstreamConfig(proxyConfig, primary?)`, where `primary` defaults to the `[models.default]` category (with the `!Array.isArray` guard, since the TOML parser can also produce an array-of-tables under that key) and may be overridden per call site — a category config, or `{ upstream_mode: descriptor.mode }`.
+- **Per-site literals stay per-site.** The helper only supplies the `'openai-completions'` literal for mode; the `'http://localhost'` base-url literals remain at the two config-loader call sites that had them, and `parseFixedRoute`'s tolerate-undefined base-url coercion (`|| ''` downstream) is unchanged. The `ModelRouteConfig` returned by `getDefaultModelRoute` is field-for-field identical.
+- **Deliberately not folded**: four sites that read `default_upstream?.default_api_key` directly with no `[models.default]` rung (`src/index.ts:1669`, `src/index.ts:1752`, `src/handlers/dashboard.ts:3643`, `src/handlers/dashboard.ts:3649`) — giving them the rung would be a behavior change, not a refactor, and is left for a separate decision.
+- **Tests**: new 6-test `getDefaultUpstreamConfig` suite in `tests/unit/config-loader.test.ts` — table-wins, array-typed `models.default` ignored, per-key `[default_upstream]` fallback, literal only when both absent, explicit-primary override semantics (per-key, not merged), empty-string fall-through.
+
+**Verification status**: `npm run typecheck` (pass), `npm run test:unit` — **1520 tests, 1520 pass, 0 fail** — and `npm run build` (pass) executed on this tree.
+
+### refactor(auth-headers): import `normalizeOpenAIAuthHeaders` from its own module, drop the routing re-export
+
+`src/handlers/openai.ts`, `src/handlers/responses.ts`, `src/handlers/chat-completions.ts`, `src/handlers/messages.ts`, `src/utils/routing.ts` — when `normalizeOpenAIAuthHeaders` moved into `src/utils/auth-headers.ts` (entry below) it kept a re-export shim in `routing.ts` so the handler files didn't have to move in that pass. They move now.
+
+- All four handlers import `normalizeOpenAIAuthHeaders` from `../utils/auth-headers.js` directly (merged into existing auth-headers import lines where present, e.g. alongside `repackBearerCredential` and `resolveIncomingAuthorization`); `addForwardedHeaders` stays from `routing.js`. All 14 call sites untouched.
+- The shim is gone: `routing.ts` no longer imports or re-exports the name (`pickRawApiKey`, which routing uses internally, stays). Pre-removal greps confirmed zero internal uses in `routing.ts` and exactly these four importers repo-wide.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1514 tests, 1514 pass, 0 fail** — executed on this tree; counts unchanged, as expected for an import-only change.
+
+### fix(routing): stop sending `/v1/models` list requests down the gemini credential chain, and unify the gemini classifiers
+
+`src/utils/routing.ts`, `tests/unit/routing.test.ts` — two related cleanups of the gemini path classification.
+
+- **`/v1/models` is a list endpoint, not a gemini call.** `isGeminiEndpoint` in `transformAuthHeadersForUpstream` matched the prefix `/v1/models/`, which also covers the OpenAI-convention model-list path; an `anthropic-messages`-mode list request carrying both `Authorization` and `x-goog-api-key` would then have the **goog key** chosen for the anthropic upstream (401). The matcher now requires a segment after `models/` — genuine gemini calls (`models/{id}`, `models/{id}:generateContent|:streamGenerateContent|:countTokens`, bare model gets) still match, while the bare list endpoint falls to the default `Authorization > x-api-key > goog` chain.
+- **One predicate for both classifiers.** `isGeminiApiPath` (leading-slash agnostic, since the two call sites receive differently-normalized inputs) now backs both `transformAuthHeadersForUpstream`'s credential priority and `getHandlerType`'s handler selection, replacing three ad-hoc pattern sets. `getHandlerType`'s behavior is input-equivalent (verified by walking list/beta-list/`:generateContent`/`:streamGenerateContent`-throws/interactions shapes — identical results, including the throw paths). Side effect, the intended one: `/v1beta/interactions*` requests now get goog-first credential priority like their `/v1/interactions*` siblings, instead of falling into the default chain.
+- **Tests**: 7 new cases in `tests/unit/routing.test.ts` — the list-endpoint regression (anthropic-mode `/v1/models` + dual credentials → emits `x-api-key: sk-anthropic`), a `:generateContent` positive control, goog-only fall-through on the list endpoint, `/v1beta/interactions` priority + Authorization-only fall-through, and `getHandlerType` pins for `v1beta/interactions` and the throw paths.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1514 tests, 1514 pass, 0 fail** — executed on this tree.
+
+### chore(converters,routing): delete dead model-list converters and a stale beta-features import
+
+`src/converters/openai-to-claude.ts`, `src/utils/routing.ts`, `tests/unit/openai-to-claude.test.ts` — dead code removal, no runtime behavior change.
+
+- **`convertOpenAIModelsToClaude` and `mergeClaudeModelsResponse` are gone.** The former was test-only — its live functionality already lives inline in `src/index.ts`'s `claude-cli` model-list branch, which never called it. The latter had zero call sites anywhere: orphaned when an earlier commit (`32121b2`, per the history below) re-pointed the test suite to `mergeOpenAIModelsResponse` — a different, still-used export; the near-identical names hid the death. Swept with them: `unixToRFC3339` (its only caller was the deleted converter), the `ClaudeModelsResponse`/`ClaudeModel` import bindings, and a pre-existing unreferenced `OpenAIModel` import binding. Module-level `DEFAULT_CONTEXT_LENGTH`/`DEFAULT_MAX_TOKENS` stay — still used by `mergeOpenAIModelsResponse`.
+- **`routing.ts` dropped a stale import**: the bare `validateBetaFeatures` binding was imported at line 11 but only the `validateBetaFeatures as validateBetaFeaturesUtil` alias was ever used.
+- **Tests**: the 2-test `convertOpenAIModelsToClaude` describe block and its import left with it; no tests existed for `mergeClaudeModelsResponse`. The other suites (`mergeOpenAIModelsResponse`, token-counting) untouched. CHANGELOG references to both names are history and stay.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1507 tests, 1507 pass, 0 fail** (−2) — executed on this tree.
+
+### refactor(auth-headers): deduplicate credential-header logic into a new shared module
+
+`src/utils/auth-headers.ts` (new), `src/index.ts`, `src/utils/routing.ts`, `src/handlers/passthrough.ts`, `src/handlers/openai.ts`, `src/handlers/chat-completions.ts`, `tests/unit/auth-headers.test.ts` (new) — sixteen scattered copies of "recover or repack an API key from auth headers" now live behind one module.
+
+- **Six strip/repack sites folded.** `getRawEndpointUserKey` (`index.ts`), `extractCallerKey` (`passthrough.ts`), the incoming-key block (`openai.ts`), and the anthropic/gemini header repacks (`chat-completions.ts`, two sites in one file) each re-implemented bearer-strip with different header orders, fallbacks, and strip mechanics. They now delegate to `stripBearerPrefix`, `extractRawCredential` (both header orders), `resolveIncomingAuthorization` (three-header recovery from raw request headers), and `repackBearerCredential`. `normalizeOpenAIAuthHeaders` moved in from `routing.ts`.
+- **Ten ternaries folded.** `transformAuthHeadersForUpstream`'s four per-endpoint credential priority chains were ten `startsWith('Bearer ') ? x.substring(7) : x` sites; they are now four `pickRawApiKey([...])` calls preserving each chain's order. `pickRawApiKey` uses the legacy **truthiness** semantics — an empty preferred header falls through to the next credential. (A `!= null` "first present wins" variant was tried and reverted after it produced a real regression: empty `x-api-key` + valid `Authorization` yielded `''`, and the caller then emitted no auth headers at all.)
+- **Uniform stripping.** All sites now use the case-insensitive `/^Bearer\s+/i` regex; the two exact-case `startsWith('Bearer ')` sites previously sent `bearer k` (lowercase) or multi-space prefixes verbatim as the key — a latent bug fixed by the fold. Deliberate edge-case changes, consistent with the majority behavior: `extractCallerKey` strips case-insensitively, and `getRawEndpointUserKey` falls through to the goog key on an empty `Bearer ` token.
+- **Intentionally untouched**: `extractAuthHeaders`'s prefix-*wrap* guard (`routing.ts:313-318`, the last non-shared bearer handler) adds rather than strips a prefix and serves a different role; folding it was judged not worth the blast radius. The four direct `default_upstream?.default_api_key` reads are recorded in the `getDefaultUpstreamConfig` entry above.
+- **Tests**: new `tests/unit/auth-headers.test.ts` — 24 tests for the module plus 9 for `pickRawApiKey`, covering both header orders, stripping variants, empty-source fall-through, `Bearer `-token-wins-returns-empty semantics, and the Azure normalization.
+
+**Verification status**: `npm run typecheck` (pass) and `npm run test:unit` — **1514 tests, 1514 pass, 0 fail** (1500 after the module landed, +9 for the `pickRawApiKey` fold, then updated in place for the truthiness fix) — executed on this tree.
+
 ### refactor(sdk): drop the `chatjimmy` submodule and stub `sdk://` routes out of existence
 
 `src/utils/sdk-handler.ts`, `package.json`, `scripts/build-sea.js`, `scripts/init-proxy-config-in-consul-server.sh`, `src/utils/config-loader.ts`, `tests/unit/config-loader.test.ts`, `tests/unit/sdk-handler.test.ts` (new), `tests/README.md`, `tests/providers/llama/messages.sh`, `docs/getting-started/README_DETAILS.md`, `docs/getting-started/configuration-guide.md`, `docs/reference/configuration-reference.md`, `docs/architecture/design_tauri_tray.md`, `docs/architecture/plan-split-cloudflare-worker-vs-local.md`, `docs/architecture/plan-llm-as-a-verifier-plugin.md`, `docs/contributing/security-review.md`, `docs/contributing/security-review-3.md`, `docs/contributing/security-review-4.md`, `.gitmodules` — removes the `submodules/chatjimmy` git submodule and the SDK code path it backed. `sdk://` config values still load; every request to one now fails loud instead of silently routing.

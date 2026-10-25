@@ -146,12 +146,14 @@ threshold = 0.5            # noul threshold (or probabilities.keep threshold)
 
 ### 4.1 State Construction
 
-The proxy builds `state` from the request:
+The proxy builds `state` from the request. Each tool is reduced to its name and
+description — the parameter schema is NOT sent, to keep the state inside the
+sidecar encoder's small token budget:
 
 ```typescript
 function buildJudgeState(
   userPrompt: string,
-  tools: Array<{ name: string; schema: object }>,
+  tools: Array<{ name: string; description?: string }>,
   context: { recentUserMessages: string[]; recentToolCalls: Array<{ name: string; args: object }> }
 ): string {
   const lines = [
@@ -161,7 +163,7 @@ function buildJudgeState(
   ];
   
   tools.forEach((tool, i) => {
-    lines.push(`${i + 1}. ${tool.name}: ${JSON.stringify(tool.schema)}`);
+    lines.push(`${i + 1}. ${tool.name}${tool.description ? `: ${tool.description}` : ""}`);
   });
   
   if (context.recentUserMessages.length > 0) {
@@ -465,7 +467,7 @@ context_window = 3         # number of recent messages/tool_calls to include
 > | `timeout_ms` | yes (default 50) — a **per-tool** budget, so a request carrying N tools gets N × this, capped at 2000ms total (see `requestTimeoutMs`) |
 > | `mode` | yes (default `"choice"`) |
 > | `threshold` | yes (default 0.5) |
-> | `max_batch_tools` | yes (default 50) — tools past the cap are kept and counted in the log |
+> | `max_batch_tools` | yes (default 50) — tools per noul request; larger tool lists are judged in sequential chunks of this size |
 > | `api_key` | yes — sent as `Authorization: Bearer` |
 > | `enabled` | **not implemented** — activation is by `judge_url` |
 > | `url` | **not implemented** — the key is `judge_url` |

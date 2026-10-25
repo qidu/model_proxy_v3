@@ -42,8 +42,11 @@ import {
   applyDashboardConfigUpdate,
   toDashboardConfigPayload,
   upsertModelTarget,
+  getDefaultUpstreamConfig,
   resolveDefaultProxyConfigPath,
   HOME_PROXY_CONFIG_PATH,
+  buildDecisionState,
+  buildDecisionQuestions,
   type ProxyConfig,
   type TransformSet,
 } from '../../src/utils/config-loader.js';
@@ -200,26 +203,27 @@ describe('parseSimpleToml', () => {
     assert.equal(cfg.general?.global_token_limit, '50k 1d');
   });
 
-  it('parses [default_upstream] section', () => {
+  it('parses [models.default] section', () => {
     const cfg = parseSimpleToml(`
-      [default_upstream]
+      [models.default]
       upstream_mode = "openai-completions"
-      default_base_url = "https://api.openai.com"
-      default_api_key = "sk-key"
+      base_url = "https://api.openai.com"
+      api_key = "sk-key"
     `);
-    assert.equal(cfg.default_upstream?.upstream_mode, 'openai-completions');
-    assert.equal(cfg.default_upstream?.default_base_url, 'https://api.openai.com');
-    assert.equal(cfg.default_upstream?.default_api_key, 'sk-key');
+    const def = cfg.models?.default as Record<string, unknown>;
+    assert.equal(def.upstream_mode, 'openai-completions');
+    assert.equal(def.base_url, 'https://api.openai.com');
+    assert.equal(def.api_key, 'sk-key');
   });
 
   it('coerces budget_to_effort_* values to numbers', () => {
     const cfg = parseSimpleToml(`
-      [default_upstream]
+      [general]
       budget_to_effort_low = "4000"
       budget_to_effort_high = "20000"
     `);
-    assert.equal(cfg.default_upstream?.budget_to_effort_low, 4000);
-    assert.equal(cfg.default_upstream?.budget_to_effort_high, 20000);
+    assert.equal(cfg.general?.budget_to_effort_low, 4000);
+    assert.equal(cfg.general?.budget_to_effort_high, 20000);
   });
 
   it('parses [models.gemini] category with inline-table entries', () => {
@@ -405,11 +409,12 @@ describe('parseSimpleToml', () => {
 
   it('handles inline comment after value containing # (no preceding space is preserved)', () => {
     const cfg = parseSimpleToml(`
-      [default_upstream]
-      default_api_key = "abc#def"
+      [models.default]
+      api_key = "abc#def"
     `);
     // '#' with no preceding space stays in the value
-    assert.equal(cfg.default_upstream?.default_api_key, 'abc#def');
+    const def = cfg.models?.default as Record<string, unknown>;
+    assert.equal(def.api_key, 'abc#def');
   });
 
   it('parses [privacy_filter] numeric and string fields', () => {
@@ -437,9 +442,9 @@ describe('parseSimpleToml', () => {
   // Without a dispatch branch for this section the parser silently dropped it,
   // so `judgeTools` always took its `!sidecarConfig?.judge_url` early return and
   // the sidecar could not be enabled from a config file at all.
-  it('parses [tool_judge_sidecar] numeric and string fields', () => {
+  it('parses [tool_judge] numeric and string fields', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       timeout_ms = 2000
       threshold = 0.65
@@ -457,9 +462,9 @@ describe('parseSimpleToml', () => {
     });
   });
 
-  it('parses unquoted [tool_judge_sidecar] string values', () => {
+  it('parses unquoted [tool_judge] string values', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = http://127.0.0.1:8081
       mode = choice
     `);
@@ -467,9 +472,9 @@ describe('parseSimpleToml', () => {
     assert.equal(cfg.tool_judge_sidecar?.mode, 'choice');
   });
 
-  it('drops unknown keys and wrong-typed values in [tool_judge_sidecar]', () => {
+  it('drops unknown keys and wrong-typed values in [tool_judge]', () => {
     const cfg = parseSimpleToml(`
-      [tool_judge_sidecar]
+      [tool_judge]
       judge_url = "http://127.0.0.1:8081"
       enabled = true
       threshold = "high"
@@ -511,6 +516,219 @@ describe('parseSimpleToml', () => {
       warnings.some((w: { path: string }) => w.path === 'tool_judge_sidecar_typo'),
       `expected a warning naming the unknown section, got ${JSON.stringify(warnings)}`
     );
+  });
+
+  it('parses [tool_judge] use_decision_api as unquoted boolean true', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = true
+      model = "laya"
+    `);
+    assert.equal(cfg.tool_judge_sidecar?.use_decision_api, true);
+    assert.equal(cfg.tool_judge_sidecar?.model, 'laya');
+  });
+
+  it('parses [tool_judge] use_decision_api as unquoted boolean false', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = false
+    `);
+    assert.equal(cfg.tool_judge_sidecar?.use_decision_api, false);
+  });
+
+  it('parses [tool_judge] use_decision_api as quoted string true/false', () => {
+    const cfgTrue = parseSimpleToml(`
+      [tool_judge]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = "true"
+    `);
+    assert.equal(cfgTrue.tool_judge_sidecar?.use_decision_api, true);
+
+    const cfgFalse = parseSimpleToml(`
+      [tool_judge]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = "false"
+    `);
+    assert.equal(cfgFalse.tool_judge_sidecar?.use_decision_api, false);
+  });
+
+  it('parses [tool_judge] model with valid values: laya, clef, clef-flash', () => {
+    for (const model of ['laya', 'clef', 'clef-flash'] as const) {
+      const cfg = parseSimpleToml(`
+        [tool_judge]
+        judge_url = "http://127.0.0.1:8081"
+        use_decision_api = true
+        model = "${model}"
+      `);
+      assert.equal(cfg.tool_judge_sidecar?.model, model, `model ${model} should be accepted`);
+    }
+  });
+
+  it('drops [tool_judge] model with invalid value', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge]
+      judge_url = "http://127.0.0.1:8081"
+      use_decision_api = true
+      model = "invalid-model"
+    `);
+    // Invalid model should be ignored, leaving model undefined
+    assert.equal(cfg.tool_judge_sidecar?.model, undefined);
+  });
+
+  // -------------------------------------------------------------------------
+  // Renamed section headers. The old headers [tool_judge_sidecar], [decision],
+  // [passthrough] (and [transform_defaults], covered in transforms-config.test.ts)
+  // were REMOVED — they hit the unknown-section branch like any unsupported
+  // header. The canonical headers must produce the config objects, and
+  // [models.decision] / [models.passthrough] must NOT register
+  // "decision"/"passthrough" as model categories.
+  // -------------------------------------------------------------------------
+
+  const captureWarns = (fn: () => void): string[] => {
+    const original = console.warn;
+    const messages: string[] = [];
+    console.warn = (...args: unknown[]) => { messages.push(args.map(String).join(' ')); };
+    try {
+      fn();
+    } finally {
+      console.warn = original;
+    }
+    return messages;
+  };
+
+  it('rejects the removed [tool_judge_sidecar] header as an unknown section and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [tool_judge_sidecar]
+      judge_url = "http://127.0.0.1:8081"
+      threshold = 0.7
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.equal(cfg.tool_judge_sidecar, undefined);
+    assert.equal(cfg.general?.global_token_limit, 1234, 'parsing continues after the rejected section');
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'tool_judge_sidecar'),
+      `expected an unknown-section warning naming [tool_judge_sidecar], got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses the canonical [tool_judge] header without any section warning', () => {
+    let cfg!: ReturnType<typeof parseSimpleToml>;
+    const warns = captureWarns(() => {
+      cfg = parseSimpleToml(`
+        [tool_judge]
+        judge_url = "http://127.0.0.1:8081"
+        threshold = 0.7
+      `);
+    });
+    assert.equal(cfg.tool_judge_sidecar?.judge_url, 'http://127.0.0.1:8081');
+    assert.equal(cfg.tool_judge_sidecar?.threshold, 0.7);
+    assert.ok(
+      !warns.some((m) => m.includes('deprecated')),
+      `unexpected deprecation warning: ${JSON.stringify(warns)}`
+    );
+    const warnings = (cfg as any)._validationWarnings ?? [];
+    assert.ok(
+      !warnings.some((w: { path: string }) => w.path === 'tool_judge'),
+      `unexpected unknown-section warning for [tool_judge]: ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('rejects the removed [decision] header as an unknown section and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [decision]
+      backend = "laya"
+      url = "http://127.0.0.1:8081/decision"
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.equal(cfg.decision, undefined);
+    assert.equal(cfg.general?.global_token_limit, 1234, 'parsing continues after the rejected section');
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'decision'),
+      `expected an unknown-section warning naming [decision], got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses [models.decision] into config.decision without creating a models.decision category', () => {
+    let cfg!: ReturnType<typeof parseSimpleToml>;
+    const warns = captureWarns(() => {
+      cfg = parseSimpleToml(`
+        [models.decision]
+        backend = "laya"
+        url = "http://127.0.0.1:8081/decision"
+        timeout_ms = 5000
+      `);
+    });
+    assert.equal(cfg.decision?.backend, 'laya');
+    assert.equal(cfg.decision?.url, 'http://127.0.0.1:8081/decision');
+    assert.equal(cfg.decision?.timeout_ms, 5000);
+    assert.ok(
+      !warns.some((m) => m.includes('deprecated')),
+      `unexpected deprecation warning: ${JSON.stringify(warns)}`
+    );
+    // Intercepted before the generic [models.*] branch: no "decision" category.
+    assert.equal(cfg.models?.decision, undefined);
+    assert.deepEqual(getConfiguredModelIds(cfg), []);
+  });
+
+  it('rejects the removed [passthrough] header as an unknown section and drops its keys', () => {
+    const cfg = parseSimpleToml(`
+      [passthrough]
+      openai = {base = "https://api.openai.com", mode = "openai-completions", share = 2}
+
+      [general]
+      global_token_limit = 1234
+    `) as any;
+    assert.equal(cfg.passthrough, undefined);
+    assert.equal(cfg.general?.global_token_limit, 1234, 'parsing continues after the rejected section');
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'passthrough'),
+      `expected an unknown-section warning naming [passthrough], got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses [models.passthrough] inline tables into config.passthrough without creating a models.passthrough category', () => {
+    let cfg!: ReturnType<typeof parseSimpleToml>;
+    const warns = captureWarns(() => {
+      cfg = parseSimpleToml(`
+        [models.passthrough]
+        openai = {base = "https://api.openai.com", mode = "openai-completions", share = 2}
+        gemini = {base = "https://generativelanguage.googleapis.com", mode = "gemini-generatecontent"}
+      `);
+    });
+    assert.deepEqual(cfg.passthrough, {
+      openai: { base: 'https://api.openai.com', mode: 'openai-completions', share: 2 },
+      gemini: { base: 'https://generativelanguage.googleapis.com', mode: 'gemini-generatecontent' },
+    });
+    assert.ok(
+      !warns.some((m) => m.includes('deprecated')),
+      `unexpected deprecation warning: ${JSON.stringify(warns)}`
+    );
+    // Intercepted before the generic [models.*] branch: no "passthrough" category.
+    assert.equal(cfg.models?.passthrough, undefined);
+    assert.deepEqual(getConfiguredModelIds(cfg), []);
+  });
+
+  it('serializeProxyConfigToml writes the canonical section headers', () => {
+    const toml = serializeProxyConfigToml({
+      tool_judge_sidecar: { judge_url: 'http://127.0.0.1:8081', threshold: 0.5 },
+      decision: { backend: 'laya', url: 'http://127.0.0.1:8081/decision' },
+      passthrough: { openai: { base: 'https://api.openai.com', mode: 'openai-completions' } },
+    });
+    assert.match(toml, /^\[tool_judge\]$/m);
+    assert.match(toml, /^\[models\.decision\]$/m);
+    assert.match(toml, /^\[models\.passthrough\]$/m);
+    assert.doesNotMatch(toml, /^\[tool_judge_sidecar\]$/m);
+    assert.doesNotMatch(toml, /^\[decision\]$/m);
+    assert.doesNotMatch(toml, /^\[passthrough\]$/m);
   });
 
   it('accepts an unknown section as the very first header without crashing', () => {
@@ -571,7 +789,7 @@ describe('parseSimpleToml', () => {
 
   it('parses transform_defaults section', () => {
     const cfg = parseSimpleToml(`
-      [transform_defaults]
+      [transforms.default]
       openai-completions = ["set_a", "set_b"]
     `);
     assert.deepEqual(cfg.transform_defaults?.['openai-completions'], ['set_a', 'set_b']);
@@ -883,8 +1101,8 @@ describe('getModelConfig', () => {
 describe('getModelRouteConfig', () => {
   it('resolves a direct model entry inheriting category base_url', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { upstream_mode: 'openai-completions' },
       models: {
+        default: { upstream_mode: 'openai-completions' },
         claude: {
           base_url: 'https://api.anthropic.com',
           api_key: 'sk-cat',
@@ -942,8 +1160,7 @@ describe('getModelRouteConfig', () => {
 
   it('falls back to default model route when no entry matches', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { upstream_mode: 'openai-completions', default_base_url: 'https://def' },
-      models: { default: { '*': ['*', '', ''] } as any },
+      models: { default: { upstream_mode: 'openai-completions', base_url: 'https://def', '*': ['*', '', ''] } as any },
     };
     const r = getModelRouteConfig('unknown', cfg);
     assert.equal(r.targetUrl, 'https://def');
@@ -1100,10 +1317,10 @@ describe('validateProxyConfig', () => {
 
   it('flags invalid base_url (bad protocol)', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'ftp://bad' },
+      models: { default: { base_url: 'ftp://bad' } },
     };
     const r = validateProxyConfig(cfg);
-    assert.ok(r.errors.some(e => e.path === 'default_upstream.default_base_url'));
+    assert.ok(r.errors.some(e => e.path === 'models.default.base_url'));
   });
 
   // sdk:// is still accepted at load time (existing configs keep working) even
@@ -1118,7 +1335,7 @@ describe('validateProxyConfig', () => {
 
   it('flags unparseable base_url', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'not a url at all' },
+      models: { default: { base_url: 'not a url at all' } },
     };
     const r = validateProxyConfig(cfg);
     assert.ok(r.errors.some(e => e.message.includes('not a valid URL')));
@@ -1144,8 +1361,10 @@ describe('validateProxyConfig', () => {
 
   it('passes a clean config with valid: true', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'https://api.x.com', upstream_mode: 'openai-completions' },
-      models: { claude: { base_url: 'https://api.x.com', 'm1': ['m1', '', ''] } as any },
+      models: {
+        default: { base_url: 'https://api.x.com', upstream_mode: 'openai-completions' },
+        claude: { base_url: 'https://api.x.com', 'm1': ['m1', '', ''] } as any
+      },
     };
     const r = validateProxyConfig(cfg);
     assert.equal(r.valid, true, `expected valid, got errors: ${JSON.stringify(r.errors)}`);
@@ -1302,10 +1521,10 @@ describe('getConfiguredModelIds', () => {
 // ---------------------------------------------------------------------------
 
 describe('getAllowedHostsFromConfig', () => {
-  it('collects hosts from default_upstream + category base_url + per-entry override', () => {
+  it('collects hosts from models.default + category base_url + per-entry override', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'https://api.default.com' },
       models: {
+        default: { base_url: 'https://api.default.com' },
         claude: {
           base_url: 'https://api.cat.com',
           'm1': ['m1', 'https://api.override.com:8443', 'k'],
@@ -1320,8 +1539,10 @@ describe('getAllowedHostsFromConfig', () => {
 
   it('skips invalid URLs silently', () => {
     const cfg: ProxyConfig = {
-      default_upstream: { default_base_url: 'not-a-url' },
-      models: { claude: { base_url: 'https://ok.com', 'm1': ['m1', 'also-bad', ''] } as any },
+      models: {
+        default: { base_url: 'not-a-url' },
+        claude: { base_url: 'https://ok.com', 'm1': ['m1', 'also-bad', ''] } as any,
+      },
     };
     const hosts = getAllowedHostsFromConfig(cfg);
     assert.ok(hosts.includes('ok.com'));
@@ -1679,30 +1900,31 @@ record_response_body = true
     });
   });
 
-  it('preserves [default_upstream] across parse→serialize→parse', () => {
+  it('preserves [models.default] across parse→serialize→parse', () => {
     const original = `
-[default_upstream]
-upstream_mode = "openai-completions"
-default_base_url = "https://api.qnaigc.com"
-default_api_key = "sk-56db1e204bf459"
+[general]
 budget_to_effort_low = 4000
 budget_to_effort_high = 20000
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://api.qnaigc.com"
+api_key = "sk-56db1e204bf459"
 `;
     const parsed = parseSimpleToml(original);
-    assert.equal(parsed.default_upstream?.upstream_mode, 'openai-completions');
-    assert.equal(parsed.default_upstream?.default_base_url, 'https://api.qnaigc.com');
-    assert.equal(parsed.default_upstream?.default_api_key, 'sk-56db1e204bf459');
-    assert.equal(parsed.default_upstream?.budget_to_effort_low, 4000);
-    assert.equal(parsed.default_upstream?.budget_to_effort_high, 20000);
+    assert.equal(parsed.models?.default?.upstream_mode, 'openai-completions');
+    assert.equal(parsed.models?.default?.base_url, 'https://api.qnaigc.com');
+    assert.equal(parsed.models?.default?.api_key, 'sk-56db1e204bf459');
+    assert.equal(parsed.general?.budget_to_effort_low, 4000);
+    assert.equal(parsed.general?.budget_to_effort_high, 20000);
 
     const roundTripped = parseSimpleToml(serializeProxyConfigToml(parsed));
-    assert.deepEqual(roundTripped.default_upstream, {
+    assert.deepEqual(roundTripped.models?.default, {
       upstream_mode: 'openai-completions',
-      default_base_url: 'https://api.qnaigc.com',
-      default_api_key: 'sk-56db1e204bf459',
-      budget_to_effort_low: 4000,
-      budget_to_effort_high: 20000,
+      base_url: 'https://api.qnaigc.com',
+      api_key: 'sk-56db1e204bf459',
     });
+    assert.equal(roundTripped.general?.budget_to_effort_low, 4000);
+    assert.equal(roundTripped.general?.budget_to_effort_high, 20000);
   });
 
   it('preserves per-entry max_tokens across parse→serialize→parse', () => {
@@ -2114,5 +2336,557 @@ describe('resolveDefaultProxyConfigPath', () => {
       if (!homeConfigDirExisted) rmSync(homeConfigDir, { recursive: true, force: true });
       if (!homeConfigRootExisted) rmSync(homeConfigRoot, { recursive: true, force: true });
     }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// getDefaultUpstreamConfig
+// ---------------------------------------------------------------------------
+
+describe('getDefaultUpstreamConfig', () => {
+  it('uses [models.default] for all keys when present', () => {
+    const proxyConfig: ProxyConfig = {
+      models: {
+        default: {
+          upstream_mode: 'anthropic-messages',
+          base_url: 'https://cat.example.com',
+          api_key: 'cat-key',
+        },
+      },
+    };
+    assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
+      upstreamMode: 'anthropic-messages',
+      baseUrl: 'https://cat.example.com',
+      apiKey: 'cat-key',
+    });
+  });
+
+  it('ignores an array-typed [models.default] and uses defaults', () => {
+    const proxyConfig: ProxyConfig = {
+      models: {
+        default: ['alias', 'https://arr.example.com', 'arr-key'],
+      },
+    };
+    assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
+      upstreamMode: 'openai-completions',
+      baseUrl: undefined,
+      apiKey: undefined,
+    });
+  });
+
+  it('uses defaults when [models.default] is absent', () => {
+    const proxyConfig: ProxyConfig = {};
+    assert.deepEqual(getDefaultUpstreamConfig(proxyConfig), {
+      upstreamMode: 'openai-completions',
+      baseUrl: undefined,
+      apiKey: undefined,
+    });
+  });
+
+  it("uses the 'openai-completions' literal only when both sources are absent", () => {
+    assert.deepEqual(getDefaultUpstreamConfig({}), {
+      upstreamMode: 'openai-completions',
+      baseUrl: undefined,
+      apiKey: undefined,
+    });
+  });
+
+  it('lets an explicit primary override [models.default] entirely (per-key, not merged)', () => {
+    const proxyConfig: ProxyConfig = {
+      models: {
+        default: {
+          upstream_mode: 'anthropic-messages',
+          base_url: 'https://cat.example.com',
+          api_key: 'cat-key',
+        },
+      },
+    };
+    assert.deepEqual(
+      getDefaultUpstreamConfig(proxyConfig, { upstream_mode: 'gemini-interactions' }),
+      {
+        upstreamMode: 'gemini-interactions',
+        baseUrl: 'https://cat.example.com',
+        apiKey: 'cat-key',
+      },
+      'primary supplies upstream_mode only; base_url/api_key come from [models.default]',
+    );
+  });
+
+  it('treats an empty-string primary value as unset and falls through per key', () => {
+    const proxyConfig: ProxyConfig = {
+      models: {
+        default: {
+          upstream_mode: 'openai-responses',
+          base_url: 'https://fallback.example.com',
+          api_key: 'fallback-key',
+        },
+      },
+    };
+    assert.deepEqual(
+      getDefaultUpstreamConfig(proxyConfig, { upstream_mode: '' }),
+      {
+        upstreamMode: 'openai-responses',
+        baseUrl: 'https://fallback.example.com',
+        apiKey: 'fallback-key',
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Composite Target ability field parsing and serialization
+// ---------------------------------------------------------------------------
+
+describe('Composite Target ability field', () => {
+  it('parses ability field from composite target config', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {"model-a" = {share = 1, ability = "coding,reasoning"}, "model-b" = {share = 1}}
+    `);
+    const targets = cfg.composite?.['alias-1'] as Record<string, unknown>;
+    assert.deepEqual(targets['model-a'], { share: 1, ability: 'coding,reasoning' });
+    assert.deepEqual(targets['model-b'], { share: 1 });
+  });
+
+  it('serializes ability field in composite target config', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          'model-a': { share: 1, ability: 'coding,reasoning' },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const toml = serializeProxyConfigToml(cfg);
+    const roundTripped = parseSimpleToml(toml);
+    const targets = roundTripped.composite?.['alias-1'] as Record<string, unknown>;
+    assert.deepEqual(targets['model-a'], { share: 1, ability: 'coding,reasoning' });
+    assert.deepEqual(targets['model-b'], { share: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Composite Model decision field parsing and serialization
+// ---------------------------------------------------------------------------
+
+describe('Composite Model decision field', () => {
+  it('parses decision block from composite model config', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {decision = {model = "clef", url = "http://localhost:8081/decision", api_key = "secret", threshold = 0.5, timeout_ms = 5000, context_prompts = 1}, "model-a" = {share = 1}, "model-b" = {share = 1}}
+    `);
+    const composite = cfg.composite?.['alias-1'] as any;
+    assert.deepEqual(composite.decision, {
+      model: 'clef',
+      url: 'http://localhost:8081/decision',
+      api_key: 'secret',
+      threshold: 0.5,
+      timeout_ms: 5000,
+      context_prompts: 1,
+    });
+    assert.deepEqual(composite['model-a'], { share: 1 });
+    assert.deepEqual(composite['model-b'], { share: 1 });
+  });
+
+  it('parses decision block with minimal fields (uses defaults)', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {decision = {model = "clef"}, "model-a" = {share = 1}, "model-b" = {share = 1}}
+    `);
+    const composite = cfg.composite?.['alias-1'] as any;
+    assert.equal(composite.decision?.model, 'clef');
+    assert.equal(composite.decision?.url, undefined);
+    assert.equal(composite.decision?.threshold, undefined);
+    assert.equal(composite.decision?.timeout_ms, undefined);
+    assert.equal(composite.decision?.context_prompts, undefined);
+  });
+
+  it('drops decision block with invalid model value', () => {
+    const cfg = parseSimpleToml(`
+      [composite]
+      "alias-1" = {decision = {model = "invalid-model", url = "http://x"}, "model-a" = {share = 1}}
+    `);
+    const composite = cfg.composite?.['alias-1'] as any;
+    // Invalid model should be dropped
+    assert.equal(composite.decision, undefined);
+  });
+
+  it('serializes decision block in composite model config', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', api_key: 'secret', threshold: 0.5, timeout_ms: 5000, context_prompts: 1 },
+          'model-a': { share: 1 },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const toml = serializeProxyConfigToml(cfg);
+    const roundTripped = parseSimpleToml(toml);
+    const composite = roundTripped.composite?.['alias-1'] as any;
+    assert.deepEqual(composite.decision, {
+      model: 'clef',
+      url: 'http://localhost:8081/decision',
+      api_key: 'secret',
+      threshold: 0.5,
+      timeout_ms: 5000,
+      context_prompts: 1,
+    });
+  });
+
+  it('serializes decision block with minimal fields', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef' },
+          'model-a': { share: 1 },
+        },
+      },
+    };
+    const toml = serializeProxyConfigToml(cfg);
+    const roundTripped = parseSimpleToml(toml);
+    const composite = roundTripped.composite?.['alias-1'] as any;
+    assert.equal(composite.decision?.model, 'clef');
+    assert.equal(composite.decision?.url, undefined);
+    assert.equal(composite.decision?.threshold, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateProxyConfig - composite decision validation
+// ---------------------------------------------------------------------------
+
+describe('validateProxyConfig - composite decision validation', () => {
+  it('flags composite with decision but no ability on any target', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1 },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision' && e.message.includes('ability')));
+    assert.equal(r.valid, false);
+  });
+
+  it('passes when composite has decision and at least one target has ability', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1, ability: 'coding' },
+          'model-b': { share: 1 },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(!r.errors.some(e => e.path === 'composite.alias-1.decision' && e.message.includes('ability')));
+  });
+
+  it('flags composite with decision.url but without decision.model', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.model' && e.message.includes('model')));
+    assert.equal(r.valid, false);
+  });
+
+  it('flags composite with decision threshold outside 0-1 range', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', threshold: 1.5 },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.threshold' && e.message.includes('threshold')));
+    assert.equal(r.valid, false);
+  });
+
+  it('flags composite with negative decision timeout_ms', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', timeout_ms: -100 },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.timeout_ms' && e.message.includes('timeout_ms')));
+    assert.equal(r.valid, false);
+  });
+
+  it('flags composite with invalid context_prompts (not positive integer)', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', context_prompts: 0 },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    assert.ok(r.errors.some(e => e.path === 'composite.alias-1.decision.context_prompts' && e.message.includes('context_prompts')));
+    assert.equal(r.valid, false);
+  });
+
+  it('allows decision config with url and model', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+        } as any,
+      },
+      composite: {
+        'alias-1': {
+          decision: { model: 'clef', url: 'http://localhost:8081/decision' },
+          'model-a': { share: 1, ability: 'coding' },
+        },
+      },
+    };
+    const r = validateProxyConfig(cfg);
+    // Should pass - url and model are provided
+    assert.ok(!r.errors.some(e => e.path === 'composite.alias-1.decision.url' && e.message.includes('url')));
+    assert.ok(!r.errors.some(e => e.path === 'composite.alias-1.decision.model' && e.message.includes('model')));
+    assert.equal(r.valid, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getCompositeAliasMode - decision mode
+// ---------------------------------------------------------------------------
+
+describe('getCompositeAliasMode - decision mode', () => {
+  it('returns decision when decision config present and at least one target has ability', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'dec': { decision: { model: 'clef', url: 'http://localhost/decision' }, 'a': { ability: 'coding' }, 'b': { ability: 'reasoning' } } },
+    };
+    assert.equal(getCompositeAliasMode('dec', cfg), 'decision');
+  });
+
+  it('returns share when decision config present but no target has ability', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'dec': { decision: { model: 'clef' }, 'a': { share: 1 }, 'b': { share: 1 } } },
+    };
+    assert.equal(getCompositeAliasMode('dec', cfg), 'share');
+  });
+
+  it('returns fallback when primary/fallback set (precedence over decision)', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'fb': { decision: { model: 'clef' }, 'a': { primary: true, ability: 'coding' }, 'b': { fallback: 1, ability: 'reasoning' } } },
+    };
+    assert.equal(getCompositeAliasMode('fb', cfg), 'fallback');
+  });
+
+  it('returns coordinator when coord present (precedence over decision)', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'coord': { decision: { model: 'clef' }, 'a': { coord: 1, role: 'planner', ability: 'coding' }, 'b': { coord: 1, role: 'executor' } } },
+    };
+    assert.equal(getCompositeAliasMode('coord', cfg), 'coordinator');
+  });
+
+  it('returns fusion when role present (precedence over decision)', () => {
+    const cfg: ProxyConfig = {
+      models: { claude: { base_url: 'https://x', 'a': ['a', '', ''], 'b': ['b', '', ''] } as any },
+      composite: { 'fusion': { decision: { model: 'clef' }, 'a': { role: 'panel', ability: 'coding' }, 'b': { role: 'synth' } } },
+    };
+    assert.equal(getCompositeAliasMode('fusion', cfg), 'fusion');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveCompositeWithDecision
+// ---------------------------------------------------------------------------
+
+describe('resolveCompositeWithDecision', () => {
+  // Import the function - we need to import it from config-loader
+  // We'll use a mock decision function for testing
+
+  it('returns candidates unchanged when no decision config', async () => {
+    const { resolveCompositeWithDecision, getCompositeRouteCandidates } = await import('../../src/utils/config-loader.js');
+
+    const proxyConfig: ProxyConfig = {
+      composite: {
+        'test-alias': {
+          targets: {
+            'model-a': { share: 1, ability: 'coding' },
+            'model-b': { share: 1, ability: 'reasoning' },
+          },
+        },
+      },
+    };
+
+    const candidates = getCompositeRouteCandidates('test-alias', proxyConfig);
+    const context: DecisionRequestContext = { prompt: 'test', recentUserMessages: [], tools: [], recentToolCalls: [] };
+
+    const result = await resolveCompositeWithDecision('test-alias', proxyConfig, context);
+    assert.deepEqual(result, candidates);
+  });
+
+  it('returns candidates unchanged when no target has ability', async () => {
+    const { resolveCompositeWithDecision, getCompositeRouteCandidates } = await import('../../src/utils/config-loader.js');
+
+    const proxyConfig: ProxyConfig = {
+      composite: {
+        'test-alias': {
+          targets: {
+            'model-a': { share: 1 },
+            'model-b': { share: 1 },
+          },
+          decision: { model: 'clef', url: 'http://localhost:8081/decision', threshold: 0.5, timeout_ms: 5000, context_prompts: 1 },
+        },
+      },
+    };
+
+    const candidates = getCompositeRouteCandidates('test-alias', proxyConfig);
+    const context: DecisionRequestContext = { prompt: 'test', recentUserMessages: [], tools: [], recentToolCalls: [] };
+
+    const result = await resolveCompositeWithDecision('test-alias', proxyConfig, context);
+    assert.deepEqual(result, candidates);
+  });
+
+  it('returns candidates unchanged when decision API call fails (fail-open)', async () => {
+    const { resolveCompositeWithDecision, getCompositeRouteCandidates } = await import('../../src/utils/config-loader.js');
+
+    const proxyConfig: ProxyConfig = {
+      composite: {
+        'test-alias': {
+          targets: {
+            'model-a': { share: 1, ability: 'coding' },
+            'model-b': { share: 1, ability: 'reasoning' },
+          },
+          decision: { model: 'clef', url: 'http://invalid-url/decision', threshold: 0.5, timeout_ms: 100, context_prompts: 1 },
+        },
+      },
+    };
+
+    const candidates = getCompositeRouteCandidates('test-alias', proxyConfig);
+    const context: DecisionRequestContext = { prompt: 'test', recentUserMessages: [], tools: [], recentToolCalls: [] };
+
+    const result = await resolveCompositeWithDecision('test-alias', proxyConfig, context);
+    // Should fail-open and return original candidates
+    assert.deepEqual(result, candidates);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DecisionRequestContext helpers
+// ---------------------------------------------------------------------------
+
+describe('buildDecisionState / buildDecisionQuestions', () => {
+  it('builds decision state from context', () => {
+    const context: DecisionRequestContext = {
+      prompt: 'Write a Python function',
+      recentUserMessages: ['Hello', 'Hi there!'],
+      tools: [{ name: 'write_file', description: 'Write a file' }],
+      recentToolCalls: [{ name: 'write_file', args: { path: 'test.py' } }],
+    };
+
+    const entries: Array<[string, CompositeTargetConfig]> = [
+      ['model-a', { ability: 'coding,reasoning' } as CompositeTargetConfig],
+      ['model-b', { ability: 'analysis' } as CompositeTargetConfig],
+      ['model-c', {} as CompositeTargetConfig],
+    ];
+
+    const state = buildDecisionState(context, entries);
+    assert.ok(state.includes('Write a Python function'));
+    assert.ok(state.includes('Hello'));
+    assert.ok(state.includes('Hi there!'));
+    assert.ok(state.includes('write_file'));
+    assert.ok(state.includes('model-a'));
+    assert.ok(state.includes('coding,reasoning'));
+  });
+
+  it('builds decision questions with target abilities', () => {
+    const entries: Array<[string, CompositeTargetConfig]> = [
+      ['model-a', { ability: 'coding,reasoning' } as CompositeTargetConfig],
+      ['model-b', { ability: 'analysis' } as CompositeTargetConfig],
+      ['model-c', {} as CompositeTargetConfig],
+    ];
+
+    const questions = buildDecisionQuestions(entries);
+    assert.ok(questions.target_selection);
+    assert.equal(questions.target_selection.type, 'choice');
+    assert.ok(questions.target_selection.criteria);
+    const criteriaKeys = Object.keys(questions.target_selection.criteria);
+    assert.ok(criteriaKeys.includes('model-a'));
+    assert.ok(criteriaKeys.includes('model-b'));
+    assert.ok(criteriaKeys.includes('model-c'));
   });
 });

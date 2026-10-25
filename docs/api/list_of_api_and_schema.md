@@ -285,7 +285,7 @@ sidecar. Source of truth for these is `src/types/shared.ts`.
 | `[composite]` | no | share/fallback/fusion/coordinator aliases |
 | `[schedule]` | no | time-of-day aliases |
 | `[transforms.<name>]` | no | named sets of request/response rewrites |
-| `[transform_defaults]` | no | per-upstream-mode default transform set list |
+| `[transforms.default]` | no | per-upstream-mode default transform set list |
 | `[dashboard]` | no | optional `api_key` for dashboard bearer auth |
 | `[fetch]` | no | optional image-encode sidecar URL (`image_encode`) |
 

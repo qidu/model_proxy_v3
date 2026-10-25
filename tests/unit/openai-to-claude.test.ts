@@ -17,7 +17,6 @@ import {
   extractTokenCounts,
   convertOpenAIToClaudeResponse,
   convertOpenAITokenCountingToClaude,
-  convertOpenAIModelsToClaude,
   mergeOpenAIModelsResponse,
 } from '../../src/converters/openai-to-claude.js';
 import type { OpenAIResponse } from '../../src/types/openai.js';
@@ -184,29 +183,6 @@ describe('convertOpenAITokenCountingToClaude', () => {
       convertOpenAITokenCountingToClaude({ prompt_tokens: 42 } as any),
       { type: 'token_count', input_tokens: 42 },
     );
-  });
-});
-
-describe('convertOpenAIModelsToClaude', () => {
-  it('maps model ids and converts created unix time to RFC3339', () => {
-    const out = convertOpenAIModelsToClaude({
-      object: 'list',
-      data: [{ id: 'gpt-x', object: 'model', created: 0, owned_by: 'o' }],
-    } as any);
-    assert.equal(out.data[0].id, 'gpt-x');
-    assert.equal(out.data[0].type, 'model');
-    assert.equal(out.data[0].created_at, '1970-01-01T00:00:00.000Z');
-    assert.equal(out.first_id, 'gpt-x');
-    assert.equal(out.has_more, false);
-  });
-
-  it('appends extra model ids that are not already present', () => {
-    const out = convertOpenAIModelsToClaude(
-      { object: 'list', data: [{ id: 'a', object: 'model', created: 0, owned_by: 'o' }] } as any,
-      ['a', 'b'],
-    );
-    const ids = out.data.map(m => m.id);
-    assert.deepEqual(ids, ['a', 'b']);
   });
 });
 

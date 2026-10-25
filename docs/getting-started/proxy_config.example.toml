@@ -50,16 +50,19 @@ global_token_limit = "700M 1w"
 week_start_day = "monday"
 # Store config api_keys in the OS keychain (local/dev-host use only — not for
 # Docker or Cloudflare Workers). Applies only to configured api_keys of
-# [models.*] targets (and [default_upstream].default_api_key) in this local
-# file — ignored for Consul/Apollo config sources, N/A for composite aliases,
-# and caller/user keys from request headers are never stored. On the first
-# load every plaintext api_key is saved under the `model_proxy_v3` service
-# with account "<target_model_id>/<base_url>" and this file is rewritten
+# [models.*] targets, [models.default].api_key, and [models.passthrough] keys
+# in this local file — ignored for Consul/Apollo config sources, N/A for
+# composite aliases, and caller/user keys from request headers are never stored.
+# On the first load every plaintext api_key is saved in one JSON object under
+# the `model_proxy_v3` service and reserved `__api_keys_v1__` account, with
+# properties named "<target_model_id>/<base_url>"; this file is rewritten
 # (backup: .bak) with those keys replaced by the literal STORE_KEY_IN_SYSTEM
-# sentinel; every later load resolves the sentinels back from the keychain.
-# Startup fails loud when the keychain is unavailable. Requires the
-# @github/keytar native addon (optionalDependency, fetched from GitHub; npm
-# installs a prebuilt NAPI binary — see README "System & toolchain requirements")
+# sentinel. Every later load reads only that one item, avoiding one macOS
+# permission prompt per key. Migration from legacy per-account items can still
+# prompt once per old item on its first run. Startup fails loud when the
+# keychain is unavailable. Requires the
+# @github/keytar native addon (optionalDependency, pinned to the npm registry
+# release with prebuilt NAPI binaries — see README "System & toolchain requirements")
 # — if startup then fails with "Cannot find package '@github/keytar'", see README
 # ("OS keychain key storage") for recovery (prune-style npm runs can strip the
 # declaration from package.json; restore it before reinstalling).
@@ -361,12 +364,12 @@ base_url = "https://openrouter.ai/api"
 #   In a [models.*] section, add `transforms = "set_name"` (or a comma-separated
 #   list `"set_a,set_b"`) inside any model's inline table.
 #
-# [transform_defaults] wires sets to every model of a given upstream mode
+# [transforms.default] wires sets to every model of a given upstream mode
 #   without touching individual model entries. Keys are upstream-mode names;
 #   values are arrays of transform-set names applied before any per-model sets.
 #
 # Resolution order (left-to-right, each set sees the previous set's output):
-#   mode-defaults (transform_defaults) → category-level transforms → per-entry transforms
+#   mode-defaults (transforms.default) → category-level transforms → per-entry transforms
 
 # Example: rename `max_tokens` → `max_completion_tokens` for an OpenAI-responses upstream,
 # and inject a fixed `reasoning` effort field.
@@ -414,7 +417,7 @@ base_url = "https://openrouter.ai/api"
 #   "o3" = {target = "o3", transforms = "openai_responses_compat,strict_tools"}
 
 # Example: apply a transform to every openai-completions model automatically.
-# [transform_defaults]
+# [transforms.default]
 # openai-completions = ["strict_tools"]
 # anthropic-messages = ["inject_missing_tool_results_set"]
 
@@ -495,7 +498,7 @@ before_upstream.ops = [
 # DEFAULT — wire max_tokens_rename to every openai-completions and openai-responses
 # route automatically. Resolution order: mode-defaults → per-entry transforms, so a
 # per-entry no_max_completion_tokens set overrides this default for that model.
-[transform_defaults]
+[transforms.default]
 openai-completions = ["max_tokens_rename"]
 openai-responses   = ["max_tokens_rename"]
 
@@ -567,11 +570,21 @@ openai-responses   = ["max_tokens_rename"]
 # against the user prompt and returns a relevance score (0.0-1.0). Tools below
 # the threshold are erased from the request before forwarding to the upstream.
 #
-# The proxy POSTs {state, questions} to <judge_url>/judge and reads the answers
-# back out of a top-level map keyed by question id. The full wire contract is
-# docs/architecture/design_tool_judge_sidecar_protocol.md.
+# Two protocols are supported:
 #
-# Two modes:
+# 1. Legacy sidecar protocol (default): POSTs {state, questions} to <judge_url>/judge
+#    and reads answers from a top-level map keyed by question id. The full wire
+#    contract is docs/architecture/design_tool_judge_sidecar_protocol.md.
+#
+# 2. Clef decision API protocol (set `use_decision_api = true`): POSTs the Clef
+#    request format {model, state, questions} to <judge_url> (which should be the
+#    full /decision endpoint URL, e.g. "http://localhost:8765/decision") and reads
+#    answers from the Clef response format {model, answers, usage}. The Clef
+#    schema is in docs/api/decision/clef-schema-input.json and clef-schema-output.json.
+#    This protocol is shared with the /decision endpoint and can use the same
+#    Laya or Cloudflare backend as the decision service.
+#
+# Two modes (both protocols):
 #   - "choice" (per-tool): one request per tool, question id "decision". Answers
 #     {"decision": {type: "choice", confidence, action, choice,
 #     probabilities: {"keep": 0.8, "discard": 0.2}}}. Kept iff
@@ -588,11 +601,15 @@ openai-responses   = ["max_tokens_rename"]
 # ~30ms). A request is budgeted N x timeout_ms for its N questions, capped at
 # 2000ms total, so a batch is not penalised for being large.
 #
-# Reference sidecar server: submodules/laya-mlx/serve_judge.py, which serves this
-# protocol from the Laya typed-decisions model. It warms the model with one
-# throwaway inference per question type before binding its port (~70ms), so the
-# first real request does not pay the lazy pipeline setup:
+# Reference sidecar server: submodules/laya-mlx/serve_judge.py, which serves BOTH
+# protocols (the legacy /judge and the Clef /decision) from the Laya
+# typed-decisions model. It warms the model with one throwaway inference per
+# question type before binding its port (~70ms), so the first real request does
+# not pay the lazy pipeline setup:
+#   # Legacy protocol (serves /judge)
 #   python submodules/laya-mlx/serve_judge.py --model convaiinnovations/laya --port 8081
+#   # Clef protocol (serves /decision)
+#   python submodules/laya-mlx/serve_judge.py --model convaiinnovations/laya --port 8765
 #
 # Integration: The sidecar is called at the `before_upstream` pipeline hook,
 # after privacy filtering and any request transforms, but before the model
@@ -600,13 +617,15 @@ openai-responses   = ["max_tokens_rename"]
 #
 # To enable: set `judge_url` to your sidecar endpoint. The presence of `judge_url` is what
 # activates the feature (no separate `enabled` flag).
-[tool_judge_sidecar]
-# judge_url = "http://localhost:8081"        # required to enable (base URL, not /judge path)
-# mode = "noul"                               # "choice" (per-tool) or "noul" (batch)
-# threshold = 0.5                             # relevance threshold 0.0-1.0
-# timeout_ms = 50                             # per-question budget (default 50ms); N questions get N × this, capped at 2000ms
-# max_batch_tools = 50                        # batch size limit for noul mode
-# api_key = "optional-bearer-token"           # optional Authorization header
+[tool_judge]
+# judge_url = "http://localhost:8081"        # required to enable; base URL for legacy protocol (not /judge path), or full /decision endpoint URL when use_decision_api = true
+# mode = "choice"                              # "choice" (per-tool) or "noul" (batch)
+# threshold = 0.5                              # relevance threshold 0.0-1.0
+# timeout_ms = 50                              # per-question budget (default 50ms); N questions get N × this, capped at 2000ms
+# max_batch_tools = 50                         # tools per noul request; larger tool lists are judged in sequential chunks of this size
+# api_key = "optional-bearer-token"            # optional Authorization header
+# use_decision_api = false                     # if true, use Clef decision API protocol (POST to judge_url as full /decision endpoint); if false (default), use legacy sidecar protocol (POST to judge_url/judge)
+# model = "laya"                               # model backend for decision API: "laya", "clef", or "clef-flash" (only used when use_decision_api = true)
 
 # ---------------------------------------------------------------------------
 # Decision endpoint — POST /decision, the Clef API.
@@ -636,7 +655,7 @@ openai-responses   = ["max_tokens_rename"]
 #
 # Laya's reference server:
 #   python submodules/laya-mlx/serve_judge.py --model convaiinnovations/laya --port 8765
-[decision]
+[models.decision]
 # backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed); required to enable
 # url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim; required to enable
 # api_key = "optional-bearer-token"           # optional, sent as Authorization: Bearer
@@ -652,7 +671,7 @@ openai-responses   = ["max_tokens_rename"]
 # appended). `buildUpstreamUrl`'s full-endpoint short-circuit and version-dedupe
 # are NOT used — the client's path is preserved verbatim.
 #
-# Each inline table under `[passthrough]` defines one target, keyed by an
+# Each inline table under `[models.passthrough]` defines one target, keyed by an
 # arbitrary name. Multiple entries with the same `mode` form a weighted pool
 # (by `share`, default 1) — `share` only matters inside such a pool, so a mode
 # with a single target always uses it whatever its `share` says. The auth key
@@ -662,7 +681,7 @@ openai-responses   = ["max_tokens_rename"]
 # Short field names are canonical here; the long aliases (base_url/url,
 # api_key/key, upstream_mode/mode) are also accepted.
 #
-# [passthrough]
+# [models.passthrough]
 # # Weighted pool: both targets serve openai-completions, split 20:30 (40% / 60%).
 # openai1 = {base = "https://api.openai-a.com", mode = "openai-completions", share = 20}
 # openai2 = {base = "https://api.openai-b.com", mode = "openai-completions", share = 30}

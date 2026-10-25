@@ -23,7 +23,7 @@ import { createLogger } from '../../src/utils/logger.js';
 const logger = createLogger({});
 const realFetch = globalThis.fetch;
 
-/** A [decision] config with the two required keys and test-friendly defaults. */
+/** A [models.decision] config with the two required keys and test-friendly defaults. */
 function proxyConfig(
   decision?: Partial<NonNullable<ProxyConfig['decision']>> | null,
 ): ProxyConfig {
@@ -91,7 +91,7 @@ function upstreamJson(text: string, status = 200): Response {
 }
 
 /**
- * The handler builds its abort signal from `[decision] timeout_ms`, so the
+ * The handler builds its abort signal from `[models.decision] timeout_ms`, so the
  * meaningful property is the exact delay handed to AbortSignal.timeout.
  */
 function spyAbortSignalTimeout(): { delays: number[]; restore: () => void } {
@@ -127,7 +127,7 @@ afterEach(() => {
 // Not configured
 // ---------------------------------------------------------------------------
 
-describe('decision: [decision] not configured', () => {
+describe('decision: [models.decision] not configured', () => {
   it('answers 503 and never calls an upstream when the section is absent', async () => {
     const calls = stubFetch(() => upstreamJson(clefAnswer()));
     const response = await handleDecisionRequest(clefBody(), proxyConfig(null), 'req-1', logger);

@@ -4,7 +4,7 @@
  * Proxies POST /decision requests to an upstream serving the Clef contract
  * (as defined by docs/api/decision/clef-schema-input.json and clef-schema-output.json).
  *
- * The upstream is configured via [decision] in proxy_config.toml:
+ * The upstream is configured via [models.decision] in proxy_config.toml:
  *   backend    = "laya" | "cloudflare" | "clef"   # required; "clef" === "cloudflare"
  *   url        = "http://..."            # required, POSTed verbatim
  *   api_key    = ""                      # optional, sent as Authorization: Bearer
@@ -28,11 +28,11 @@ export async function handleDecisionRequest(
 ): Promise<Response> {
   const decisionConfig = proxyConfig.decision;
 
-  // [decision] must supply both backend and url to enable this endpoint.
+  // [models.decision] must supply both backend and url to enable this endpoint.
   if (!decisionConfig?.backend || !decisionConfig?.url) {
-    logger.error(requestId, 'Decision endpoint not enabled: [decision] backend and url are required');
+    logger.error(requestId, 'Decision endpoint not enabled: [models.decision] backend and url are required');
     return createErrorResponse(
-      new Error('Decision endpoint not configured: [decision] backend ("laya" | "cloudflare" | "clef") and url are required'),
+      new Error('Decision endpoint not configured: [models.decision] backend ("laya" | "cloudflare" | "clef") and url are required'),
       requestId,
       503,
     );
@@ -74,7 +74,7 @@ export async function handleDecisionRequest(
   // upstream call so the client gets a clear reason instead of a silent drop.
   if (backend === 'laya' && Array.isArray(body.images) && body.images.length > 0) {
     return createErrorResponse(
-      new Error('Image input is not supported by the "laya" backend; set [decision] backend = "cloudflare" to use an upstream that accepts images'),
+      new Error('Image input is not supported by the "laya" backend; set [models.decision] backend = "cloudflare" to use an upstream that accepts images'),
       requestId,
       400,
     );

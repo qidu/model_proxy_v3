@@ -124,7 +124,7 @@ echo "stub upstream pid=$STUB_PID"
 wait_for_port "$STUB_PORT" || { echo "FATAL: stub did not start"; cat "$ROOT/tests/manual/stub.log"; exit 1; }
 echo "stub upstream ready"
 
-# --------------------------------------------------------- config: no [decision]
+# ------------------------------------------------- config: no [models.decision]
 cat > "$ROOT/tests/manual/proxy_decision_none.toml" <<'EOF'
 [general]
 EOF
@@ -210,9 +210,9 @@ r=$(curl -s -w '\n%{http_code}' -X POST "$L" -H "$H" -d '{"model":"clef","state"
 check "empty questions -> 400" 400 "$(echo "$r" | tail -1)"
 
 echo ""
-echo "==================== 5. unconfigured [decision] -> 503 ===================="
+echo "==================== 5. unconfigured [models.decision] -> 503 ===================="
 r=$(curl -s -w '\n%{http_code}' -X POST "$N" -H "$H" -d "$NOUL")
-check "no [decision] section -> 503" 503 "$(echo "$r" | tail -1)"
+check "no [models.decision] section -> 503" 503 "$(echo "$r" | tail -1)"
 echo "        body: $(echo "$r" | sed '$d')"
 
 echo ""

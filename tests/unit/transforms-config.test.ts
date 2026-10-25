@@ -306,7 +306,7 @@ describe('validateAllTransforms', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseSimpleToml — [transforms.*] and [transform_defaults] sections
+// parseSimpleToml — [transforms.*] and [transforms.default] sections
 // ---------------------------------------------------------------------------
 
 describe('parseSimpleToml — transforms sections', () => {
@@ -382,18 +382,87 @@ before_upstream.ops = [{op="rename",path="max_tokens",to="max_completion_tokens"
     });
   });
 
-  it('parses [transform_defaults]', () => {
+  it('parses [transforms.default]', () => {
     const config = parseSimpleToml(`
 [transforms.max_tokens_completion]
 schema = "openai-completions"
 before_upstream.ops = [{op="rename",path="max_tokens",to="max_completion_tokens"}]
 
-[transform_defaults]
+[transforms.default]
 openai-completions = ["max_tokens_completion"]
 openai-responses = ["max_tokens_completion"]
 `);
     assert.deepEqual(config.transform_defaults?.['openai-completions'], ['max_tokens_completion']);
     assert.deepEqual(config.transform_defaults?.['openai-responses'], ['max_tokens_completion']);
+  });
+
+  // [transform_defaults] → [transforms.default]: the old header was REMOVED and
+  // now hits the unknown-section branch; the canonical header must NOT register
+  // a transform set named "default" (the name is now reserved).
+
+  const captureWarns = (fn: () => void): string[] => {
+    const original = console.warn;
+    const messages: string[] = [];
+    console.warn = (...args: unknown[]) => { messages.push(args.map(String).join(' ')); };
+    try {
+      fn();
+    } finally {
+      console.warn = original;
+    }
+    return messages;
+  };
+
+  it('rejects the removed [transform_defaults] header as an unknown section and drops its keys', () => {
+    const config = parseSimpleToml(`
+[transforms.max_tokens_completion]
+schema = "openai-completions"
+
+[transform_defaults]
+openai-completions = ["max_tokens_completion"]
+
+[defaults]
+max_tokens = "100"
+`) as any;
+    assert.equal(config.transform_defaults, undefined);
+    assert.deepEqual(config.defaults, { max_tokens: '100' }, 'parsing continues after the rejected section');
+    const warnings = config._validationWarnings ?? [];
+    assert.ok(
+      warnings.some((w: { path: string }) => w.path === 'transform_defaults'),
+      `expected an unknown-section warning naming [transform_defaults], got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('parses the canonical [transforms.default] header without a deprecation warning and without a "default" transform set', () => {
+    let config!: ReturnType<typeof parseSimpleToml>;
+    const warns = captureWarns(() => {
+      config = parseSimpleToml(`
+[transforms.max_tokens_completion]
+schema = "openai-completions"
+
+[transforms.default]
+openai-completions = ["max_tokens_completion"]
+`);
+    });
+    assert.deepEqual(config.transform_defaults?.['openai-completions'], ['max_tokens_completion']);
+    assert.ok(
+      !warns.some((m) => m.includes('deprecated')),
+      `unexpected deprecation warning: ${JSON.stringify(warns)}`
+    );
+    // Intercepted before the generic [transforms.<name>] branch: no "default" set.
+    assert.equal(config.transforms?.['default'], undefined);
+    assert.deepEqual(Object.keys(config.transforms ?? {}), ['max_tokens_completion']);
+  });
+
+  it('serializeProxyConfigToml writes the canonical [transforms.default] header', () => {
+    const serialized = serializeProxyConfigToml({
+      transform_defaults: { 'openai-completions': ['set_a'] },
+    });
+    assert.match(serialized, /^\[transforms\.default\]$/m);
+    assert.doesNotMatch(serialized, /^\[transform_defaults\]$/m);
+    // And it reparses into transform_defaults, not a transform set.
+    const reparsed = parseSimpleToml(serialized);
+    assert.deepEqual(reparsed.transform_defaults, { 'openai-completions': ['set_a'] });
+    assert.equal(reparsed.transforms?.['default'], undefined);
   });
 
   it('parses multiple transforms and transform_defaults together', () => {
@@ -408,7 +477,7 @@ before_upstream.ops = [{op="map_value",path="messages[role=assistant].content",w
 schema = "openai-completions"
 before_upstream.ops = [{op="rename",path="max_tokens",to="max_completion_tokens"}]
 
-[transform_defaults]
+[transforms.default]
 openai-completions = ["max_tokens_completion"]
 `);
     const ds = config.transforms?.['deepseek_compat'];
@@ -434,7 +503,7 @@ const maxTokensToml = `
 schema = "openai-completions"
 before_upstream.ops = [{op = "rename", path = "max_tokens", to = "max_completion_tokens"}]
 
-[transform_defaults]
+[transforms.default]
 "openai-completions" = ["max_tokens_rename"]
 "openai-responses" = ["max_tokens_rename"]
 
@@ -464,7 +533,7 @@ request_ingress.builtins = ["lowercase_tool_schema_types"]
 before_upstream.builtins = ["recover_tool_message_name"]
 before_upstream.ops = [{op = "map_value", path = "messages[role=assistant].content", when_sibling = "tool_calls", from = "", to = null}]
 
-[transform_defaults]
+[transforms.default]
 "openai-completions" = ["max_tokens_rename"]
 `;
 

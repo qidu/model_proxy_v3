@@ -7,7 +7,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTargetUrl, buildUpstreamUrl, getHandlerType, parseDynamicRoute } from '../../src/utils/routing.js';
+import { buildTargetUrl, buildUpstreamUrl, getHandlerType, parseDynamicRoute, transformAuthHeadersForUpstream } from '../../src/utils/routing.js';
 import { decayEffectiveCompositeShare, getEffectiveCompositeShare, recoverEffectiveCompositeShare, resetEffectiveCompositeSharesForTest } from '../../src/index.js';
 
 describe('composite primary effective share decay', () => {
@@ -469,6 +469,16 @@ describe('getHandlerType', () => {
     // production and currently surfaces as an error rather than a handler.
     assert.throws(() => getHandlerType('v1/models/gemini-2.5-pro'), /Unknown Claude endpoint/);
   });
+
+  it('classifies v1beta interactions paths with sub-resources as interactions', () => {
+    assert.equal(getHandlerType('v1beta/interactions/session-1'), 'interactions');
+  });
+
+  it('still throws for models paths without a generative action after unification', () => {
+    assert.throws(() => getHandlerType('v1beta/models/gemini-2.5:streamGenerateContent'), /Unknown Claude endpoint/);
+    assert.throws(() => getHandlerType('v1/models/'), /Unknown Claude endpoint/);
+    assert.throws(() => getHandlerType('v1beta/models'), /Unknown Claude endpoint/);
+  });
 });
 
 describe('buildTargetUrl', () => {
@@ -542,5 +552,68 @@ describe('buildTargetUrl', () => {
         `round-trip failed for ${route}`
       );
     }
+  });
+});
+
+
+describe('transformAuthHeadersForUpstream', () => {
+  const makeRequest = (path: string, headers: Record<string, string>) =>
+    new Request(`http://localhost${path}`, { headers });
+
+  it('prefers Authorization over x-goog-api-key for the /v1/models list in anthropic-messages mode', () => {
+    const headers = transformAuthHeadersForUpstream(
+      makeRequest('/v1/models', {
+        Authorization: 'Bearer sk-anthropic',
+        'x-goog-api-key': 'goog-key',
+      }),
+      'anthropic-messages',
+      '/v1/models'
+    );
+    assert.equal(headers['x-api-key'], 'sk-anthropic');
+    assert.equal(headers['x-goog-api-key'], undefined);
+  });
+
+  it('still prefers x-goog-api-key for genuine Gemini native calls', () => {
+    const headers = transformAuthHeadersForUpstream(
+      makeRequest('/v1beta/models/gemini-2.5:generateContent', {
+        Authorization: 'Bearer sk-anthropic',
+        'x-goog-api-key': 'goog-key',
+      }),
+      'gemini-generatecontent',
+      '/v1beta/models/gemini-2.5:generateContent'
+    );
+    assert.equal(headers['x-goog-api-key'], 'goog-key');
+    assert.equal(headers['x-api-key'], undefined);
+  });
+
+  it('falls through to x-goog-api-key for the /v1/models list when it is the only credential', () => {
+    const headers = transformAuthHeadersForUpstream(
+      makeRequest('/v1/models', { 'x-goog-api-key': 'goog-key' }),
+      'anthropic-messages',
+      '/v1/models'
+    );
+    assert.equal(headers['x-api-key'], 'goog-key');
+  });
+
+  it('prefers x-goog-api-key for v1beta interactions paths in gemini-interactions mode', () => {
+    const headers = transformAuthHeadersForUpstream(
+      makeRequest('/v1beta/interactions/session-1', {
+        Authorization: 'Bearer sk-x',
+        'x-goog-api-key': 'goog-key',
+      }),
+      'gemini-interactions',
+      '/v1beta/interactions/session-1'
+    );
+    assert.equal(headers['x-goog-api-key'], 'goog-key');
+    assert.equal(headers['Authorization'], undefined);
+  });
+
+  it('still authenticates a v1beta interactions path when only Authorization is present', () => {
+    const headers = transformAuthHeadersForUpstream(
+      makeRequest('/v1beta/interactions/session-1', { Authorization: 'Bearer sk-x' }),
+      'gemini-interactions',
+      '/v1beta/interactions/session-1'
+    );
+    assert.equal(headers['x-goog-api-key'], 'sk-x');
   });
 });

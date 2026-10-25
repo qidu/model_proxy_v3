@@ -17,11 +17,11 @@ import { extractToolRecords, type ToolRecord } from './tool-shapes.js';
 const logger = createLogger({});
 
 // The sidecar is a small encoder (Laya runs with max_len=512 tokens), so the
-// state has to stay inside that budget: an unbounded tool-schema dump would
-// blow the token budget and every judge call would fail open. Caps below keep
-// the state useful and bounded.
+// state has to stay inside that budget: each tool appears as just its name and
+// description — a schema dump would blow the token budget and every judge call
+// would fail open. Caps below keep the state useful and bounded.
 const MAX_PROMPT_CHARS = 2000;
-const MAX_SCHEMA_CHARS = 600;
+const MAX_TOOL_DESCRIPTION_CHARS = 600;
 const MAX_CONTEXT_MESSAGES = 3;
 const MAX_CONTEXT_TOOL_CALLS = 5;
 
@@ -38,6 +38,10 @@ export interface JudgeSidecarConfig {
   mode: 'choice' | 'noul';
   apiKey?: string;
   maxBatchTools: number;
+  /** Use the /decision API (Clef protocol) instead of the sidecar /judge endpoint. */
+  useDecisionApi?: boolean;
+  /** Model to use when calling the decision API (e.g., "clef" for Laya judge). */
+  model?: string;
 }
 
 
@@ -84,6 +88,100 @@ export interface JudgeDecision {
   reason: string;
 }
 
+// ============================================================================
+// Clef Protocol Types (for /decision API)
+// ============================================================================
+
+/** Clef protocol request body (doc §3.1). */
+export interface ClefRequest {
+  model: string;
+  state: string;
+  questions: Record<string, ClefQuestion>;
+}
+
+/** Clef protocol question (doc §3.2). */
+export interface ClefChoiceQuestion {
+  type: 'choice';
+  instructions: string;
+  /** Mapping of criterion label to description. */
+  criteria: Record<string, string>;
+}
+
+/** Clef protocol noul question (doc §3.2). */
+export interface ClefNoulQuestion {
+  type: 'noul';
+  instructions: string;
+}
+
+export type ClefQuestion = ClefChoiceQuestion | ClefNoulQuestion;
+
+/** Clef protocol answer (doc §3.3). */
+export interface ClefAnswer {
+  type: 'choice' | 'noul';
+  confidence: number;
+  action: { act_probability: number };
+  /** `choice` only: winning criterion label. */
+  choice?: string;
+  /** `choice` only: probability per criterion label. */
+  probabilities?: Record<string, number>;
+  /** `noul` only: relevance score 0.0–1.0. */
+  noul?: number;
+}
+
+/** Clef protocol response (doc §3.4). */
+export interface ClefResponse {
+  model: string;
+  answers: Record<string, ClefAnswer>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+}
+
+/**
+ * Adapt a sidecar JudgeRequest to a Clef request.
+ * Maps sidecar question types to Clef question types.
+ * Converts choice criteria from array (sidecar) to object (Clef).
+ */
+export function adaptToClefRequest(
+  request: JudgeRequest,
+  model: string,
+): ClefRequest {
+  const clefQuestions: Record<string, ClefQuestion> = {};
+  for (const [qid, question] of Object.entries(request.questions)) {
+    if (question.type === 'choice') {
+      // Convert criteria from array ["keep", "discard"] to object {"keep": "Keep the tool", "discard": "Discard the tool"}
+      const criteria: Record<string, string> = {};
+      for (const criterion of question.criteria) {
+        criteria[criterion] = criterion === 'keep' ? 'Keep the tool' : 'Discard the tool';
+      }
+      clefQuestions[qid] = {
+        type: 'choice',
+        instructions: question.instructions,
+        criteria,
+      };
+    } else {
+      clefQuestions[qid] = { type: 'noul', instructions: question.instructions };
+    }
+  }
+  return {
+    model,
+    state: request.state,
+    questions: clefQuestions,
+  };
+}
+
+/**
+ * Adapt a Clef response to a sidecar JudgeResponse.
+ * Clef returns a top-level `answers` map with ClefAnswer objects.
+ * Sidecar expects a flat map of question_id → JudgeAnswer.
+ * The structures are identical, so we just extract the answers map.
+ */
+export function adaptFromClefResponse(clefResponse: ClefResponse): JudgeResponse {
+  return clefResponse.answers;
+}
+
 // Result of the sidecar call
 export interface JudgeResult {
   /** Tools to erase (at or below threshold) */
@@ -94,6 +192,8 @@ export interface JudgeResult {
   unjudgedNames: string[];
   /** Tools never sent because they exceeded max_batch_tools — kept (fail-open) */
   skippedNames: string[];
+  /** Erased tool name → judge factor (noul score / keep probability), for logging */
+  eraseFactors?: Record<string, number>;
   /** Raw sidecar response for debugging */
   rawResponse?: JudgeResponse;
   /** Whether the sidecar was called */
@@ -104,8 +204,8 @@ export interface JudgeResult {
 
 /**
  * Build the judge `state` text from the request body and the tools to judge
- * (design doc §4.1). Each `ToolRecord` is a provider-native tool definition
- * reduced to what the judge needs; its schema is serialized into the text.
+ * (design doc §4.1). Each `ToolRecord` is reduced to what the judge needs:
+ * its name and description — the parameter schema is not sent.
  */
 export function buildStateText(body: Record<string, unknown>, tools: ToolRecord[]): string {
   const userTexts: string[] = [];
@@ -126,7 +226,7 @@ export function buildStateText(body: Record<string, unknown>, tools: ToolRecord[
   }
 
   // The final user message is the prompt being judged; earlier ones are context.
-  const userPrompt = userTexts.length > 0 ? userTexts[userTexts.length - 1] : '';
+  const userPrompt = userTexts.length > 0 ? stripClientInjectedContent(userTexts[userTexts.length - 1]) : '';
   const recentUserMessages = userTexts
     .slice(0, -1)
     .slice(-MAX_CONTEXT_MESSAGES);
@@ -138,7 +238,10 @@ export function buildStateText(body: Record<string, unknown>, tools: ToolRecord[
     'Tools to evaluate:',
   ];
   tools.forEach((tool, i) => {
-    lines.push(`${i + 1}. ${tool.name}: ${truncate(JSON.stringify(tool.schema), MAX_SCHEMA_CHARS)}`);
+    const description = tool.description
+      ? `: ${truncate(tool.description, MAX_TOOL_DESCRIPTION_CHARS)}`
+      : '';
+    lines.push(`${i + 1}. ${tool.name}${description}`);
   });
 
   if (recentUserMessages.length > 0 || recentToolCalls.length > 0) {
@@ -156,6 +259,122 @@ export function buildStateText(body: Record<string, unknown>, tools: ToolRecord[
 
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/**
+ * Client-injected (not user-typed) content stripped from the judged prompt.
+ * These blocks are added by the client harness around the real user input, carry
+ * no tool-relevance signal, and burn the sidecar's small token budget:
+ *   - system-reminder       Claude Code context injection (date, cwd, git status…)
+ *   - environment_context   Codex environment block (cwd, shell, permissions…)
+ *   - local-command-stdout  Claude Code `! cmd` output
+ *   - local-command-stderr
+ *   - ide_opened_file       Claude Code IDE-integration context
+ *   - ide_selection
+ * Tag blocks are removed with their contents plus the whitespace clients pad
+ * them with (including indentation between adjacent blocks); the open/close
+ * names must match (\1 backreference), so an unclosed or mismatched tag passes
+ * through untouched. The Claude Code local-command "Caveat:" paragraph is
+ * matched to end-of-line.
+ *
+ * Claude Code slash-command wrappers get split treatment: <command-message> is
+ * client boilerplate and is stripped outright, while <command-name> and
+ * <command-args> hold what the user actually typed, so they are UNWRAPPED —
+ * tags removed, inner text kept.
+ *
+ * Stripping runs in three layers (see stripClientInjectedContent):
+ *   1. the known-tag list below,
+ *   2. a generalized pass stripping ANY leading blank-line-separated tag block,
+ *      which covers clients whose tag names we don't know,
+ *   3. only if no tag matched at all, a heuristic that drops leading paragraphs
+ *      made entirely of machine-looking lines (key: value, dates, paths).
+ * Layers 2–3 can false-positive on user text that happens to look injected
+ * (e.g. a leading XML example, or a pasted config block followed by a question)
+ * — the blast radius is limited to the judge's view; the upstream request body
+ * is never touched.
+ */
+const CLIENT_INJECTED_TAGS = [
+  'system-reminder',
+  'environment_context',
+  'local-command-stdout',
+  'local-command-stderr',
+  'ide_opened_file',
+  'ide_selection',
+  'command-message',
+];
+
+const CLIENT_INJECTED_BLOCK_RE = new RegExp(
+  `\\s*<(${CLIENT_INJECTED_TAGS.join('|')})>[\\s\\S]*?</\\1>\\s*`,
+  'g',
+);
+
+const CLIENT_INJECTED_CAVEAT_RE =
+  /\n*Caveat: The messages below were generated by the user while running local commands\.[^\n]*\n*/g;
+
+/** Claude Code slash-command wrappers whose inner text is user-typed: unwrap. */
+const CLIENT_COMMAND_UNWRAP_RE =
+  /<\/(command-name|command-args)>|<(command-name|command-args)>/g;
+
+function stripClientInjectedContent(text: string): string {
+  const knownStripped = text
+    .replace(CLIENT_INJECTED_BLOCK_RE, '\n')
+    .replace(CLIENT_INJECTED_CAVEAT_RE, '\n')
+    .replace(CLIENT_COMMAND_UNWRAP_RE, '')
+    .trim();
+  const tagStripped = stripLeadingTaggedBlocks(knownStripped).trim();
+  if (tagStripped !== text.trim()) {
+    // A tag-based rule matched; what remains is the prompt.
+    return tagStripped;
+  }
+  // No tag matched at all. Last resort: if the message is blank-line-separated
+  // paragraphs and the leading ones look machine-generated (config dumps,
+  // timestamps), drop them and keep from the first human-looking paragraph on.
+  return dropMachineLeadingParagraphs(tagStripped).trim();
+}
+
+/**
+ * Fallback for clients whose injected context uses tags outside the known list:
+ * strip leading paragraphs that are wholly enclosed in a matched tag pair and
+ * followed by a blank line (or end of message) — the shape every observed
+ * injection takes. Plain-text paragraphs never match, so real multi-paragraph
+ * user input passes through untouched.
+ */
+function stripLeadingTaggedBlocks(text: string): string {
+  const blockStart = /^\s*<([a-zA-Z][a-zA-Z0-9_-]*)>[\s\S]*?<\/\1>(?:\n{2,}|\s*$)/;
+  let rest = text;
+  for (;;) {
+    const m = blockStart.exec(rest);
+    if (!m) return rest;
+    rest = rest.slice(m[0].length);
+  }
+}
+
+/**
+ * A line "looks machine-generated" when it is structured data rather than
+ * prose: a `key: value` line, an ISO date, a single-line tag pair, or a bare
+ * path. A paragraph qualifies only when EVERY line qualifies — one prose line
+ * anywhere keeps the paragraph, which is what protects real user text.
+ */
+const STRUCTURED_LINE_RES = [
+  /^[\w .-]+:\s*\S/,                       // key: value ("cwd: /Users/x")
+  /\b\d{4}-\d{2}-\d{2}\b/,                 // ISO date anywhere in the line
+  /^<[^>\s]+(\s[^>]*)?>.*<\/[^>\s]+>\s*$/, // single-line tag-wrapped content
+  /^([~\/]|[A-Za-z]:[\\\/])\S*$/,          // bare absolute path
+];
+
+function looksMachineGenerated(paragraph: string): boolean {
+  const lines = paragraph.split('\n').map((l) => l.trim()).filter(Boolean);
+  return lines.length > 0 && lines.every((l) => STRUCTURED_LINE_RES.some((re) => re.test(l)));
+}
+
+function dropMachineLeadingParagraphs(text: string): string {
+  const paragraphs = text.split(/\n{2,}/);
+  if (paragraphs.length < 2) return text;
+  let firstHuman = 0;
+  while (firstHuman < paragraphs.length - 1 && looksMachineGenerated(paragraphs[firstHuman])) {
+    firstHuman++;
+  }
+  return paragraphs.slice(firstHuman).join('\n\n');
 }
 
 /**
@@ -359,10 +578,17 @@ export async function callJudgeSidecar(
       headers['Authorization'] = `Bearer ${config.apiKey}`;
     }
 
+    const bodyJson = JSON.stringify(request);
+    logger.debug(
+      requestId,
+      `Tool judge sidecar request to ${judgeEndpoint(config.judge_url)} ` +
+        `(${config.mode} mode, ${questionCount} question(s), timeout ${timeoutMs}ms): ${truncate(bodyJson, 4000)}`,
+    );
+
     const resp = await fetch(judgeEndpoint(config.judge_url), {
       method: 'POST',
       headers,
-      body: JSON.stringify(request),
+      body: bodyJson,
       signal: controller.signal,
     });
 
@@ -374,6 +600,10 @@ export async function callJudgeSidecar(
     }
 
     const text = await resp.text();
+    logger.debug(
+      requestId,
+      `Tool judge sidecar raw response (${resp.status}, ${questionCount} question(s)): ${truncate(text, 4000)}`,
+    );
     let data: unknown;
     try {
       data = JSON.parse(text);
@@ -396,6 +626,97 @@ export async function callJudgeSidecar(
       );
     } else {
       logger.warn(requestId, `Tool judge sidecar error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return null;
+  }
+}
+
+/**
+ * Call the /decision API (Clef protocol) with the given request.
+ * Returns null on any failure (timeout, non-2xx, malformed body) so the caller can fail open.
+ */
+export async function callDecisionApi(
+  config: JudgeSidecarConfig,
+  request: JudgeRequest,
+  requestId: string,
+): Promise<JudgeResponse | null> {
+  if (!config.model) {
+    logger.warn(requestId, 'Tool judge decision API: model not configured');
+    return null;
+  }
+  if (!config.judge_url) {
+    logger.warn(requestId, 'Tool judge decision API: judge_url not configured');
+    return null;
+  }
+
+  const questionCount = Object.keys(request.questions).length;
+  const timeoutMs = requestTimeoutMs(config, questionCount);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (config.apiKey) {
+      headers['Authorization'] = `Bearer ${config.apiKey}`;
+    }
+
+    const clefRequest = adaptToClefRequest(request, config.model);
+    const bodyJson = JSON.stringify(clefRequest);
+    // judge_url is the full decision endpoint URL (e.g., http://127.0.0.1:8081/decision)
+    const decisionEndpoint = config.judge_url.replace(/\/+$/, '');
+
+    logger.trace(requestId, `Tool judge decision API request (full): ${bodyJson}`);
+    logger.debug(
+      requestId,
+      `Tool judge decision API request to ${decisionEndpoint} ` +
+        `(${config.mode} mode, ${questionCount} question(s), model=${config.model}, timeout ${timeoutMs}ms): ${truncate(bodyJson, 4000)}`,
+    );
+
+    const resp = await fetch(decisionEndpoint, {
+      method: 'POST',
+      headers,
+      body: bodyJson,
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!resp.ok) {
+      logger.warn(requestId, `Tool judge decision API returned ${resp.status}: ${resp.statusText}`);
+      return null;
+    }
+
+    const text = await resp.text();
+    logger.trace(requestId, `Tool judge decision API response (full): ${text}`);
+    logger.debug(
+      requestId,
+      `Tool judge decision API raw response (${resp.status}, ${questionCount} question(s)): ${truncate(text, 4000)}`,
+    );
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      logger.warn(requestId, `Tool judge decision API returned malformed JSON: ${truncate(text, 200)}`);
+      return null;
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      logger.warn(requestId, `Tool judge decision API returned non-object body: ${truncate(text, 200)}`);
+      return null;
+    }
+
+    const clefResponse = data as ClefResponse;
+    return adaptFromClefResponse(clefResponse);
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof Error && err.name === 'AbortError') {
+      logger.warn(
+        requestId,
+        `Tool judge decision API timeout (${timeoutMs}ms for ${questionCount} question(s))`,
+      );
+    } else {
+      logger.warn(requestId, `Tool judge decision API error: ${err instanceof Error ? err.message : String(err)}`);
     }
     return null;
   }
@@ -430,11 +751,12 @@ export async function judgeTools(
     return { eraseNames: [], judgedNames: [], unjudgedNames: [], skippedNames: [], called: false };
   }
 
-  // Tools past the batch cap are never sent — kept, but reported so the
-  // overflow is not a silent no-op.
+  // Every tool is judged: noul mode batches into sequential chunks of
+  // max_batch_tools (one request per chunk), choice mode already sends one
+  // request per tool. skippedNames stays in the result shape for callers but
+  // is always empty.
   const maxBatch = sidecarConfig.max_batch_tools ?? 50;
-  const toolsToJudge = tools.slice(0, maxBatch);
-  const skippedNames = tools.slice(maxBatch).map((tool) => tool.name);
+  const skippedNames: string[] = [];
 
   const config: JudgeSidecarConfig = {
     judge_url: sidecarConfig.judge_url,
@@ -443,21 +765,28 @@ export async function judgeTools(
     mode: sidecarConfig.mode ?? 'choice',
     apiKey: sidecarConfig.api_key,
     maxBatchTools: maxBatch,
+    useDecisionApi: sidecarConfig.use_decision_api ?? false,
+    model: sidecarConfig.model,
   };
 
   const startedAt = Date.now();
-  const toolNames = toolsToJudge.map((tool) => tool.name);
-  logger.debug(requestId, `Calling tool judge sidecar (${config.mode}, ${toolsToJudge.length} tools)`);
+  const useDecisionApi = config.useDecisionApi;
+  const label = useDecisionApi ? 'decision API' : 'sidecar';
+  logger.debug(requestId, `Calling tool judge ${label} (${config.mode}, ${tools.length} tools)`);
 
-  let decisions: JudgeDecision[] = [];
+  const decisions: JudgeDecision[] = [];
   const unjudgedNames: string[] = [];
   let rawResponse: JudgeResponse | undefined;
   let callFailed = false;
 
+  // Choose the appropriate call function based on config
+  const callFn = useDecisionApi ? callDecisionApi : callJudgeSidecar;
+  logger.debug(requestId, `Tool judge routing: using ${useDecisionApi ? 'callDecisionApi (Clef /decision)' : 'callJudgeSidecar (sidecar /judge)'}`);
+
   if (config.mode === 'choice') {
     // Doc §2.2 is single-tool: one request per tool, each with its own state.
-    for (const tool of toolsToJudge) {
-      const response = await callJudgeSidecar(
+    for (const tool of tools) {
+      const response = await callFn(
         config,
         buildChoiceRequest(buildStateText(body, [tool])),
         requestId,
@@ -471,28 +800,37 @@ export async function judgeTools(
       } catch (err) {
         logger.warn(
           requestId,
-          `Tool judge sidecar gave an unusable answer for ${tool.name}: ${err instanceof Error ? err.message : String(err)}`,
+          `Tool judge ${label} gave an unusable answer for ${tool.name}: ${err instanceof Error ? err.message : String(err)}`,
         );
         unjudgedNames.push(tool.name);
       }
     }
     callFailed = decisions.length === 0;
   } else {
-    const response = await callJudgeSidecar(
-      config,
-      buildNoulRequest(buildStateText(body, toolsToJudge), toolNames),
-      requestId,
-    );
-    if (!response) {
-      callFailed = true;
-      unjudgedNames.push(...toolNames);
-    } else {
-      rawResponse = response;
-      decisions = parseNoulResponse(response, toolNames, config.threshold);
-      for (const decision of decisions) {
+    // Doc §2.3 batch mode, chunked: one request per max_batch_tools chunk, each
+    // carrying only its own tools' schemas so the sidecar's small token budget
+    // is per-chunk rather than per-request. A failed chunk fails open for just
+    // its own tools; the rest are still judged.
+    for (let i = 0; i < tools.length; i += maxBatch) {
+      const chunk = tools.slice(i, i + maxBatch);
+      const chunkNames = chunk.map((tool) => tool.name);
+      const response = await callFn(
+        config,
+        buildNoulRequest(buildStateText(body, chunk), chunkNames),
+        requestId,
+      );
+      if (!response) {
+        unjudgedNames.push(...chunkNames);
+        continue;
+      }
+      rawResponse = { ...rawResponse, ...response };
+      const chunkDecisions = parseNoulResponse(response, chunkNames, config.threshold);
+      decisions.push(...chunkDecisions);
+      for (const decision of chunkDecisions) {
         if (decision.reason === 'missing from response') unjudgedNames.push(decision.toolName);
       }
     }
+    callFailed = decisions.length === 0;
   }
 
   const eraseNames = decisions.filter((d) => d.action === 'erase').map((d) => d.toolName);
@@ -501,24 +839,31 @@ export async function judgeTools(
     .map((d) => d.toolName);
   const elapsedMs = Date.now() - startedAt;
 
-  // Fail loud: anything the sidecar did not decide is reported, not hidden.
+  for (const decision of decisions) {
+    logger.debug(
+      requestId,
+      `Tool judge ${label}: ${decision.toolName} -> ${decision.action} ` +
+        `(confidence=${decision.factor.toFixed(4)}, ${decision.reason})`,
+    );
+  }
+  for (const name of unjudgedNames) {
+    logger.debug(requestId, `Tool judge ${label}: ${name} -> unjudged (kept)`);
+  }
+
+  // Fail loud: anything the judge did not decide is reported, not hidden.
   const summary =
-    `Tool judge sidecar (mode=${config.mode}, threshold=${config.threshold}): ` +
-    `${judgedNames.length}/${toolsToJudge.length} judged, ${eraseNames.length} to erase` +
+    `Tool judge ${label} (mode=${config.mode}, threshold=${config.threshold}): ` +
+    `${judgedNames.length}/${tools.length} judged, ${eraseNames.length} to erase` +
     (unjudgedNames.length > 0 ? `, ${unjudgedNames.length} unjudged (kept)` : '') +
-    (skippedNames.length > 0
-      ? `, ${skippedNames.length} over max_batch_tools=${maxBatch} (kept)`
-      : '') +
     ` in ${elapsedMs}ms`;
 
   let error: string | undefined;
-  if (toolsToJudge.length > 0 && judgedNames.length === 0) {
-    error = `Sidecar judged none of ${toolsToJudge.length} tools — failing open`;
+  if (tools.length > 0 && judgedNames.length === 0) {
+    error = `Judge judged none of ${tools.length} tools — failing open`;
     logger.warn(requestId, summary);
   } else {
     const notes: string[] = [];
-    if (unjudgedNames.length > 0) notes.push(`${unjudgedNames.length} of ${toolsToJudge.length} tools unjudged (kept)`);
-    if (skippedNames.length > 0) notes.push(`${skippedNames.length} tools over max_batch_tools=${maxBatch} (kept)`);
+    if (unjudgedNames.length > 0) notes.push(`${unjudgedNames.length} of ${tools.length} tools unjudged (kept)`);
     if (notes.length > 0) {
       error = notes.join('; ');
       logger.warn(requestId, summary);
@@ -527,14 +872,19 @@ export async function judgeTools(
     }
   }
 
+  const eraseFactors = Object.fromEntries(
+    decisions.filter((d) => d.action === 'erase').map((d) => [d.toolName, d.factor]),
+  );
+
   if (callFailed && eraseNames.length === 0 && decisions.length === 0) {
     return {
       eraseNames,
       judgedNames,
       unjudgedNames,
       skippedNames,
+      eraseFactors,
       called: true,
-      error: error ?? 'Sidecar call failed (timeout or error) — failing open',
+      error: error ?? `Judge call failed (timeout or error) — failing open`,
     };
   }
 
@@ -543,6 +893,7 @@ export async function judgeTools(
     judgedNames,
     unjudgedNames,
     skippedNames,
+    eraseFactors,
     rawResponse,
     called: true,
     error,

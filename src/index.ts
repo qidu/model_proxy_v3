@@ -9,6 +9,7 @@ import { Env } from './types/shared.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
+import { extractRawCredential } from './utils/auth-headers.js';
 import { createErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { createLogger, type Logger } from './utils/logger.js';
 import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled } from './handlers/models.js';
@@ -40,7 +41,7 @@ import {
   handleDashboardUpsertModelTarget,
   handleDashboardUpsertScheduleTarget,
 } from './handlers/dashboard.js';
-import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget } from './utils/config-loader.js';
+import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget, getDefaultUpstreamConfig, resolveCompositeWithDecision, DecisionRequestContext } from './utils/config-loader.js';
 import { parseAuthTargets, hasRequiredProtocolVersion, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
 import { detectCoordinatorStage } from './utils/coordinator.js';
 import {
@@ -335,11 +336,7 @@ function applyCorsHeaders(response: Response, request: Request, env: Env): Respo
 }
 
 function getRawEndpointUserKey(authHeaders: Record<string, string>): string {
-  const authorization = authHeaders['Authorization'] || authHeaders['authorization'];
-  if (authorization) {
-    return authorization.replace(/^Bearer\s+/i, '');
-  }
-  return authHeaders['x-goog-api-key'] || '';
+  return extractRawCredential(authHeaders, 'authorization-first') ?? '';
 }
 
 function validateDashboardApiAuth(request: Request, proxyConfig: ProxyConfig): Response | null {
@@ -414,7 +411,7 @@ const FIXED_ROUTE_ENDPOINTS: Record<UpstreamTargetKind, string> = {
 /**
  * Two routing dialects share the table below:
  *
- * - `fixed-route`: `[models.default]` / `[default_upstream]` routing (parseFixedRoute).
+ * - `fixed-route`: `[models.default]` routing (parseFixedRoute).
  * - `model-route`: the per-model builders — composite candidates, fusion, the
  *   remote auth-target ladder and the /v1/chat/completions model passthrough.
  *
@@ -623,7 +620,7 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
 /**
  * Parse fixed route and return target configuration
  * Fixed route: /v1/messages -> /v1/chat/completions
- * Uses [models.default] and [default_upstream] from proxy_config.toml
+ * Uses [models.default] from proxy_config.toml
  * The mode → target mapping is shared with model-specific routing (resolveUpstreamTarget).
  */
 function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
@@ -634,14 +631,8 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   modelId?: string;
   forceStreaming?: boolean;
 } {
-  // Get default config from [models.default] or [default_upstream]
-  const defaultCategory = proxyConfig.models?.default;
-  const defaultCategoryConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
-  const defaultMode = defaultCategoryConfig?.upstream_mode || 
-                      proxyConfig.default_upstream?.upstream_mode || 
-                      'openai-completions';
-  const defaultBaseUrl = defaultCategoryConfig?.base_url || 
-                        proxyConfig.default_upstream?.default_base_url;
+  // Get default config from [models.default]
+  const { upstreamMode: defaultMode, baseUrl: defaultBaseUrl } = getDefaultUpstreamConfig(proxyConfig);
 
   // Endpoints whose target does not depend on the upstream mode keep their own
   // branches; everything else goes through the shared (path × upstream_mode) table.
@@ -945,28 +936,32 @@ export default {
 
       // Health check endpoint (also for root path)
       if (path === '/health' || path === '/') {
-        const defaultCategory = proxyConfig.models?.default;
-        const defaultCategoryConfig = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory : undefined;
-        const healthBaseUrl = defaultCategoryConfig?.base_url ||
-                             proxyConfig.default_upstream?.default_base_url;
-        const healthUrl = `${healthBaseUrl}/v1/models`;
+        const { baseUrl: healthBaseUrl } = getDefaultUpstreamConfig(proxyConfig);
         const healthAuth = extractAuthHeaders(request);
 
-        try {
-          const { count, cached } = await getModelCount(healthUrl, healthAuth, requestId, logger, env as unknown as Record<string, unknown>);
-          if (count > 0) {
-            return new Response(JSON.stringify({
-              status: 'ok',
-              models: count,
-              cached,
-              version: env.VERSION || 'unknown'
-            }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            });
+        if (!healthBaseUrl) {
+          logger.warn(
+            requestId,
+            'Health check: no default upstream configured ([models.default] table) — skipping upstream model count',
+          );
+        } else {
+          const healthUrl = `${healthBaseUrl}/v1/models`;
+          try {
+            const { count, cached } = await getModelCount(healthUrl, healthAuth, requestId, logger, env as unknown as Record<string, unknown>);
+            if (count > 0) {
+              return new Response(JSON.stringify({
+                status: 'ok',
+                models: count,
+                cached,
+                version: env.VERSION || 'unknown'
+              }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+          } catch {
+            // Fall through to error
           }
-        } catch {
-          // Fall through to error
         }
         return new Response(JSON.stringify({
           error: 'No models Found.',
@@ -1414,7 +1409,13 @@ export default {
           // downstream path (single/composite/fusion) operates on the filtered
           // body. Mirrors the privacy-filter pattern above — mutate `body`, then
           // reserialize `bodyText` so the passthrough reconstruction picks it up.
-          const eraseResult = eraseBlockedTools(body, logger, requestId, sidecarEraseNames);
+          if (sidecarEraseNames.length > 0) {
+            logger.debug(
+              requestId,
+              `Tool judge sidecar: erasing ${sidecarEraseNames.length} tool(s) from request: ${sidecarEraseNames.join(', ')}`,
+            );
+          }
+          const eraseResult = eraseBlockedTools(body, logger, requestId, sidecarEraseNames, judgeResult.eraseFactors);
           if (eraseResult.erasedNames.length > 0 || eraseResult.toolChoiceReset) {
             bodyText = JSON.stringify(body);
           }
@@ -1562,7 +1563,105 @@ export default {
             }
 
             if (!((request as any)._fusionPlan)) {
-            const compositeCandidates = getCompositeRouteCandidates(modelName, proxyConfig);
+            // Build decision context from request body for ability-based target selection
+            const decisionContext: DecisionRequestContext = {
+              requestId,
+              prompt: '',
+              recentUserMessages: [],
+              recentToolCalls: [],
+              tools: [],
+            };
+
+            // Extract user messages and tool calls from body
+            if (body && Array.isArray(body.messages)) {
+              const userMessages: string[] = [];
+              const toolCalls: Array<{ name: string; args: unknown }> = [];
+
+              for (const msg of body.messages) {
+                if (!msg || typeof msg !== 'object') continue;
+                const m = msg as Record<string, unknown>;
+                const role = m.role === 'model' ? 'assistant' : (m.role as string);
+                const content = m.parts ?? m.content;
+
+                if (role === 'user') {
+                  // Extract text from content
+                  let text = '';
+                  if (typeof content === 'string') {
+                    text = content;
+                  } else if (Array.isArray(content)) {
+                    for (const block of content) {
+                      if (block && typeof block === 'object' && typeof (block as Record<string, unknown>).text === 'string') {
+                        text += (block as Record<string, unknown>).text + '\n';
+                      }
+                    }
+                    text = text.trim();
+                  }
+                  if (text) userMessages.push(text);
+                } else if (role === 'assistant') {
+                  // Extract tool calls
+                  if (Array.isArray(content)) {
+                    for (const block of content) {
+                      if (block && typeof block === 'object') {
+                        const b = block as Record<string, unknown>;
+                        if (b.type === 'tool_use' && typeof b.name === 'string') {
+                          toolCalls.push({ name: b.name, args: b.input ?? {} });
+                        } else if (b.functionCall && typeof b.functionCall === 'object') {
+                          const fc = b.functionCall as Record<string, unknown>;
+                          if (typeof fc.name === 'string') toolCalls.push({ name: fc.name, args: fc.args ?? {} });
+                        }
+                      }
+                    }
+                  }
+                  if (Array.isArray(m.tool_calls)) {
+                    for (const call of m.tool_calls) {
+                      if (!call || typeof call !== 'object') continue;
+                      const fn = (call as Record<string, unknown>).function;
+                      if (fn && typeof fn === 'object') {
+                        const f = fn as Record<string, unknown>;
+                        if (typeof f.name === 'string') {
+                          let args: unknown = {};
+                          try { args = JSON.parse(typeof f.arguments === 'string' ? f.arguments : '{}'); } catch { args = f.arguments ?? {}; }
+                          toolCalls.push({ name: f.name, args });
+                        }
+                      }
+                    }
+                  }
+                  const functionCall = m.function_call;
+                  if (functionCall && typeof functionCall === 'object') {
+                    const f = functionCall as Record<string, unknown>;
+                    if (typeof f.name === 'string') {
+                      let args: unknown = {};
+                      try { args = JSON.parse(typeof f.arguments === 'string' ? f.arguments : '{}'); } catch { args = f.arguments ?? {}; }
+                      toolCalls.push({ name: f.name, args });
+                    }
+                  }
+                }
+              }
+
+              // Last user message is the current prompt, earlier ones are context
+              if (userMessages.length > 0) {
+                decisionContext.prompt = userMessages[userMessages.length - 1];
+                decisionContext.recentUserMessages = userMessages.slice(0, -1).slice(-3);
+              }
+              decisionContext.recentToolCalls = toolCalls.slice(-5);
+            }
+
+            // Extract available tools from body
+            if (body && Array.isArray(body.tools)) {
+              decisionContext.tools = body.tools.map((t: any) => ({
+                name: t.name || (t.function?.name || ''),
+                description: t.description || (t.function?.description || ''),
+              })).filter((t: any) => t.name);
+            }
+
+            // Try decision-aware resolution first
+            let compositeCandidates = await resolveCompositeWithDecision(modelName, proxyConfig, decisionContext);
+
+            // Fall back to default logic if decision API not used or failed
+            if (!compositeCandidates) {
+              compositeCandidates = getCompositeRouteCandidates(modelName, proxyConfig);
+            }
+
             compositeAliasName = (compositeCandidates.length > 0 || (request as any)._coordCandidate) ? modelName : undefined;
 
             // Token-limit enforcement: check tokens in the current duration window against the alias-level limit.
@@ -1675,10 +1774,11 @@ export default {
               body: bodyText,
             });
 
-            // In config_key mode, apply default_upstream.default_api_key for models
+            // In config_key mode, apply [models.default] api_key for models
             // that fall through to the default route (no model-specific entry).
             if (useConfigKey) {
-              const defaultApiKey = proxyConfig.default_upstream?.default_api_key;
+              const defaultCategory = proxyConfig.models?.default;
+              const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
               if (defaultApiKey && upstreamMode) {
                 modelAuthHeaders = {
                   ...transformAuthHeadersForUpstream(request, upstreamMode, path, requestId, env as Record<string, unknown>),
@@ -1759,9 +1859,10 @@ export default {
             logger.debug(requestId, `No auth headers found for fixed routing ${upstreamMode}`);
           }
 
-          // In config_key mode, override with default_upstream.default_api_key for fixed routing
+          // In config_key mode, override with [models.default] api_key for fixed routing
           if (useConfigKey) {
-            const defaultApiKey = proxyConfig.default_upstream?.default_api_key;
+            const defaultCategory = proxyConfig.models?.default;
+            const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
             if (defaultApiKey) {
               modelAuthHeaders = { ...modelAuthHeaders, ...formatApiKeyForUpstream(defaultApiKey, upstreamMode) };
             }

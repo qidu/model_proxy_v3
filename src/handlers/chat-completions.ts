@@ -6,7 +6,8 @@
 
 import type { Env, Logger } from '../types/shared.js';
 import { logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
-import { addForwardedHeaders, normalizeOpenAIAuthHeaders } from '../utils/routing.js';
+import { addForwardedHeaders } from '../utils/routing.js';
+import { repackBearerCredential, normalizeOpenAIAuthHeaders } from '../utils/auth-headers.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
@@ -86,10 +87,7 @@ export async function handleChatCompletionsPassthrough(
     logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
 
     const anthropicHeaders: Record<string, string> = { ...authHeaders };
-    if (anthropicHeaders['Authorization'] && !anthropicHeaders['x-api-key']) {
-      anthropicHeaders['x-api-key'] = anthropicHeaders['Authorization'].replace(/^Bearer\s+/i, '');
-      delete anthropicHeaders['Authorization'];
-    }
+    repackBearerCredential(anthropicHeaders, 'x-api-key');
 
     const anthropicFetchHeaders = {
       'Content-Type': 'application/json',
@@ -314,10 +312,7 @@ export async function handleChatCompletionsPassthrough(
     const geminiHeaders: Record<string, string> = { ...authHeaders };
     // Gemini native API uses x-goog-api-key. If the request came in with
     // Authorization: Bearer, repack the key into x-goog-api-key.
-    if (geminiHeaders['Authorization'] && !geminiHeaders['x-goog-api-key']) {
-      geminiHeaders['x-goog-api-key'] = geminiHeaders['Authorization'].replace(/^Bearer\s+/i, '');
-      delete geminiHeaders['Authorization'];
-    }
+    repackBearerCredential(geminiHeaders, 'x-goog-api-key');
 
     // For streaming, switch :generateContent -> :streamGenerateContent?alt=sse
     // (matches src/handlers/gemini.ts constructGeminiUrl convention).
