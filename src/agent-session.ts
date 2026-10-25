@@ -1696,6 +1696,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       'anthropic-messages': anthropicMessagesApi(),
       'openai-completions': openAICompletionsApi(),
       'openai-responses': openAIResponsesApi(),
+      'open-responses': openAIResponsesApi(),
       'google-generative-ai': googleGenerativeAIApi(),
       'pi-messages': piMessagesApi(),
     },
@@ -1822,6 +1823,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     { value: 'anthropic-messages' as ProxyApiType, label: 'Anthropic Messages', description: 'Default: /v1/messages (Claude format)' },
     { value: 'openai-completions' as ProxyApiType, label: 'OpenAI Completions', description: '/v1/chat/completions (OpenAI chat format)' },
     { value: 'openai-responses' as ProxyApiType, label: 'OpenAI Responses', description: '/v1/responses (OpenAI Responses API)' },
+    { value: 'open-responses' as ProxyApiType, label: 'Open Responses', description: '/v1/responses (Open Responses spec)' },
     { value: 'google-generative-ai' as ProxyApiType, label: 'Google Generative AI', description: '/v1beta/models/{model}:generateContent (Gemini format)' },
   ];
   const apiChoice = await pickFromList(

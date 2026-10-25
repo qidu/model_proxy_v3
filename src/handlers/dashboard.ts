@@ -3624,6 +3624,7 @@ function buildTestToolRequest(upstreamMode: string): Record<string, unknown> {
 
   if (upstreamMode === 'openai-completions' ||
       upstreamMode === 'openai-responses' ||
+      upstreamMode === 'open-responses' ||
       upstreamMode === 'gemini-generatecontent' ||
       upstreamMode === 'gemini-interactions') {
     return openaiToolBody;

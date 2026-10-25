@@ -199,7 +199,7 @@ export interface ProxyConfig {
 export interface PassthroughTargetConfig {
   /** Base URL (bare origin + optional path prefix). Must NOT end with an endpoint path. */
   base: string;
-  /** Upstream mode: one of 'openai-completions', 'anthropic-messages', 'openai-responses', 'gemini-generatecontent', 'gemini-interactions' */
+  /** Upstream mode: one of 'openai-completions', 'anthropic-messages', 'openai-responses', 'open-responses', 'gemini-generatecontent', 'gemini-interactions' */
   mode: string;
   /** Weight for weighted random selection (default: 1) */
   share?: number;

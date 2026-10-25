@@ -10,6 +10,9 @@ export const UPSTREAM_MODES = [
   'openai-completions',
   'anthropic-messages',
   'openai-responses',
+  // Open Responses spec (openresponses.org) — wire-compatible with
+  // openai-responses; resolveUpstreamTarget canonicalizes it to that mode.
+  'open-responses',
   'gemini-generatecontent',
   'gemini-interactions',
 ] as const;

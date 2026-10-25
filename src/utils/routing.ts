@@ -402,7 +402,7 @@ function transformAuthHeadersForUpstream(
   
   // Determine priority based on endpoint
   const isMessagesEndpoint = endpointPath?.startsWith('/v1/messages');
-  const isOpenAIEndpoint = upstreamMode === 'openai-completions' || upstreamMode === 'openai-responses';
+  const isOpenAIEndpoint = upstreamMode === 'openai-completions' || upstreamMode === 'openai-responses' || upstreamMode === 'open-responses';
   const isGeminiEndpoint = isGeminiApiPath(endpointPath);
 
   if (isMessagesEndpoint) {

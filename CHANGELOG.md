@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(modes): add `open-responses` upstream mode and endpoint schema
+
+`upstream_mode = "open-responses"` targets an [Open Responses](https://www.openresponses.org) spec-compliant upstream. The spec's wire format is identical to the OpenAI Responses API (same `/v1/responses` resource, SSE events, and error envelope), so the mode canonicalizes to `openai-responses` at route resolution: `/v1/responses` requests pass through natively, and every other client endpoint (`/v1/messages`, `/v1/chat/completions`, `/v1/interactions`, `:generateContent`) converts through the existing Responses transform paths. `open-responses` passthrough targets match `/v1/responses*` paths, and the embedded agent session offers `open-responses` as an endpoint schema (served by the same `/v1/responses` loopback). The WebSocket transport from the 2026-04-24 spec revision is not implemented (the spec marks it MAY).
+
 ### build(ci): build the native binary for every supported target
 
 `.github/workflows/ci.yml` — `npm run build:native` moved out of the ubuntu

@@ -244,8 +244,65 @@ api_key = "decision-key"
     assert.equal(new Headers(seenInit?.headers).get('authorization'), 'Bearer decision-key');
   });
 
-  it('dispatches passthrough requests with path, body, and mode-specific auth intact', async () => {
+  it('routes an open-responses upstream mode as a Responses passthrough', async () => {
     writeFileSync(configPath, `
+[models.default]
+upstream_mode = "open-responses"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+`, 'utf8');
+    clearProxyConfigCache();
+    let seenUrl = '';
+    let seenInit: RequestInit | undefined;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      seenUrl = String(input);
+      seenInit = init;
+      return new Response('{"id":"resp_open_responses","status":"completed","output":[]}', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const body = { model: 'test', input: 'hello' };
+
+    const response = await handler.fetch(new Request('http://proxy/v1/responses', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }), env());
+    assert.equal(response.status, 200);
+    assert.equal(seenUrl, 'https://upstream.example/v1/responses');
+    assert.equal(seenInit?.body, JSON.stringify(body));
+    assert.equal(new Headers(seenInit?.headers).get('authorization'), 'Bearer client-key');
+  });
+
+  it('matches open-responses passthrough targets to /v1/responses paths', async () => {
+    writeFileSync(configPath, `
+[models.passthrough]
+openres = { base = "https://openres.example", mode = "open-responses", key = "openres-key" }
+`, 'utf8');
+    clearProxyConfigCache();
+    let seenUrl = '';
+    let seenInit: RequestInit | undefined;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      seenUrl = String(input);
+      seenInit = init;
+      return new Response('{"id":"resp_passthrough"}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+    const body = { model: 'test', input: 'hello' };
+
+    const response = await handler.fetch(new Request('http://proxy/passthrough/v1/responses', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }), env());
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), '{"id":"resp_passthrough"}');
+    assert.equal(seenUrl, 'https://openres.example/v1/responses');
+    assert.equal(seenInit?.body, JSON.stringify(body));
+    assert.equal(new Headers(seenInit?.headers).get('authorization'), 'Bearer openres-key');
+  });
+
+  it('dispatches passthrough requests with path, body, and mode-specific auth intact', async () => {    writeFileSync(configPath, `
 [models.passthrough]
 claude = { base = "https://passthrough.example", mode = "anthropic-messages", key = "passthrough-key" }
 `, 'utf8');

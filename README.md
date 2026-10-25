@@ -82,7 +82,7 @@ next rung on a retryable upstream failure, and skips resolving the model from
 |---|---|---|
 | `target` | string **required** | Real upstream model id to send (like an alias `target`). |
 | `base` / `base_url` | string **required** | Upstream base URL. |
-| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[models.default].upstream_mode`, else `openai-completions`. |
+| `mode` / `upstream_mode` | string *(optional)* | Upstream protocol: `anthropic-messages`, `openai-completions`, `openai-responses`, `open-responses`, `gemini-generatecontent`, `gemini-interactions`. Defaults to `[models.default].upstream_mode`, else `openai-completions`. |
 | `key` / `api_key` | string *(optional)* | Upstream API key for this rung only. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (subject to `auth_passthrough_with`). |
 | `otac` | string *(optional)* | Per-rung value replacing the `one_time_auth_code` header for the upstream call and the stats record. Overrides the auth response's OTAC header for this rung. |
 | `transforms` | string *(optional)* | Comma-separated `[transforms.*]` set names to apply. When omitted, no transforms are attached. |
@@ -425,6 +425,7 @@ Upstream modes a route can select (full transform matrix in [Supported `upstream
 | `anthropic-messages` | Claude Messages (`/v1/messages`) |
 | `openai-completions` | OpenAI Chat Completions (`/v1/chat/completions`) |
 | `openai-responses` | OpenAI Responses (`/v1/responses`) |
+| `open-responses` | Open Responses spec (`/v1/responses`) — wire-compatible with `openai-responses`; routed identically (native passthrough on the `/v1/responses` endpoint) |
 | `gemini-generatecontent` | Gemini generateContent (`/v1beta/models/{model}:generateContent`) |
 | `gemini-interactions` | Gemini Interactions (served through the generateContent endpoint) |
 

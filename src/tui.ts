@@ -288,7 +288,7 @@ function buildClaudeToolRequest(): Record<string, unknown> {
 // 'max_tokens' is not supported"), which expects `max_completion_tokens` instead.
 // Map the parameter name per upstream mode so the test request is accepted as-is.
 export function maxTokensField(upstreamMode: string): string {
-  return upstreamMode === 'openai-responses' ? 'max_completion_tokens' : 'max_tokens';
+  return (upstreamMode === 'openai-responses' || upstreamMode === 'open-responses') ? 'max_completion_tokens' : 'max_tokens';
 }
 
 function buildOpenAIToolRequest(upstreamMode: string): Record<string, unknown> {
@@ -345,6 +345,7 @@ export function buildTestTextRequest(upstreamMode: string): Record<string, unkno
 export function buildTestToolRequest(upstreamMode: string): Record<string, unknown> {
   if (upstreamMode === 'openai-completions' ||
       upstreamMode === 'openai-responses' ||
+      upstreamMode === 'open-responses' ||
       upstreamMode === 'gemini-generatecontent' ||
       upstreamMode === 'gemini-interactions') {
     return buildOpenAIToolRequest(upstreamMode);
@@ -2350,12 +2351,13 @@ class DashboardApp {
     );
   }
 
-  /** Upstream mode select for the model target wizard — the 4 closed TransformSchema values. */
+  /** Upstream mode select for the model target wizard. */
   private openModelModePicker(currentMode: string, onPicked: (mode: string) => void): void {
     const choices: SelectItem[] = [
       { value: 'openai-completions', label: 'openai-completions' },
       { value: 'anthropic-messages', label: 'anthropic-messages' },
       { value: 'openai-responses', label: 'openai-responses' },
+      { value: 'open-responses', label: 'open-responses' },
       { value: 'gemini-generatecontent', label: 'gemini-generatecontent' },
     ];
     if (currentMode) {

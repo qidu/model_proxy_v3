@@ -457,7 +457,9 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
   const fixed = dialect === 'fixed-route';
   const upstreamUrl = (suffix: string) => buildUpstreamUrl(baseUrl, suffix);
   const isAnthropic = upstreamMode === 'anthropic-messages';
-  const isResponses = upstreamMode === 'openai-responses';
+  // 'open-responses' (Open Responses spec) shares the openai-responses wire
+  // format, so it canonicalizes to 'openai-responses' in every return below.
+  const isResponses = upstreamMode === 'openai-responses' || upstreamMode === 'open-responses';
   const isGemini = upstreamMode === 'gemini-generatecontent' || upstreamMode === 'gemini-interactions';
   const isModelPath = path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/');
   const isStreamEndpoint = path.includes(':streamGenerateContent');

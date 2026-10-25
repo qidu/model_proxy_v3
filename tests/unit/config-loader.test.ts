@@ -2063,7 +2063,7 @@ describe('upsertModelTarget', () => {
     );
   });
 
-  it('accepts all five valid upstream modes', () => {
+  it('accepts every valid upstream mode', () => {
     for (const mode of UPSTREAM_MODES) {
       const next = upsertModelTarget(baseConfig, 'free', `model-${mode}`, {
         target: 't',

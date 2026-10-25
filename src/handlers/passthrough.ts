@@ -137,7 +137,9 @@ export async function handlePassthroughRequest(
   const candidates: Array<{ name: string; config: PassthroughTargetConfig }> = [];
   if (proxyConfig.passthrough) {
     for (const [name, target] of Object.entries(proxyConfig.passthrough)) {
-      if (target.mode === mode) {
+      // 'open-responses' targets serve the same /v1/responses paths as
+      // 'openai-responses' (identical wire format).
+      if (target.mode === mode || (target.mode === 'open-responses' && mode === 'openai-responses')) {
         candidates.push({ name, config: target });
       }
     }

@@ -16,6 +16,7 @@ export type ProxyApiType =
   | 'anthropic-messages'
   | 'openai-completions'
   | 'openai-responses'
+  | 'open-responses'
   | 'google-generative-ai'
   | 'pi-messages';
 
@@ -67,7 +68,7 @@ export function proxyLoopbackBaseUrl(port: string | number | undefined): string 
  * all of them:
  *   - anthropic-messages: the Anthropic SDK posts to `v1/messages` (version in
  *     the path), so the origin is already correct.
- *   - openai-completions / openai-responses: the OpenAI SDK posts to
+ *   - openai-completions / openai-responses / open-responses: the OpenAI SDK posts to
  *     `/chat/completions` and `/responses` (version in its own default base
  *     URL), so the base must supply `/v1`.
  *   - google-generative-ai: pi-ai sets `apiVersion = ''` and lets the SDK post
@@ -86,6 +87,7 @@ export function proxyBaseUrlForApi(port: string | number | undefined, api: Proxy
   switch (api) {
     case 'openai-completions':
     case 'openai-responses':
+    case 'open-responses':
       return `${origin}/v1`;
     case 'google-generative-ai':
       return `${origin}/v1beta`;
