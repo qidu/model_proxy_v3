@@ -5,6 +5,23 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### build(ci): build the native binary for every supported target
+
+`.github/workflows/ci.yml` — `npm run build:native` moved out of the ubuntu
+`test` job into one leg per target, because a SEA binary embeds the Node that
+built it and cannot be cross-compiled. The matrix covers all six targets
+(`x86_64` and `aarch64` on Linux, macOS, and Windows, via `ubuntu-latest`,
+`ubuntu-24.04-arm`, `macos-latest`, `macos-15-intel`, `windows-latest`, and
+`windows-11-arm`), instead of the three an OS-only matrix reached. Each leg looks
+for `dist/model-proxy-v3-<triple>` and fails if it is missing, which also proves
+the runner is the architecture the matrix claims; on Windows the expected name
+additionally ends in `.exe`, the suffix Tauri resolves an `externalBin` sidecar
+to. Binaries upload as artifacts named after their triple, and a new
+`release: [published]` trigger attaches all six to that release. The matrix is
+skipped on pull requests, which keep the ubuntu typecheck/build/test gate.
+README.md gains a target table and lists the targets that are deliberately not
+built (universal macOS, musl Linux, 32-bit).
+
 ### test(unit): increase interactive function coverage
 
 `tests/unit/` — exercise populated dashboard composite/schedule/statistics/tool overlays, monthly heatmap rendering, and agent working-directory submission through mocked terminal and local skills-CLI dependencies. The agent startup test also verifies clean abort with an empty model configuration and no upstream requests.

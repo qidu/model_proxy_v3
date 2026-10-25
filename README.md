@@ -687,6 +687,10 @@ npm run build:native     # -> dist/model-proxy-v3-<host-triple>
 The output is named `<name>-<host target triple>` (e.g.
 `model-proxy-v3-x86_64-apple-darwin`), the same name the Tauri tray's
 `externalBin` stages the sidecar under, so it can be copied across unchanged.
+On Windows the name carries a `.exe` suffix
+(`model-proxy-v3-x86_64-pc-windows-msvc.exe`), appended by `scripts/build-sea.js`
+because that is the name Tauri resolves an `externalBin` sidecar to on Windows —
+worth knowing before you rename or hand-copy an artifact.
 A ready-to-use system tray for this proxy lives in
 `git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
 its sidecar and supervises it over the `--rpc` JSON-RPC control channel
@@ -704,6 +708,41 @@ without touching the system install:
 ```bash
 npx --yes --package=node@22 node scripts/build-sea.js
 ```
+
+#### Targets built by CI
+
+`.github/workflows/ci.yml` builds one binary per target, each on the standard
+GitHub-hosted runner whose host triple it names — a SEA output embeds the Node
+that produced it, so no leg can be cross-compiled. The matrix runs on push and on
+release; pull requests keep only the ubuntu typecheck/build/test job.
+
+| Runner | Target triple |
+| --- | --- |
+| `ubuntu-latest` | `x86_64-unknown-linux-gnu` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `macos-latest` | `aarch64-apple-darwin` |
+| `macos-15-intel` | `x86_64-apple-darwin` |
+| `windows-latest` | `x86_64-pc-windows-msvc` |
+| `windows-11-arm` | `aarch64-pc-windows-msvc` |
+
+The two Windows outputs end in `.exe`
+(`model-proxy-v3-x86_64-pc-windows-msvc.exe`, `model-proxy-v3-aarch64-pc-windows-msvc.exe`),
+and the workflow fails the leg if the `model-proxy-v3-<triple>.exe` file it expects
+is absent — the same name check also proves each runner is the architecture its
+matrix entry claims. Every binary is uploaded as the artifact
+`model-proxy-v3-<target triple>`, and publishing a GitHub release attaches all six
+to it.
+
+These targets are deliberately not built. All three come down to "no runner
+produces them, and SEA cannot stand in for one":
+
+- **Universal macOS** (a `lipo` of the two macOS binaries). SEA cannot merge two
+  Nodes into one executable.
+- **musl Linux** (`x86_64-unknown-linux-musl`, for Alpine). The embedded Node is
+  an official glibc build.
+- **32-bit** (`linux-armv7l`, `linux-ia32`, `win32-ia32`). `outputName()` in
+  `scripts/build-sea.js` maps every non-`arm64` architecture to the 64-bit name,
+  so it cannot name these outputs correctly.
 
 ### Node response compression headers
 
