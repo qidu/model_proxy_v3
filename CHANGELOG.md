@@ -5,6 +5,42 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### test(unit): increase interactive function coverage
+
+`tests/unit/` — exercise populated dashboard composite/schedule/statistics/tool overlays, monthly heatmap rendering, and agent working-directory submission through mocked terminal and local skills-CLI dependencies. The agent startup test also verifies clean abort with an empty model configuration and no upstream requests.
+
+### test(unit): cover streamed bodies and defensive response extraction
+
+`tests/unit/` — add seven tests for content-length-free request buffering, OpenAI reasoning/tool history conversion to Responses input, dashboard malformed JSON and OpenAI tool/error formatting, and dashboard-stat malformed-node handling, response-tool deduplication, and duplicate-tool request-size aggregation.
+
+### test(unit): cover interactive TUI and agent startup lifecycles
+
+`tests/unit/` — drive the real dashboard renderer and help overlay through mocked TTY streams, verifying refresh/timer and terminal cleanup; cancel the agent's first prompt through its real input handler, verifying early exit, ANSI-free trajectory logging, and console/stream restoration without network access.
+
+### test(unit): cover dashboard route tables and request guards
+
+`tests/unit/` — add five tests for dashboard stats/tools/quota/mutation dispatch, malformed model JSON, global token-limit enforcement, OpenAI-style thinking normalization, and nested Responses tool/usage extraction.
+
+### test(unit): cover dashboard tracking and dispatch paths
+
+`tests/unit/`, `src/utils/dashboard-stats.ts` — add 12 tests for dashboard model-test variants and quota validation, timing/response-tool tracking and fragmented SSE, Messages upstream errors, and Decision/passthrough dispatch. Timing recorders now ignore non-finite samples, and response tool-name collection deduplicates repeated names.
+
+### test(unit): cover persistence and remaining routing branches
+
+`tests/unit/` — add 10 tests for dashboard composite/schedule mutations, JSONL stats restore/dump, Messages reasoning/options/stream conversion, dashboard API authentication, request-size limits, and plain Messages routing.
+
+### test(unit): cover low-coverage routing, dashboard, and utility paths
+
+`tests/unit/` — add 47 tests for dashboard page/stats/model-test endpoints, TUI startup and model defaults, Consul KV parsing and URL guards, tool blocklist filtering, agent-session filesystem/skill edges, Messages reasoning/tool streaming, dashboard-stat lifecycle and extraction helpers, and top-level CORS/admin/health/auth/model routing.
+
+### test(unit): broaden source function and handler coverage
+
+`tests/unit/` — add 82 tests for heatmap aggregation/rendering, model caching/discovery, embeddings, token-counting handlers, Messages/Responses conversion and passthrough, TUI request builders/model resolution, and dashboard config sanitization/persistence/validation. Upstream requests are mocked and mutable global/config state is restored between tests.
+
+### test(server): cover the Node HTTP adapter
+
+`src/server.ts`, `tests/unit/server.test.ts` — environment construction, response-header filtering, and request adaptation are now exported and startup runs only for direct execution. Unit tests cover GET/POST forwarding, non-streaming and SSE responses, request-counter release, and handler failures through an ephemeral local HTTP server.
+
 ### docs(api): gap analysis of `/v1/responses` against the Open Responses specification (2026-04-24)
 
 `docs/api/review-for-gaps-to-the-open-responses-spec.md` — new review document comparing the `/v1/responses` implementation against `docs/api/spec-of-open-responses-2026-04-24.mdx.txt`. Sixteen items, each with the spec quote (line-cited), current behavior with `file:line` evidence, the minimal fix, and a status; plus a scope rule, a verified-compliant list, a status summary table, and an implementation order.

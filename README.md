@@ -943,7 +943,7 @@ models you trust. See `src/agent-tools.ts` for the exact checks.
 ### Models Involved
 1. `DeepSeek-R1`, `V3.2`, `V4-Flash`, `V4-Pro`, `V4.1-Flash`
 2. `Minimax-M2.6`, `M2.7-highspeed`, `M3`
-3. `Kimi-K2.6`, `K2.7-Code`, `K2.8`, `K3`
+3. `Kimi-K2.6`, `K2.7-Code`, `K2.8`, `K3`, `K3.1-Pro`
 4. `GPT-5.4-Mini`, `GPT-5.4`, `GPT-5.5`, `GPT-5.6`
 5. `Gemini-2.5-Flash`, `3.0-Preview`, `3.1-Flash`
 6. `Claude-Sonnet-4.5`, `Sonnet-4.6`, `Opus 4.6`, `Opus 4.8`, `Fable 5`

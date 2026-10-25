@@ -263,6 +263,12 @@ describe('loadSelectedSkills', () => {
     assert.match(result, /Body B\./);
     assert.ok(result.includes('\n\n')); // join separator
   });
+
+  it('ignores selected names that are not present in the candidate list', async () => {
+    const candidates = await gatherSkillCandidates(workDir, globalSkillsDir, lockFilePath);
+    const result = await loadSelectedSkills(workDir, candidates, new Set(['not-a-candidate']));
+    assert.equal(result, '');
+  });
 });
 
 /**
@@ -299,6 +305,11 @@ describe('snapshotWorkDir', () => {
 
   it('returns an empty map for a directory with no files', async () => {
     const snapshot = await snapshotWorkDir(workDir);
+    assert.deepEqual([...snapshot.keys()], []);
+  });
+
+  it('returns an empty map when the working directory does not exist', async () => {
+    const snapshot = await snapshotWorkDir(join(workDir, 'missing', 'nested'));
     assert.deepEqual([...snapshot.keys()], []);
   });
 });
@@ -989,5 +1000,199 @@ describe('output trimming before Markdown', () => {
     // trimStart must not flatten real Markdown structure: a reply that opens
     // with prose and then indents a code block keeps it as a code block.
     assert.equal(lead("Here's the code:\n\n    indented thing".trim()).fenced, true);
+  });
+});
+
+describe('startAgentSession cancellation', () => {
+  it('cancels the first prompt, records the trajectory, and restores global state', { timeout: 5000 }, async () => {
+    const { ProcessTerminal } = await import('@earendil-works/pi-tui');
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalWrite = process.stdout.write;
+    const originalTerminalStart = ProcessTerminal.prototype.start;
+    const originalTerminalStop = ProcessTerminal.prototype.stop;
+    const originalTerminalWrite = ProcessTerminal.prototype.write;
+    const originalFetch = globalThis.fetch;
+    const originalTraj = process.env.TRAJ;
+    const originalTmpdir = process.env.TMPDIR;
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const terminalOutput: string[] = [];
+    let terminalInput: ((data: string) => void) | undefined;
+    let terminalStarts = 0;
+    let terminalStops = 0;
+    let configLoads = 0;
+    let fetchCalls = 0;
+
+    const restoreEnv = (name: 'TRAJ' | 'TMPDIR', value: string | undefined) => {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    };
+
+    process.env.TRAJ = '1';
+    process.env.TMPDIR = workDir;
+    const captureLog = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+    const captureError = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    console.log = captureLog;
+    console.error = captureError;
+    process.stdout.write = ((chunk: unknown) => (originalWrite as (this: NodeJS.WriteStream, value: unknown) => boolean).call(process.stdout, chunk)) as typeof process.stdout.write;
+    ProcessTerminal.prototype.start = function (onInput) {
+      terminalStarts += 1;
+      terminalInput = onInput;
+    };
+    ProcessTerminal.prototype.stop = function () {
+      terminalStops += 1;
+    };
+    ProcessTerminal.prototype.write = function (data) {
+      terminalOutput.push(data);
+    };
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error('unexpected network request');
+    }) as typeof fetch;
+
+    try {
+      const { startAgentSession } = await import('../../src/agent-session.js');
+      const session = startAgentSession({
+        env: {},
+        port: 1,
+        loadConfig: async () => {
+          configLoads += 1;
+          return {};
+        },
+      });
+
+      assert.ok(terminalInput, 'prompt input handler was not installed');
+      for (let attempt = 0; attempt < 200 && !terminalOutput.join('').includes('Working directory'); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.match(terminalOutput.join(''), /Working directory/);
+      terminalInput('\x03');
+      await session;
+
+      assert.equal(configLoads, 0, 'cancelling the working-directory prompt must stop startup');
+      assert.equal(fetchCalls, 0);
+      assert.equal(console.log, captureLog, 'trajectory logging must restore the console.log active at session entry');
+      assert.equal(console.error, captureError, 'trajectory logging must restore the console.error active at session entry');
+      assert.equal(terminalStarts, 1);
+      assert.equal(terminalStops, 1);
+      assert.match(terminalOutput.join(''), /Working directory/);
+      assert.ok(logs.some((line) => line.includes('Cancelled — exiting agent session')));
+      assert.deepEqual(errors, []);
+
+      const { readdir, readFile } = await import('node:fs/promises');
+      const trajectoryFiles = (await readdir(workDir)).filter((name) => /^agent_trajectory-[0-9a-f]{8}\.log$/.test(name));
+      assert.equal(trajectoryFiles.length, 1);
+      const trajectory = await readFile(join(workDir, trajectoryFiles[0]), 'utf8');
+      assert.match(trajectory, /\[LOG\] \[WARN\] No OS-level sandbox/);
+      assert.match(trajectory, /\[LOG\] Cancelled — exiting agent session/);
+      assert.doesNotMatch(trajectory, /\x1b\[[0-9;]*m/, 'trajectory logs must strip terminal colors');
+    } finally {
+      ProcessTerminal.prototype.start = originalTerminalStart;
+      ProcessTerminal.prototype.stop = originalTerminalStop;
+      ProcessTerminal.prototype.write = originalTerminalWrite;
+      console.log = originalLog;
+      console.error = originalError;
+      process.stdout.write = originalWrite;
+      globalThis.fetch = originalFetch;
+      restoreEnv('TRAJ', originalTraj);
+      restoreEnv('TMPDIR', originalTmpdir);
+    }
+  });
+});
+
+describe('startAgentSession startup validation', () => {
+  it('submits a working directory, probes skills locally, and aborts cleanly with no models', { timeout: 5000 }, async () => {
+    const { ProcessTerminal } = await import('@earendil-works/pi-tui');
+    const { chmodSync } = await import('node:fs');
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalTerminalStart = ProcessTerminal.prototype.start;
+    const originalTerminalStop = ProcessTerminal.prototype.stop;
+    const originalTerminalWrite = ProcessTerminal.prototype.write;
+    const originalFetch = globalThis.fetch;
+    const originalPath = process.env.PATH;
+    const originalTraj = process.env.TRAJ;
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const terminalOutput: string[] = [];
+    let terminalInput: ((data: string) => void) | undefined;
+    let terminalStarts = 0;
+    let terminalStops = 0;
+    let configLoads = 0;
+    let fetchCalls = 0;
+
+    const mockBin = join(workDir, 'mock-bin');
+    mkdirSync(mockBin);
+    const npxPath = join(mockBin, process.platform === 'win32' ? 'npx.cmd' : 'npx');
+    writeFileSync(npxPath, process.platform === 'win32' ? '@echo off\r\nexit /b 1\r\n' : '#!/bin/sh\nexit 1\n');
+    chmodSync(npxPath, 0o755);
+    process.env.PATH = `${mockBin}${process.platform === 'win32' ? ';' : ':'}${originalPath ?? ''}`;
+    process.env.TRAJ = '0';
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    ProcessTerminal.prototype.start = function (onInput) {
+      terminalStarts += 1;
+      terminalInput = onInput;
+    };
+    ProcessTerminal.prototype.stop = function () {
+      terminalStops += 1;
+    };
+    ProcessTerminal.prototype.write = function (data) {
+      terminalOutput.push(data);
+    };
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error('unexpected network request');
+    }) as typeof fetch;
+
+    try {
+      const { startAgentSession } = await import('../../src/agent-session.js');
+      const session = startAgentSession({
+        env: {},
+        port: 1,
+        loadConfig: async () => {
+          configLoads += 1;
+          return { models: {} };
+        },
+      });
+
+      assert.ok(terminalInput, 'working-directory input handler was not installed');
+      for (let attempt = 0; attempt < 200 && !terminalOutput.join('').includes('Working directory'); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      terminalInput('\x15');
+      terminalInput(workDir);
+      terminalInput('\r');
+
+      let confirmedSkills = false;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        if (!confirmedSkills && terminalOutput.join('').includes('Select skills to load')) {
+          terminalInput('\r');
+          confirmedSkills = true;
+        }
+        if (errors.some((line) => line.includes('No models configured'))) break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      await session;
+
+      assert.equal(configLoads, 1);
+      assert.equal(fetchCalls, 0);
+      assert.ok(logs.some((line) => line.includes('skills" CLI not found')));
+      assert.ok(errors.some((line) => line.includes('No models configured')));
+      assert.equal(terminalStarts, terminalStops, 'every prompt screen must be stopped');
+      assert.ok(terminalStarts >= 1);
+    } finally {
+      ProcessTerminal.prototype.start = originalTerminalStart;
+      ProcessTerminal.prototype.stop = originalTerminalStop;
+      ProcessTerminal.prototype.write = originalTerminalWrite;
+      console.log = originalLog;
+      console.error = originalError;
+      globalThis.fetch = originalFetch;
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalTraj === undefined) delete process.env.TRAJ;
+      else process.env.TRAJ = originalTraj;
+    }
   });
 });

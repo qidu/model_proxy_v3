@@ -1100,7 +1100,8 @@ export function extractToolRequestCharLengthsFromBody(body: Record<string, unkno
 
 function addToolName(names: string[], value: unknown): boolean {
   if (typeof value === 'string' && value.trim()) {
-    names.push(value.trim());
+    const name = value.trim();
+    if (!names.includes(name)) names.push(name);
     return true;
   }
 
@@ -1664,7 +1665,7 @@ export function recordRequestEndpoint(endpoint: string): void {
 
 export function recordRequestTiming(endpoint: string, elapsedMs: number): void {
   if (!areModeFlagsEnabled()) return;
-  if (!endpoint || typeof elapsedMs !== 'number' || elapsedMs < 0) {
+  if (!endpoint || !Number.isFinite(elapsedMs) || elapsedMs < 0) {
     return;
   }
 
@@ -1694,7 +1695,7 @@ export function getRequestEndpointTimingStatsDesc(): (RequestEndpointTimingStats
 
 export function recordModelTiming(model: string | undefined, elapsedMs: number): void {
   if (!areModeFlagsEnabled()) return;
-  if (!model || typeof elapsedMs !== 'number' || elapsedMs < 0) {
+  if (!model || !Number.isFinite(elapsedMs) || elapsedMs < 0) {
     return;
   }
 
