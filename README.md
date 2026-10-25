@@ -848,6 +848,8 @@ in the configuration reference for the full mapping tables.
 
 ## Testing
 
+The [CI workflow](./.github/workflows/ci.yml) runs dependency installation, typechecking, server and native builds, and unit tests on pushes to `feature/targeting_failover` and pull requests targeting that branch. The build does not check out submodules.
+
 ```bash
 # Coverage testcases: run from the project root; the runner builds an isolated test config.
 node tests/run-integration-tests.js --all
