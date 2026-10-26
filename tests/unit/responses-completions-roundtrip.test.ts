@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../../src/converters/completions-to-responses.js';
-import { convertResponsesToChatCompletions, convertInputItemsToMessages, getNamespaceMap } from '../../src/converters/responses-to-completions.js';
+import { convertResponsesToChatCompletions, convertInputItemsToMessages, getNamespaceMap, extractAllowedTools } from '../../src/converters/responses-to-completions.js';
 import { completionsToClaudeBody } from '../../src/handlers/openai.js';
 import type { OpenAIResponse } from '../../src/types/openai.js';
 
@@ -709,24 +709,23 @@ describe('convertInputItemsToMessages', () => {
     assert.equal(msgs[0].role, 'system');
   });
 
-  it('warns (not silently drops) on an unrecognized item type', () => {
+  it('rejects an unrecognized item type with a 400 ValidationError rather than dropping it', () => {
     // The Responses API item union keeps growing. An item this converter does
-    // not know still emits no message, but must be reported rather than
-    // vanishing from the upstream conversation — CLAUDE.md rule 8 (fail loud).
-    const warnings: string[] = [];
-    const logger = {
-      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
-      warn: (_requestId: string, message: string) => { warnings.push(message); },
-    } as any;
-
-    const msgs = convertInputItemsToMessages(
-      [{ type: 'computer_call_output', id: 'x1', call_id: 'c1', output: {} }],
-      { logger, requestId: 'req-1' },
+    // not know must fail loudly: answering from partial context while the client
+    // believes the full input was used is worse than refusing — CLAUDE.md rule 8.
+    assert.throws(
+      () => convertInputItemsToMessages(
+        [{ type: 'computer_call_output', id: 'x1', call_id: 'c1', output: {} }],
+        { requestId: 'req-1' },
+      ),
+      (err: any) => {
+        assert.equal(err.name, 'ValidationError');
+        assert.equal(err.status, 400, 'surfaces to the client as a 400, not a 500');
+        assert.match(err.message, /computer_call_output/);
+        assert.match(err.message, /openai-responses/, 'points at the passthrough upstream as the fix');
+        return true;
+      },
     );
-
-    assert.equal(msgs.length, 0, 'unrecognized item emits no message');
-    assert.equal(warnings.length, 1, 'exactly one warning for the dropped item');
-    assert.match(warnings[0], /unrecognized input item type: computer_call_output/);
   });
 
   it('rejects a program item with a 400 ValidationError rather than degrading it', () => {
@@ -793,5 +792,199 @@ describe('convertInputItemsToMessages', () => {
     );
 
     assert.deepEqual(warnings, [], 'no warnings for recognized types');
+  });
+});
+
+describe('request parameter forwarding (spec item 10)', () => {
+  it('forwards service_tier, metadata, and parallel_tool_calls', () => {
+    const out = convertResponsesToChatCompletions({
+      model: 'm',
+      input: 'hi',
+      service_tier: 'priority',
+      metadata: { tenant: 't1' },
+      parallel_tool_calls: false,
+    }, 'm');
+
+    assert.equal(out.service_tier, 'priority');
+    assert.deepEqual(out.metadata, { tenant: 't1' });
+    assert.equal(out.parallel_tool_calls, false);
+  });
+
+  it('maps text.format json_schema to response_format', () => {
+    const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] };
+    const out = convertResponsesToChatCompletions({
+      model: 'm',
+      input: 'hi',
+      text: { format: { type: 'json_schema', name: 'answer_schema', schema, strict: true } },
+    }, 'm');
+
+    assert.deepEqual(out.response_format, {
+      type: 'json_schema',
+      json_schema: { name: 'answer_schema', schema, strict: true },
+    });
+  });
+
+  it('maps text.format json_object to response_format', () => {
+    const out = convertResponsesToChatCompletions({
+      model: 'm',
+      input: 'hi',
+      text: { format: { type: 'json_object' } },
+    }, 'm');
+
+    assert.deepEqual(out.response_format, { type: 'json_object' });
+  });
+
+  it('text.format wins over a directly-passed response_format', () => {
+    const out = convertResponsesToChatCompletions({
+      model: 'm',
+      input: 'hi',
+      response_format: { type: 'text' },
+      text: { format: { type: 'json_object' } },
+    }, 'm');
+
+    assert.deepEqual(out.response_format, { type: 'json_object' });
+  });
+
+  it('rejects an unknown text.format type', () => {
+    assert.throws(
+      () => convertResponsesToChatCompletions({
+        model: 'm',
+        input: 'hi',
+        text: { format: { type: 'xml' } },
+      }, 'm'),
+      (err: any) => err.name === 'ValidationError' && err.status === 400 && /xml/.test(err.message),
+    );
+  });
+
+  it('accepts and drops truncation: auto and disabled (completions upstreams fail on overflow)', () => {
+    for (const truncation of ['auto', 'disabled']) {
+      const out = convertResponsesToChatCompletions({ model: 'm', input: 'hi', truncation }, 'm');
+      assert.equal((out as Record<string, unknown>).truncation, undefined);
+    }
+  });
+
+  it('rejects an invalid truncation value', () => {
+    assert.throws(
+      () => convertResponsesToChatCompletions({ model: 'm', input: 'hi', truncation: 'sometimes' }, 'm'),
+      (err: any) => err.name === 'ValidationError' && err.status === 400,
+    );
+  });
+});
+
+describe('allowed_tools (spec item 3)', () => {
+  it('translates tool_choice allowed_tools to auto and keeps the full tools list', () => {
+    const out = convertResponsesToChatCompletions({
+      model: 'm',
+      input: 'hi',
+      tools: [
+        { type: 'function', name: 'allowed_fn', parameters: { type: 'object', properties: {} } },
+        { type: 'function', name: 'blocked_fn', parameters: { type: 'object', properties: {} } },
+      ],
+      tool_choice: { type: 'allowed_tools', tools: [{ type: 'function', name: 'allowed_fn' }] },
+    }, 'm');
+
+    assert.equal(out.tool_choice, 'auto', 'completions cannot express a subset — enforce response-side');
+    assert.deepEqual(out.tools?.map(t => t.function.name), ['allowed_fn', 'blocked_fn'], 'full tools list still goes upstream');
+  });
+
+  it('maps an empty allowed_tools subset to tool_choice none', () => {
+    const out = convertResponsesToChatCompletions({
+      model: 'm',
+      input: 'hi',
+      tools: [{ type: 'function', name: 'fn', parameters: { type: 'object', properties: {} } }],
+      tool_choice: { type: 'allowed_tools', tools: [] },
+    }, 'm');
+
+    assert.equal(out.tool_choice, 'none');
+  });
+
+  it('extractAllowedTools reads the tool_choice form', () => {
+    const allowed = extractAllowedTools({
+      tool_choice: { type: 'allowed_tools', tools: [{ type: 'function', name: 'a' }, { type: 'function', name: 'b' }] },
+    });
+    assert.deepEqual(allowed, new Set(['a', 'b']));
+  });
+
+  it('extractAllowedTools reads the top-level field', () => {
+    const allowed = extractAllowedTools({ allowed_tools: [{ type: 'function', name: 'a' }] });
+    assert.deepEqual(allowed, new Set(['a']));
+  });
+
+  it('extractAllowedTools returns null when unconstrained, empty set when nothing is allowed', () => {
+    assert.equal(extractAllowedTools({ tool_choice: 'auto' }), null);
+    assert.equal(extractAllowedTools({}), null);
+    assert.deepEqual(extractAllowedTools({ allowed_tools: [] }), new Set());
+  });
+
+  it('non-streaming: suppresses disallowed tool calls and reports the count', () => {
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+    const completions = baseCompletion({
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: null as unknown as string,
+          tool_calls: [
+            { id: 'c1', type: 'function', function: { name: 'allowed_fn', arguments: '{}' } },
+            { id: 'c2', type: 'function', function: { name: 'blocked_fn', arguments: '{}' } },
+          ],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    });
+
+    const out = convertCompletionsToResponses(completions, 'm', undefined, {
+      allowedTools: new Set(['allowed_fn']), logger, requestId: 'req-1',
+    });
+
+    const functionCalls = out.output.filter(it => it.type === 'function_call');
+    assert.deepEqual(functionCalls.map(it => it.name), ['allowed_fn']);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /suppressed 1 tool call/);
+  });
+
+  it('non-streaming: suppressing the only tool call falls back to a direct-reply message', () => {
+    const completions = baseCompletion({
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: null as unknown as string,
+          tool_calls: [
+            { id: 'c1', type: 'function', function: { name: 'blocked_fn', arguments: '{}' } },
+          ],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    });
+
+    const out = convertCompletionsToResponses(completions, 'm', undefined, { allowedTools: new Set(['other_fn']) });
+
+    assert.equal(out.output.length, 1);
+    assert.equal(out.output[0].type, 'message', 'output must never be empty — direct-reply fallback');
+    assert.deepEqual(out.output[0].content, [{ type: 'output_text', text: '', annotations: [] }]);
+  });
+});
+
+describe('unknown input item types (spec item 12)', () => {
+  it('rejects provider-slug-prefixed extension types too', () => {
+    assert.throws(
+      () => convertInputItemsToMessages([{ type: 'acme:search_result', id: 'x1' }]),
+      (err: any) => err.name === 'ValidationError' && err.status === 400 && /acme:search_result/.test(err.message),
+    );
+  });
+
+  it('still converts the known item types', () => {
+    const msgs = convertInputItemsToMessages([
+      { type: 'message', role: 'user', content: 'hi' },
+      { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'thinking' }] },
+      { type: 'function_call', call_id: 'c1', name: 'fn', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'c1', output: 'ok' },
+    ]);
+    assert.deepEqual(msgs.map(m => m.role), ['user', 'assistant', 'tool']);
   });
 });

@@ -216,7 +216,7 @@ describe('Responses endpoint handlers', () => {
         type: 'message',
         status: 'completed',
         role: 'assistant',
-        content: [{ type: 'output_text', text: 'Compacted conversation' }],
+        content: [{ type: 'output_text', text: 'Compacted conversation', annotations: [] }],
       }],
       usage: {
         input_tokens: 19,
@@ -356,7 +356,7 @@ describe('Responses endpoint handlers', () => {
           type: 'message',
           status: 'completed',
           role: 'assistant',
-          content: [{ type: 'output_text', text: 'I will look that up.' }],
+          content: [{ type: 'output_text', text: 'I will look that up.', annotations: [] }],
         },
         {
           id: 'toolu-weather',

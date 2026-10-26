@@ -360,6 +360,7 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `POST /v1/responses` | OpenAI Responses API |
 | `POST /v1/responses/input_tokens` | Count input tokens for a Responses request (forwarded to `/v1/responses/input_tokens` under `openai-responses`, or bridged through Chat Completions token counting under other modes) |
 | `POST /v1/responses/compact` | Compact a Responses conversation (forwarded to `/v1/responses/compact` under `openai-responses`, or bridged through Chat Completions under other modes) |
+| `GET /v1/responses/{id}`, `GET /v1/responses/{id}/input_items` | Retrieve a stored response (or its input items) from the in-process conversation store. Only available when `CONVERSATION_STATE` is enabled; unknown, expired, or `store: false` ids return 404. |
 | `POST /v1beta/models/{model}:generateContent` | Gemini content (also `:streamGenerateContent`, `:countTokens`) |
 | `POST /v1/interactions` | Gemini Interactions API |
 | `POST /v1/embeddings` | Embeddings (proxied to an OpenAI-compatible upstream) |
@@ -400,6 +401,21 @@ Notes:
 - **Direct transform via Claude Messages** means Responses uses Claude Messages as its internal bridge before calling Gemini; it does not go through `openai-completions`.
 - **Indirect transform via `openai-completions`** means the request body is routed through OpenAI Chat Completions as an intermediate shape before reaching the target upstream family. This covers two cases: (a) Gemini endpoint input becomes Chat Completions, then becomes Claude Messages or OpenAI Responses; (b) `/v1/messages` routed to an `openai-responses` upstream becomes Chat Completions, then Responses `input`. This reuses the Chat Completions middle mode for code reuse while preserving the original client endpoint response shape.
 - Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/architecture/routing-review.md) for tradeoffs and recommendations.
+
+### `/v1/responses` converter-path semantics
+
+These apply when a `/v1/responses` request is served through a converter path
+(`anthropic-messages`, `openai-completions`, `gemini-*` upstreams). Under
+`openai-responses` / `open-responses` the request passes through unchanged and
+the upstream server defines this behavior.
+
+- **Conversation state**: with `CONVERSATION_STATE=true`, `previous_response_id` and `conversation` resume stored context (prior input → prior output → new input, on all converter paths). A referenced `previous_response_id` that is missing from the store fails with 404 `previous_response_not_found` rather than silently answering without the prior context. `store: false` skips persistence. See [configuration reference](./docs/reference/configuration-reference.md).
+- **`allowed_tools` is a hard constraint**: `tool_choice: {type: "allowed_tools", tools: [...]}` (or a top-level `allowed_tools` array) suppresses any model tool call outside the allowed set — the call never appears in the stream or `output`, and the suppression is logged. If every call is suppressed, the response falls back to a direct-reply message item.
+- **Streaming fidelity**: converter paths emit the full Responses SSE lifecycle (`content_part.added`/`done`, per-item `output_item.added`/`done`, `logprobs` on text deltas when the upstream supplies them). Token exhaustion surfaces as `status: "incomplete"` with terminal event `response.incomplete`; a mid-stream upstream failure surfaces as `response.failed` with a populated `response.error`.
+- **Parameters**: `service_tier`, `metadata`, `parallel_tool_calls`, and `text.format` (mapped to `response_format`) are forwarded to completions upstreams. `truncation` is validated but not forwarded — completions upstreams fail on context overflow instead of truncating, which satisfies both `auto` and `disabled`. Unrecognized input item types fail the request with a 400 instead of being dropped.
+- **Errors** on `/v1/responses*` routes use the Responses spec envelope `{error: {message, type, param, code}}` (`invalid_request`, `not_found`, `too_many_requests`, `server_error`) — not the Anthropic-shaped envelope other endpoints use.
+
+The full conformance analysis lives in [the gap review](./docs/api/review-for-gaps-to-the-open-responses-spec.md).
 
 ### Code map: endpoints → handlers → converters
 

@@ -5,6 +5,35 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(responses): allowed_tools enforcement, parameter forwarding, item lifecycle, logprobs (gap-review items 3, 8, 10, 12, 13)
+
+Resolves the remaining gap-review items on the `/v1/responses` converter paths (`openai-completions`, `anthropic-messages`, `gemini-*` upstreams):
+
+- **Item 3 — `allowed_tools` is now enforced as a hard constraint.** The converter translates `tool_choice: {type: "allowed_tools", tools: [...]}` to `auto` (or `none` for an empty subset) while keeping the full `tools` list upstream; both stream pumps and both non-streaming converters suppress any tool call outside the allowed set — no lifecycle events, no `output` entry — and log the suppressed count. If suppression empties the output, a fallback direct-reply message item keeps `output` spec-valid. A new exported `extractAllowedTools()` reads both the `tool_choice` form and a top-level `allowed_tools` array.
+- **Item 8 — synthesized items now get full lifecycle events.** The reasoning item (built from upstream `reasoning_content` / `<think>` tags) is announced with `output_item.added` → `content_part.added` → `content_part.done` → `output_item.done`, and so is the empty fallback message item, in both pumps. Terminal `output` arrays are assembled in `output_index` order so event indices match payload positions.
+- **Item 10 — dropped request parameters are forwarded or mapped.** `service_tier`, `metadata`, and `parallel_tool_calls` pass through; `text.format` (`json_schema` / `json_object` / `text`) maps to `response_format` and wins over a directly-passed `response_format`; `truncation: "auto" | "disabled"` is validated and deliberately not forwarded (completions upstreams fail on context overflow rather than truncating, which satisfies both modes). Invalid `truncation` / `text.format` values throw a 400 `ValidationError`.
+- **Item 12 — unknown input item types now fail loudly.** The converter throws a 400 `ValidationError` for any unrecognized item type (including provider-slug-prefixed extension types) instead of warn-and-drop, matching the existing `program` / `program_output` behavior.
+- **Item 13 — `logprobs` on deltas.** `response.output_text.delta` now carries the upstream's `logprobs.content` when present, `[]` otherwise (always `[]` on the Anthropic path, whose SSE deltas carry no logprobs).
+
+Item 11 (un-prefixed `reasoning_text` / `namespace` extensions) is resolved as a **documented exception, no code change**: both spellings are read back on input by the converter and have a live round-trip dependency (Codex/DeepSeek), so dual-emitting prefixed variants would double-inject content on the next turn. Recorded in the gap review.
+
+### feat(responses): spec error envelope and previous_response_not_found (gap-review decisions A/B)
+
+Resolves the two open decisions in `docs/api/review-for-gaps-to-the-open-responses-spec.md`:
+
+- **Decision A (item 4)**: with `CONVERSATION_STATE` enabled, a `previous_response_id` that is not in the store now fails the request with 404 `{error: {type: "not_found", code: "previous_response_not_found", param: "previous_response_id"}}` instead of silently answering without the prior context. With state disabled the field is still ignored, preserving the existing locked-in behavior. The prior-history merge (prior input → prior output → new input) now also runs on the `anthropic-messages` and `gemini-*` converter paths via a shared `applyConversationState` helper — previously those paths dropped the field entirely.
+- **Decision B (item 7)**: `/v1/responses`-family routes now emit the spec error envelope `{error: {message, type, param, code}}` with the spec's type vocabulary (`invalid_request`, `not_found`, `too_many_requests`, `server_error`), via new `ResponsesApiError` / `createResponsesErrorResponse` / `handleResponsesApiError` in `src/utils/errors.ts`. The outer catch in `src/index.ts` selects the envelope by path; `/v1/messages` and other endpoints keep the Anthropic-shaped envelope unchanged.
+
+### fix(responses): spec-compliant terminal events, content-part lifecycle, and incomplete status on converter paths
+
+Three Open Responses spec violations on the `/v1/responses` converter paths (`openai-completions`, `anthropic-messages`, `gemini-*` upstreams) — the passthrough modes were already compliant by delegation:
+
+- **Mid-stream errors now emit `response.failed`** instead of silently closing the stream. Both SSE pumps (`streamCompletionsAsResponses`, `streamClaudeAsResponses`) send a terminal `response.failed` event with a populated `response.error` once `response.created` has gone out, and log the upstream error instead of swallowing it.
+- **`response.content_part.done` is now emitted** between `response.output_text.done` and `response.output_item.done` in both pumps, and every `output_text` part carries the spec-required zero-value `annotations: []` (streaming events, terminal `output` arrays, and the non-streaming converters).
+- **Token exhaustion now surfaces as `incomplete`**: `finish_reason: "length"` (Completions) and `stop_reason: "max_tokens"` (Anthropic) map to item/response `status: "incomplete"`, terminal event `response.incomplete`, and `incomplete_details: { reason: "max_output_tokens" }`, in both stream pumps and both non-streaming converters (`convertCompletionsToResponses`, `claudeResponseToResponses`). Previously truncation was misreported as `completed`.
+
+The Claude pump's text events also no longer hardcode `output_index: 0` — the text item's allocated index is tracked, fixing item association when a `tool_use` block precedes text. New `tests/unit/responses-stream-events.test.ts` adds the first SSE event-shape coverage (full lifecycle sequence, mid-stream failure, truncation) for both pumps plus non-streaming conversion; two exact-body expectations in `responses-endpoints.test.ts` gained the `annotations: []` field.
+
 ### feat(modes): add `open-responses` upstream mode and endpoint schema
 
 `upstream_mode = "open-responses"` targets an [Open Responses](https://www.openresponses.org) spec-compliant upstream. The spec's wire format is identical to the OpenAI Responses API (same `/v1/responses` resource, SSE events, and error envelope), so the mode canonicalizes to `openai-responses` at route resolution: `/v1/responses` requests pass through natively, and every other client endpoint (`/v1/messages`, `/v1/chat/completions`, `/v1/interactions`, `:generateContent`) converts through the existing Responses transform paths. `open-responses` passthrough targets match `/v1/responses*` paths, and the embedded agent session offers `open-responses` as an endpoint schema (served by the same `/v1/responses` loopback). The WebSocket transport from the 2026-04-24 spec revision is not implemented (the spec marks it MAY).

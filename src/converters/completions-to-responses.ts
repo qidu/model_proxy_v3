@@ -4,6 +4,7 @@
 
 import { OpenAIResponse } from '../types/openai.js';
 import { NamespaceMap } from './responses-to-completions.js';
+import { Logger } from '../utils/logger.js';
 
 /**
  * OpenAI Responses API Response format
@@ -12,17 +13,19 @@ export interface OpenAIResponsesResponse {
   id: string;
   object: 'response';
   created_at: number;
-  status: 'completed' | 'in_progress' | 'failed';
+  status: 'completed' | 'in_progress' | 'failed' | 'incomplete';
+  incomplete_details?: { reason: string };
   model: string;
   output_text?: string;
   output: Array<{
     id: string;
     type: 'message' | 'function_call' | 'function_call_output' | 'web_search_call' | 'code_interpreter_call' | 'computer_call' | 'computer_call_output' | 'file_search_call' | 'reasoning' | 'refusal';
-    status?: 'completed' | 'in_progress' | 'failed';
+    status?: 'completed' | 'in_progress' | 'failed' | 'incomplete';
     role?: 'assistant' | 'user' | 'system';
     content?: Array<{
       type: 'output_text' | 'input_text' | 'input_image' | 'input_file' | 'refusal';
       text?: string;
+      annotations?: unknown[];
       image_url?: string;
       file_id?: string;
     }>;
@@ -53,14 +56,19 @@ export interface OpenAIResponsesResponse {
 export function convertCompletionsToResponses(
   completionsResponse: OpenAIResponse,
   model: string,
-  namespaceMap?: NamespaceMap
+  namespaceMap?: NamespaceMap,
+  options?: { allowedTools?: Set<string> | null; logger?: Logger; requestId?: string }
 ): OpenAIResponsesResponse {
+  const allowedTools = options?.allowedTools;
   const responseId = `resp_${completionsResponse.id || generateResponseId()}`;
   const created_at = completionsResponse.created || Math.floor(Date.now() / 1000);
 
   // Extract the assistant message content
   const choice = completionsResponse.choices?.[0];
   const message = choice?.message;
+  // finish_reason "length" means the model exhausted its token budget — the
+  // response (and its open item) is terminal-incomplete, not completed.
+  const isIncomplete = choice?.finish_reason === 'length';
 
   // Build output items from the chat completion message
   const outputItems: OpenAIResponsesResponse['output'] = [];
@@ -79,7 +87,7 @@ export function convertCompletionsToResponses(
         type: 'message',
         status: 'completed',
         role: 'assistant',
-        content: [{ type: 'output_text', text: '' }],
+        content: [{ type: 'output_text', text: '', annotations: [] }],
       }],
     };
   }
@@ -88,7 +96,7 @@ export function convertCompletionsToResponses(
     const outputItem: OpenAIResponsesResponse['output'][0] = {
       id: `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
       type: 'message',
-      status: 'completed',
+      status: isIncomplete ? 'incomplete' : 'completed',
       role: 'assistant',
       content: [],
     };
@@ -113,7 +121,7 @@ export function convertCompletionsToResponses(
         }
         const cleanedText = message.content.replace(/<(?:thinking|think)>[\s\S]*?<\/(?:thinking|think)>/g, '').trim();
         if (cleanedText) {
-          outputItem.content = [{ type: 'output_text', text: cleanedText }];
+          outputItem.content = [{ type: 'output_text', text: cleanedText, annotations: [] }];
         }
       } else if (Array.isArray(message.content)) {
         const contentParts: NonNullable<typeof outputItem.content> = [];
@@ -122,6 +130,7 @@ export function convertCompletionsToResponses(
             contentParts.push({
               type: 'output_text',
               text: part.text,
+              annotations: [],
             });
           } else if (part.type === 'image_url') {
             // Forward image as input_image with the URL
@@ -160,11 +169,17 @@ export function convertCompletionsToResponses(
       }
     }
 
-    // Handle tool calls
+    // Handle tool calls. allowedTools is a hard constraint (spec): calls to
+    // tools outside the set are suppressed and reported, never returned.
     if (message.tool_calls && message.tool_calls.length > 0) {
+      let suppressedCalls = 0;
       for (const toolCall of message.tool_calls) {
         const flatName = toolCall.function?.name || '';
         const entry = namespaceMap?.get(flatName);
+        if (allowedTools != null && !allowedTools.has(entry ? entry.name : flatName)) {
+          suppressedCalls++;
+          continue;
+        }
         outputItems.push({
           id: toolCall.id || `tool_${Date.now()}`,
           type: 'function_call',
@@ -175,6 +190,9 @@ export function convertCompletionsToResponses(
           ...(entry?.namespace ? { namespace: entry.namespace } : {}),
         });
       }
+      if (suppressedCalls > 0) {
+        options?.logger?.warn(options?.requestId ?? '', `[responses] suppressed ${suppressedCalls} tool call(s) outside allowed_tools`);
+      }
     }
 
     // Only include the message item when it has actual content.
@@ -184,6 +202,19 @@ export function convertCompletionsToResponses(
     if (hasContent) {
       outputItems.push(outputItem);
     }
+  }
+
+  // output: [] is invalid per spec. If every tool call was suppressed (or the
+  // message was otherwise empty) and only a reasoning item remains, emit a
+  // fallback empty-text message item — the spec's "direct reply" fallback.
+  if (outputItems.every(it => it.type === 'reasoning')) {
+    outputItems.push({
+      id: `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
+      type: 'message',
+      status: isIncomplete ? 'incomplete' : 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: '', annotations: [] }],
+    });
   }
 
   // Build usage info
@@ -213,7 +244,8 @@ export function convertCompletionsToResponses(
     id: responseId,
     object: 'response',
     created_at,
-    status: 'completed',
+    status: isIncomplete ? 'incomplete' : 'completed',
+    ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
     model: completionsResponse.model || model,
     output_text,
     output: outputItems,

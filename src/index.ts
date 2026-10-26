@@ -10,7 +10,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
 import { extractRawCredential } from './utils/auth-headers.js';
-import { createErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
+import { createErrorResponse, createResponsesErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { createLogger, type Logger } from './utils/logger.js';
 import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled } from './handlers/models.js';
 import { handleTokenCountingRequest } from './handlers/token-counting.js';
@@ -2734,7 +2734,9 @@ export default {
       return applyCorsHeaders(await restorePrivacyResponse(response, piiMapping, requestId, logger), request, env);
 
     } catch (error) {
-      // Handle errors with Claude API format (without exposing sensitive info)
+      // Handle errors without exposing sensitive info. The envelope shape
+      // follows the endpoint family: Responses-spec for /v1/responses routes,
+      // Anthropic for everything else.
       if (!modelFailureRecorded && failedModelId) {
         recordModelFailedRequest(failedModelId);
       }
@@ -2742,6 +2744,9 @@ export default {
       logger.error(requestId, `Catch Error [model=${failedModelId ?? '-'} status=${err.status ?? '-'} type=${err.type ?? '-'}: ${err.message}`);
       recordRequestTiming(path, Date.now() - requestStartTime);
       recordModelTiming(failedModelId, Date.now() - requestStartTime);
+      if (path === '/v1/responses' || path.startsWith('/v1/responses/') || path.startsWith('/v1/responses?')) {
+        return createResponsesErrorResponse(error as Error, requestId);
+      }
       return createErrorResponse(error as Error, requestId);
     }
     })();

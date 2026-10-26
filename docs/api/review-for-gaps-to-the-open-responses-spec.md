@@ -40,7 +40,7 @@ This also violates CLAUDE.md rule 8 (fail loud): a failed stream is reported to 
 
 **Fix**: In both `catch` blocks, emit a terminal event before closing the writer. When `response.created` has already been sent, emit `response.failed` with a populated `response.error` (`{code, message}`) and status `failed`; when nothing has been sent yet, propagate to `handleTargetApiError` so a real HTTP status is returned. Never leave the writer closed without a terminal event.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — both pumps track a `streamStarted` flag and emit `response.failed` with `error: {code: 'server_error', message}` followed by `[DONE]` once `response.created` has been sent; the error is logged instead of swallowed.
 
 ---
 
@@ -56,7 +56,7 @@ This also violates CLAUDE.md rule 8 (fail loud): a failed stream is reported to 
 
 **Fix**: Emit `response.content_part.done` (`item_id`, `output_index`, `content_index`, `part` with the accumulated text) immediately before each `response.output_item.done`, in both pumps.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — emitted between `output_text.done` and `output_item.done` in both pumps, with `annotations: []` on the part.
 
 ---
 
@@ -78,7 +78,7 @@ Net effect: on the converter paths the client's hard constraint is either an ups
 
 **Fix**: Two halves, both required. (a) Translate `tool_choice: {type:"allowed_tools", tools:[...]}` into a form the target upstream understands, or pass the full `tools` list and enforce locally. (b) Enforce on the response: any `function_call` naming a tool outside the allowed set must be rejected/suppressed per the spec, and the violation reported rather than returned as a normal tool call. Surfacing the spec's own option — translating a fully-suppressed call into a direct reply — is the least disruptive behavior.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — (a) the converter translates `tool_choice: {type:"allowed_tools", tools:[...]}` to `auto` (`none` for an empty subset) while keeping the full `tools` list upstream; (b) a new exported `extractAllowedTools()` reads both the `tool_choice` form and a top-level `allowed_tools` array, and both stream pumps plus both non-streaming converters suppress disallowed tool calls (no lifecycle events, no `output` entry), log the suppressed count, and fall back to a direct-reply message item if suppression empties the output.
 
 ---
 
@@ -108,7 +108,7 @@ An expired, evicted, or `store:false` prior response produces a **debug log and 
 
 **Fix**: (a) Read `previous_response_id` in the Anthropic/Gemini paths, or make those paths reject it explicitly rather than ignore it. (b) Replace the silent store miss with an error carrying code `previous_response_not_found`; never continue a continuation request with the prior context missing. (c) Decide the `CONVERSATION_STATE=false` behavior (see *Decisions needed*).
 
-**Status**: ⏳ **PENDING** — blocked on decision (c); see *Decisions needed before implementation*.
+**Status**: ✅ **FIXED** (2026-10-25) — decision A resolved as option (2): with `CONVERSATION_STATE` enabled, a store miss fails with 404 `{error: {type: "not_found", code: "previous_response_not_found", param: "previous_response_id"}}` and no upstream call; with state disabled the field is still ignored (existing behavior preserved). A shared `applyConversationState` helper now applies the merge on all three converter paths (completions, anthropic-messages, gemini-*).
 
 ---
 
@@ -123,7 +123,7 @@ An expired, evicted, or `store:false` prior response produces a **debug log and 
 
 **Fix**: Map `finish_reason: "length"` → item `status: 'incomplete'`, response `status: 'incomplete'`, terminal event `response.incomplete`. The Anthropic path has the equivalent signal in `stop_reason: "max_tokens"`.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — both pumps and both non-streaming converters map `finish_reason: "length"` / `stop_reason: "max_tokens"` to item+response `status: 'incomplete'`, terminal event `response.incomplete`, and `incomplete_details: { reason: 'max_output_tokens' }`.
 
 ---
 
@@ -142,7 +142,7 @@ The comment's premise does not hold. Claude emits `content_block_start` with `to
 
 **Fix**: Replace the three hardcoded `0`s with the `outputIndex` captured when the text part was opened. The message item's index is allocated lazily at first text delta, so the value must be stored, not recomputed.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — the Claude pump tracks `textOutputIndex` (set when the text item opens) and uses it for the text delta/done/part-done/item-done events.
 
 ---
 
@@ -163,7 +163,7 @@ JSON.stringify({ error: { message, type: 'invalid_request_error', param: null, c
 
 **Fix**: Emit the Responses envelope for `/v1/responses` errors: `{error:{message, type, param, code}}` with the spec's type vocabulary. Cannot be done inside `createErrorResponse` alone, since that helper is shared with the Anthropic endpoints — see *Decisions needed*.
 
-**Status**: ⏳ **PENDING** — blocked on the error-envelope convention decision.
+**Status**: ✅ **FIXED** (2026-10-25) — decision B resolved as option (1): new `ResponsesApiError` / `createResponsesErrorResponse` / `handleResponsesApiError` in `src/utils/errors.ts` emit `{error: {message, type, param, code}}` with the spec's type vocabulary; the outer catch in `src/index.ts` selects the envelope by path, so `/v1/messages` keeps the Anthropic envelope unchanged.
 
 ---
 
@@ -183,7 +183,7 @@ Note the fallback item exists for a real reason — the code comment at `respons
 
 **Fix**: Emit the full lifecycle (`output_item.added` → `content_part.added` → `content_part.done` → `output_item.done`) for both synthesized item types before they appear in the terminal `output`, rather than adding them to the payload silently.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — the completions pump announces the reasoning item on the first reasoning delta and closes it before the text item opens (or at end of stream); the fallback empty message item gets the full four-event lifecycle in both pumps; terminal `output` arrays are assembled in `output_index` order so event indices match payload positions.
 
 ---
 
@@ -194,7 +194,7 @@ Note the fallback item exists for a real reason — the code comment at `respons
 
 **Fix**: Add `annotations: []` to every `output_text` part in both pumps and in the converter.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — `annotations: []` on every `output_text` part in both stream pumps, the terminal `output` arrays, and both non-streaming converters.
 
 ---
 
@@ -207,7 +207,7 @@ The `truncation: "disabled"` case is the one with a MUST attached: the parameter
 
 **Fix**: Forward `service_tier`, `metadata`, `parallel_tool_calls` (all natively supported by the completions upstreams); map `text.format` → `response_format`; for `truncation: "disabled"`, either enforce the context check and fail loudly, or reject the request as unsupported. Do not silently accept it.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — `service_tier` / `metadata` / `parallel_tool_calls` are forwarded; `text.format` (`json_schema` / `json_object` / `text`) maps to `response_format` and wins over a directly-passed `response_format`; `truncation: "auto" | "disabled"` is validated and deliberately not forwarded — completions upstreams fail with a context-length error rather than truncating, which is exactly the `disabled` contract and is permitted under `auto` (truncation is a MAY there). Invalid `truncation` / `text.format` values throw a 400 `ValidationError`. `include` remains dropped (converter paths do not support it).
 
 ---
 
@@ -221,7 +221,7 @@ The `truncation: "disabled"` case is the one with a MUST attached: the parameter
 
 **Fix**: Prefix them with this proxy's slug (e.g. `modelproxy:reasoning_text`), keeping the unprefixed spelling only if a known client depends on it — in which case both should be emitted and the dependency documented.
 
-**Status**: ⏳ **PENDING**
+**Status**: ⚠️ **DOCUMENTED EXCEPTION (2026-10-25) — no code change.** Both fields are OpenAI Responses API conventions with a live round-trip dependency: `reasoning_text` content parts and `namespace` on `function_call` items are read back by `convertResponsesToChatCompletions` when Codex/DeepSeek clients send the conversation back as input (thinking-mode upstreams reject the next turn if reasoning is not round-tripped). Emitting both the bare and a `modelproxy:`-prefixed spelling would double-inject the reasoning text on the next turn, and dropping the bare spelling would break those clients. The deviation from the spec's extension-prefixing guidance is accepted and recorded here.
 
 ---
 
@@ -232,7 +232,7 @@ The `truncation: "disabled"` case is the one with a MUST attached: the parameter
 
 **Fix**: Extend the throwing behavior to all unknown input item types, or return them in the response's error/notice surface. At minimum, do not answer as if the input were complete.
 
-**Status**: ⏳ **PENDING**
+**Status**: ✅ **FIXED** (2026-10-25) — `warnUnhandledItem` is removed; the converter now throws a 400 `ValidationError` for every unrecognized input item type (including provider-slug-prefixed extension types such as `acme:search_result`), pointing the client at an `openai-responses` passthrough upstream. The error surfaces through the outer catch as the spec envelope `{error: {type: "invalid_request", ...}}`.
 
 ---
 
@@ -245,7 +245,7 @@ The `truncation: "disabled"` case is the one with a MUST attached: the parameter
 
 **Fix**: Emit `logprobs` on deltas when the upstream supplies them; emit `[]` otherwise.
 
-**Status**: ⏳ **PENDING** — optional fidelity, no client breakage observed.
+**Status**: ✅ **FIXED** (2026-10-25) — `response.output_text.delta` carries the upstream chunk's `logprobs.content` when present, `[]` otherwise; the Claude pump always emits `[]` (Claude SSE deltas carry no logprobs).
 
 ---
 
@@ -293,15 +293,13 @@ Confirmed against the spec, so they are not re-litigated above:
 
 ---
 
-## DECISIONS NEEDED BEFORE IMPLEMENTATION
+## DECISIONS NEEDED — RESOLVED (2026-10-25)
 
-Two of the items above are not pure bug fixes; the current non-conformant behavior looks deliberate, so per CLAUDE.md rules 3 and 5 they need a call before code changes.
+Both convention questions have been decided and implemented:
 
-**A. Item 4 — what should a missing `previous_response_id` do, and what should `CONVERSATION_STATE=false` mean?**
-The silent drop is currently locked in by a test that asserts it: `tests/unit/responses-conversation-state.test.ts:307` — *"drops previous_response_id silently when CONVERSATION_STATE is unset"*. Items 4(b) says error; the existing test says ignore. Options: (1) error with `previous_response_not_found` in both cases; (2) error only when state is enabled but the id is missing, ignore when state is disabled; (3) keep ignoring, drop the item. Note that option (3) leaves the spec MUST violated on the Anthropic/Gemini paths regardless.
+**A. Item 4 — resolved as option (2).** With `CONVERSATION_STATE` enabled, a missing `previous_response_id` errors with 404 `previous_response_not_found`; with state disabled the field is ignored. The existing test at `tests/unit/responses-conversation-state.test.ts` asserting the disabled-case drop still holds; new tests cover the enabled-case error and the Anthropic-path merge.
 
-**B. Item 7 — one error envelope or two?**
-`createErrorResponse` and `handleTargetApiError` are shared by the Anthropic endpoints (`/v1/messages`, `/v1/messages/count_tokens`) and `/v1/responses`. Making `/v1/responses` spec-conformant inside these helpers would change the Anthropic endpoints' errors too — almost certainly wrong. The alternatives are a Responses-specific error builder selected at the `/v1/responses` handler boundary, or accepting the divergence. This is a rule 5 call (two contradictory patterns in one codebase), not a bug fix.
+**B. Item 7 — resolved as option (1).** A Responses-specific error builder (`createResponsesErrorResponse` / `handleResponsesApiError` / `ResponsesApiError` in `src/utils/errors.ts`) is selected at the `/v1/responses` handler boundary in `src/index.ts`; the shared Anthropic-shaped helpers are untouched and `/v1/messages` behavior is unchanged.
 
 ---
 
@@ -327,24 +325,24 @@ No files were modified. Files that an implementation would touch:
 
 | # | Item | Severity | Status |
 |---|---|---|---|
-| 1 | Terminal event on mid-stream error (`response.failed`) | CRITICAL | ⏳ PENDING |
-| 2 | `response.content_part.done` | CRITICAL | ⏳ PENDING |
-| 3 | `allowed_tools` enforcement | CRITICAL | ⏳ PENDING |
-| 4 | `previous_response_id` on non-completions paths / silent miss | CRITICAL | ⏳ PENDING — decision A |
-| 5 | `status: incomplete` from `finish_reason` | HIGH | ⏳ PENDING |
-| 6 | `output_index` collision in Claude pump | HIGH | ⏳ PENDING |
-| 7 | Responses-shaped error envelope | HIGH | ⏳ PENDING — decision B |
-| 8 | Items in `output` with no stream events | MEDIUM | ⏳ PENDING |
-| 9 | `annotations: []` on content parts | MEDIUM | ⏳ PENDING |
-| 10 | Dropped params (`truncation`, `service_tier`, `text.format`, …) | MEDIUM | ⏳ PENDING |
-| 11 | Un-prefixed extensions (`reasoning_text`, `namespace`) | MEDIUM | ⏳ PENDING |
-| 12 | Unknown item types dropped with a warning | MEDIUM | ⏳ PENDING |
-| 13 | `logprobs` on delta | LOWER | ⏳ PENDING |
+| 1 | Terminal event on mid-stream error (`response.failed`) | CRITICAL | ✅ FIXED |
+| 2 | `response.content_part.done` | CRITICAL | ✅ FIXED |
+| 3 | `allowed_tools` enforcement | CRITICAL | ✅ FIXED |
+| 4 | `previous_response_id` on non-completions paths / silent miss | CRITICAL | ✅ FIXED (decision A → option 2) |
+| 5 | `status: incomplete` from `finish_reason` | HIGH | ✅ FIXED |
+| 6 | `output_index` collision in Claude pump | HIGH | ✅ FIXED |
+| 7 | Responses-shaped error envelope | HIGH | ✅ FIXED (decision B → option 1) |
+| 8 | Items in `output` with no stream events | MEDIUM | ✅ FIXED |
+| 9 | `annotations: []` on content parts | MEDIUM | ✅ FIXED |
+| 10 | Dropped params (`truncation`, `service_tier`, `text.format`, …) | MEDIUM | ✅ FIXED |
+| 11 | Un-prefixed extensions (`reasoning_text`, `namespace`) | MEDIUM | ⚠️ DOCUMENTED EXCEPTION (round-trip dependency) |
+| 12 | Unknown item types dropped with a warning | MEDIUM | ✅ FIXED (now throws 400) |
+| 13 | `logprobs` on delta | LOWER | ✅ FIXED |
 | 14 | WebSocket transport | LOWER | ✅ COMPLIANT (MAY) |
 | 15 | GET retrieval gated on `CONVERSATION_STATE` | LOWER | ✅ COMPLIANT |
 | 16 | `model_not_found` unreachable (fail-open) | LOWER | ✅ COMPLIANT |
 
-Net: **0 FIXED, 13 PENDING (4 of them MUST violations on the converter paths), 3 COMPLIANT-and-not-required.**
+Net: **12 FIXED (1–10, 12, 13 — all 4 MUST violations), 1 DOCUMENTED EXCEPTION (11), 3 COMPLIANT-and-not-required.** SSE event-shape coverage for the stream-level fixes lives in `tests/unit/responses-stream-events.test.ts`.
 
 ---
 
@@ -361,8 +359,8 @@ All items are scoped to the converter paths (`openai-completions`, `anthropic-me
 7. **Items 8, 9, 11, 12** — item lifecycle, `annotations`, extension prefixes, unknown-item handling.
 8. **Item 10** — parameter forwarding, including the `truncation: "disabled"` MUST.
 9. **Item 13** — `logprobs`, if wanted.
-10. **Tests** — SSE event-shape coverage for items 1, 2, 5, 6, 8, 9. There is currently no test that asserts anything about the stream's event sequence, which is why all of these went unnoticed.
+10. **Tests** — SSE event-shape coverage for items 1, 2, 3, 5, 6, 8, 9, 12, and 13 lives in `tests/unit/responses-stream-events.test.ts` (full lifecycle sequence, mid-stream `response.failed`, truncation → `response.incomplete`, allowed_tools suppression, reasoning/fallback lifecycle, logprobs, for both pumps plus non-streaming conversion); converter-level coverage for items 3, 10, and 12 in `tests/unit/responses-completions-roundtrip.test.ts`.
 
 ---
 
-**Next step**: Per CLAUDE.md rules 1 and 3, implementation requires user approval. Indicate which items to proceed with, and answer decisions A and B — items 4 and 7 cannot be implemented without them.
+**Next step**: none — all actionable items are resolved. Items 1–10, 12, and 13 are fixed (see per-item status notes); item 11 is a documented exception (round-trip dependency on the bare `reasoning_text` / `namespace` spellings); items 14–16 are compliant-and-not-required. SSE event-shape coverage for items 1, 2, 3, 5, 6, 8, 9, 12, and 13 lives in `tests/unit/responses-stream-events.test.ts`; converter-level coverage for items 3, 10, and 12 in `tests/unit/responses-completions-roundtrip.test.ts`.

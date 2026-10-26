@@ -8,21 +8,12 @@ import { stringify } from '../utils/stringify.js';
 import { ValidationError } from '../utils/errors.js';
 
 /**
- * Reports input items this converter did not recognize. The Responses API item
- * union keeps growing (e.g. `program` / `program_output` for programmatic tool
- * calling, `mcp_approval_response`, `computer_call_output`), and an unhandled
- * item would otherwise be dropped from the upstream conversation with no trace.
+ * Optional logging context passed through conversion so notable rewrites
+ * (e.g. best-effort `custom` tool conversion) can be traced to a request.
  */
 export interface ConversionWarnings {
   logger?: Logger;
   requestId?: string;
-}
-
-function warnUnhandledItem(type: string, warn?: ConversionWarnings): void {
-  warn?.logger?.warn(
-    warn.requestId ?? '',
-    `[responses->completions] dropped unrecognized input item type: ${type || '(missing type)'}`
-  );
 }
 
 /**
@@ -198,8 +189,51 @@ export function convertResponsesToChatCompletions(
   if (responsesRequest.stop !== undefined) {
     completionsRequest.stop = responsesRequest.stop as string | string[];
   }
+  // Structured output: the Responses API spells it `text.format`; Chat
+  // Completions spells it `response_format`. `text.format` is the canonical
+  // Responses field, so it wins when both are present.
   if (responsesRequest.response_format !== undefined) {
-    completionsRequest.response_format = responsesRequest.response_format as { type: 'text' | 'json_object' };
+    completionsRequest.response_format = responsesRequest.response_format as OpenAIRequest['response_format'];
+  }
+  const textFormat = (responsesRequest.text as Record<string, unknown> | undefined)?.format as Record<string, unknown> | undefined;
+  if (textFormat && typeof textFormat === 'object') {
+    if (textFormat.type === 'json_schema') {
+      completionsRequest.response_format = {
+        type: 'json_schema',
+        json_schema: {
+          name: (textFormat.name as string) ?? 'response',
+          schema: textFormat.schema,
+          ...(textFormat.strict !== undefined ? { strict: textFormat.strict as boolean } : {}),
+        },
+      };
+    } else if (textFormat.type === 'json_object' || textFormat.type === 'text') {
+      completionsRequest.response_format = { type: textFormat.type };
+    } else {
+      throw new ValidationError(`Unsupported text.format type '${String(textFormat.type)}'. Supported: 'text', 'json_object', 'json_schema'.`);
+    }
+  }
+  if (responsesRequest.service_tier !== undefined) {
+    completionsRequest.service_tier = responsesRequest.service_tier as string;
+  }
+  if (responsesRequest.metadata !== undefined) {
+    completionsRequest.metadata = responsesRequest.metadata as Record<string, string>;
+  }
+  if (responsesRequest.parallel_tool_calls !== undefined) {
+    completionsRequest.parallel_tool_calls = responsesRequest.parallel_tool_calls as boolean;
+  }
+  if (responsesRequest.truncation !== undefined) {
+    const truncation = responsesRequest.truncation as string;
+    if (truncation !== 'auto' && truncation !== 'disabled') {
+      throw new ValidationError(`Invalid truncation value '${truncation}'. Supported: 'auto', 'disabled'.`);
+    }
+    // Not forwarded: Chat Completions has no truncation parameter. Both modes are
+    // still honored — completions upstreams never truncate input silently; they
+    // fail with a context-length error, which is exactly the 'disabled' contract
+    // and is permitted under 'auto' (truncation is a MAY there).
+    warn?.logger?.debug(
+      warn.requestId ?? '',
+      `[responses->completions] truncation='${truncation}' not forwarded: completions upstreams fail on context overflow instead of truncating`
+    );
   }
   // Combine top-level `tools` with any `additional_tools` input items (developer-
   // supplied extra tools for this turn — see the `input` loop above). `namespace`
@@ -265,6 +299,13 @@ export function convertResponsesToChatCompletions(
         type: 'function',
         function: { name: tc.name as string },
       };
+    } else if (typeof tc === 'object' && tc !== null && tc.type === 'allowed_tools') {
+      // Chat Completions cannot express "any of this subset" — the full tools
+      // list still goes upstream (cache-preserving is the point of the field)
+      // and the allowed set is enforced on the response side by the handler
+      // (see extractAllowedTools). An empty subset means no tool may run.
+      const subset = Array.isArray(tc.tools) ? tc.tools : [];
+      completionsRequest.tool_choice = subset.length > 0 ? 'auto' : 'none';
     } else {
       // "auto" | "none" | "required" — pass through as-is
       completionsRequest.tool_choice = tc as OpenAIRequest['tool_choice'];
@@ -306,6 +347,40 @@ export function convertResponsesToChatCompletions(
 
   return completionsRequest;
 }
+
+/**
+ * Reads the `allowed_tools` constraint from a Responses API request body, in
+ * either spelling: `tool_choice: {type: "allowed_tools", tools: [...]}` (the
+ * spec's documented form) or a top-level `allowed_tools: [...]` array.
+ *
+ * Returns null when no constraint is present, otherwise the set of permitted
+ * tool names — possibly empty, which means no tool may be called. Handlers use
+ * this to enforce the constraint on the response side, since Chat Completions
+ * upstreams cannot express it (the converter maps the tool_choice form to
+ * 'auto'/'none' and keeps the full tools list).
+ */
+export function extractAllowedTools(requestBody: Record<string, unknown>): Set<string> | null {
+  const names = new Set<string>();
+  let constrained = false;
+
+  const collect = (tools: unknown): void => {
+    if (!Array.isArray(tools)) return;
+    constrained = true;
+    for (const t of tools) {
+      const name = (t as Record<string, unknown>)?.name;
+      if (typeof name === 'string') names.add(name);
+    }
+  };
+
+  const tc = requestBody.tool_choice;
+  if (tc && typeof tc === 'object' && (tc as Record<string, unknown>).type === 'allowed_tools') {
+    collect((tc as Record<string, unknown>).tools);
+  }
+  collect(requestBody.allowed_tools);
+
+  return constrained ? names : null;
+}
+
 
 /**
  * Reads back the `flatName -> { name, namespace }` map attached to a request
@@ -550,9 +625,14 @@ function convertInputItemToMessages(item: Record<string, unknown>, pendingReason
       `Use an 'openai-responses' upstream to pass these items through unmodified.`
     );
   } else {
-    // Unrecognized item type — emit nothing, but say so rather than dropping
-    // conversation content silently.
-    warnUnhandledItem(type, warn);
+    // Unknown item type (including provider-slug-prefixed extension types like
+    // `acme:search_result`, which this proxy does not model). Dropping it would
+    // answer from partial context while the client believes the full input was
+    // used, so refuse the request instead — same treatment as program items above.
+    throw new ValidationError(
+      `Input item type '${type || '(missing type)'}' cannot be converted to the Chat Completions API. ` +
+      `Use an 'openai-responses' upstream to pass these items through unmodified.`
+    );
   }
 
   return messages;

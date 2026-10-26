@@ -65,7 +65,12 @@ export interface OpenAIRequest {
     stop?: string | string[];
     stream?: boolean;
     stream_options?: { include_usage?: boolean };
-    response_format?: { type: "text" | "json_object" };
+    response_format?:
+        | { type: "text" | "json_object" }
+        | { type: "json_schema"; json_schema: { name: string; schema: unknown; strict?: boolean } };
+    service_tier?: string;
+    metadata?: Record<string, string>;
+    parallel_tool_calls?: boolean;
     tools?: Array<{
         type: "function";
         function: {

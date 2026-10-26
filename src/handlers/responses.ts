@@ -8,13 +8,13 @@
 import { Env } from '../types/shared.js';
 import { Logger, createLogger, logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
-import { handleTargetApiError, createErrorResponse } from '../utils/errors.js';
+import { handleResponsesApiError, createResponsesErrorResponse, ResponsesApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { normalizeOpenAIAuthHeaders } from '../utils/auth-headers.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
-import { convertResponsesToChatCompletions, getNamespaceMap, NamespaceMap } from '../converters/responses-to-completions.js';
+import { convertResponsesToChatCompletions, getNamespaceMap, extractAllowedTools, NamespaceMap } from '../converters/responses-to-completions.js';
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../converters/completions-to-responses.js';
 import { getConversation, saveConversation, normalizeInputToItems, getConversationThreadItems, appendConversationThreadItems } from '../utils/conversation-store.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
@@ -116,9 +116,9 @@ export function handleResponsesRetrievalRequest(
   logger?: Logger,
 ): Response {
   const conversationEnabled = env?.CONVERSATION_STATE === 'true' || env?.CONVERSATION_STATE === '1';
-  const notFound = (message: string): Response => new Response(
-    JSON.stringify({ error: { message, type: 'invalid_request_error', param: null, code: null } }),
-    { status: 404, headers: { 'Content-Type': 'application/json', 'x-request-id': requestId } }
+  const notFound = (message: string): Response => createResponsesErrorResponse(
+    new ResponsesApiError(message, 404, 'not_found'),
+    requestId,
   );
 
   if (!conversationEnabled) {
@@ -231,11 +231,20 @@ function completionsBodyToClaudeBody(completions: OpenAIRequest, model: string):
 /**
  * Convert a Claude Messages JSON response to Responses API format.
  */
-function claudeResponseToResponses(claudeJson: Record<string, unknown>, model: string): Record<string, unknown> {
+function claudeResponseToResponses(
+  claudeJson: Record<string, unknown>,
+  model: string,
+  allowedTools?: Set<string> | null,
+  logger?: Logger,
+  requestId?: string,
+): Record<string, unknown> {
   const content = (claudeJson.content as Array<Record<string, unknown>>) ?? [];
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
   const created_at = Math.floor(Date.now() / 1000);
   const msgId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  // stop_reason "max_tokens" means the model exhausted its token budget — the
+  // response is terminal-incomplete, not completed.
+  const isIncomplete = claudeJson.stop_reason === 'max_tokens';
 
   const outputItems: unknown[] = [];
 
@@ -245,15 +254,21 @@ function claudeResponseToResponses(claudeJson: Record<string, unknown>, model: s
     outputItems.push({
       id: msgId,
       type: 'message',
-      status: 'completed',
+      status: isIncomplete ? 'incomplete' : 'completed',
       role: 'assistant',
-      content: [{ type: 'output_text', text: (textBlock?.text as string) ?? '' }],
+      content: [{ type: 'output_text', text: (textBlock?.text as string) ?? '', annotations: [] }],
     });
   }
 
-  // Tool use content
+  // Tool use content. allowedTools is a hard constraint (spec): calls to tools
+  // outside the set are suppressed and reported, never returned to the client.
+  let suppressedCalls = 0;
   for (const block of content) {
     if (block.type === 'tool_use') {
+      if (allowedTools != null && !allowedTools.has(block.name as string)) {
+        suppressedCalls++;
+        continue;
+      }
       outputItems.push({
         id: block.id ?? `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`,
         type: 'function_call',
@@ -264,6 +279,9 @@ function claudeResponseToResponses(claudeJson: Record<string, unknown>, model: s
       });
     }
   }
+  if (suppressedCalls > 0) {
+    logger?.warn(requestId ?? '', `[responses] suppressed ${suppressedCalls} tool call(s) outside allowed_tools`);
+  }
 
   const usage = claudeJson.usage as Record<string, unknown> | undefined;
   const cachedTokens = (usage?.cache_read_input_tokens as number | undefined) ?? 0;
@@ -271,14 +289,15 @@ function claudeResponseToResponses(claudeJson: Record<string, unknown>, model: s
     id: responseId,
     object: 'response',
     created_at,
-    status: 'completed',
+    status: isIncomplete ? 'incomplete' : 'completed',
+    ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
     model: (claudeJson.model as string) ?? model,
     output: outputItems.length > 0 ? outputItems : [{
       id: msgId,
       type: 'message',
-      status: 'completed',
+      status: isIncomplete ? 'incomplete' : 'completed',
       role: 'assistant',
-      content: [{ type: 'output_text', text: '' }],
+      content: [{ type: 'output_text', text: '', annotations: [] }],
     }],
     usage: usage ? {
       input_tokens: usage.input_tokens ?? 0,
@@ -300,6 +319,7 @@ function streamClaudeAsResponses(
   model: string,
   requestId: string,
   logger?: Logger,
+  allowedTools?: Set<string> | null,
 ): Response {
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
   const itemId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -307,6 +327,10 @@ function streamClaudeAsResponses(
 
   let sequenceNumber = 0;
   const nextSeq = () => sequenceNumber++;
+  // Set once response.created has been written; gates the response.failed
+  // terminal event in the catch below (a stream that never started must
+  // surface the error as an HTTP failure instead).
+  let streamStarted = false;
 
   const activeLogger = logger ?? createLogger({});
 
@@ -327,8 +351,11 @@ function streamClaudeAsResponses(
         sequence_number: nextSeq(),
         response: { id: responseId, object: 'response', created_at, status: 'in_progress', model, output: [] },
       })));
+      streamStarted = true;
 
       let textPartOpened = false;
+      let textOutputIndex = -1; // set when the text item is opened (tool_use blocks may claim index 0 first)
+      let stopReason: string | undefined; // message_delta.delta.stop_reason
       let accumulatedText = '';
       let inputTokens = 0;
       let outputTokens = 0;
@@ -336,6 +363,7 @@ function streamClaudeAsResponses(
       let buffer = '';
       // Map from Claude block index → whether it's a tool_use block
       const toolBlocks = new Map<number, { id: string; name: string; arguments: string; outputIndex: number }>();
+      let suppressedToolCalls = 0; // tool_use blocks rejected by allowedTools
       let nextOutputIndex = 0;
 
       const reader = upstreamResponse.body?.getReader();
@@ -370,27 +398,33 @@ function streamClaudeAsResponses(
             const idx = evt.index as number;
             if (block?.type === 'text') {
               if (!textPartOpened) {
-                const outputIndex = nextOutputIndex++;
+                textOutputIndex = nextOutputIndex++;
                 await writer.write(encoder.encode(sseEvent('response.output_item.added', {
                   type: 'response.output_item.added',
                   sequence_number: nextSeq(),
-                  output_index: outputIndex,
+                  output_index: textOutputIndex,
                   item: { id: itemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
                 })));
                 await writer.write(encoder.encode(sseEvent('response.content_part.added', {
                   type: 'response.content_part.added',
                   sequence_number: nextSeq(),
                   item_id: itemId,
-                  output_index: outputIndex,
+                  output_index: textOutputIndex,
                   content_index: 0,
-                  part: { type: 'output_text', text: '' },
+                  part: { type: 'output_text', text: '', annotations: [] },
                 })));
                 textPartOpened = true;
               }
             } else if (block?.type === 'tool_use') {
+              const toolName = block.name as string ?? '';
+              // allowedTools is a hard constraint (spec): suppress calls to
+              // tools outside the set — no lifecycle events, no output entry.
+              if (allowedTools != null && !allowedTools.has(toolName)) {
+                suppressedToolCalls++;
+                continue;
+              }
               const outputIndex = nextOutputIndex++;
               const toolId = block.id as string ?? `call_${Date.now()}_${idx}`;
-              const toolName = block.name as string ?? '';
               toolBlocks.set(idx, { id: toolId, name: toolName, arguments: '', outputIndex });
               await writer.write(encoder.encode(sseEvent('response.output_item.added', {
                 type: 'response.output_item.added',
@@ -409,9 +443,10 @@ function streamClaudeAsResponses(
                 type: 'response.output_text.delta',
                 sequence_number: nextSeq(),
                 item_id: itemId,
-                output_index: 0, // text item is always first
+                output_index: textOutputIndex,
                 content_index: 0,
                 delta: text,
+                logprobs: [], // Claude SSE deltas carry no logprobs
               })));
             } else if (delta?.type === 'input_json_delta') {
               const tool = toolBlocks.get(idx);
@@ -446,6 +481,8 @@ function streamClaudeAsResponses(
               })));
             }
           } else if (type === 'message_delta') {
+            const deltaBody = evt.delta as Record<string, unknown> | undefined;
+            if (typeof deltaBody?.stop_reason === 'string') stopReason = deltaBody.stop_reason;
             const usage = evt.usage as Record<string, unknown> | undefined;
             if (usage?.input_tokens) inputTokens = usage.input_tokens as number;
             if (usage?.output_tokens) outputTokens = usage.output_tokens as number;
@@ -454,51 +491,126 @@ function streamClaudeAsResponses(
         }
       }
 
+      // stop_reason "max_tokens" means the model exhausted its token budget —
+      // the open item and the response end terminal-incomplete, not completed.
+      const isIncomplete = stopReason === 'max_tokens';
+
       if (textPartOpened) {
         await writer.write(encoder.encode(sseEvent('response.output_text.done', {
           type: 'response.output_text.done',
           sequence_number: nextSeq(),
           item_id: itemId,
-          output_index: 0,
+          output_index: textOutputIndex,
           content_index: 0,
           text: accumulatedText,
+        })));
+        await writer.write(encoder.encode(sseEvent('response.content_part.done', {
+          type: 'response.content_part.done',
+          sequence_number: nextSeq(),
+          item_id: itemId,
+          output_index: textOutputIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: accumulatedText, annotations: [] },
         })));
         await writer.write(encoder.encode(sseEvent('response.output_item.done', {
           type: 'response.output_item.done',
           sequence_number: nextSeq(),
-          output_index: 0,
-          item: { id: itemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accumulatedText }] },
+          output_index: textOutputIndex,
+          item: { id: itemId, type: 'message', status: isIncomplete ? 'incomplete' : 'completed', role: 'assistant', content: [{ type: 'output_text', text: accumulatedText, annotations: [] }] },
         })));
       }
 
       const outputItems: unknown[] = [];
       if (textPartOpened) {
-        outputItems.push({ id: itemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accumulatedText }] });
+        outputItems.push({ id: itemId, type: 'message', status: isIncomplete ? 'incomplete' : 'completed', role: 'assistant', content: [{ type: 'output_text', text: accumulatedText, annotations: [] }] });
       }
       for (const tool of toolBlocks.values()) {
         outputItems.push({ id: tool.id, type: 'function_call', status: 'completed', name: tool.name, arguments: tool.arguments, call_id: tool.id });
       }
+      if (suppressedToolCalls > 0) {
+        activeLogger.warn(requestId, `[responses] suppressed ${suppressedToolCalls} tool call(s) outside allowed_tools`);
+      }
       if (outputItems.length === 0) {
-        outputItems.push({ id: itemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: '' }] });
+        // output: [] is invalid per spec — synthesize an empty message item.
+        // It must get the full lifecycle events too: a client rebuilding state
+        // from SSE events must not first see this item in the terminal payload.
+        const fallbackIndex = nextOutputIndex++;
+        const fallbackItem = { id: itemId, type: 'message', status: isIncomplete ? 'incomplete' : 'completed', role: 'assistant', content: [{ type: 'output_text', text: '', annotations: [] }] };
+        await writer.write(encoder.encode(sseEvent('response.output_item.added', {
+          type: 'response.output_item.added',
+          sequence_number: nextSeq(),
+          output_index: fallbackIndex,
+          item: { ...fallbackItem, status: 'in_progress', content: [] },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.content_part.added', {
+          type: 'response.content_part.added',
+          sequence_number: nextSeq(),
+          item_id: itemId,
+          output_index: fallbackIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: '', annotations: [] },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.content_part.done', {
+          type: 'response.content_part.done',
+          sequence_number: nextSeq(),
+          item_id: itemId,
+          output_index: fallbackIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: '', annotations: [] },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.output_item.done', {
+          type: 'response.output_item.done',
+          sequence_number: nextSeq(),
+          output_index: fallbackIndex,
+          item: fallbackItem,
+        })));
+        outputItems.push(fallbackItem);
       }
 
-      await writer.write(encoder.encode(sseEvent('response.completed', {
-        type: 'response.completed',
+      // Terminal event: response.incomplete when the model exhausted its token
+      // budget, otherwise response.completed.
+      const terminalEvent = isIncomplete ? 'response.incomplete' : 'response.completed';
+      await writer.write(encoder.encode(sseEvent(terminalEvent, {
+        type: terminalEvent,
         sequence_number: nextSeq(),
         response: {
           id: responseId,
           object: 'response',
           created_at,
-          status: 'completed',
+          status: isIncomplete ? 'incomplete' : 'completed',
           model,
           output: outputItems,
           usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens, input_tokens_details: { cached_tokens: cachedTokens } },
+          ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
         },
       })));
 
       await writer.write(encoder.encode('data: [DONE]\n\n'));
-    } catch {
-      // stream ended or errored
+    } catch (err) {
+      // Upstream failed mid-stream. Once response.created has been sent the spec
+      // requires a terminal event — never leave the client with a stream that
+      // just stops.
+      activeLogger.error(requestId, `Responses stream (claude) failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (streamStarted) {
+        try {
+          await writer.write(encoder.encode(sseEvent('response.failed', {
+            type: 'response.failed',
+            sequence_number: nextSeq(),
+            response: {
+              id: responseId,
+              object: 'response',
+              created_at,
+              status: 'failed',
+              model,
+              output: [],
+              error: { code: 'server_error', message: err instanceof Error ? err.message : String(err) },
+            },
+          })));
+          await writer.write(encoder.encode('data: [DONE]\n\n'));
+        } catch {
+          // client is already gone; nothing more can be delivered
+        }
+      }
     } finally {
       await writer.close();
     }
@@ -532,7 +644,11 @@ async function handleAsAnthropicMessages(
   route?: ModelRouteConfig,
   upstreamMode?: string,
 ): Promise<Response> {
-  const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger, requestId });
+  const conversationEnabled = env?.CONVERSATION_STATE === 'true' || env?.CONVERSATION_STATE === '1';
+  const stateResult = applyConversationState(requestBody, conversationEnabled, logger, requestId);
+  if ('error' in stateResult) return stateResult.error;
+  const completionsRequest = convertResponsesToChatCompletions(stateResult.body, model, { logger, requestId });
+  const allowedTools = extractAllowedTools(stateResult.body);
   let claudeBody: Record<string, unknown> = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
 
   // before_upstream: apply declared transforms to the upstream-format body.
@@ -577,18 +693,18 @@ async function handleAsAnthropicMessages(
   if (!response.ok) {
     const upstreamBody = await response.text();
     logger.error(requestId, `Responses->anthropic-messages error: ${response.status}, URL: ${targetUrl}`);
-    handleTargetApiError(response, 'Responses API (via anthropic-messages)', { url: targetUrl, upstreamBody });
+    handleResponsesApiError(response, 'Responses API (via anthropic-messages)', { url: targetUrl, upstreamBody });
   }
 
   if (isStreaming) {
-    return streamClaudeAsResponses(response, model, requestId, logger);
+    return streamClaudeAsResponses(response, model, requestId, logger, allowedTools);
   }
 
   const claudeJsonText = await response.text();
   logger.debug(requestId, `Upstream claude response: ${claudeJsonText.substring(0, 500)}`);
   logPipelineStage(logger, requestId, 'upstream-response', targetUrl, claudeJsonText);
   const claudeJson = JSON.parse(claudeJsonText) as Record<string, unknown>;
-  const responsesResponse = claudeResponseToResponses(claudeJson, model);
+  const responsesResponse = claudeResponseToResponses(claudeJson, model, allowedTools, logger, requestId);
   logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
 
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
@@ -612,7 +728,11 @@ async function handleAsGemini(
   env?: Env,
   upstreamMode?: string
 ): Promise<Response> {
-  const completionsRequest = convertResponsesToChatCompletions(requestBody, model, { logger, requestId });
+  const conversationEnabled = env?.CONVERSATION_STATE === 'true' || env?.CONVERSATION_STATE === '1';
+  const stateResult = applyConversationState(requestBody, conversationEnabled, logger, requestId);
+  if ('error' in stateResult) return stateResult.error;
+  const completionsRequest = convertResponsesToChatCompletions(stateResult.body, model, { logger, requestId });
+  const allowedTools = extractAllowedTools(stateResult.body);
   const claudeBody = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
 
   logger.debug(requestId, `Responses->${upstreamMode}: ${JSON.stringify(claudeBody).substring(0, 500)}`);
@@ -630,23 +750,100 @@ async function handleAsGemini(
   const claudeResponse = await handleGeminiRequestForMessages(claudeRequest, targetUrl, authHeaders, requestId, model, env, logger);
 
   if (!claudeResponse.ok) {
-    // Error already handled by the Gemini handler; propagate it
-    return claudeResponse;
+    // The Gemini handler produced an Anthropic-shaped error; re-throw it in the
+    // Responses envelope so /v1/responses clients get the spec's shape.
+    const upstreamErrorBody = await claudeResponse.text();
+    handleResponsesApiError(claudeResponse, 'Responses API (via gemini)', { url: targetUrl, upstreamBody: upstreamErrorBody });
   }
 
   if (isStreaming) {
     // claudeResponse is Claude SSE; convert to Responses SSE
-    return streamClaudeAsResponses(claudeResponse, model, requestId, logger);
+    return streamClaudeAsResponses(claudeResponse, model, requestId, logger, allowedTools);
   }
 
   const claudeJson = await claudeResponse.json() as Record<string, unknown>;
   logger.debug(requestId, `Upstream gemini claude response: ${JSON.stringify(claudeJson).substring(0, 500)}`);
-  const responsesResponse = claudeResponseToResponses(claudeJson, model);
+  const responsesResponse = claudeResponseToResponses(claudeJson, model, allowedTools, logger, requestId);
   logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
 
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
   logPipelineHeaders(logger, requestId, 'outbound', '/v1/responses', outHeaders);
   return new Response(JSON.stringify(responsesResponse), { status: 200, headers: outHeaders });
+}
+
+/**
+ * Resolve conversation state for a Responses request on a converter path.
+ * Merges `previous_response_id` history (prior input + output, in that order)
+ * and `conversation` thread items in front of the new input, and strips the
+ * stateful fields so they never reach a non-Responses upstream.
+ *
+ * When CONVERSATION_STATE is enabled, a referenced previous_response_id that is
+ * not in the store (expired, evicted, or store:false) fails the request with
+ * `previous_response_not_found` — continuing without the prior context would
+ * silently answer a different conversation than the client asked about. When
+ * state is disabled the field is ignored (dropped) as before.
+ */
+function applyConversationState(
+  requestBody: Record<string, unknown>,
+  conversationEnabled: boolean,
+  logger: Logger,
+  requestId: string,
+): { body: Record<string, unknown>; conversationId?: string; newInputItems: unknown[]; mergedInput: unknown[] } | { error: Response } {
+  const previousResponseId = requestBody.previous_response_id as string | undefined;
+  // `conversation`: string (ConversationID) or { id } (ResponseConversationParam).
+  const conversationParam = requestBody.conversation as string | { id?: string } | undefined;
+  const conversationId = typeof conversationParam === 'string'
+    ? conversationParam
+    : conversationParam?.id;
+  // Spec: `previous_response_id` "Cannot be used in conjunction with `conversation`".
+  if (previousResponseId && conversationId) {
+    return {
+      error: createResponsesErrorResponse(
+        new ResponsesApiError('previous_response_id and conversation cannot be used together.', 400, 'invalid_request', 'previous_response_id'),
+        requestId,
+      ),
+    };
+  }
+
+  // Normalize current input to an item array so we can prepend prior history
+  const newInputItems = normalizeInputToItems(requestBody.input);
+  let mergedInput: unknown[] = newInputItems;
+
+  // If conversation caching is on and client references a prior response,
+  // prepend [prior_input_items, prior_output_items] before the new input.
+  if (conversationEnabled && previousResponseId) {
+    const prior = getConversation(previousResponseId);
+    if (prior) {
+      mergedInput = [...prior.inputItems, ...prior.outputItems, ...mergedInput];
+      logger.debug(requestId, `[conversation] loaded prior=${previousResponseId} (${prior.inputItems.length + prior.outputItems.length} items prepended)`);
+    } else {
+      logger.debug(requestId, `[conversation] previous_response_id=${previousResponseId} not found in store (expired or unknown)`);
+      return {
+        error: createResponsesErrorResponse(
+          new ResponsesApiError(`Previous response with id '${previousResponseId}' not found.`, 404, 'not_found', 'previous_response_id', 'previous_response_not_found'),
+          requestId,
+        ),
+      };
+    }
+  }
+
+  // Conversation mode: prepend the accumulated thread items to the new input.
+  if (conversationEnabled && conversationId) {
+    const threadItems = getConversationThreadItems(conversationId);
+    if (threadItems) {
+      mergedInput = [...threadItems, ...mergedInput];
+      logger.debug(requestId, `[conversation] loaded thread=${conversationId} (${threadItems.length} items prepended)`);
+    } else {
+      logger.debug(requestId, `[conversation] starting new thread=${conversationId}`);
+    }
+  }
+
+  // Build effective request body: use merged input, drop stateful fields
+  // (non-Responses upstreams do not understand them)
+  const body: Record<string, unknown> = { ...requestBody, input: mergedInput };
+  delete body.previous_response_id;
+  delete body.conversation;
+  return { body, conversationId, newInputItems, mergedInput };
 }
 
 /**
@@ -666,56 +863,14 @@ async function handleAsCompletions(
   upstreamMode?: string,
 ): Promise<Response> {
   const conversationEnabled = env?.CONVERSATION_STATE === 'true' || env?.CONVERSATION_STATE === '1';
-  const previousResponseId = requestBody.previous_response_id as string | undefined;
-  // `conversation`: string (ConversationID) or { id } (ResponseConversationParam).
-  const conversationParam = requestBody.conversation as string | { id?: string } | undefined;
-  const conversationId = typeof conversationParam === 'string'
-    ? conversationParam
-    : conversationParam?.id;
-  // Spec: `previous_response_id` "Cannot be used in conjunction with `conversation`".
-  if (previousResponseId && conversationId) {
-    return createErrorResponse(
-      new Error('previous_response_id and conversation cannot be used together.'),
-      requestId,
-      400
-    );
-  }
+  const stateResult = applyConversationState(requestBody, conversationEnabled, logger, requestId);
+  if ('error' in stateResult) return stateResult.error;
+  const { conversationId, newInputItems, mergedInput } = stateResult;
   // Spec default: store=true. store=false → the response is not stored for
   // retrieval or continuation, so skip all conversation-state saves below.
   const storeResponse = requestBody.store !== false;
 
-  // Normalize current input to an item array so we can prepend prior history
-  const newInputItems = normalizeInputToItems(requestBody.input);
-  let mergedInput: unknown[] = newInputItems;
-
-  // If conversation caching is on and client references a prior response,
-  // prepend [prior_input_items, prior_output_items] before the new input.
-  if (conversationEnabled && previousResponseId) {
-    const prior = getConversation(previousResponseId);
-    if (prior) {
-      mergedInput = [...prior.inputItems, ...prior.outputItems, ...mergedInput];
-      logger.debug(requestId, `[conversation] loaded prior=${previousResponseId} (${prior.inputItems.length + prior.outputItems.length} items prepended)`);
-    } else {
-      logger.debug(requestId, `[conversation] previous_response_id=${previousResponseId} not found in store (expired or unknown)`);
-    }
-  }
-
-  // Conversation mode: prepend the accumulated thread items to the new input.
-  if (conversationEnabled && conversationId) {
-    const threadItems = getConversationThreadItems(conversationId);
-    if (threadItems) {
-      mergedInput = [...threadItems, ...mergedInput];
-      logger.debug(requestId, `[conversation] loaded thread=${conversationId} (${threadItems.length} items prepended)`);
-    } else {
-      logger.debug(requestId, `[conversation] starting new thread=${conversationId}`);
-    }
-  }
-
-  // Build effective request body: use merged input, drop stateful fields
-  // (Chat Completions upstream does not understand them)
-  let effectiveBody: Record<string, unknown> = { ...requestBody, input: mergedInput };
-  delete effectiveBody.previous_response_id;
-  delete effectiveBody.conversation;
+  let effectiveBody: Record<string, unknown> = stateResult.body;
 
   // before_conversion: client-schema transforms before format conversion
   if (route) {
@@ -734,6 +889,9 @@ async function handleAsCompletions(
   // Convert Responses API request to Chat Completions format
   const completionsRequest = convertResponsesToChatCompletions(effectiveBody, model, { logger, requestId });
   const namespaceMap = getNamespaceMap(completionsRequest);
+  // allowed_tools is a hard constraint (spec): completions upstreams cannot
+  // express it, so it is enforced here on the response side.
+  const allowedTools = extractAllowedTools(effectiveBody);
 
   // Inject stored reasoning_content onto any assistant messages that have tool_calls
   // whose IDs were recorded from a prior thinking-mode response (DeepSeek requires
@@ -801,7 +959,7 @@ async function handleAsCompletions(
     const bodyPreview = JSON.stringify(completionsRequest);
     const upstreamErrorBody = await response.text();
     logger.debug(requestId, `Responses->Completions API error code: ${response.status}, URL: ${targetUrl}`);
-    handleTargetApiError(response, 'Responses API (via Completions)', { url: targetUrl, status: response.status, body: bodyPreview, upstreamBody: upstreamErrorBody });
+    handleResponsesApiError(response, 'Responses API (via Completions)', { url: targetUrl, status: response.status, body: bodyPreview, upstreamBody: upstreamErrorBody });
   }
 
   if (isStreaming) {
@@ -815,7 +973,7 @@ async function handleAsCompletions(
           logger.debug(requestId, `[conversation] saved responseId=${responseId} (${mergedInput.length} input + ${outputItems.length} output items)`);
         }
       : undefined;
-    return streamCompletionsAsResponses(response, model, requestId, logger, onComplete, conversationId, namespaceMap);
+    return streamCompletionsAsResponses(response, model, requestId, logger, onComplete, conversationId, namespaceMap, allowedTools);
   }
 
   // Convert Chat Completions response back to Responses API format
@@ -823,7 +981,7 @@ async function handleAsCompletions(
   logger.debug(requestId, `Upstream completions response: ${responseText.substring(0, 1000)}`);
   logPipelineStage(logger, requestId, 'upstream-response', targetUrl, responseText);
   const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
-  const responsesResponse = convertCompletionsToResponses(completionsResponse, model, namespaceMap);
+  const responsesResponse = convertCompletionsToResponses(completionsResponse, model, namespaceMap, { allowedTools, logger, requestId });
   if (conversationId) {
     (responsesResponse as unknown as Record<string, unknown>).conversation = conversationId;
   }
@@ -865,7 +1023,8 @@ function streamCompletionsAsResponses(
   logger?: Logger,
   onComplete?: (responseId: string, outputItems: unknown[], completedResponse?: Record<string, unknown>) => void,
   conversationId?: string,
-  namespaceMap?: NamespaceMap
+  namespaceMap?: NamespaceMap,
+  allowedTools?: Set<string> | null
 ): Response {
   // Given a possibly-flattened tool name, restores the original `name`/`namespace`
   // split recorded by convertResponsesToChatCompletions, if it was a namespaced tool.
@@ -880,6 +1039,10 @@ function streamCompletionsAsResponses(
 
   let sequenceNumber = 0;
   const nextSeq = () => sequenceNumber++;
+  // Set once response.created has been written; gates the response.failed
+  // terminal event in the catch below (a stream that never started must
+  // surface the error as an HTTP failure instead).
+  let streamStarted = false;
 
   const activeLogger = logger ?? createLogger({});
 
@@ -905,12 +1068,17 @@ function streamCompletionsAsResponses(
         sequence_number: nextSeq(),
         response: { id: responseId, object: 'response', created_at, status: 'in_progress', model, output: [] },
       })));
+      streamStarted = true;
 
       let accumulatedText = '';
       let accumulatedReasoning = ''; // reasoning_content / thinking tokens from upstream
       let thinkBuffer = ''; // partial <think>/<thinking> tag buffer for streaming extraction
       let textPartOpened = false;
       let textOutputIndex = -1; // set when text item is opened
+      let reasoningOutputIndex = -1; // set when the reasoning item is announced (first reasoning delta)
+      let reasoningClosed = false;
+      const reasoningItemId = `rs_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+      let finishReason: string | undefined; // choices[0].finish_reason from the final chunk
       let usageData: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; prompt_cache_hit_tokens?: number } | undefined;
       let upstreamModel = model;
       let buffer = '';
@@ -919,7 +1087,51 @@ function streamCompletionsAsResponses(
       const toolCalls: Map<number, ToolCallAccum> = new Map();
       // Track which tool call output_index slots have been opened
       const toolCallOutputIndex: Map<number, number> = new Map();
+      // Tool call indices suppressed by the allowedTools constraint — no
+      // lifecycle events are emitted for them and they never reach `output`.
+      const suppressedToolCalls: Set<number> = new Set();
       let nextOutputIndex = 0; // claimed by the text message item if/when text appears, else tool calls start at 0
+
+      // The reasoning item is synthesized from upstream reasoning_content /
+      // <think> tags. It must still get a full lifecycle (added → part added →
+      // part done → item done) or a client rebuilding state from SSE events
+      // first sees it in the terminal payload.
+      const openReasoningItem = async () => {
+        if (reasoningOutputIndex !== -1) return;
+        reasoningOutputIndex = nextOutputIndex++;
+        await writer.write(encoder.encode(sseEvent('response.output_item.added', {
+          type: 'response.output_item.added',
+          sequence_number: nextSeq(),
+          output_index: reasoningOutputIndex,
+          item: { id: reasoningItemId, type: 'reasoning', status: 'in_progress', content: [] },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.content_part.added', {
+          type: 'response.content_part.added',
+          sequence_number: nextSeq(),
+          item_id: reasoningItemId,
+          output_index: reasoningOutputIndex,
+          content_index: 0,
+          part: { type: 'reasoning_text', text: '' },
+        })));
+      };
+      const closeReasoningItem = async () => {
+        if (reasoningOutputIndex === -1 || reasoningClosed) return;
+        reasoningClosed = true;
+        await writer.write(encoder.encode(sseEvent('response.content_part.done', {
+          type: 'response.content_part.done',
+          sequence_number: nextSeq(),
+          item_id: reasoningItemId,
+          output_index: reasoningOutputIndex,
+          content_index: 0,
+          part: { type: 'reasoning_text', text: accumulatedReasoning },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.output_item.done', {
+          type: 'response.output_item.done',
+          sequence_number: nextSeq(),
+          output_index: reasoningOutputIndex,
+          item: { id: reasoningItemId, type: 'reasoning', status: 'completed', content: [{ type: 'reasoning_text', text: accumulatedReasoning }] },
+        })));
+      };
 
       const reader = upstreamResponse.body?.getReader();
       if (!reader) {
@@ -964,8 +1176,10 @@ function streamCompletionsAsResponses(
               }>;
             };
             finish_reason?: string;
+            logprobs?: { content?: unknown[] } | null;
           }> | undefined;
           if (!choices?.length) continue;
+          if (choices[0].finish_reason) finishReason = choices[0].finish_reason;
 
           const delta = choices[0].delta;
           if (!delta) continue;
@@ -975,6 +1189,7 @@ function streamCompletionsAsResponses(
           const reasoningDelta = (delta as Record<string, unknown>).reasoning_content
             ?? (delta as Record<string, unknown>).thinking;
           if (typeof reasoningDelta === 'string' && reasoningDelta) {
+            await openReasoningItem();
             accumulatedReasoning += reasoningDelta;
           }
 
@@ -991,6 +1206,7 @@ function streamCompletionsAsResponses(
             let cleanChunk = '';
             while ((m = thinkRegex.exec(pendingText)) !== null) {
               cleanChunk += pendingText.slice(lastIdx, m.index);
+              if (m[1]) await openReasoningItem();
               accumulatedReasoning += m[1];
               lastIdx = thinkRegex.lastIndex;
             }
@@ -1007,6 +1223,9 @@ function streamCompletionsAsResponses(
 
             if (cleanChunk) {
               if (!textPartOpened) {
+                // Reasoning precedes text in the output ordering — close the
+                // reasoning item before the message item opens.
+                await closeReasoningItem();
                 // Text message item claims the next available index (always 0 if no tool calls came first)
                 textOutputIndex = nextOutputIndex++;
                 // Open the message output item and text part on first text delta
@@ -1022,7 +1241,7 @@ function streamCompletionsAsResponses(
                   item_id: itemId,
                   output_index: textOutputIndex,
                   content_index: 0,
-                  part: { type: 'output_text', text: '' },
+                  part: { type: 'output_text', text: '', annotations: [] },
                 })));
                 textPartOpened = true;
               }
@@ -1034,6 +1253,7 @@ function streamCompletionsAsResponses(
                 output_index: textOutputIndex,
                 content_index: 0,
                 delta: cleanChunk,
+                logprobs: choices[0].logprobs?.content ?? [],
               })));
             }
           }
@@ -1042,7 +1262,17 @@ function streamCompletionsAsResponses(
           if (delta.tool_calls) {
             for (const tc of delta.tool_calls) {
               const idx = tc.index;
+              if (suppressedToolCalls.has(idx)) continue;
               if (!toolCalls.has(idx)) {
+                // allowedTools is a hard constraint (spec): suppress calls to
+                // tools outside the set — no lifecycle events, no output entry.
+                // The name normally arrives complete in the first chunk; when it
+                // does not we cannot decide yet and the call is treated as allowed.
+                const firstName = tc.function?.name ?? '';
+                if (allowedTools != null && firstName && !allowedTools.has(splitNamespace(firstName).name)) {
+                  suppressedToolCalls.add(idx);
+                  continue;
+                }
                 // First chunk for this tool call index
                 const tcId = tc.id ?? `call_${Date.now()}_${idx}`;
                 const initialArgs = tc.function?.arguments ?? '';
@@ -1104,6 +1334,14 @@ function streamCompletionsAsResponses(
         thinkBuffer = '';
       }
 
+      // Close the reasoning item if it is still open (reasoning with no
+      // following text — otherwise it was closed when the text item opened).
+      await closeReasoningItem();
+
+      // finish_reason "length" means the model exhausted its token budget —
+      // the open item and the response end terminal-incomplete, not completed.
+      const isIncomplete = finishReason === 'length';
+
       // --- close text part if it was opened ---
       if (textPartOpened) {
         await writer.write(encoder.encode(sseEvent('response.output_text.done', {
@@ -1114,11 +1352,19 @@ function streamCompletionsAsResponses(
           content_index: 0,
           text: accumulatedText,
         })));
+        await writer.write(encoder.encode(sseEvent('response.content_part.done', {
+          type: 'response.content_part.done',
+          sequence_number: nextSeq(),
+          item_id: itemId,
+          output_index: textOutputIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: accumulatedText, annotations: [] },
+        })));
         // Include reasoning_text alongside output_text so Codex echoes it back on
         // the next turn. DeepSeek rejects multi-turn requests when reasoning_content
         // is missing from the assistant message that followed a thinking turn.
-        const doneContent: Array<{ type: string; text: string }> = [
-          { type: 'output_text', text: accumulatedText },
+        const doneContent: Array<{ type: string; text: string; annotations?: unknown[] }> = [
+          { type: 'output_text', text: accumulatedText, annotations: [] },
         ];
         if (accumulatedReasoning) {
           doneContent.push({ type: 'reasoning_text', text: accumulatedReasoning });
@@ -1130,7 +1376,7 @@ function streamCompletionsAsResponses(
           item: {
             id: itemId,
             type: 'message',
-            status: 'completed',
+            status: isIncomplete ? 'incomplete' : 'completed',
             role: 'assistant',
             content: doneContent,
           },
@@ -1139,6 +1385,7 @@ function streamCompletionsAsResponses(
 
       // --- close each tool call item ---
       const completedToolCalls: Array<{ id: string; type: string; status: string; name: string; arguments: string; call_id: string; namespace?: string }> = [];
+      const completedToolCallIndices: number[] = []; // output_index per entry, for ordered assembly below
       for (const [idx, accum] of toolCalls) {
         const outputIndex = toolCallOutputIndex.get(idx)!;
         await writer.write(encoder.encode(sseEvent('response.function_call_arguments.done', {
@@ -1168,41 +1415,52 @@ function streamCompletionsAsResponses(
           arguments: accum.arguments, call_id: accum.id,
           ...(doneNamespace ? { namespace: doneNamespace } : {}),
         });
+        completedToolCallIndices.push(outputIndex);
       }
 
-      // Build output array for response.completed
-      const outputItems: unknown[] = [];
+      // Build output array for response.completed. Positions must match the
+      // output_index values the lifecycle events carried, so assemble by index.
+      const indexedOutput: Array<{ index: number; item: unknown }> = [];
 
-      // Prepend a reasoning output item when the upstream produced reasoning content.
+      // Reasoning output item when the upstream produced reasoning content.
       // This preserves the reasoning so Codex can echo it back on the next turn, which
       // is required by thinking-mode upstreams like DeepSeek ("reasoning_content must
       // be passed back to the API").
       if (accumulatedReasoning) {
-        const reasoningId = `rs_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
-        outputItems.push({
-          id: reasoningId,
-          type: 'reasoning',
-          status: 'completed',
-          content: [{ type: 'reasoning_text', text: accumulatedReasoning }],
+        indexedOutput.push({
+          index: reasoningOutputIndex,
+          item: {
+            id: reasoningItemId,
+            type: 'reasoning',
+            status: 'completed',
+            content: [{ type: 'reasoning_text', text: accumulatedReasoning }],
+          },
         });
       }
 
       if (textPartOpened) {
-        const textContent: Array<{ type: string; text: string }> = [{ type: 'output_text', text: accumulatedText }];
+        const textContent: Array<{ type: string; text: string; annotations?: unknown[] }> = [{ type: 'output_text', text: accumulatedText, annotations: [] }];
         // Also embed reasoning_text inside the message so it round-trips via assistant
         // message content when Codex sends the conversation back.
         if (accumulatedReasoning) {
           textContent.push({ type: 'reasoning_text', text: accumulatedReasoning });
         }
-        outputItems.push({
-          id: itemId,
-          type: 'message',
-          status: 'completed',
-          role: 'assistant',
-          content: textContent,
+        indexedOutput.push({
+          index: textOutputIndex,
+          item: {
+            id: itemId,
+            type: 'message',
+            status: isIncomplete ? 'incomplete' : 'completed',
+            role: 'assistant',
+            content: textContent,
+          },
         });
       }
-      outputItems.push(...completedToolCalls);
+      for (const [i, tc] of completedToolCalls.entries()) {
+        indexedOutput.push({ index: completedToolCallIndices[i], item: tc });
+      }
+      indexedOutput.sort((a, b) => a.index - b.index);
+      const outputItems: unknown[] = indexedOutput.map(e => e.item);
 
       // If there was reasoning and tool calls, persist the reasoning keyed by each
       // call_id so we can inject it on the next turn when Codex echoes the calls back
@@ -1211,17 +1469,52 @@ function streamCompletionsAsResponses(
         storeReasoningForCalls(completedToolCalls.map(tc => tc.id), accumulatedReasoning);
       }
 
+      if (suppressedToolCalls.size > 0) {
+        activeLogger.warn(requestId, `[responses] suppressed ${suppressedToolCalls.size} tool call(s) outside allowed_tools`);
+      }
+
       // output: [] is invalid per spec. If the stream had only thinking/reasoning content
       // (no text, no tool calls), emit a fallback empty-text message item so the client
-      // receives a non-empty output array.
+      // receives a non-empty output array. It gets the full lifecycle events too — a
+      // client rebuilding state from SSE events must not first see it in the terminal payload.
       if (outputItems.every((it: unknown) => (it as Record<string, unknown>).type === 'reasoning')) {
-        outputItems.push({
+        const fallbackIndex = nextOutputIndex++;
+        const fallbackItem = {
           id: itemId,
           type: 'message',
-          status: 'completed',
+          status: isIncomplete ? 'incomplete' : 'completed',
           role: 'assistant',
-          content: [{ type: 'output_text', text: '' }],
-        });
+          content: [{ type: 'output_text', text: '', annotations: [] }],
+        };
+        await writer.write(encoder.encode(sseEvent('response.output_item.added', {
+          type: 'response.output_item.added',
+          sequence_number: nextSeq(),
+          output_index: fallbackIndex,
+          item: { ...fallbackItem, status: 'in_progress', content: [] },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.content_part.added', {
+          type: 'response.content_part.added',
+          sequence_number: nextSeq(),
+          item_id: itemId,
+          output_index: fallbackIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: '', annotations: [] },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.content_part.done', {
+          type: 'response.content_part.done',
+          sequence_number: nextSeq(),
+          item_id: itemId,
+          output_index: fallbackIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: '', annotations: [] },
+        })));
+        await writer.write(encoder.encode(sseEvent('response.output_item.done', {
+          type: 'response.output_item.done',
+          sequence_number: nextSeq(),
+          output_index: fallbackIndex,
+          item: fallbackItem,
+        })));
+        outputItems.push(fallbackItem);
       }
 
       // Build usage for response.completed
@@ -1233,32 +1526,59 @@ function streamCompletionsAsResponses(
       } : undefined;
 
       // Build the completed response object once; it is both emitted in the
-      // response.completed event and passed to onComplete for the store
+      // terminal event and passed to onComplete for the store
       // (GET /v1/responses/{id} retrieval).
       const completedResponse: Record<string, unknown> = {
         id: responseId,
         object: 'response',
         created_at,
-        status: 'completed',
+        status: isIncomplete ? 'incomplete' : 'completed',
         model: upstreamModel,
         output: outputItems,
         usage,
+        ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
         ...(conversationId ? { conversation: conversationId } : {}),
       };
 
-      // Save conversation state before emitting the completed event
+      // Save conversation state before emitting the terminal event
       onComplete?.(responseId, outputItems, completedResponse);
 
-      // Emit response.completed
-      await writer.write(encoder.encode(sseEvent('response.completed', {
-        type: 'response.completed',
+      // Emit the terminal response event (response.incomplete when the model
+      // exhausted its token budget, otherwise response.completed)
+      const terminalEvent = isIncomplete ? 'response.incomplete' : 'response.completed';
+      await writer.write(encoder.encode(sseEvent(terminalEvent, {
+        type: terminalEvent,
         sequence_number: nextSeq(),
         response: completedResponse,
       })));
 
       await writer.write(encoder.encode('data: [DONE]\n\n'));
-    } catch {
-      // Stream ended or errored; close writer to flush what we have
+    } catch (err) {
+      // Upstream failed mid-stream. Once response.created has been sent the spec
+      // requires a terminal event — never leave the client with a stream that
+      // just stops. Before anything was sent the error stays silent here because
+      // no bytes reached the client yet; the fetch-level error path reports it.
+      activeLogger.error(requestId, `Responses stream (completions) failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (streamStarted) {
+        try {
+          await writer.write(encoder.encode(sseEvent('response.failed', {
+            type: 'response.failed',
+            sequence_number: nextSeq(),
+            response: {
+              id: responseId,
+              object: 'response',
+              created_at,
+              status: 'failed',
+              model,
+              output: [],
+              error: { code: 'server_error', message: err instanceof Error ? err.message : String(err) },
+            },
+          })));
+          await writer.write(encoder.encode('data: [DONE]\n\n'));
+        } catch {
+          // client is already gone; nothing more can be delivered
+        }
+      }
     } finally {
       await writer.close();
     }
@@ -1343,7 +1663,7 @@ export async function handleResponsesInputTokensRequest(
     if (!response.ok) {
       const upstreamErrorBody = await response.text();
       activeLogger.error(requestId, `Responses input_tokens error: ${response.status}, URL: ${targetUrl}`);
-      handleTargetApiError(response, 'Responses input_tokens (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
+      handleResponsesApiError(response, 'Responses input_tokens (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
     }
 
     const responseText = await response.text();
@@ -1392,7 +1712,7 @@ export async function handleResponsesInputTokensRequest(
   if (!passthroughInputTokensResponse.ok) {
     const upstreamErrorBody = await passthroughInputTokensResponse.text();
     activeLogger.error(requestId, `Responses input_tokens passthrough error: ${passthroughInputTokensResponse.status}, URL: ${targetUrl}`);
-    handleTargetApiError(passthroughInputTokensResponse, 'Responses input_tokens', { url: targetUrl, upstreamBody: upstreamErrorBody });
+    handleResponsesApiError(passthroughInputTokensResponse, 'Responses input_tokens', { url: targetUrl, upstreamBody: upstreamErrorBody });
   }
 
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
@@ -1468,7 +1788,7 @@ export async function handleResponsesCompactRequest(
     if (!compactCompletionsResponse.ok) {
       const upstreamErrorBody = await compactCompletionsResponse.text();
       activeLogger.error(requestId, `Responses compact error: ${compactCompletionsResponse.status}, URL: ${targetUrl}`);
-      handleTargetApiError(compactCompletionsResponse, 'Responses compact (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
+      handleResponsesApiError(compactCompletionsResponse, 'Responses compact (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
     }
 
     const responseText = await compactCompletionsResponse.text();
@@ -1517,7 +1837,7 @@ export async function handleResponsesCompactRequest(
   if (!compactPassthroughResponse.ok) {
     const upstreamErrorBody = await compactPassthroughResponse.text();
     activeLogger.error(requestId, `Responses compact passthrough error: ${compactPassthroughResponse.status}, URL: ${targetUrl}`);
-    handleTargetApiError(compactPassthroughResponse, 'Responses compact', { url: targetUrl, upstreamBody: upstreamErrorBody });
+    handleResponsesApiError(compactPassthroughResponse, 'Responses compact', { url: targetUrl, upstreamBody: upstreamErrorBody });
   }
 
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
@@ -1580,7 +1900,7 @@ async function handleAsPassthrough(
     const bodyPreview = JSON.stringify(requestBody);
     const upstreamErrorBody = await response.text();
     logger.debug(requestId, `Responses API error code: ${response.status} from URL: ${targetUrl}`);
-    handleTargetApiError(response, 'Responses API', { url: targetUrl, status: response.status, body: bodyPreview, upstreamBody: upstreamErrorBody });
+    handleResponsesApiError(response, 'Responses API', { url: targetUrl, status: response.status, body: bodyPreview, upstreamBody: upstreamErrorBody });
   }
 
   if (isStreaming) {

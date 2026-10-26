@@ -309,6 +309,50 @@ describe('handleAsCompletions stateful mode', () => {
     assert.equal(resp.status, 200);
     assert.equal(upstreamBodies[0].messages.length, 1, 'no history prepended with state disabled');
   });
+
+  it('fails with previous_response_not_found when state is enabled but the id is unknown', async () => {
+    const resp = await postResponses({ model: 'gpt', input: 'solo', previous_response_id: 'resp_never_existed' });
+    assert.equal(resp.status, 404);
+    const body = await resp.json();
+    assert.equal(body.error.code, 'previous_response_not_found');
+    assert.equal(body.error.type, 'not_found');
+    assert.equal(body.error.param, 'previous_response_id');
+    assert.equal(upstreamBodies.length, 0, 'no upstream call on a store miss');
+  });
+
+  it('merges previous_response_id history on the anthropic-messages path', async () => {
+    saveConversation(
+      'resp_anthropic_prior',
+      [{ type: 'message', role: 'user', content: 'q1' }],
+      [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'pong' }] }],
+    );
+    upstreamBodies = [];
+    upstreamResponseBody = JSON.stringify({
+      id: 'msg_anthropic_1', type: 'message', model: 'claude-test', role: 'assistant',
+      content: [{ type: 'text', text: 'pong2' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 5, output_tokens: 2 },
+    });
+    const resp = await handleResponsesRequest(
+      responsesRequest({ model: 'gpt', input: 'q2', previous_response_id: 'resp_anthropic_prior' }),
+      'http://up.example.com/v1/messages', {}, 'req', 'gpt', STATE_ENV as any, undefined, 'anthropic-messages'
+    );
+    assert.equal(resp.status, 200);
+    const msgs = upstreamBodies[0].messages;
+    assert.deepEqual(msgs.map((m: any) => `${m.role}:${m.content}`), ['user:q1', 'assistant:pong', 'user:q2']);
+  });
+
+  it('returns previous_response_not_found on the anthropic-messages path when the id is unknown', async () => {
+    upstreamBodies = [];
+    const resp = await handleResponsesRequest(
+      responsesRequest({ model: 'gpt', input: 'q2', previous_response_id: 'resp_anthropic_missing' }),
+      'http://up.example.com/v1/messages', {}, 'req', 'gpt', STATE_ENV as any, undefined, 'anthropic-messages'
+    );
+    assert.equal(resp.status, 404);
+    const body = await resp.json();
+    assert.equal(body.error.code, 'previous_response_not_found');
+    assert.equal(upstreamBodies.length, 0, 'no upstream call on a store miss');
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -300,6 +300,124 @@ export function handleTargetApiError(
   throw new ClaudeProxyError(errorMessage, status, errorType);
 }
 
+// ---------------------------------------------------------------------------
+// Open Responses / Responses API error envelope
+//
+// The Responses spec uses a different envelope than the Anthropic endpoints:
+//   { "error": { "message", "type", "param", "code" } }
+// with types server_error (500), invalid_request (400), not_found (404),
+// model_error (500), too_many_requests (429). These helpers produce that shape
+// for the /v1/responses route family only; createErrorResponse /
+// handleTargetApiError above stay Anthropic-shaped for /v1/messages.
+// ---------------------------------------------------------------------------
+
+/** Error carrying the Responses-spec envelope fields. */
+export class ResponsesApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number = 500,
+    public readonly type: string = 'server_error',
+    public readonly param: string | null = null,
+    public readonly code: string | null = null,
+  ) {
+    super(message);
+    this.name = 'ResponsesApiError';
+  }
+}
+
+/** Map an HTTP status onto the spec's error-type vocabulary. */
+export function responsesErrorTypeForStatus(status: number): string {
+  if (status === 404) return 'not_found';
+  if (status === 429) return 'too_many_requests';
+  if (status >= 400 && status < 500) return 'invalid_request';
+  return 'server_error';
+}
+
+/**
+ * Create a Responses-spec error response: {error: {message, type, param, code}}.
+ * Plain errors are classified like createErrorResponse does (transport errors
+ * get a sanitized message); ClaudeProxyError instances keep their status but
+ * are re-typed onto the spec vocabulary.
+ */
+export function createResponsesErrorResponse(
+  error: Error,
+  requestId?: string,
+): Response {
+  let status = 500;
+  let type = 'server_error';
+  let message = error.message;
+  let param: string | null = null;
+  let code: string | null = null;
+
+  if (error instanceof ResponsesApiError) {
+    status = error.status;
+    type = error.type;
+    param = error.param;
+    code = error.code;
+  } else if (error instanceof ClaudeProxyError) {
+    status = error.status;
+    type = responsesErrorTypeForStatus(status);
+  } else {
+    // Outer-catch path: classify transport failures so internal hostnames /
+    // ports in the raw message are never echoed to the client.
+    const classified = classifyTransportError(error);
+    if (classified) {
+      status = classified.status;
+      message = classified.message;
+    }
+    type = responsesErrorTypeForStatus(status);
+  }
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (requestId) headers['x-request-id'] = requestId;
+
+  return new Response(JSON.stringify({ error: { message, type, param, code } }), {
+    status,
+    headers,
+  });
+}
+
+/**
+ * Responses-spec mirror of handleTargetApiError: same message extraction and
+ * status preservation, but throws a ResponsesApiError typed with the spec
+ * vocabulary. Thrown errors reach the outer catch, which renders them through
+ * createResponsesErrorResponse for /v1/responses routes.
+ */
+export function handleResponsesApiError(
+  response: Response,
+  targetApiName: string,
+  requestInfo?: { url: string; status?: number; body?: string; upstreamBody?: string }
+): never {
+  const status = response.status;
+  const upstreamMessage = extractUpstreamMessage(requestInfo?.upstreamBody);
+
+  let errorMessage = upstreamMessage ?? `Target API (${targetApiName}) returned error: ${status}`;
+
+  if (status === 400 && !upstreamMessage) {
+    errorMessage = `Invalid request to ${targetApiName}`;
+    // Log the body server-side only; do NOT include it in the client-facing
+    // error message (it may contain user messages, PII, or tool arguments).
+    if (requestInfo) {
+      const logger = createLogger({});
+      if (requestInfo.url) {
+        logger.debug('errors', `Upstream 400 from ${targetApiName} [URL: ${requestInfo.url}]`);
+      }
+      if (requestInfo.body) {
+        const bodyPreview = requestInfo.body.length > 300
+          ? requestInfo.body.substring(0, 300) + '...'
+          : requestInfo.body;
+        logger.debug('errors', `Upstream 400 from ${targetApiName} [Body: ${bodyPreview}]`);
+      }
+    }
+  } else if (status === 401) {
+    errorMessage = upstreamMessage
+      ? `Upstream (${targetApiName}) rejected the API key: ${upstreamMessage}`
+      : `Upstream (${targetApiName}) rejected the API key (HTTP 401) — check the configured api_key for this route.`;
+  }
+
+  throw new ResponsesApiError(errorMessage, status, responsesErrorTypeForStatus(status));
+}
+
 /**
  * Validate required parameters
  */
