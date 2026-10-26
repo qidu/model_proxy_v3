@@ -229,7 +229,7 @@ export function createAgentTools(workDir: string, options?: AgentToolsOptions): 
       const fullPath = resolveInWorkDir(workDir, params.path);
       // Reads are confined to the same roots as writes. Without this the agent
       // could read anything the operator's account can (~/.ssh/id_rsa,
-      // ~/.aws/credentials, proxy_config.toml's default_api_key) — and because
+      // ~/.aws/credentials, proxy_config.toml's [models.default].api_key) — and because
       // this session's model provider is the proxy itself, whatever it reads is
       // sent upstream as conversation context.
       if (!isPathAllowed(workDir, fullPath)) {

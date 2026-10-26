@@ -44,13 +44,6 @@ A minimal `proxy_config.toml` looks like this (shipped as
 # record_server = "http://127.0.0.1:8080/model-usage"
 # record_response_body = false     # when true, each record also includes the constructed response body
 
-# Global upstream defaults — applied ONLY to models that are NOT claimed by
-# any `[models.*]` category section below. A model name that falls through
-# every section's exact / wildcard / catch-all lookup gets routed here.
-[default_upstream]
-default_base_url = "https://api.your-provider.com"
-# default_api_key = "your-key"   # used in config_key mode or as fallback for [models.FREE]
-
 # Claude models, spoken to in native Anthropic format
 [models.claude]
 upstream_mode = "anthropic-messages"
@@ -66,33 +59,71 @@ base_url = "https://generativelanguage.googleapis.com"
 api_key = "your-gemini-key"
 "gemini-*" = {}
 
-# Everything else goes here (OpenAI-compatible). Empty entry fields inherit
-# from the section, then from `[default_upstream]` defaults.
+# Everything else goes here (OpenAI-compatible). This section is also the global
+# default: empty entry fields inherit from their section, then from
+# `[models.default]`, and a model claimed by no other section is routed here.
+# There is no separate `[default_upstream]` section — it was removed, and a config
+# still carrying one is warned about at load time with its keys ignored.
 [models.default]
 upstream_mode = "openai-completions"
-base_url = "https://api.your-provider.com"   # section base_url overrides [default_upstream].default_base_url
+base_url = "https://api.your-provider.com"   # inherited by other sections' entries that set no base_url of their own
 "*" = {}                                     # final catch-all for this section
 "deepseek/deepseek-v3.2" = {}
 
-# /v1/embeddings — OpenAI-compatible. The proxy appends `v1/embeddings` to
-# `base_url`, so set the **API root** (e.g. `https://integrate.api.nvidia.com`,
-# NOT `…/v1`). When `api_key` is set, it always overrides any caller-supplied
+# /v1/embeddings — OpenAI-compatible by default. The proxy appends `v1/embeddings`
+# to `base_url`, so set the **API root** (e.g. `https://integrate.api.nvidia.com`,
+# NOT `…/v1`). `base_url` is **required** here and is not inherited from
+# `[models.default].base_url`: this route never resolves a model entry, so only the
+# section-level `base_url` is used and a missing one returns `500` without calling an
+# upstream. When `api_key` is set, it always overrides any caller-supplied
 # header on `/v1/embeddings` — see the "Who wins" tables in
 # ../reference/routing-and-aliases.md. Model entries are exact-match only; bare model names without
 # the upstream's required prefix (e.g. `nvidia/`) will fail at the upstream.
 [models.EMBEDDING]
-upstream_mode = "openai-completions"   # value is informational — the proxy hardcodes this for /v1/embeddings
+upstream_mode = "openai-completions"   # "ollama-embed" switches the upstream to Ollama's native /api/embed
 base_url = "https://integrate.api.nvidia.com"
 api_key = "nvapi-..."
 "nvidia/nemotron-3-embed-1b" = {}
 ```
+
+Unlike every other category, `[models.EMBEDDING].upstream_mode` selects the
+upstream's **wire shape**, not an inference request converter — the route is fixed,
+so there is no target list to pick a mode per target. Two values are accepted:
+
+| Value | Upstream call | Notes |
+| --- | --- | --- |
+| `openai-completions` (default) | `POST {base_url}/v1/embeddings` | Body and response are forwarded as-is. |
+| `ollama-embed` | `POST {base_url}/api/embed` | Both directions are converted by the proxy. |
+
+With `ollama-embed`:
+
+```toml
+[models.EMBEDDING]
+upstream_mode = "ollama-embed"
+base_url = "http://localhost:11434"   # Ollama root — the proxy appends `api/embed`
+"nomic-embed-text" = {}
+```
+
+- Set `base_url` to the Ollama **root**. A `base_url` already ending in `/v1` would
+  produce `/v1/api/embed`.
+- The request is reduced to what `/api/embed` accepts: `model`, `input`, and, when
+  present, `dimensions`, `truncate`, `keep_alive`, and `options`. `user` and
+  `encoding_format` are dropped.
+- `encoding_format: "base64"` is rejected with `400` — `/api/embed` returns float
+  arrays only, and returning floats to a caller that asked for base64 would be a
+  silent correctness bug.
+- `usage.prompt_tokens` / `total_tokens` come from Ollama's `prompt_eval_count`, as
+  they do on Ollama's own `/v1/embeddings`.
+- Anything else — including a typo such as `ollama-embedd` — logs a config warning
+  and falls back to `openai-completions`.
 
 Key ideas:
 
 - **Categories** group models by provider: `[models.claude]`, `[models.gemini]`,
   `[models.default]`, etc.
 - **`upstream_mode`** picks the protocol: `anthropic-messages`, `gemini-generatecontent`,
-  `gemini-interactions`, `openai-completions`, or `openai-responses`.
+  `gemini-interactions`, `openai-completions`, or `openai-responses`. In
+  `[models.EMBEDDING]` it instead picks the upstream wire shape — see the table above.
 - **Per-model overrides** use an inline table: `"my-model" = {target = "real-name", base_url = "...", api_key = "..."}`.
   Empty fields inherit from the category. Both the canonical keys (`upstream_mode`, `base_url`,
   `api_key`) and the short aliases (`mode`, `base`, `key`) are accepted; when both are present

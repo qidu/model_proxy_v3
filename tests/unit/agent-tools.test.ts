@@ -114,7 +114,7 @@ describe('read_file', () => {
 
   // read_file previously had no path check at all (write_file did), letting the
   // agent read ~/.ssh/id_rsa, ~/.aws/credentials, or proxy_config.toml's
-  // default_api_key — and since this session's provider is the proxy itself,
+  // [models.default].api_key — and since this session's provider is the proxy itself,
   // anything read is sent upstream as context.
   it('blocks reads outside workDir and outside /tmp/', async () => {
     const tools = createAgentTools(workDir);

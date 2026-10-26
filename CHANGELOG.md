@@ -5,6 +5,163 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### docs(config): purge the removed `[default_upstream]` / `[upstream]` `default_*` keys from live docs, and pin `defaultBaseUrl` to `[models.default].base_url`
+
+`docs/**`, `tests/**` comments, `CHANGELOG.md` — `[default_upstream]` was removed earlier
+(CHANGELOG:255, a breaking change), yet live documentation still presented
+`default_base_url` / `default_api_key` / `default_upstream_mode` as working config, and four
+`src/` strings still named them. Nothing in `src/` reads those keys, so every occurrence was
+stale. Cleaned up:
+
+- **`src/` user-visible strings and comments** — `handlers/dashboard.ts` warned about
+  `upstream.default_api_key`; `tui.ts`, `key-store.ts`, and `agent-tools.ts` comments named
+  `default_api_key` / `default_base_url`. The only remaining mention is the intentional
+  removal note at `utils/config-loader.ts:52`.
+- **`docs/reference/configuration-reference.md`** — the whole `[default_upstream]` field
+  section is replaced by "Global defaults — `[models.default]`", which states that the
+  section is removed, that an unrecognized header is warned about at load time with its keys
+  ignored, and that `[models.default]` is both the inheritance fallback and the Priority-3
+  routing stop.
+- **`docs/reference/routing-and-aliases.md`** — inheritance chains now read
+  `per-entry → section → [models.default]`, and both "Who wins" tables reference
+  `[models.default].api_key`.
+- **Templates** — `proxy_config.example.toml`, `proxy_config.minimal.toml`,
+  `configuration-guide.md`, and `README_DETAILS.md` drop their `[upstream]` /
+  `[default_upstream]` blocks and document `[models.default]` as the global default instead.
+  `proxy_config.toml_template` also had `[upstream]` holding `budget_to_effort_*` and
+  `global_token_limit`, which are `[general]` fields — the section header is corrected to
+  `[general]`, so those three settings actually load instead of being discarded with a
+  warning.
+- **Consul example** — `consul kv put model-proxy-v3/upstream/...` is corrected to
+  `general/...` and `models/default/...`; `consul-loader.ts` recognizes only `general`,
+  `defaults`, and `models`, so the old paths were silently dropped.
+- **`docs/architecture/auth-stats-protocol.md`** — the auth-target descriptor table's `mode`
+  row said its default came from `[default_upstream].upstream_mode`; it now names
+  `[models.default].upstream_mode`, matching `descriptorToRoute`
+  (`utils/target-retry.ts:244`), which layers `descriptor.mode` over
+  `getDefaultUpstreamConfig(proxyConfig)`.
+- **SSRF allowlist docs** — `api-endpoints.md`, `list_of_api_and_schema.md`,
+  `README_DETAILS.md`, and the header of `tests/integration/16_security/ssrf_dynamic_route.test.js`
+  now say the allowlist comes from `[models.*].base_url` (including `[models.default]`),
+  per-model `base_url` overrides, and `[models.passthrough]` target bases — matching
+  `getAllowedHostsFromConfig`.
+
+Also adds `describe('getDefaultUpstreamConfig on a loaded config')` to
+`tests/unit/config-loader.test.ts`, which loads real TOML through `loadProxyConfig` and
+asserts, for six config shapes, that `getDefaultUpstreamConfig(config).baseUrl` **strictly
+equals** `config.models.default.base_url` (including `undefined` when the section or its
+`base_url` is absent, and the verbatim `''` a section-level empty string produces — only a
+`primary` empty string is normalized to unset). A second test proves the removed
+`[default_upstream]` / `[upstream]` `default_*` keys resolve to
+`{openai-completions, undefined, undefined}`, create no model categories, and raise
+`unknown section header` warnings for both section names.
+
+### fix(embeddings): `[models.EMBEDDING].base_url` is required — `/v1/embeddings` no longer inherits `[models.default].base_url`
+
+`src/index.ts`, `tests/unit/index-routing.test.ts`, docs — `/v1/embeddings` is a fixed route:
+it forwards the caller's model id verbatim and never resolves a model entry, so the
+inheritance chain documented for the other categories never really applied to it. The
+category `base_url` used to fall back to the resolved default host
+(`getDefaultUpstreamConfig` → `[models.default].base_url`), which meant an embeddings request
+with no `[models.EMBEDDING].base_url` was silently sent to the inference provider. Embeddings
+usually live on a different host — a local Ollama, a dedicated embedding provider — so that
+fallback is gone:
+
+- `[models.EMBEDDING].base_url` (or `[models.embedding].base_url`) is now **required**. A
+  request without it throws before any upstream call and surfaces as `500` with
+  `/v1/embeddings requires [models.EMBEDDING].base_url (or [models.embedding].base_url): this
+  route does not inherit [models.default].base_url`. The previous `http://localhost` fallback
+  is gone with it — `buildUpstreamUrl('', 'v1/embeddings')` would have produced the
+  unparseable relative path `/v1/embeddings` anyway.
+- Per-entry `base_url` still has no effect on this route, as before.
+
+Only this route changed: model-route resolution in `resolveModelRouteFromEntry` still
+inherits `[models.default].base_url` and still falls through to `http://localhost`, and
+`api_key` inheritance is untouched — when `[models.EMBEDDING].api_key` is unset, the fixed
+route still applies `[models.default].api_key` for `config_key` passthrough. Making `base_url`
+EMBEDDING-specific while `api_key` stays inheritable means such a config can now send the
+default provider's key to an embeddings host; set `[models.EMBEDDING].api_key` alongside
+`base_url` if the hosts differ. That asymmetry predates this change (it applied whenever the
+category `base_url` was set explicitly) but is now reachable in every config that has an
+EMBEDDING section.
+
+Covered by three cases in `tests/unit/index-routing.test.ts`: routing to
+`[models.EMBEDDING].base_url` rather than `[models.default].base_url` when both are set; the
+`500` for a missing section `base_url` (section omitted, and section present without
+`base_url`) asserting the message and **zero** upstream calls in both configs; and
+`ollama-embed` posting to `{base_url}/api/embed` with both directions converted. Docs
+updated: `routing-and-aliases.md`, `configuration-reference.md`, `configuration-guide.md`,
+`README_DETAILS.md`, `README.md`, and the three config templates.
+
+### feat(embeddings): `upstream_mode = "ollama-embed"` fronts Ollama's native `POST /api/embed`
+
+`[models.EMBEDDING]` is the one category where `upstream_mode` picks the *upstream wire
+shape* rather than an inference request converter — `/v1/embeddings` is a fixed route, so
+there is no target list and no per-target mode. It now accepts two values instead of
+ignoring the field:
+
+- `openai-completions` (default) — posts to `{base_url}/v1/embeddings`, body and response
+  forwarded unchanged, exactly as before.
+- `ollama-embed` — posts to `{base_url}/api/embed` and converts both directions: the
+  request is reduced to `model` / `input` plus `dimensions`, `truncate`, `keep_alive`, and
+  `options` when present (`user` and `encoding_format` are dropped), and the response's
+  `embeddings` array is wrapped as `{object: "list", data: [{object: "embedding",
+  embedding, index}], model, usage}`, with `prompt_tokens` and `total_tokens` both taken
+  from Ollama's `prompt_eval_count` — the same accounting Ollama's own `/v1/embeddings`
+  uses. Set `base_url` to the Ollama root, since the proxy appends `api/embed`.
+
+Two failure modes are loud rather than silent. `encoding_format: "base64"` is rejected with
+`400` before any upstream call, because `/api/embed` returns float arrays only and handing
+floats to a caller that asked for base64 would be a silent correctness bug. A response
+whose `embeddings` is missing or not an array of arrays is a `502`, not a response shaped
+like a success. An unrecognized mode — a typo such as `ollama-embedd` — logs a
+`models.EMBEDDING.upstream_mode` config warning naming the accepted values and falls back
+to `openai-completions`; a warning rather than an error because the field was ignored here
+before, so existing configs may hold stale values.
+
+`EMBEDDING_UPSTREAM_MODES` is a new registry in `src/utils/upstream-modes.ts`, kept
+separate from `UPSTREAM_MODES` so these values never reach the retry ladder or the
+dashboard's target wizard. The dashboard's category `upstream_mode` select is now
+category-aware and preserves any value that is on neither list, so saving from the
+dashboard can no longer rewrite `ollama-embed` to the first option.
+
+Covered by ten new cases in `tests/unit/embeddings.test.ts` (request conversion, Ollama-native
+field forwarding, response conversion with the timing fields dropped, `usage` fallback when
+`prompt_eval_count` is absent, model echo and fallback, the base64 `400` with zero upstream
+calls, the three `502` shapes, an empty `embeddings` array as a successful empty result,
+non-OK forwarding, and that an absent or `openai-completions` mode leaves the body
+byte-identical) plus four `[models.EMBEDDING].upstream_mode` cases in
+`tests/unit/config-loader.test.ts` (both accepted values silent, the typo warning's exact
+message, and no false positive on other categories).
+
+### feat(decision): add the `ollama` backend for Ollama's `POST /v1/systemone`
+
+`[models.decision] backend = "ollama"` fronts Ollama's System One API — the base API
+the Clef schemas are a documented extension of — so `/decision` and `/v1/decision` can
+serve typed decisions from `nimble` / `tev` / `clef` / `clef:cloud` on a local Ollama
+server (v0.35.0+) or Ollama's cloud (`url = "http://localhost:11434/v1/systemone"`).
+The response envelope is byte-identical to Clef's, so nothing else changes.
+
+- **Images are converted, not rejected.** System One takes images as bare base64
+  strings and rejects data URLs and remote URLs, so the proxy rewrites the `images`
+  array on this backend only: `data:<mime>;base64,<bytes>` → `<bytes>`, and
+  `{content_type, base64}` → `base64` (dropping `content_type`, which has no System One
+  equivalent). A bare base64 string passes through untouched. This is the first backend
+  whose request body is not forwarded byte-for-byte; every other field keeps its value.
+- **Unconvertible images fail loud.** A `data:` URL with no base64 payload, an object
+  with no non-empty string `base64`, or a non-string/non-object entry is rejected with
+  `400` naming the offending index (`images[N]`) before any upstream call, rather than
+  being forwarded for the upstream to misread.
+- **No model aliasing.** `model` is still the upstream's business: a Clef-only name such
+  as `clef-flash` is passed through verbatim and rejected by Ollama. The timeout default
+  is the 30000ms shared by the non-laya backends; `timeout_ms` overrides it.
+
+Covered by nine new cases in `tests/unit/decision.test.ts` (data-URL stripping, object
+flattening, bare-base64 and field passthrough, the three 400 shapes, byte-for-byte
+forwarding when there are no images, the timeout default, and that other backends do
+not convert) plus a `[models.decision]` backend-enum case in
+`tests/unit/config-loader.test.ts`.
+
 ### feat(responses): allowed_tools enforcement, parameter forwarding, item lifecycle, logprobs (gap-review items 3, 8, 10, 12, 13)
 
 Resolves the remaining gap-review items on the `/v1/responses` converter paths (`openai-completions`, `anthropic-messages`, `gemini-*` upstreams):

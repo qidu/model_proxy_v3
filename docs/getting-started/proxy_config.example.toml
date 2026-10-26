@@ -68,19 +68,12 @@ week_start_day = "monday"
 # declaration from package.json; restore it before reinstalling).
 # store_key_in_system = true
 
-[default_upstream]
-# `default_base_url` is the *global* upstream endpoint applied **only** to models
-# that are NOT claimed by any `[models.*]` category section — i.e. a model name
-# that falls through every section's exact / wildcard / catch-all lookup gets
-# routed here. It is **NOT** a fallback chain link for any category. Every
-# `[models.*]` section must define its own `base_url` (section-level), or every
-# entry in that section must define its own per-entry `base_url`. A section that
-# does neither will fail to resolve at routing time rather than silently
-# inheriting from this global default.
-default_base_url = "https://api.qnaigc.com"
-# default_api_key = "sk-..."  # In user_key mode (default): fallback for [models.FREE] and models
-                               # with no configured key. In config_key mode: used for all models.
-                               # Typically left unset in production.
+# There is no `[default_upstream]` section — it has been removed, and a config
+# still carrying it (or any other unrecognized section) is warned about at load
+# time with its keys ignored. Global defaults live in `[models.default]` further
+# down: its `base_url` / `api_key` / `upstream_mode` fill in whatever a route's
+# own entry and section left unset, and it is the last routing stop, so a model
+# claimed by no other section is caught by its `*` wildcard.
 
 [models.claude]
 # For the `claude` model category:
@@ -239,10 +232,23 @@ deepseek-v4-pro = {base_url = "https://api.deepseek.com", api_key = "sk-66c13986
 
 [models.EMBEDDING]
 # For `EMBEDDING` models ONLY.
+# `base_url` is REQUIRED here: /v1/embeddings is a fixed route that never resolves a
+# model entry, so it does not fall back to `[models.default].base_url` (nor to
+# http://localhost). Without it the request returns 500 and no upstream is called.
+# Embeddings usually live on a different host than the inference models, which is
+# why this route does not inherit one.
 # If a configured `api_key` exists (section-level or per-entry), it takes
 # priority over the caller's auth key because there are not so many embedding existing.
 # So this priority order should be easier for users.
 # If no `api_key` is configured, the caller's auth key is passed through to the upstream unchanged.
+#
+# `upstream_mode` is the one place where this category differs from the others: it
+# selects the upstream's wire shape rather than an inference converter.
+#   "openai-completions" (default) -> POST {base_url}/v1/embeddings, body forwarded as-is
+#   "ollama-embed"                  -> POST {base_url}/api/embed, request and response converted
+# With "ollama-embed", set base_url to the Ollama root (e.g. "http://localhost:11434");
+# `encoding_format = "base64"` is rejected with 400 because /api/embed returns float
+# arrays only.
 upstream_mode = "openai-completions"
 base_url = "https://openrouter.ai/api"
 

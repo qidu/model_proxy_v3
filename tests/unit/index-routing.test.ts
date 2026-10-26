@@ -405,6 +405,116 @@ api_key = "upstream-key"
     }
   });
 
+  it('routes embeddings to [models.EMBEDDING].base_url, never to [models.default].base_url', async () => {
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[models.EMBEDDING]
+base_url = "https://embed.example"
+"nomic-embed-text" = {}
+`, 'utf8');
+    clearProxyConfigCache();
+    let seenUrl = '';
+    let seenBody = '';
+    const upstreamPayload = {
+      object: 'list',
+      data: [{ object: 'embedding', embedding: [0.1, 0.2], index: 0 }],
+      model: 'nomic-embed-text',
+      usage: { prompt_tokens: 3, total_tokens: 3 },
+    };
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      seenUrl = String(input);
+      seenBody = String(init?.body);
+      return new Response(JSON.stringify(upstreamPayload), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+    const payload = { model: 'nomic-embed-text', input: 'hello' };
+
+    const response = await handler.fetch(new Request('http://proxy/v1/embeddings', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), env());
+
+    assert.equal(response.status, 200);
+    assert.equal(seenUrl, 'https://embed.example/v1/embeddings');
+    assert.equal(seenBody, JSON.stringify(payload));
+    assert.deepEqual(await response.json(), upstreamPayload);
+  });
+
+  it('rejects /v1/embeddings when [models.EMBEDDING].base_url is absent', async () => {
+    // The default upstream is configured and reachable — the point is that it is
+    // NOT used as a fallback, so this must fail loudly and never call upstream.
+    for (const [label, embeddingSection] of [
+      ['section omitted', ''],
+      ['section without base_url', '[models.EMBEDDING]\n"nomic-embed-text" = {}\n'],
+    ] as const) {
+      writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+${embeddingSection}`, 'utf8');
+      clearProxyConfigCache();
+
+      const response = await handler.fetch(new Request('http://proxy/v1/embeddings', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'nomic-embed-text', input: 'hello' }),
+      }), env());
+
+      assert.equal(response.status, 500, label);
+      assert.equal(
+        ((await response.json()) as { error: { message: string } }).error.message,
+        '/v1/embeddings requires [models.EMBEDDING].base_url (or [models.embedding].base_url): this route does not inherit [models.default].base_url',
+        label,
+      );
+      assert.deepEqual(upstreamUrls, [], label);
+    }
+  });
+
+  it('posts to {base_url}/api/embed for upstream_mode "ollama-embed" and converts both directions', async () => {
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[models.EMBEDDING]
+upstream_mode = "ollama-embed"
+base_url = "http://localhost:11434"
+`, 'utf8');
+    clearProxyConfigCache();
+    let seenUrl = '';
+    let seenBody: Record<string, unknown> = {};
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      seenUrl = String(input);
+      seenBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        model: 'nomic-embed-text', embeddings: [[0.1, 0.2]], total_duration: 42, prompt_eval_count: 7,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const response = await handler.fetch(new Request('http://proxy/v1/embeddings', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'nomic-embed-text', input: 'hello', encoding_format: 'float', user: 'user-1' }),
+    }), env());
+
+    assert.equal(response.status, 200);
+    assert.equal(seenUrl, 'http://localhost:11434/api/embed');
+    assert.deepEqual(seenBody, { model: 'nomic-embed-text', input: 'hello' });
+    assert.deepEqual(await response.json(), {
+      object: 'list',
+      data: [{ object: 'embedding', embedding: [0.1, 0.2], index: 0 }],
+      model: 'nomic-embed-text',
+      usage: { prompt_tokens: 7, total_tokens: 7 },
+    });
+  });
+
   it('buffers streamed request bodies without a content-length before forwarding', async () => {
     const payload = { model: 'test', messages: [{ role: 'user', content: 'streamed body' }] };
     const encoded = new TextEncoder().encode(JSON.stringify(payload));

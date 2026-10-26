@@ -6,7 +6,8 @@
  * response { model, answers, usage }. The proxy is a pure pass-through — it
  * validates only the top-level envelope (per-question shapes belong to the
  * upstream) and forwards the body verbatim — so the tests below check the
- * envelope validation, the `images` gate that separates the two backends, that
+ * envelope validation, the `images` handling that separates the backends (the
+ * laya gate, the ollama base64 conversion, cloudflare's untouched forward), that
  * the body really is forwarded byte-for-byte, and that a bad upstream response
  * is reported as 502 rather than presented as a success.
  *
@@ -352,6 +353,150 @@ describe('decision: "clef" is an equivalent spelling of "cloudflare"', () => {
     }
 
     assert.deepEqual(spy.delays, [30000]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ollama backend — POST /v1/systemone
+// ---------------------------------------------------------------------------
+
+describe('decision: ollama backend image conversion', () => {
+  const dataUrl = 'data:image/png;base64,iVBORw0KGgo=';
+  const bare = 'iVBORw0KGgo=';
+
+  /** The `images` array as it actually reached the upstream. */
+  const sentImages = (call: FetchCall): unknown => (JSON.parse(call.rawBody) as { images: unknown }).images;
+
+  it('strips the data-URL prefix down to the bare base64 System One takes', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    const response = await handleDecisionRequest(
+      clefBody({ images: [dataUrl] }),
+      proxyConfig({ backend: 'ollama' }),
+      'req-1',
+      logger,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(sentImages(calls[0]), [bare]);
+  });
+
+  it('flattens a {content_type, base64} image to its base64', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    await handleDecisionRequest(
+      clefBody({ images: [{ content_type: 'image/jpeg', base64: '/9j/4AAQ' }] }),
+      proxyConfig({ backend: 'ollama' }),
+      'req-1',
+      logger,
+    );
+
+    assert.deepEqual(sentImages(calls[0]), ['/9j/4AAQ'], 'content_type has no System One equivalent and is dropped');
+  });
+
+  it('leaves bare base64 untouched and preserves every other request field', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    // The body is rebuilt on this path, so assert the other fields survive it
+    // with their values (not their byte layout) intact.
+    const questions = { keep: { type: 'noul', instructions: 'Is this tool relevant?' } };
+    await handleDecisionRequest(
+      clefBody({ images: [bare], model: 'clef:cloud', state: { a: [1, 2] }, questions }),
+      proxyConfig({ backend: 'ollama' }),
+      'req-1',
+      logger,
+    );
+
+    const sent = JSON.parse(calls[0].rawBody) as Record<string, unknown>;
+    assert.deepEqual(sent.images, [bare]);
+    assert.equal(sent.model, 'clef:cloud', 'the model id is not rewritten');
+    assert.deepEqual(sent.state, { a: [1, 2] });
+    assert.deepEqual(sent.questions, questions);
+    assert.deepEqual(Object.keys(sent).sort(), ['images', 'model', 'questions', 'state']);
+  });
+
+  it('rejects a data URL that carries no base64 payload with 400 and no upstream call', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    for (const bad of ['data:image/png,abc', 'data:image/png;base64,']) {
+      const response = await handleDecisionRequest(
+        clefBody({ images: [bad] }),
+        proxyConfig({ backend: 'ollama' }),
+        'req-1',
+        logger,
+      );
+      assert.equal(response.status, 400, `expected 400 for ${bad}`);
+      const body = await response.json() as { error: { message: string } };
+      assert.match(body.error.message, /images\[0\]/);
+      assert.match(body.error.message, /"ollama" backend/);
+    }
+    assert.equal(calls.length, 0, 'an unconvertible image must not reach the upstream');
+  });
+
+  it('rejects an image object with no usable base64, naming its index', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    const response = await handleDecisionRequest(
+      clefBody({ images: [bare, { content_type: 'image/png' }] }),
+      proxyConfig({ backend: 'ollama' }),
+      'req-1',
+      logger,
+    );
+
+    assert.equal(response.status, 400);
+    const body = await response.json() as { error: { message: string } };
+    assert.match(body.error.message, /images\[1\]/, 'the message points at the offending entry');
+    assert.equal(calls.length, 0);
+  });
+
+  it('rejects a non-string, non-object image entry', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    for (const bad of [7, null, ['iVBORw0KGgo=']]) {
+      const response = await handleDecisionRequest(
+        clefBody({ images: [bad] }),
+        proxyConfig({ backend: 'ollama' }),
+        'req-1',
+        logger,
+      );
+      assert.equal(response.status, 400, `expected 400 for images=[${JSON.stringify(bad)}]`);
+    }
+    assert.equal(calls.length, 0);
+  });
+
+  it('forwards byte-for-byte when there are no images', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    const bodyText = '{\n  "questions": {"a": {"type": "noul", "instructions": "i"}},\n  "state": "s",\n  "model": "nimble"\n}';
+    await handleDecisionRequest(bodyText, proxyConfig({ backend: 'ollama' }), 'req-1', logger);
+
+    assert.equal(calls[0].rawBody, bodyText, 'the ollama path only rewrites the body when it has images to convert');
+  });
+
+  it('forwards an empty images array byte-for-byte', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    const bodyText = clefBody({ images: [] });
+    await handleDecisionRequest(bodyText, proxyConfig({ backend: 'ollama' }), 'req-1', logger);
+
+    assert.equal(calls[0].rawBody, bodyText);
+  });
+
+  it('uses the 30000ms timeout default shared with cloudflare', async () => {
+    stubFetch(() => upstreamJson(clefAnswer()));
+    const spy = spyAbortSignalTimeout();
+    try {
+      await handleDecisionRequest(clefBody(), proxyConfig({ backend: 'ollama' }), 'req-1', logger);
+    } finally {
+      spy.restore();
+    }
+
+    assert.deepEqual(spy.delays, [30000]);
+  });
+
+  it('does not convert images on the non-ollama backends', async () => {
+    const calls = stubFetch(() => upstreamJson(clefAnswer()));
+    await handleDecisionRequest(
+      clefBody({ images: [dataUrl] }),
+      proxyConfig({ backend: 'cloudflare' }),
+      'req-1',
+      logger,
+    );
+
+    assert.deepEqual(sentImages(calls[0]), [dataUrl], 'the data URL reaches Cloudflare intact');
   });
 });
 

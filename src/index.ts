@@ -44,6 +44,7 @@ import {
 import { loadProxyConfig, clearProxyConfigCache, dumpProxyConfigToml, getConfiguredModelIds, getModelRouteConfig, getCompositeRouteCandidates, getCompositeAliasMode, resolveFusionPlan, resolveCoordinatorPlan, FusionPlan, ModelRouteConfig, ProxyConfig, CompositeRouteCandidate, CompositeTargetConfig, parseHumanTokenLimit, getAllowedHostsFromConfig, resolveScheduleTarget, getDefaultUpstreamConfig, resolveCompositeWithDecision, DecisionRequestContext } from './utils/config-loader.js';
 import { parseAuthTargets, hasRequiredProtocolVersion, validateDescriptorEntries, dedupeAndCap, descriptorToRoute, outcomeFromResponse, outcomeFromError, isRetryableOutcome, DEFAULT_MAX_TARGETS, DEFAULT_MAX_TARGET_RETRIES, RemoteTargetDescriptor, AttemptOutcome } from './utils/target-retry.js';
 import { detectCoordinatorStage } from './utils/coordinator.js';
+import { type EmbeddingUpstreamMode } from './utils/upstream-modes.js';
 import {
   extractToolNamesFromBody,
   extractToolRequestCharLengthsFromBody,
@@ -659,12 +660,29 @@ function parseFixedRoute(path: string, proxyConfig: ProxyConfig, env: Env): {
   if (path === '/v1/embeddings' || path.startsWith('/v1/embeddings?')) {
     const embeddingCategory = proxyConfig.models?.EMBEDDING ?? proxyConfig.models?.embedding;
     const embeddingConfig = embeddingCategory && !Array.isArray(embeddingCategory) ? embeddingCategory : undefined;
-    const embeddingBaseUrl = embeddingConfig?.base_url || defaultBaseUrl;
+    // Unlike the other fixed routes this one does NOT fall back to
+    // [models.default].base_url: embeddings usually live on a different host
+    // (e.g. a local Ollama), so inheriting the default inference host would
+    // silently send them somewhere unrelated. Per-entry base_urls do not apply
+    // either — this route forwards the caller's model id verbatim and never
+    // resolves a model entry — so the category-level base_url is required.
+    const embeddingBaseUrl = embeddingConfig?.base_url;
+    if (!embeddingBaseUrl) {
+      throw new Error(
+        '/v1/embeddings requires [models.EMBEDDING].base_url (or [models.embedding].base_url): this route does not inherit [models.default].base_url',
+      );
+    }
+    // Unlike the inference categories, `upstream_mode` here picks the upstream's
+    // wire shape rather than a request converter (see EMBEDDING_UPSTREAM_MODES):
+    // "ollama-embed" targets Ollama's native POST /api/embed and the handler
+    // converts both directions.
+    const embeddingMode: EmbeddingUpstreamMode =
+      embeddingConfig?.upstream_mode === 'ollama-embed' ? 'ollama-embed' : 'openai-completions';
     return {
-      targetUrl: buildUpstreamUrl(embeddingBaseUrl || '', 'v1/embeddings'),
+      targetUrl: buildUpstreamUrl(embeddingBaseUrl, embeddingMode === 'ollama-embed' ? 'api/embed' : 'v1/embeddings'),
       targetEndpoint: 'v1/embeddings',
       handlerType: 'embeddings',
-      upstreamMode: 'openai-completions',
+      upstreamMode: embeddingMode,
     };
   }
 
@@ -2392,7 +2410,7 @@ export default {
             break;
 
           case 'embeddings':
-            response = await handleEmbeddingsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env);
+            response = await handleEmbeddingsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env, attemptUpstreamMode);
             break;
 
           default:

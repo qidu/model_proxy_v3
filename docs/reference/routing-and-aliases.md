@@ -49,24 +49,38 @@ resolved against the configured sections in three priority levels (highest first
 Each model entry is an inline table `{target, base_url, api_key}`. Resolution walks an
 inheritance chain — anything left empty falls back to the level above:
 
-- **`base_url`**: per-entry override → section `base_url` → `[default_upstream] default_base_url`
+- **`base_url`**: per-entry override → section `base_url` → `[models.default].base_url`
   → `http://localhost`.
-- **Configured `api_key`**: per-entry override → section `api_key` → `[default_upstream] default_api_key`.
+- **Configured `api_key`**: per-entry override → section `api_key` → `[models.default].api_key`.
   This only resolves the configured fallback key; runtime caller-vs-config priority is section-specific below.
-- **`upstream_mode`**: per-entry `mode` → section `upstream_mode` → `[default_upstream] upstream_mode`
+- **`upstream_mode`**: per-entry `mode` → section `upstream_mode` → `[models.default].upstream_mode`
   → `"openai-completions"`.
 - The target-only form (`opus48 = {target = "..."}`) inherits `base_url` from the section,
-  then `[default_upstream] default_base_url`; `api_key` may be inherited from the section or
-  `[default_upstream] default_api_key`, or supplied by the caller for non-`free` sections.
+  then `[models.default].base_url`; `api_key` may be inherited from the section or
+  `[models.default].api_key`, or supplied by the caller for non-`free` sections.
+
+> **Exception — `[models.EMBEDDING].base_url` is required and is never inherited.** `/v1/embeddings`
+> is a fixed route: it forwards the caller's model id verbatim and never resolves a model entry,
+> so the chain above does not apply to it. Only the **section-level** `base_url` is used — a
+> per-entry `base_url` has no effect, and there is no fallback to the resolved default host
+> (`[models.default].base_url`) or `http://localhost`. Embeddings usually live on a different host
+> than the inference models, so inheriting the default host would silently send them somewhere
+> unrelated. A `/v1/embeddings` request with no section `base_url` fails with `500` and no upstream
+> call is made.
 
 > **Section-level keys take only the long names.** A `[models.<category>]` section accepts
 > `upstream_mode` / `base_url` / `api_key`. The short aliases (`mode` / `url` / `key`) belong
 > to inline entries and to `[models.passthrough]` targets; at section level they are reported as a
 > config error (shown in the TUI/dashboard status) and are not applied.
 
-> **What `[default_upstream] default_base_url` is for:** it is the global upstream endpoint used
-> when no per-entry or section `base_url` is configured, including models that fall through
-> every section's exact / wildcard / catch-all lookup.
+> **What `[models.default]` is for:** it serves two roles, and both come from the same
+> section fields. As the **inheritance fallback**, its `base_url` / `api_key` / `upstream_mode`
+> fill in whatever a route's own entry and section left unset. As the **last routing stop**,
+> it is consulted last (Priority 3): any model that falls through every other section's exact
+> and wildcard lookup is claimed by its wildcards and its `*` catch-all, which is why an
+> unclaimed model still reaches an upstream instead of failing to route. There is no separate
+> defaults section — `[default_upstream]` is removed, and a config still carrying it is warned
+> about at load time with its keys ignored.
 
 > **`base_url` may include the full endpoint path.** If `base_url` already contains a known
 > full upstream endpoint path, the proxy uses it as-is instead of appending the endpoint
@@ -88,7 +102,7 @@ inheritance chain — anything left empty falls back to the level above:
 | Section | Caller's auth header | Configured `api_key` |
 |:--------|:---------------------|:---------------------|
 | `[models.FREE]` | **Ignored** | Section/per-entry key **always wins** — the proxy authenticates upstream on the caller's behalf (this is what makes the FREE tier work). |
-| `[models.default]` | **Wins** | Used only when the caller sends no key. May come from the entry, section, or `[default_upstream] default_api_key`. |
+| `[models.default]` | **Wins** | Used only when the caller sends no key. May come from the entry, section, or `[models.default].api_key`. |
 | `[models.claude]`, `[models.gemini]` | **Wins** | Caller's key passes through; configured keys are not used. |
 | `[models.EMBEDDING]` | **Overridden for embeddings** | Section `api_key` wins for `/v1/embeddings` requests when configured. |
 
@@ -97,8 +111,8 @@ inheritance chain — anything left empty falls back to the level above:
 | Section | Caller's auth header | Configured `api_key` |
 |:--------|:---------------------|:---------------------|
 | `[models.FREE]` | **Ignored** | Section/per-entry key always wins (unchanged). |
-| `[models.default]`, `[models.claude]`, `[models.gemini]`, etc. | **Replaced** | Configured key **always wins** — per-entry → section → `[default_upstream] default_api_key`. |
-| Models hitting `[default_upstream]` (no section match) | **Replaced** | `[default_upstream] default_api_key` is used if set. |
+| `[models.default]`, `[models.claude]`, `[models.gemini]`, etc. | **Replaced** | Configured key **always wins** — per-entry → section → `[models.default].api_key`. |
+| Models hitting `[models.default]` (no section match) | **Replaced** | `[models.default].api_key` is used if set. |
 | `[models.EMBEDDING]` | **Overridden for embeddings** | Section `api_key` wins for `/v1/embeddings` requests when configured. |
 
 > **Why `[models.EMBEDDING].api_key` always wins** — the fixed-route branch in
@@ -392,7 +406,7 @@ Direct routing to an upstream. Three lookup modes, tried in priority order:
   that wasn't claimed by an earlier mode, preserving the original model name.
 
 Each entry picks its `upstream_mode` / `base_url` / `api_key` from an inheritance
-chain (per-entry → section → `[default_upstream]` defaults). Custom/target models are the
+chain (per-entry → section → `[models.default]`). Custom/target models are the
 *only* level that actually talks to an upstream — Levels 2 and 3 must always
 resolve down to a Level-1 entry before a single byte is sent.
 

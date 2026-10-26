@@ -79,10 +79,12 @@ PROXY_CONFIG_PATH = "./proxy_config.toml"
 
 #### Model Configuration (`proxy_config.toml`):
 ```toml
-[upstream]
+# Global defaults live on the ordinary category section `[models.default]`
+# (there is no `[default_upstream]` / `[upstream]` defaults section).
+[models.default]
 upstream_mode = "openai-completions"
-default_base_url = "https://api.qnaigc.com"
-default_api_key = "your-api-key"
+base_url = "https://api.qnaigc.com"
+api_key = "your-api-key"
 
 # Claude models with native API
 [models.claude]
@@ -319,10 +321,11 @@ PROXY_CONFIG_CONSUL = "http://localhost:8500"
 Put config into Consul KV using the `model-proxy-v3/` prefix:
 
 ```bash
-consul kv put model-proxy-v3/upstream/default_base_url "https://api.qnaigc.com"
-consul kv put model-proxy-v3/upstream/budget_to_effort_low "8000"
-consul kv put model-proxy-v3/upstream/budget_to_effort_medium "20000"
-consul kv put model-proxy-v3/upstream/budget_to_effort_high "0"
+consul kv put model-proxy-v3/general/budget_to_effort_low "8000"
+consul kv put model-proxy-v3/general/budget_to_effort_medium "20000"
+consul kv put model-proxy-v3/general/budget_to_effort_high "0"
+
+consul kv put model-proxy-v3/models/default/base_url "https://api.qnaigc.com"
 
 consul kv put model-proxy-v3/models/claude/upstream_mode "anthropic-messages"
 consul kv put model-proxy-v3/models/claude/base_url "http://localhost:4000"
@@ -550,7 +553,7 @@ What is **bypassed**:
 What **applies** for routing:
 - **Per-model routing** — `[models.*]` category lookup runs. Per-model `base_url`, `api_key`, and `upstream_mode` overrides apply; the correct upstream is selected based on the model in the request body.
 - **Composite/alias resolution** — composite aliases (e.g. `for-claw`) and `target`-mapped entries (e.g. `minimax-m3` → `MiniMax-M3`) are resolved. The `model` field in the forwarded body is rewritten to the resolved target model id. If no alias resolves, the original model name is forwarded unchanged.
-- **Falls back** to `parseFixedRoute` / `[upstream] default_base_url` only when no per-model route is found.
+- **Falls back** to `parseFixedRoute` / `[models.default].base_url` only when no per-model route is found.
 
 What still **applies**: request validation (openai-completions schema), privacy-filter / Kompress
 / blocked-tool erasure, upstream auth-header transformation, and dashboard stats.
@@ -1022,7 +1025,9 @@ POST /v1/messages/count_tokens
 
 **Endpoint**: `POST /v1/embeddings`
 
-Generate vector embeddings for text input. Proxied to the upstream OpenAI-compatible API (`{defaultBaseUrl}/v1/embeddings`). The `provider` field is stripped from the upstream response.
+Generate vector embeddings for text input. Proxied to the upstream OpenAI-compatible API (`{models.EMBEDDING.base_url}/v1/embeddings`). The `provider` field is stripped from the upstream response. `[models.EMBEDDING].base_url` is **required** — this route never falls back to `[models.default].base_url`, so a request without it returns `500` and no upstream call is made.
+
+Set `[models.EMBEDDING].upstream_mode = "ollama-embed"` to target Ollama's native `POST /api/embed` instead: the proxy converts the request (keeping `model`, `input`, `dimensions`, `truncate`, `keep_alive`, `options`) and the response (Ollama's `embeddings` array becomes an OpenAI `data` list, with `usage` taken from `prompt_eval_count`). `encoding_format = "base64"` is rejected with `400` on that mode.
 
 **Example Request**:
 ```bash
@@ -1194,7 +1199,7 @@ UPSTREAM_BODY_TIMEOUT_MS = "600000"
 # ⚠️ DYNAMIC ROUTES ONLY: `isHostAllowed()` (src/utils/routing.ts) is invoked from
 # src/index.ts when a request hits a `/https/{host}/...` dynamic-route path; the
 # parsed host is matched against `getAllowedHostsFromConfig(proxyConfig)`
-# (hosts derived from `[upstream].default_base_url`, every `[models.*].base_url`,
+# (hosts derived from every `[models.*].base_url`,
 # and per-model array overrides in proxy_config.toml), with `ALLOWED_HOSTS` here
 # serving as an additional fallback list. Wildcards are supported (e.g.,
 # `*.example.com` — note the literal `.` separator; the apex `example.com` does
@@ -1557,26 +1562,21 @@ For models without specific configuration, use this minimal setup:
 
 ```toml
 # proxy_config.toml
-[upstream]
-default_base_url = "https://api.qnaigc.com"
-default_api_key = "sk-..."
-upstream_mode = "openai-completions"
-
 [models.default]
 upstream_mode = "openai-completions"
+base_url = "https://api.qnaigc.com"
+api_key = "sk-..."
 ```
 
-All unconfigured models will automatically use these defaults. No need to list every model explicitly.
+All unconfigured models will automatically use these defaults — `[models.default]` is the
+last routing stop (Priority 3), so any model claimed by no other section lands here. No need
+to list every model explicitly. There is no `[default_upstream]` / `[upstream]` section: a
+config still carrying one is warned about at load time with its keys ignored.
 
 #### Full Configuration Example
 
 ```toml
 # proxy_config.toml
-[upstream]
-upstream_mode = "openai-completions"
-default_base_url = "https://api.qnaigc.com"
-default_api_key = "sk-your-api-key"
-
 [models.gemini]
 upstream_mode = "gemini-generatecontent"
 base_url = "https://api.example.com"
@@ -1591,6 +1591,8 @@ api_key = "sk-claude-key"
 
 [models.default]
 upstream_mode = "openai-completions"
+base_url = "https://api.qnaigc.com"
+api_key = "sk-your-api-key"
 "deepseek/deepseek-v3.2" = {}
 ```
 
@@ -1633,11 +1635,6 @@ Model lookup follows three priority levels (highest first):
 #### Full Configuration Example with Wildcards
 
 ```toml
-[upstream]
-default_base_url = "https://api.qnaigc.com"
-default_api_key = "sk-..."
-upstream_mode = "openai-completions"
-
 [models.claude]
 upstream_mode = "anthropic-messages"
 base_url = "https://api.anthropic.com"

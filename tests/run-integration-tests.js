@@ -15,7 +15,7 @@ import { suites } from './integration/suites.js';
 //                    ./proxy_config.toml (see src/server.ts).
 // API_KEY=xxx      — bearer token the test runner uses to talk to the
 //                    proxy (matches the API_KEY the proxy is started with,
-//                    typically the one configured at `default_base_url`).
+//                    typically the one configured at `[models.default].base_url`).
 // These three are ALWAYS required when running tests in tests/integration/.
 // PROXY_URL / TEST_TIMEOUT have sensible defaults below.
 // -------------------------------------------------------------------
@@ -23,7 +23,7 @@ import { suites } from './integration/suites.js';
 // Start testing proxy server WITH PORT=7777
 // NEVER use 'pkill', use 'lsof -ni :7777' alternatively to find the process id (pid), then use 'kill -p ${pid}`
 const PROXY_URL = process.env.PROXY_URL || 'http://localhost:7777';
-const API_KEY = process.env.API_KEY || 'sk-***13145'; // set a testing api_key for models at `default_base_url`
+const API_KEY = process.env.API_KEY || 'sk-***13145'; // set a testing api_key for models at `[models.default].base_url`
 const TEST_TIMEOUT = process.env.TEST_TIMEOUT || '30000';
 
 // TEST_CONFIG is the prefix for the isolated test config file.

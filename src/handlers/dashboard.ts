@@ -54,7 +54,7 @@ import {
   getPrivacyKeysDetected,
 } from '../utils/dashboard-stats.js';
 import { formatApiKeyForUpstream } from '../utils/routing.js';
-import { UPSTREAM_MODES } from '../utils/upstream-modes.js';
+import { UPSTREAM_MODES, EMBEDDING_UPSTREAM_MODES } from '../utils/upstream-modes.js';
 import { getModelQuota, formatQuotaLeft, getUpstreamRateLimitLeft, getUpstreamRateLimitLeftForUrl, type QuotaResult } from '../utils/provider-quota.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -2172,8 +2172,14 @@ export function handleDashboardPage(env: Env): Response {
 
       function upstreamModeSelect(categoryName, currentMode) {
         const disabledAttr = isReadOnly ? ' disabled' : '';
-        const options = ${JSON.stringify(UPSTREAM_MODES)};
-        const optionHtml = options.map((mode) => {
+        // [models.EMBEDDING] selects the embeddings wire shape rather than an
+        // inference converter, so it offers EMBEDDING_UPSTREAM_MODES. The value
+        // is kept as an extra option when it is on neither list, so a save from
+        // this form cannot silently rewrite it to the first option.
+        const isEmbedding = categoryName === 'EMBEDDING' || categoryName === 'embedding';
+        const options = isEmbedding ? ${JSON.stringify(EMBEDDING_UPSTREAM_MODES)} : ${JSON.stringify(UPSTREAM_MODES)};
+        const choices = currentMode === '' || options.indexOf(currentMode) !== -1 ? options : options.concat([currentMode]);
+        const optionHtml = choices.map((mode) => {
           const selected = mode === currentMode ? ' selected' : '';
           return '<option value="' + escapeHtml(mode) + '"' + selected + '>' + escapeHtml(mode) + '</option>';
         }).join('');
@@ -3867,7 +3873,7 @@ export async function handleDashboardTestModel(
       // call will then fail with its own 401, which is a clearer signal than
       // a generic local 401.
       Object.assign(authHeaders, formatApiKeyForUpstream('unconfigured-test-key', upstreamMode));
-      console.warn(`[dashboard-test-model] No API key configured for "${modelId}" or upstream.default_api_key; using placeholder.`);
+      console.warn(`[dashboard-test-model] No API key configured for "${modelId}" or [models.default].api_key; using placeholder.`);
     }
 
     // Debug log test request/response to /tmp/test_model.log (LOG_LEVEL=debug)

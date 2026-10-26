@@ -2719,7 +2719,7 @@ class DashboardApp {
     //   anthropic-messages  -> x-api-key: <key>
     //   openai-completions  -> Authorization: Bearer <key>
     //   gemini-*            -> x-goog-api-key: <key>
-    // For composite aliases we fall back to the proxy-wide default_api_key
+    // For composite aliases we fall back to [models.default].api_key
     // (read from the unsanitized config).
     const defaultCategory = this.proxyConfig?.models?.default;
 const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;

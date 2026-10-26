@@ -16,13 +16,6 @@
 # record_server = "http://127.0.0.1:8080/model-usage"
 # record_response_body = false     # when true, each record also includes the constructed response body
 
-# Global upstream defaults — applied ONLY to models that are NOT claimed by
-# any `[models.*]` category section below. A model name that falls through
-# every section's exact / wildcard / catch-all lookup gets routed here.
-[default_upstream]
-default_base_url = "https://api.your-provider.com"
-# default_api_key = "your-key"   # used in config_key mode or as fallback for [models.FREE]
-
 # Claude models, spoken to in native Anthropic format
 [models.claude]
 upstream_mode = "anthropic-messages"
@@ -38,22 +31,27 @@ base_url = "https://generativelanguage.googleapis.com"
 api_key = "your-gemini-key"
 "gemini-*" = {}
 
-# Everything else goes here (OpenAI-compatible). Empty entry fields inherit
-# from the section, then from `[default_upstream]` defaults.
+# Everything else goes here (OpenAI-compatible). This section is also the global
+# default: empty entry fields inherit from their section, then from
+# `[models.default]`, and a model claimed by no other section is routed here.
+# There is no separate `[default_upstream]` section — it was removed, and a config
+# still carrying one is warned about at load time with its keys ignored.
 [models.default]
 upstream_mode = "openai-completions"
-base_url = "https://api.your-provider.com"   # section base_url overrides [default_upstream].default_base_url
+base_url = "https://api.your-provider.com"   # inherited by other sections' entries that set no base_url of their own
 "*" = {}                                     # final catch-all for this section
 "deepseek/deepseek-v3.2" = {}
 
 # /v1/embeddings — OpenAI-compatible. The proxy appends `v1/embeddings` to
 # `base_url`, so set the **API root** (e.g. `https://integrate.api.nvidia.com`,
-# NOT `…/v1`). When `api_key` is set, it always overrides any caller-supplied
+# NOT `…/v1`). `base_url` is **required** here: this fixed route does not inherit
+# `[models.default].base_url`, and without a section `base_url` the request returns
+# `500` with no upstream call. When `api_key` is set, it always overrides any caller-supplied
 # header on `/v1/embeddings` — see the "Who wins" tables in
 # docs/routing-and-aliases.md. Model entries are exact-match only; bare model names without
 # the upstream's required prefix (e.g. `nvidia/`) will fail at the upstream.
 [models.EMBEDDING]
-upstream_mode = "openai-completions"   # value is informational — the proxy hardcodes this for /v1/embeddings
+upstream_mode = "openai-completions"   # "ollama-embed" targets Ollama's native POST /api/embed instead
 base_url = "https://integrate.api.nvidia.com"
 api_key = "nvapi-..."
 "nvidia/nemotron-3-embed-1b" = {}

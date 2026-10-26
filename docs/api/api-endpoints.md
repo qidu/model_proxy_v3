@@ -23,7 +23,8 @@ optional model id, and the trailing Claude-style endpoint (`v1/messages`, `v1/mo
   upstream URL verbatim, and auth headers (`Authorization` / `x-api-key` / `x-goog-api-key`) are
   forwarded as-is from the caller. The proxy does **not** perform a local credential check.
 - **SSRF guard.** The parsed host is checked against `ALLOWED_HOSTS` (env, default
-  `127.0.0.1,localhost`) plus any host derived from `[models.*]` / `[default_upstream]` config
+  `127.0.0.1,localhost`) plus any host derived from `[models.*]` (including
+  `[models.default]`) and `[models.passthrough]` config
   (`getAllowedHostsFromConfig`). Requests for hosts outside that allowlist are rejected with `403`.
 - **Use case.** Lets a single proxy instance fan out to many config-approved upstreams without a
   `[models.*]` entry per target — useful for ad-hoc probing during development.

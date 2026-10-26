@@ -109,7 +109,7 @@ interface KeySlot {
  * Enumerate every api_key slot relevant for keychain storage:
  * - category-level `api_key` → account `<category>/<category base_url>`
  * - entry-level `api_key` (index 2) → account `<target>/<entry or category base_url>`
- * - `[models.default].api_key` → account `default/<default_base_url>`
+ * - `[models.default].api_key` → account `default/<category base_url>`
  * - `[models.passthrough].<name>.key` → account `passthrough.<name>/<base>`
  */
 function collectKeySlots(config: ProxyConfig): KeySlot[] {

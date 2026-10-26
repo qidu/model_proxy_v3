@@ -142,7 +142,7 @@ full wire-level contract.
   - `/v1/interactions` — Gemini Interactions API
   - `/v1/responses` — OpenAI Responses API
   - `/v1/chat/completions` — OpenAI Chat Completions API (always enabled; per-model routed passthrough)
-- **Embeddings** — `/v1/embeddings` proxied to an OpenAI-compatible upstream.
+- **Embeddings** — `/v1/embeddings` proxied to an OpenAI-compatible upstream, or to Ollama's native `/api/embed` via `upstream_mode = "ollama-embed"`.
 - **Model-based routing** — route each model name to its own upstream URL, API key,
   and protocol via a simple TOML config. Exact model keys are supported in every
   `[models.*]` category; provider wildcards (`claude-*`) and the final catch-all
@@ -363,14 +363,14 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /v1/responses/{id}`, `GET /v1/responses/{id}/input_items` | Retrieve a stored response (or its input items) from the in-process conversation store. Only available when `CONVERSATION_STATE` is enabled; unknown, expired, or `store: false` ids return 404. |
 | `POST /v1beta/models/{model}:generateContent` | Gemini content (also `:streamGenerateContent`, `:countTokens`) |
 | `POST /v1/interactions` | Gemini Interactions API |
-| `POST /v1/embeddings` | Embeddings (proxied to an OpenAI-compatible upstream) |
+| `POST /v1/embeddings` | Embeddings (proxied to an OpenAI-compatible upstream, or Ollama's native `/api/embed`) |
 | `GET /v1/models` | List available models (no auth required) |
 | `GET /dashboard` | Web dashboard for config + stats |
 | `GET /dashboard/api/quota?model=<id>` | Remaining usage/credits for a model's route (minimax, deepseek, kimi, openrouter, zhipu, qnaigc coding plans; provider detected from the route host). `?base_url=<origin>` variant serves the web dashboard's per-URL "Usage Left" column, falling back to the recorded anthropic 5h percent. Dashboard `api_key` auth. |
 | `GET /config-reload` | Reload config from `PROXY_CONFIG_CONSUL` or `PROXY_CONFIG_APOLLO`. Only meaningful when a remote config source is set; returns `400`/`500` otherwise. Clears the config cache and re-fetches. |
 | `GET /health` (also `GET /`) | Health check. Probes the resolved `[models.default]` upstream `/v1/models`; returns `{status:"ok", models, cached, version}` on success or `404` when no models are reachable. No auth required. |
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
-| `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar or Cloudflare Clef). See [Decision endpoint](#decision-endpoint-post-decision). |
+| `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar, Cloudflare Clef, or Ollama's System One API). See [Decision endpoint](#decision-endpoint-post-decision). |
 | `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
 | `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[models.passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
 
@@ -393,13 +393,14 @@ The mode is selected by the route's `defaultMode` / model config:
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | **Indirect transform via `openai-completions`**: generateContent → Chat Completions → Claude Messages → generateContent. Forwards upstream to `/v1/messages`; text, tool calls, and streaming text deltas return as Gemini `candidates[].content.parts`; tool calls become `functionCall` parts. | **Direct transform**: generateContent → Chat Completions → generateContent. Forwards upstream to `/v1/chat/completions`. | **Indirect transform via `openai-completions`**: generateContent → Chat Completions → Responses `input` → generateContent. Forwards upstream to `/v1/responses`; `system`/`developer` messages become Responses `instructions`; content-part arrays are normalized to text. | **Native passthrough** to `:generateContent` / `:streamGenerateContent` using the configured Gemini API version. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint using Interactions-compatible mode. |
 | `POST /v1/interactions` | **Indirect transform via `openai-completions`**: Interactions → Chat Completions → Claude Messages → Interactions. Forwards upstream to `/v1/messages`; text, tool calls, and streaming text deltas return in Interactions shape. | **Direct transform**: Interactions → Chat Completions → Interactions. Forwards upstream to `/v1/chat/completions`. | **Indirect transform via `openai-completions`**: Interactions → Chat Completions → Responses `input` → Interactions. Forwards upstream to `/v1/responses`; `system`/`developer` messages become Responses `instructions`; content-part arrays are normalized to text. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint. | **Native Gemini-family route**; forwards to Gemini generateContent/stream endpoint using Interactions-compatible mode. |
 | `GET /v1/models` | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. | Passthrough model listing; no `upstreamMode` conversion is applied. |
-| `POST /v1/embeddings` | Not supported. | **Only supported mode**; forwards to OpenAI-compatible embeddings upstream. | Not supported. | Not supported. | Not supported. |
+| `POST /v1/embeddings` | Not supported. | **Default embedding mode**; forwards to `{base_url}/v1/embeddings` with the body unchanged. | Not supported. | Not supported. | Not supported. |
 
 Notes:
 - **Native passthrough** means the client endpoint and upstream API family already match, so the request body is not converted to another provider's format.
 - **Direct transform** means the proxy converts directly between the client endpoint format and the selected upstream family, then converts the response directly back to the client endpoint shape.
 - **Direct transform via Claude Messages** means Responses uses Claude Messages as its internal bridge before calling Gemini; it does not go through `openai-completions`.
 - **Indirect transform via `openai-completions`** means the request body is routed through OpenAI Chat Completions as an intermediate shape before reaching the target upstream family. This covers two cases: (a) Gemini endpoint input becomes Chat Completions, then becomes Claude Messages or OpenAI Responses; (b) `/v1/messages` routed to an `openai-responses` upstream becomes Chat Completions, then Responses `input`. This reuses the Chat Completions middle mode for code reuse while preserving the original client endpoint response shape.
+- **`POST /v1/embeddings` is a fixed route**, so `[models.EMBEDDING].upstream_mode` selects the upstream's wire shape rather than an inference converter. Besides the default `openai-completions`, it accepts **`ollama-embed`**, which posts to Ollama's native `{base_url}/api/embed` and converts the request and response both ways (`usage` comes from `prompt_eval_count`; `encoding_format = "base64"` is rejected with `400`). `[models.EMBEDDING].base_url` is **required**: because the route never resolves a model entry it does not inherit `[models.default].base_url`, and a request without it returns `500` with no upstream call. See the [configuration guide](./docs/getting-started/configuration-guide.md).
 - Direct transforms are preferred long-term for endpoint fidelity. The current `/v1/interactions` → `anthropic-messages` / `openai-responses` routes use the indirect `openai-completions` bridge for code reuse; see [Routing transform review](./docs/architecture/routing-review.md) for tradeoffs and recommendations.
 
 ### `/v1/responses` converter-path semantics
@@ -431,7 +432,7 @@ The full conformance analysis lives in [the gap review](./docs/api/review-for-ga
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` / `:countTokens` | `gemini.ts` (gemini upstream), `openai.ts` (other upstreams) | `openai-to-gemini` (`convertOpenAIToGeminiGenerateContent`), `gemini-streaming` |
 | `POST /v1/messages/count_tokens` | `token-counting.ts` | `utils/token-counting` (local tiktoken counting) |
 | `GET /v1/models` | `models.ts` | — (passthrough listing) |
-| `POST /v1/embeddings` | `embeddings.ts` | — (passthrough) |
+| `POST /v1/embeddings` | `embeddings.ts` | — (passthrough; `upstream_mode = "ollama-embed"` converts `/api/embed` both ways) |
 | `GET /dashboard`, `POST /decision`, `POST /passthrough/v1/...` | `dashboard.ts`, `decision.ts`, `passthrough.ts` | — |
 
 Upstream modes a route can select (full transform matrix in [Supported `upstream_mode`](#supported-upstream_mode) above):
@@ -519,13 +520,13 @@ the route; without them `/decision` answers `503`.
 
 ```toml
 [models.decision]
-backend = "laya"                            # "laya" (text-only) or "cloudflare"/"clef" (images allowed)
+backend = "laya"                            # "laya" (text-only), "cloudflare"/"clef" (images passed through), "ollama" (images converted)
 url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim
 # api_key = "optional-bearer-token"         # sent as Authorization: Bearer
-# timeout_ms = 5000                         # default: 5000 for "laya", 30000 for "cloudflare"/"clef"
+# timeout_ms = 5000                         # default: 5000 for "laya", 30000 otherwise
 ```
 
-**Two backends, differing in exactly one thing — `images`:**
+**Three backends, differing in how `images` are handled:**
 
 - **`laya`** — the local sidecar [`submodules/laya-mlx/serve_judge.py`](./submodules/laya-mlx/serve_judge.py),
   serving this contract from the Laya typed-decisions model. Its MLX encoder is
@@ -538,13 +539,30 @@ url = "http://localhost:8765/decision"      # full endpoint URL, POSTed verbatim
   Cloudflare's `@cf/cloudflare/clef`). The `images` array is forwarded untouched, and
   the model id in the body selects the remote model. **`clef` is an accepted equivalent
   spelling for this backend.**
+- **`ollama`** — [Ollama](https://ollama.com)'s `POST /v1/systemone`, the base API the
+  Clef schemas extend (its own docs are in [`docs/api/ollama/`](./docs/api/ollama/)),
+  e.g. `url = "http://localhost:11434/v1/systemone"`. Requires Ollama v0.35.0+.
+  System One takes images as **bare base64 strings** and rejects both data URLs and
+  remote URLs, so the proxy converts the two Clef forms before forwarding: a
+  `data:<mime>;base64,<bytes>` URL is stripped to `<bytes>`, and a
+  `{content_type, base64}` object is flattened to its `base64` (`content_type` has no
+  System One equivalent and is dropped). A bare base64 string is forwarded as-is. An
+  image that cannot be converted — a `data:` URL with no base64 payload, an object with
+  no `base64` string, or a non-string/non-object entry — is rejected with `400` naming
+  the offending index, before any upstream call. This is the only backend whose request
+  body is not forwarded byte-for-byte.
+  The `model` id must be a System One model (`nimble`, `tev`, `clef`, or `clef:cloud`);
+  the proxy does not alias it, so a Clef-only name such as `clef-flash` is passed
+  through verbatim and rejected by the upstream.
 
 **Behaviour notes:**
 
 - **Verbatim forwarding** — the request body is forwarded byte-for-byte, and the
   upstream response body is returned byte-for-byte. The proxy implements no transport
   of its own beyond the POST, and does no model routing or alias resolution: the
-  `model` field in the body is the upstream's business.
+  `model` field in the body is the upstream's business. The one exception is the
+  `ollama` backend, which rebuilds the body when it has `images` to convert (all other
+  fields keep their values).
 - **Envelope-only validation** — the proxy checks only the top-level required fields
   (`model`/`state`/`questions` in, `model`/`answers`/`usage` out). Per-question shapes,
   id charset, the 1–64 question bound, and the `model` pattern are the upstream's

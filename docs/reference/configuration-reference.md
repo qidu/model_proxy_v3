@@ -15,13 +15,16 @@ environment.
 | `budget_to_effort_high` | `128000` | Threshold above `medium` → `reasoning_effort: "high"`. Set to `0` to always emit `"high"`. |
 | `store_key_in_system` | `true` | Store config `api_key` values in the OS keychain (macOS Keychain / Windows Credential Vault / Linux Secret Service). Applies ONLY to configured api_keys of `[models.*]` targets, `[models.default].api_key`, and `[models.passthrough]` target `key`s in the local `proxy_config.toml` file — not to Consul/Apollo config-center sources (flag ignored there; a `STORE_KEY_IN_SYSTEM` sentinel in a Consul/Apollo config is a fatal load error), not to composite/schedule aliases (they carry no api_key), and never to caller/user keys from request headers (empty api_key = auth passthrough is skipped). On config load, plaintext keys are saved as properties of one JSON object under the `model_proxy_v3` service and reserved `__api_keys_v1__` account. Property names use the logical account `<target_model_id>/<base_url>` (a `[models.passthrough]` target has no model id, so its property is `passthrough.<name>/<base>`), and the config file is rewritten (backup: `<config>.bak`) replacing each key with the literal `STORE_KEY_IN_SYSTEM` sentinel. Every later load reads only that one bundle, avoiding one macOS item-authorization prompt per key. On an exact-property miss the resolve pass falls back to a best-effort match over the other bundled properties, scored by base_url similarity (prefix relation, e.g. `glm-5.3/https://…/api` can serve a wanted `glm-5.3-anth/https://…/api/anthropic`; base_url dominates, target-name similarity tiebreaks) and logs a warning per fallback; when nothing matches, that one slot is cleared (treated as unconfigured, so the normal api_key fallback chain applies) and reported as a config error in the TUI/dashboard/console — it is NOT fatal, so the remaining models still load and the proxy still starts. Existing per-account keychain items are migrated automatically when no bundle exists; that one-time compatibility pass must read the old items and can still prompt once per old item on macOS. Old items are left in place and are not read after the bundle exists. (The keychain itself being unavailable, bundle access being denied, or malformed bundle content is still a fatal `KeyStoreError`.) Local/dev-host feature only — requires the `@github/keytar` native addon, pinned in `optionalDependencies` as `@github/keytar@7.10.6` from the npm registry: the package includes prebuilt NAPI binaries and its install script copies the current platform's binary into place (ABI 3 — works on any modern Node, no compiler or Python needed; node-gyp compiles from source only as the fallback for an unsupported platform/architecture); if startup fails with `Cannot find package '@github/keytar'`, first check `git diff package.json` — npm prune-style runs (`--dry-run --omit=dev`, `--production`) can strip the `optionalDependencies` block, after which no `npm install` ever re-fetches the addon; restore with `git checkout -- package.json && npm install`. A source copy of the addon is kept at `submodules/node-keytar` for local development — it is NOT used by `npm install`. Fails loud (refuses to start) when the keychain is unavailable, e.g. in Docker or Cloudflare Workers (the Dockerfile installs with `--omit=optional --ignore-scripts`). Exception — the **win32 single-executable (SEA) build**: `@github/keytar` needs too many dependencies on Windows (Visual Studio Build Tools with the C++ workload + Python 3, via node-gyp), so there the executable instead stores the keys **in its own file body** (`process.execPath`) as plaintext records appended at EOF — that is portability (a self-contained single file), not secrecy; it needs a writable directory next to the exe and is wiped by a rebuild. macOS and Linux keep the OS keychain via `@github/keytar`; macOS/Linux SEA binaries and Docker/Workers keep the fatal error. Keychain access itself is silent — macOS grants read access to the bundle for whichever binary wrote it, so the same `node` binary/path resolves all sentinels without a password prompt on every run. Upgrading Node (or invoking through a different binary path, e.g. `npx` vs. a global install) changes that code identity: macOS may show a one-time keychain access prompt for the new binary, or in stricter setups silently deny access — surfacing here as a fatal `KeyStoreError` rather than a prompt. |
 
-## `[default_upstream]` config fields
+## Global defaults — `[models.default]`
 
-| Field | Example | Purpose |
-|---|---|---|
-| `default_base_url` | `"https://api.example.com"` | Global upstream endpoint fallback when a route has no per-entry or section `base_url`, and for models not claimed by any `[models.*]` section. |
-| `default_api_key` | `"sk-..."` | Global configured-key fallback. In `user_key` mode (default): wins only for `[models.FREE]`, acts as a fallback for other sections when the caller sends no key. In `config_key` mode: used for all models that have no per-entry or section `api_key`. Typically left unset in production. |
-| `upstream_mode` | `"openai-completions"` | Default protocol for models not claimed by any `[models.*]` section. |
+There is no separate defaults section: the former `[default_upstream]` is **removed**, and a
+config still carrying it (or any other unrecognized section header) logs an
+`unknown section header` warning at load time and **ignores its keys**. Global defaults are
+set on the ordinary category section `[models.default]` instead — it is consulted last
+(Priority 3), so a model claimed by no exact match and no wildcard in any other section
+falls through to its wildcards and its `*` catch-all. Its `base_url`, `api_key`, and
+`upstream_mode` are the section-level fields documented under
+[`[models.*]` section-level fields](#models-section-level-fields-category-defaults).
 
 ## `[remote]` config fields
 
@@ -336,6 +339,18 @@ key = "sk-..."                         # ✗ REJECTED at load time
 | `api_key` | **Not accepted** | Only canonical `api_key` works at section level. |
 
 **Reason**: Section-level defaults must be explicit; short aliases are reserved for inline tables only.
+
+> **Exception — `[models.EMBEDDING].upstream_mode`.** `/v1/embeddings` is a fixed route, so
+> this field selects the upstream's wire shape rather than an inference protocol, and its
+> accepted values are `openai-completions` (default, posts to `{base_url}/v1/embeddings`)
+> and `ollama-embed` (posts to Ollama's native `{base_url}/api/embed` and converts both
+> directions). Any other value warns and falls back to `openai-completions`. The
+> per-model `upstream_mode` in the table above does not affect this route.
+
+> **Exception — `[models.EMBEDDING].base_url` is required.** Because `/v1/embeddings` is a
+> fixed route, it never resolves a model entry: only the section-level `base_url` is used, a
+> per-entry `base_url` has no effect, and there is no fallback to `[models.default].base_url`
+> or `http://localhost`. Omitting it returns `500` without calling an upstream.
 
 ### `[models.passthrough]` inline tables
 

@@ -5,10 +5,14 @@
  * (as defined by docs/api/decision/clef-schema-input.json and clef-schema-output.json).
  *
  * The upstream is configured via [models.decision] in proxy_config.toml:
- *   backend    = "laya" | "cloudflare" | "clef"   # required; "clef" === "cloudflare"
+ *   backend    = "laya" | "cloudflare" | "clef" | "ollama"   # required; "clef" === "cloudflare"
  *   url        = "http://..."            # required, POSTed verbatim
  *   api_key    = ""                      # optional, sent as Authorization: Bearer
  *   timeout_ms = 5000                    # optional, defaults per backend
+ *
+ * The body is forwarded verbatim except on the "ollama" backend, whose
+ * POST /v1/systemone takes images as bare base64 strings: see
+ * toSystemOneImage() below.
  *
  * `bodyText` is passed in rather than read from the Request because the caller
  * (src/index.ts) has already consumed the body to run the deferred auth gate —
@@ -19,6 +23,28 @@ import type { Logger } from '../types/shared.js';
 import type { ProxyConfig } from '../utils/config-loader.js';
 import { createErrorResponse } from '../utils/errors.js';
 import { createUpstreamAbortSignal } from '../utils/fetch-timeout.js';
+
+/**
+ * Convert one Clef `images` entry into the bare base64 string that Ollama's
+ * POST /v1/systemone takes. The Clef schema's two forms are a data URL and a
+ * `{content_type, base64}` object; anything else is already expected to be
+ * base64 and is forwarded as-is (the upstream owns that validation, as it does
+ * for `model`). Returns null when a recognised form carries no base64 payload,
+ * so the caller can fail loud instead of forwarding a shape the upstream will
+ * reject with a less specific error.
+ */
+function toSystemOneImage(image: unknown): string | null {
+  if (typeof image === 'string') {
+    if (!/^data:/i.test(image)) return image;
+    const match = /^data:[^,]*;base64,(.+)$/is.exec(image);
+    return match ? match[1] : null;
+  }
+  if (image && typeof image === 'object' && !Array.isArray(image)) {
+    const base64 = (image as { base64?: unknown }).base64;
+    return typeof base64 === 'string' && base64.length > 0 ? base64 : null;
+  }
+  return null;
+}
 
 export async function handleDecisionRequest(
   bodyText: string,
@@ -32,7 +58,7 @@ export async function handleDecisionRequest(
   if (!decisionConfig?.backend || !decisionConfig?.url) {
     logger.error(requestId, 'Decision endpoint not enabled: [models.decision] backend and url are required');
     return createErrorResponse(
-      new Error('Decision endpoint not configured: [models.decision] backend ("laya" | "cloudflare" | "clef") and url are required'),
+      new Error('Decision endpoint not configured: [models.decision] backend ("laya" | "cloudflare" | "clef" | "ollama") and url are required'),
       requestId,
       503,
     );
@@ -80,8 +106,29 @@ export async function handleDecisionRequest(
     );
   }
 
-  // Make upstream request. The body is forwarded verbatim — the proxy implements
-  // no transport of its own beyond the POST.
+  // Ollama's System One API takes images as bare base64 strings and rejects data
+  // URLs, so the Clef image forms are converted here. This is the only backend
+  // whose body is rebuilt rather than forwarded byte-for-byte.
+  let upstreamBody = bodyText;
+  if (backend === 'ollama' && Array.isArray(body.images) && body.images.length > 0) {
+    const images: string[] = [];
+    for (const [index, image] of body.images.entries()) {
+      const base64 = toSystemOneImage(image);
+      if (base64 === null) {
+        return createErrorResponse(
+          new Error(`images[${index}] is not a form the "ollama" backend accepts: POST /v1/systemone takes base64 strings, so a data URL must be "data:<mime>;base64,<bytes>" and an object must carry a non-empty string "base64"`),
+          requestId,
+          400,
+        );
+      }
+      images.push(base64);
+    }
+    upstreamBody = JSON.stringify({ ...body, images });
+  }
+
+  // Make upstream request. The body is forwarded verbatim (except for the
+  // ollama image conversion above) — the proxy implements no transport of its
+  // own beyond the POST.
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`;
@@ -90,7 +137,7 @@ export async function handleDecisionRequest(
   const upstreamResponse = await fetch(url, {
     method: 'POST',
     headers,
-    body: bodyText,
+    body: upstreamBody,
     signal: createUpstreamAbortSignal(timeoutMs),
   });
 

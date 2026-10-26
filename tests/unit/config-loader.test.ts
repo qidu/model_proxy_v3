@@ -12,7 +12,7 @@
  * Run with: npx tsx --test tests/unit/config-loader.test.ts
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -47,10 +47,13 @@ import {
   HOME_PROXY_CONFIG_PATH,
   buildDecisionState,
   buildDecisionQuestions,
+  loadProxyConfig,
+  clearProxyConfigCache,
   type ProxyConfig,
   type TransformSet,
 } from '../../src/utils/config-loader.js';
 import { UPSTREAM_MODES } from '../../src/utils/upstream-modes.js';
+import type { Env } from '../../src/types/shared.js';
 
 // ---------------------------------------------------------------------------
 // parseHumanTokenLimit
@@ -676,6 +679,28 @@ describe('parseSimpleToml', () => {
     // Intercepted before the generic [models.*] branch: no "decision" category.
     assert.equal(cfg.models?.decision, undefined);
     assert.deepEqual(getConfiguredModelIds(cfg), []);
+  });
+
+  it('accepts every [models.decision] backend and reports an unknown one', () => {
+    for (const backend of ['laya', 'cloudflare', 'clef', 'ollama']) {
+      const cfg = parseSimpleToml(`
+        [models.decision]
+        backend = "${backend}"
+        url = "http://127.0.0.1:11434/v1/systemone"
+      `) as any;
+      assert.equal(cfg.decision.backend, backend);
+      assert.deepEqual(cfg._validationErrors, [], `backend "${backend}" must validate`);
+    }
+
+    const bad = parseSimpleToml(`
+      [models.decision]
+      backend = "ollamma"
+      url = "http://127.0.0.1:11434/v1/systemone"
+    `) as any;
+    assert.deepEqual(
+      bad._validationErrors.map((e: { path: string; message: string }) => `${e.path}: ${e.message}`),
+      ['decision.backend: backend must be "laya", "cloudflare", "clef", or "ollama"'],
+    );
   });
 
   it('rejects the removed [passthrough] header as an unknown section and drops its keys', () => {
@@ -2435,6 +2460,93 @@ describe('getDefaultUpstreamConfig', () => {
 });
 
 // ---------------------------------------------------------------------------
+// getDefaultUpstreamConfig on a LOADED config — defaultBaseUrl is exactly
+// [models.default].base_url (src/index.ts:638), from no other source.
+// ---------------------------------------------------------------------------
+
+describe('getDefaultUpstreamConfig on a loaded config', () => {
+  let dir = '';
+
+  const load = async (toml: string): Promise<ProxyConfig> => {
+    const configPath = join(dir, 'proxy.toml');
+    writeFileSync(configPath, toml, 'utf8');
+    clearProxyConfigCache();
+    return loadProxyConfig({ PROXY_CONFIG_PATH: configPath, LOG_LEVEL: 'error' } as unknown as Env);
+  };
+
+  const defaultSectionBaseUrl = (config: ProxyConfig): string | undefined => {
+    const section = config.models?.default;
+    return section && !Array.isArray(section) ? section.base_url : undefined;
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mpv3-default-baseurl-'));
+    clearProxyConfigCache();
+  });
+
+  afterEach(() => {
+    clearProxyConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('resolves to [models.default].base_url and never to another section', async () => {
+    const cases: Array<[string, string, string | undefined]> = [
+      ['section base_url', '[models.default]\nbase_url = "https://default.example"\n', 'https://default.example'],
+      ['section present without base_url', '[models.default]\nupstream_mode = "openai-completions"\n"*" = {}\n', undefined],
+      // Unlike a `primary` empty string, an empty section value is NOT
+      // normalized to "unset" — it is passed through verbatim, so consumers
+      // that need "no host" must treat '' as unset themselves.
+      ['empty-string base_url', '[models.default]\nbase_url = ""\n', ''],
+      ['section absent', '[models.gemini]\nbase_url = "https://gemini.example"\n"gemini-*" = {}\n', undefined],
+      ['only another category sets one', '[models.EMBEDDING]\nbase_url = "https://embed.example"\n"m" = {}\n', undefined],
+      ['entry-level base_url only', '[models.default]\n"m" = {base_url = "https://entry.example"}\n', undefined],
+    ];
+    for (const [label, toml, expected] of cases) {
+      const config = await load(toml);
+      assert.equal(getDefaultUpstreamConfig(config).baseUrl, expected, `${label}: resolved value`);
+      assert.equal(
+        getDefaultUpstreamConfig(config).baseUrl,
+        defaultSectionBaseUrl(config),
+        `${label}: defaultBaseUrl must equal [models.default].base_url`,
+      );
+    }
+  });
+
+  it('ignores the removed [default_upstream] / [upstream] default_* keys and reports them', async () => {
+    const config = await load([
+      '[default_upstream]',
+      'default_base_url = "https://legacy.example"',
+      'default_api_key = "legacy-key"',
+      'default_upstream_mode = "anthropic-messages"',
+      '',
+      '[upstream]',
+      'default_base_url = "https://also-legacy.example"',
+      '',
+    ].join('\n'));
+
+    assert.deepEqual(
+      getDefaultUpstreamConfig(config),
+      { upstreamMode: 'openai-completions', baseUrl: undefined, apiKey: undefined },
+      'no default_* key may survive: neither section exists in the loader',
+    );
+    assert.deepEqual(
+      Object.keys(config.models ?? {}),
+      [],
+      'the removed sections must not create model categories',
+    );
+
+    const warnings = (config as unknown as { _validationWarnings?: Array<{ path: string; message: string }> })._validationWarnings ?? [];
+    for (const section of ['default_upstream', 'upstream']) {
+      assert.ok(
+        warnings.some((w) => w.path === section && w.message.includes('unknown section header')),
+        `[${section}] must be reported as an unknown section (loud, not silently absorbed)`,
+      );
+    }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
 // Composite Target ability field parsing and serialization
 // ---------------------------------------------------------------------------
 
@@ -2888,5 +3000,71 @@ describe('buildDecisionState / buildDecisionQuestions', () => {
     assert.ok(criteriaKeys.includes('model-a'));
     assert.ok(criteriaKeys.includes('model-b'));
     assert.ok(criteriaKeys.includes('model-c'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [models.EMBEDDING].upstream_mode
+// ---------------------------------------------------------------------------
+
+describe('[models.EMBEDDING].upstream_mode validation', () => {
+  it('accepts "ollama-embed" without warning', () => {
+    const cfg = parseSimpleToml(`
+      [models.EMBEDDING]
+      upstream_mode = "ollama-embed"
+      base_url = "http://localhost:11434"
+      "nomic-embed-text" = {}
+    `) as any;
+
+    assert.equal((cfg.models.EMBEDDING as Record<string, unknown>).upstream_mode, 'ollama-embed');
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      !warnings.some((w: { path: string }) => w.path === 'models.EMBEDDING.upstream_mode'),
+      `expected no upstream_mode warning, got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('accepts "openai-completions" without warning', () => {
+    const cfg = parseSimpleToml(`
+      [models.EMBEDDING]
+      upstream_mode = "openai-completions"
+      base_url = "https://integrate.api.nvidia.com"
+    `) as any;
+
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      !warnings.some((w: { path: string }) => w.path === 'models.EMBEDDING.upstream_mode'),
+      `expected no upstream_mode warning, got ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('warns and names the fallback for an unrecognized mode', () => {
+    const cfg = parseSimpleToml(`
+      [models.EMBEDDING]
+      upstream_mode = "ollama-embedd"
+      base_url = "http://localhost:11434"
+    `) as any;
+
+    const warnings = cfg._validationWarnings ?? [];
+    const warning = warnings.find((w: { path: string }) => w.path === 'models.EMBEDDING.upstream_mode');
+    assert.ok(warning, `expected a models.EMBEDDING.upstream_mode warning, got ${JSON.stringify(warnings)}`);
+    assert.equal(
+      warning.message,
+      '"ollama-embedd" is not an embeddings upstream mode; falling back to "openai-completions" (accepted: openai-completions, ollama-embed)'
+    );
+  });
+
+  it('does not flag an unrecognized mode on other categories', () => {
+    const cfg = parseSimpleToml(`
+      [models.default]
+      upstream_mode = "openai-responses"
+      base_url = "https://api.example.com"
+    `) as any;
+
+    const warnings = cfg._validationWarnings ?? [];
+    assert.ok(
+      !warnings.some((w: { path: string }) => w.path === 'models.default.upstream_mode'),
+      `expected no warning for [models.default], got ${JSON.stringify(warnings)}`
+    );
   });
 });

@@ -15,7 +15,7 @@ import type { ConsulKvEntry } from './consul-loader.js';
 import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
 import { createLogger } from './logger.js';
 import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
-import { UPSTREAM_MODES } from './upstream-modes.js';
+import { UPSTREAM_MODES, EMBEDDING_UPSTREAM_MODES } from './upstream-modes.js';
 import { callDecisionApi, adaptToClefRequest, adaptFromClefResponse, type ClefRequest, type ClefChoiceQuestion } from './tool-judge-sidecar.js';
 
 // Check if we're running in Node.js environment
@@ -165,22 +165,25 @@ export interface ProxyConfig {
    * The proxy POSTs the request body to `url` verbatim and returns the upstream
    * body verbatim; it implements no transport of its own.
    *
-   * `backend` picks which upstream serves that contract, and only affects one
-   * thing — whether `images` are allowed:
+   * `backend` picks which upstream serves that contract:
    *   - "laya": the local `submodules/laya-mlx` sidecar. Its MLX encoder is
    *     text-only, so a request carrying `images` is rejected with 400.
    *   - "cloudflare": any endpoint serving the Clef schemas with `images`
    *     support. The `images` array is forwarded untouched. "clef" is an
    *     accepted equivalent spelling of this backend.
+   *   - "ollama": Ollama's `POST /v1/systemone` — the base API the Clef schemas
+   *     extend. It takes images as bare base64 strings and rejects data URLs,
+   *     so the Clef image forms are converted before forwarding. This is the
+   *     only backend whose request body is not forwarded byte-for-byte.
    */
   decision?: {
-    /** Which upstream serves the Clef contract: "laya" | "cloudflare" | "clef". Required to enable. */
-    backend?: 'laya' | 'cloudflare' | 'clef';
+    /** Which upstream serves the Clef contract: "laya" | "cloudflare" | "clef" | "ollama". Required to enable. */
+    backend?: 'laya' | 'cloudflare' | 'clef' | 'ollama';
     /** Full endpoint URL, POSTed verbatim (e.g. "http://localhost:8765/decision"). Required to enable. */
     url?: string;
     /** Optional API key, sent as `Authorization: Bearer <api_key>`. */
     api_key?: string;
-    /** Timeout in milliseconds (default: 5000 for "laya", 30000 for "cloudflare") */
+    /** Timeout in milliseconds (default: 5000 for "laya", 30000 otherwise) */
     timeout_ms?: number;
   };
 }
@@ -2273,6 +2276,20 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
       const typedCategory = categoryConfig as Record<string, unknown>;
       const categoryBaseUrl = typeof typedCategory.base_url === 'string' ? typedCategory.base_url : undefined;
 
+      // [models.EMBEDDING] is the one category where upstream_mode picks the
+      // upstream wire shape, so an unrecognized value would silently fall back to
+      // the OpenAI shape. Warned rather than rejected because the field was
+      // ignored here before, so existing configs may hold stale values.
+      if (categoryName === 'EMBEDDING' || categoryName === 'embedding') {
+        const embeddingMode = typedCategory.upstream_mode;
+        if (typeof embeddingMode === 'string' && !(EMBEDDING_UPSTREAM_MODES as readonly string[]).includes(embeddingMode)) {
+          warnings.push({
+            path: `models.${categoryName}.upstream_mode`,
+            message: `"${embeddingMode}" is not an embeddings upstream mode; falling back to "openai-completions" (accepted: ${EMBEDDING_UPSTREAM_MODES.join(', ')})`,
+          });
+        }
+      }
+
       for (const [key, value] of Object.entries(categoryConfig)) {
         if (reservedKeys.has(key)) continue;
         if (value === undefined) continue;
@@ -2603,8 +2620,8 @@ export function validateProxyConfig(config: ProxyConfig): ValidationResult {
   // Validate decision config
   if (config.decision) {
     const d = config.decision;
-    if (!d.backend || !['laya', 'cloudflare', 'clef'].includes(d.backend)) {
-      errors.push({ path: 'decision.backend', message: 'backend must be "laya", "cloudflare", or "clef"' });
+    if (!d.backend || !['laya', 'cloudflare', 'clef', 'ollama'].includes(d.backend)) {
+      errors.push({ path: 'decision.backend', message: 'backend must be "laya", "cloudflare", "clef", or "ollama"' });
     }
     if (!d.url || typeof d.url !== 'string') {
       errors.push({ path: 'decision.url', message: 'url is required' });

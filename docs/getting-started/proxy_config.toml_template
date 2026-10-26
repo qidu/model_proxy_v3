@@ -1,5 +1,4 @@
-[upstream]
-default_base_url = "https://api.qnaigc.com"
+[general]
 budget_to_effort_low = 8000
 budget_to_effort_medium = 20000
 budget_to_effort_high = 0
@@ -43,7 +42,12 @@ deepseek-v4-flash = ["deepseek-v4-flash", "https://api.deepseek.com", "sk-66c139
 deepseek-v4-pro = ["deepseek-v4-pro", "https://api.deepseek.com", "sk-66c13986***"]
 
 [models.EMBEDDING]
-upstream_mode = "anthropic-messages"
+# Wire shape for /v1/embeddings: "openai-completions" (default) posts to
+# {base_url}/v1/embeddings; "ollama-embed" posts to Ollama's native
+# {base_url}/api/embed and converts both directions. No other value is accepted here.
+# `base_url` is REQUIRED: this fixed route does not inherit `[models.default].base_url`,
+# so without it the request returns 500 and no upstream is called.
+upstream_mode = "openai-completions"
 base_url = "https://openrouter.ai/api"
 
 [composite]

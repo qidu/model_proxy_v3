@@ -67,7 +67,7 @@ dashboard routes.
 | `POST /v1/models/{model}:streamGenerateContent` | `src/handlers/gemini.ts` | Same as above, `v1` API path | Forwarded |
 | `POST /v1/models/{model}:countTokens` | `src/handlers/gemini.ts` | Same as above, `v1` API path | Forwarded |
 | `POST /v1/interactions` | `src/handlers/messages.ts` | Gemini Interactions API | Forwarded |
-| `POST /v1/embeddings` | `src/handlers/embeddings.ts` | OpenAI-compatible embeddings | Forwarded |
+| `POST /v1/embeddings` | `src/handlers/embeddings.ts` | OpenAI-compatible embeddings (`ollama-embed` for Ollama's native `/api/embed`) | Forwarded |
 
 ### 1.2 Model listing & meta
 
@@ -117,8 +117,9 @@ routing is **disabled by default**: unless `ENABLE_DYNAMIC_ROUTING` is `true` (o
 not reinterpreted as fixed routes. When enabled, they are
 **passthrough** — the body is forwarded verbatim and auth headers are forwarded
 as-is. Hosts are checked against `ALLOWED_HOSTS` (env, default
-`127.0.0.1,localhost`) plus any host derived from `[models.*]` / `[default_upstream]`
-config (`getAllowedHostsFromConfig`); out-of-allowlist hosts are rejected with `403`.
+`127.0.0.1,localhost`) plus any host derived from `[models.*]` (including
+`[models.default]`) and `[models.passthrough]` config (`getAllowedHostsFromConfig`);
+out-of-allowlist hosts are rejected with `403`.
 
 ---
 
@@ -135,7 +136,7 @@ is selected by the route's `defaultMode` / model config.
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Indirect transform via `openai-completions` | Direct transform | Indirect transform via `openai-completions` | Native passthrough | Native Gemini-family |
 | `POST /v1/interactions` | Indirect transform via `openai-completions` | Direct transform | Indirect transform via `openai-completions` | Native Gemini-family | Native Gemini-family |
 | `GET /v1/models` | Passthrough | Passthrough | Passthrough | Passthrough | Passthrough |
-| `POST /v1/embeddings` | Not supported | Only supported mode | Not supported | Not supported | Not supported |
+| `POST /v1/embeddings` | Not supported | Default embedding mode (`ollama-embed` also accepted) | Not supported | Not supported | Not supported |
 
 **Mode semantics:**
 - **Native passthrough** — client endpoint and upstream family match; body is not converted.
@@ -280,8 +281,7 @@ sidecar. Source of truth for these is `src/types/shared.ts`.
 | Section | Required | Purpose |
 |---|---|---|
 | `[general]` | no | global knobs (limits, week-start, keychain) |
-| `[default_upstream]` | no | default `base_url`, `upstream_mode`, `api_key` |
-| `[models.<category>]` | no | category of model entries (`claude`, `gemini`, `gpt`, `free`, `default`, user-defined) |
+| `[models.<category>]` | no | category of model entries (`claude`, `gemini`, `gpt`, `free`, `default`, user-defined). `[models.default]` also carries the global defaults — there is no separate defaults section. |
 | `[composite]` | no | share/fallback/fusion/coordinator aliases |
 | `[schedule]` | no | time-of-day aliases |
 | `[transforms.<name>]` | no | named sets of request/response rewrites |

@@ -126,7 +126,7 @@ carry no config inheritance:
 |---|---|---|
 | `target` | **yes** | Upstream model id sent as `model` (the alias key is ignored). |
 | `base` | **yes** | Upstream base URL — the descriptor's `base_url`. |
-| `mode` | no | Upstream mode. Defaults to `[default_upstream].upstream_mode`, else `openai-completions`. |
+| `mode` | no | Upstream mode. Defaults to `[models.default].upstream_mode`, else `openai-completions`. |
 | `key` | no | Upstream API key. When present it **replaces** the caller's credential for that rung (see the notice below); when omitted, the caller's credential is forwarded (passthrough). |
 | `otac` | no | Per-rung replacement for the `one_time_auth_code` header sent upstream and on the stats record. |
 | `transforms` | no | `[transforms.*]` set names applied at the same five lifecycle hooks as config-attached sets. Resolved with no section layer. |
