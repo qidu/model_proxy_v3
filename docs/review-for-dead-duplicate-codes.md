@@ -93,11 +93,7 @@ Referenced only by unit tests. Decision needed: keep as tested public API, or re
 
 6. **Identical "Messages→openai-responses upstream" block twice within `src/handlers/messages.ts`:** :318-403 (OpenAI-format inbound) and :593-690 (Claude-format inbound) — same `responsesBody` build, fetch/`applyAfterUpstream`/error handling, near-verbatim `syntheticCompletions` literal (~30 lines each). Includes a duplicated `LOG_LEVEL=debug` `test_tool` file-dump block (:440-456 and :739-754).
 
-7. **TUI ↔ dashboard model-test code — already diverged (bug risk):**
-   - `src/tui.ts:278` `buildClaudeToolRequest` + :294 `buildOpenAIToolRequest` + :345 `buildTestToolRequest` + `TEST_TOOL_*` consts (:48-58) vs `src/handlers/dashboard.ts:3405-3443` (own copy, comment admits "mirrored from tui.ts"). **Diverged:** tui.ts uses `maxTokensField()` (`max_completion_tokens` for openai-responses); dashboard hardcodes `max_tokens`.
-   - `src/tui.ts:2676` `executeModelTest` + :3660 `resolveModelTestConfig` vs `src/handlers/dashboard.ts:3617` `handleDashboardTestModel` (loopback endpoint construction, per-mode auth headers, composite-alias resolution, `test_model.log` dump).
-   - `src/tui.ts:73` `formatTestResultDetail` vs `src/handlers/dashboard.ts:3446` `extractTestResultDetail`.
-   - Canonical: tui.ts versions.
+7. ~~**TUI ↔ dashboard model-test code — already diverged (bug risk)**~~ — ✅ **FIXED (2026-10-27)**: the request builders (`maxTokensField`, `buildTestTextRequest`, `buildTestToolRequest`, `TEST_TOOL_*` consts) are extracted to a shared module, `src/utils/model-test.ts`, imported by both `src/tui.ts` (re-exported for existing callers/tests) and `src/handlers/dashboard.ts`. The dashboard's mirrored `buildTestToolRequest` — which hardcoded `max_tokens` and so failed against `openai-responses` routes — is deleted. Still duplicated (not merged, different output formats): `src/tui.ts` `formatTestResultDetail` vs `src/handlers/dashboard.ts` `extractTestResultDetail`; `executeModelTest` vs `handleDashboardTestModel`.
 
 8. **Shell exec helpers:** `src/agent-session.ts:66-99` (`getShell`, `runShellCommand`) vs `src/agent-tools.ts:37-42` (`getShell`, byte-identical) + `runCli`/bash-tool execFile wrapper (:114-124, :279-324). Canonical: agent-tools.ts.
 
@@ -156,9 +152,9 @@ Referenced only by unit tests. Decision needed: keep as tested public API, or re
 
 ---
 
-## 4. Independent issue: NUL bytes in `src/tui.ts`
+## 4. Independent issue: NUL bytes in `src/tui.ts` — ✅ FIXED (before commit `b843a6a`)
 
-`src/tui.ts` contains literal NUL bytes around lines 2183/2193/2219 (a `'^@'` separator convention, ~offset 92890). This makes ripgrep/Grep treat the file as binary and silently truncate matches — and would likely break automated dead-code tools (knip/ts-prune) as well. Two review agents hit this independently. Recommend replacing with an escaped `'\0'` string literal if intentional.
+`src/tui.ts` contained literal NUL bytes around lines 2183/2193/2219 (a `'^@'` separator convention, ~offset 92890), which made ripgrep/Grep treat the file as binary and silently truncate matches — and would have broken automated dead-code tools (knip/ts-prune). The three literals are now escaped `'\0'` (current lines 2184/2194/2220); the whole file contains zero NUL bytes and greps normally. Verified 2026-10-27.
 
 ---
 
@@ -187,8 +183,8 @@ Consequences:
 ## 6. Suggested next steps (priority order)
 
 1. Delete fully-dead code in §1 (converters dead island ✅ done, gemini.ts config block + unreachable branches ✅ done, unused imports/consts, dead types).
-2. Fix the diverged TUI↔dashboard model-test duplication (§2.7) — live bug risk.
+2. ~~Fix the diverged TUI↔dashboard model-test duplication (§2.7)~~ ✅ done (request builders merged into `src/utils/model-test.ts`).
 3. Merge `routing.ts` auth-header switch (§2.1) and `selectWeightedCompositeCandidate` (§2.9).
 4. Factor `extractThinkContent` (§2.2) and the JSON-args parser (§2.10) into shared helpers.
 5. Decide fate of test-only exports (§1) — either wire them in or delete with their tests.
-6. Fix NUL bytes in `tui.ts` (§4), then consider adding `knip` to CI to keep this from regressing.
+6. ~~Fix NUL bytes in `tui.ts` (§4)~~ ✅ done — consider adding `knip` to CI to keep this class of issue from regressing.

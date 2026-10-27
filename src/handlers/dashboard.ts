@@ -54,6 +54,7 @@ import {
   getPrivacyKeysDetected,
 } from '../utils/dashboard-stats.js';
 import { formatApiKeyForUpstream } from '../utils/routing.js';
+import { buildTestToolRequest } from '../utils/model-test.js';
 import { UPSTREAM_MODES, EMBEDDING_UPSTREAM_MODES } from '../utils/upstream-modes.js';
 import { getModelQuota, formatQuotaLeft, getUpstreamRateLimitLeft, getUpstreamRateLimitLeftForUrl, type QuotaResult } from '../utils/provider-quota.js';
 
@@ -3601,48 +3602,9 @@ export function handleDashboardRequestStats(proxyConfig: ProxyConfig): Response 
   });
 }
 
-// Test model constants (mirrored from tui.ts)
+// Test model endpoint (request shape comes from utils/model-test.ts, shared
+// with the TUI so the two cannot diverge again).
 const TEST_MODEL_ENDPOINT = '/v1/messages';
-const TEST_TOOL_NAME = 'test_tool';
-const TEST_TOOL_DESCRIPTION = 'test tool';
-const TEST_TOOL_PROMPT = 'Use the test_tool and say hi.';
-const TEST_TOOL_SCHEMA = {
-  type: 'object',
-  properties: { message: { type: 'string' } },
-  required: ['message'],
-  additionalProperties: false,
-};
-
-function buildTestToolRequest(upstreamMode: string): Record<string, unknown> {
-  const openaiToolBody = {
-    messages: [{ role: 'user', content: TEST_TOOL_PROMPT }],
-    max_tokens: 128,
-    tools: [{
-      type: 'function',
-      function: {
-        name: TEST_TOOL_NAME,
-        description: TEST_TOOL_DESCRIPTION,
-        parameters: TEST_TOOL_SCHEMA,
-      },
-    }],
-    tool_choice: 'auto',
-  };
-
-  if (upstreamMode === 'openai-completions' ||
-      upstreamMode === 'openai-responses' ||
-      upstreamMode === 'open-responses' ||
-      upstreamMode === 'gemini-generatecontent' ||
-      upstreamMode === 'gemini-interactions') {
-    return openaiToolBody;
-  }
-
-  return {
-    messages: [{ role: 'user', content: TEST_TOOL_PROMPT }],
-    max_tokens: 128,
-    tools: [{ name: TEST_TOOL_NAME, description: TEST_TOOL_DESCRIPTION, input_schema: TEST_TOOL_SCHEMA }],
-    tool_choice: { type: 'tool', name: TEST_TOOL_NAME },
-  };
-}
 
 function extractTestResultDetail(responseBody: unknown): string {
   if (!responseBody || typeof responseBody !== 'object') return String(responseBody);

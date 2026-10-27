@@ -81,8 +81,9 @@ The sample output of this code is as follows:
 
 ## Proxy notes: `tool_choice` and `thinking` in model-test requests
 
-Findings from reviewing the model-test request builders in `src/tui.ts` and
-`src/handlers/dashboard.ts`, both of which POST to the proxy's own
+Findings from reviewing the model-test request builders, now shared between
+the TUI and the dashboard via `src/utils/model-test.ts` (previously mirrored
+in `src/tui.ts` and `src/handlers/dashboard.ts`). Both POST to the proxy's own
 `/v1/messages` endpoint (Anthropic-Messages shape) to probe a configured
 model/upstream. The proxy translates that body per `upstreamMode` before
 forwarding to the real upstream (`/v1/chat/completions` for
@@ -90,11 +91,12 @@ forwarding to the real upstream (`/v1/chat/completions` for
 
 ### `tool_choice`
 
-- **TUI** (`buildOpenAIToolRequest`, `src/tui.ts`): OpenAI-mode test request
+- **TUI** (`buildOpenAIToolRequest`, `src/utils/model-test.ts`): OpenAI-mode test request
   uses `tool_choice: 'auto'`.
-- **Dashboard** (`buildTestToolRequest`, `src/handlers/dashboard.ts`):
+- **Dashboard** (`buildTestToolRequest`, previously mirrored in `src/handlers/dashboard.ts`):
   previously forced `tool_choice: { type: 'function', function: { name:
-  TEST_TOOL_NAME } }`. Synced to `tool_choice: 'auto'` to match the TUI.
+  TEST_TOOL_NAME } }`. Synced to `tool_choice: 'auto'` to match the TUI; the
+  dashboard now imports the shared builder from `src/utils/model-test.ts`.
 - Claude-mode (`anthropic-messages`) test requests in both files still force
   `tool_choice: { type: 'tool', name: TEST_TOOL_NAME }` — unchanged, since
   Anthropic's schema doesn't have an `'auto'` shorthand string form for tools

@@ -5,6 +5,23 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(dashboard): dedupe the model-test request builders — dashboard now shares `src/utils/model-test.ts` with the TUI
+
+The dashboard's `buildTestToolRequest` (`src/handlers/dashboard.ts`) was a mirrored copy
+of the TUI's and had **diverged**: it hardcoded `max_tokens: 128` for every upstream mode,
+so the dashboard "test model" button sent `max_tokens` to `openai-responses` /
+`open-responses` routes, which reject it with `400 Unsupported parameter: 'max_tokens'`
+(the TUI had already fixed this via `maxTokensField()` → `max_completion_tokens`).
+
+The canonical builders (`maxTokensField`, `buildTestTextRequest`, `buildTestToolRequest`,
+plus the `TEST_TOOL_*` constants) now live in **`src/utils/model-test.ts`**, imported by
+both `src/tui.ts` (which re-exports them for existing callers/tests) and
+`src/handlers/dashboard.ts` (mirrored copy deleted). The dashboard's OpenAI-mode test
+request now carries `max_completion_tokens` for responses-mode routes, matching the TUI.
+
+Verified: `npm run typecheck` clean; `tests/unit/tui.test.ts` 21/21 (exact request-shape
+assertions per upstream mode); `dashboard-endpoints` / `dashboard-config` 24/24.
+
 ### docs(config): purge the removed `[default_upstream]` / `[upstream]` `default_*` keys from live docs, and pin `defaultBaseUrl` to `[models.default].base_url`
 
 `docs/**`, `tests/**` comments, `CHANGELOG.md` — `[default_upstream]` was removed earlier
