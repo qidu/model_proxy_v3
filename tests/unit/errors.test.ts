@@ -9,8 +9,10 @@ import {
   RateLimitError,
   ProcessingError,
   OverLimitError,
+  UpstreamApiError,
   classifyTransportError,
   createErrorResponse,
+  handleTargetApiError,
   validateRequired,
   validateString,
   validateNumber,
@@ -141,6 +143,88 @@ describe('createErrorResponse', () => {
   it('uses customStatus when provided, even for a generic Error', async () => {
     const resp = createErrorResponse(new Error('oops'), undefined, 503);
     assert.equal(resp.status, 503);
+  });
+
+  it('forwards an upstream error body unmodified with status and headers', async () => {
+    const upstreamBody = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'model does not support tools' } });
+    const err = new UpstreamApiError('synthesized log message', 400, 'invalid_request_error', upstreamBody, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-status': 'rejected',
+    });
+    const resp = createErrorResponse(err, 'req-upstream');
+    assert.equal(resp.status, 400);
+    assert.equal(await resp.text(), upstreamBody);
+    assert.equal(resp.headers.get('x-request-id'), 'req-upstream');
+    assert.equal(resp.headers.get('anthropic-ratelimit-unified-status'), 'rejected');
+  });
+
+  it('wraps a non-JSON upstream body in the proxy envelope', async () => {
+    const err = new UpstreamApiError('Service error from Claude API', 500, 'processing_error', '<html>oops</html>');
+    const resp = createErrorResponse(err);
+    assert.equal(resp.status, 500);
+    const body = await resp.json();
+    assert.equal(body.error.type, 'processing_error');
+    assert.equal(body.error.message, 'Service error from Claude API');
+  });
+
+  it('emits retry-after (integer seconds) and x-should-retry on a local 429', async () => {
+    const resp = createErrorResponse(new OverLimitError(), 'req-429');
+    assert.equal(resp.status, 429);
+    assert.match(resp.headers.get('retry-after') ?? '', /^\d+$/);
+    assert.equal(resp.headers.get('x-should-retry'), 'true');
+  });
+
+  it('emits retry-after and x-should-retry on a 503 with custom status', async () => {
+    const resp = createErrorResponse(new Error('down'), undefined, 503);
+    assert.match(resp.headers.get('retry-after') ?? '', /^\d+$/);
+    assert.equal(resp.headers.get('x-should-retry'), 'true');
+  });
+
+  it('prefers the captured upstream retry-after, normalized to integer seconds', async () => {
+    const upstreamBody = JSON.stringify({ error: { message: 'slow down' } });
+    const err = new UpstreamApiError('rate limited', 429, 'rate_limit_error', upstreamBody, {
+      'retry-after': '17.4',
+      'x-should-retry': 'false',
+    });
+    const resp = createErrorResponse(err);
+    assert.equal(resp.headers.get('retry-after'), '18');
+    assert.equal(resp.headers.get('x-should-retry'), 'false');
+  });
+});
+
+// ─── handleTargetApiError ──────────────────────────────────────────────────
+
+describe('handleTargetApiError', () => {
+  it('throws UpstreamApiError carrying the raw upstream body', () => {
+    const upstreamBody = JSON.stringify({ error: { message: 'context too long' } });
+    const response = new Response(upstreamBody, {
+      status: 400,
+      headers: { 'Content-Type': 'application/json', 'retry-after': '5' },
+    });
+    try {
+      handleTargetApiError(response, 'Claude API', { url: 'https://api.example/v1/messages', upstreamBody });
+      assert.fail('should have thrown');
+    } catch (err: any) {
+      assert.ok(err instanceof UpstreamApiError);
+      assert.ok(err instanceof ClaudeProxyError);
+      assert.equal(err.status, 400);
+      assert.equal(err.type, 'invalid_request_error');
+      assert.equal(err.message, 'context too long');
+      assert.equal(err.upstreamBody, upstreamBody);
+      assert.equal(err.upstreamHeaders['retry-after'], '5');
+    }
+  });
+
+  it('throws a plain ClaudeProxyError when no upstream body was captured', () => {
+    const response = new Response(null, { status: 503 });
+    try {
+      handleTargetApiError(response, 'Claude API', { url: 'https://api.example/v1/messages' });
+      assert.fail('should have thrown');
+    } catch (err: any) {
+      assert.ok(!(err instanceof UpstreamApiError));
+      assert.ok(err instanceof ClaudeProxyError);
+      assert.equal(err.status, 503);
+    }
   });
 });
 

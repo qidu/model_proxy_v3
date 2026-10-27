@@ -11,8 +11,9 @@ import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
 import { extractRawCredential } from './utils/auth-headers.js';
 import { createErrorResponse, createResponsesErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
+import { wrapSseStreamWithKeepAlive } from './utils/sse-keepalive.js';
 import { createLogger, type Logger } from './utils/logger.js';
-import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled } from './handlers/models.js';
+import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled, isAnthropicModelId, toAnthropicModel } from './handlers/models.js';
 import { handleTokenCountingRequest } from './handlers/token-counting.js';
 import { handleMessagesRequest } from './handlers/messages.js';
 import { handleResponsesRequest, handleResponsesCompactRequest, handleResponsesInputTokensRequest, handleResponsesRetrievalRequest } from './handlers/responses.js';
@@ -2325,19 +2326,27 @@ export default {
             } else {
               response = await handleModelsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, logger, env as unknown as Record<string, unknown>, configuredModelIds);
 
-              // Check if User-Agent contains 'claude-cli' to return Anthropic model list format (legacy)
+              // Claude Code clients (UA 'claude-cli' or 'claude-code') get the
+              // Anthropic model-list shape: id / display_name / optional
+              // description, filtered to claude/anthropic ids per the gateway
+              // model-discovery spec.
               const userAgent = request.headers.get('user-agent') || '';
-              if (userAgent.includes('claude-cli')) {
+              if (userAgent.includes('claude-cli') || userAgent.includes('claude-code')) {
                 try {
                   const body: any = await response.json();
                   // Transform OpenAI response to Anthropic format
                   if (body.object === 'list' && Array.isArray(body.data)) {
-                    const anthropicModels = body.data.map((model: any) => ({
-                      id: model.id,
-                      type: 'model',
-                      created_at: new Date(model.created * 1000).toISOString(),
-                      display_name: model.id,
-                    }));
+                    const anthropicModels = body.data
+                      .map((model: any) => {
+                        const mapped = toAnthropicModel(model);
+                        if (!mapped) return null;
+                        return {
+                          ...mapped,
+                          type: 'model',
+                          created_at: typeof model.created === 'number' ? new Date(model.created * 1000).toISOString() : undefined,
+                        };
+                      })
+                      .filter((model: any) => model !== null && isAnthropicModelId(model.id));
                     const transformedResponse = {
                       data: anthropicModels,
                       first_id: anthropicModels[0]?.id || '',
@@ -2518,6 +2527,18 @@ export default {
               modelUsageOneTimeAuthCode,
               sidecarForwardedHeaders,
             );
+          }
+        }
+
+        // SSE keep-alive: inject `: ping` comment lines when the upstream goes
+        // silent (Claude Code aborts a stream after 5 min without bytes).
+        // Applied centrally here so every streaming path (native pass-through,
+        // converters, SDK handler) is covered. The PII-restore and usage/tool
+        // tracking transforms treat comment lines as opaque bytes.
+        if (response.ok) {
+          const sseContentType = response.headers.get('content-type') || '';
+          if (sseContentType.includes('text/event-stream') && response.body) {
+            response = new Response(wrapSseStreamWithKeepAlive(response.body), response);
           }
         }
 

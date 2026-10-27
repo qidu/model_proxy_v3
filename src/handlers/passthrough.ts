@@ -17,6 +17,7 @@ import type { PassthroughTargetConfig, ProxyConfig } from '../utils/config-loade
 import type { UpstreamMode } from '../utils/upstream-modes.js';
 import { selectWeightedCompositeCandidate } from '../index.js';
 import { handleTargetApiError } from '../utils/errors.js';
+import { wrapSseStreamWithKeepAlive } from '../utils/sse-keepalive.js';
 
 interface EndpointModeMap {
   path: string;
@@ -297,9 +298,11 @@ export async function handlePassthroughRequest(
       modelUsageRecordBody
     );
 
-    // Pipe upstream -> usage tracker -> client
+    // Pipe upstream -> usage tracker -> keep-alive -> client. The keep-alive
+    // wrapper injects `: ping` comment lines when the upstream is silent for
+    // 30s+ (Claude Code aborts a stream after 5 min without bytes).
     const trackedResponse = new Response(
-      response.body.pipeThrough(usageTrackingStream),
+      wrapSseStreamWithKeepAlive(response.body.pipeThrough(usageTrackingStream)),
       {
         status: response.status,
         headers: sanitizeUpstreamResponseHeaders(response),

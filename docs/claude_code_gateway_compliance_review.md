@@ -33,7 +33,7 @@ Consequences:
 
 Per the scope rule, the *header*-preservation half of this fix applies to `anthropic-messages` only; the *body*-forwarding half applies to every path, since error wording is payload, not an Anthropic header.
 
-**Status**: ⏳ **PENDING** — affects the native pass-through too (`claude.ts:157`), not just the converted paths. Requires handler-level changes to pipe raw upstream error bodies.
+**Status**: ✅ **FIXED** — `handleTargetApiError`/`handleResponsesApiError` now throw `UpstreamApiError` (a `ClaudeProxyError` subclass carrying the raw upstream body + preserved headers); `createErrorResponse`/`createResponsesErrorResponse` render that body verbatim with the upstream status. Non-JSON/missing bodies still fall back to the synthesized envelope. The synthesized message is retained for logs and failover classification (status/`instanceof` semantics unchanged).
 
 ---
 
@@ -64,7 +64,7 @@ Per the scope rule, `openai-*` / `gemini-*` upstreams do not carry Anthropic hea
 1. `createErrorResponse()` (errors.ts:194-200) — when `responseStatus` is 429 or 503, emit `retry-after: <integer seconds>` and `x-should-retry: true`. Thread the intended backoff duration in from the caller.
 2. Ensure `sanitizeUpstreamResponseHeaders()` (routing.ts:643-659) does **not** delete these headers — **already satisfied**, it only strips `content-encoding` / `content-length`.
 
-**Status**: ✅ **FIXED for upstream pass-through** (`claude.ts:174,198` forwards everything). ⏳ **PENDING** for the proxy's own 429/503 — `createErrorResponse()` still emits neither `retry-after` nor `x-should-retry`.
+**Status**: ✅ **FIXED** — upstream pass-through (`claude.ts:174,198`) forwards everything, and `createErrorResponse()`/`createResponsesErrorResponse()` now emit `retry-after` (integer seconds, normalized from HTTP-date when captured upstream) and `x-should-retry` on every 429/503, preferring captured upstream values and defaulting to 30s for purely local errors.
 
 ---
 
@@ -80,7 +80,7 @@ Per the scope rule, `openai-*` / `gemini-*` upstreams do not carry Anthropic hea
 
 **Fix**: In each streaming handler, start a 30–45 s interval that writes `: ping\n\n` (SSE comment) when no data events have been sent in that window. Stop interval on stream close. For the native pass-through path, wrap `response.body` in a `TransformStream` that interleaves the heartbeat rather than returning it untouched.
 
-**Status**: ⏳ **PENDING** — no keep-alive synthesis on any path.
+**Status**: ✅ **FIXED** — `src/utils/sse-keepalive.ts` (`wrapSseStreamWithKeepAlive`) injects `: ping\n\n` SSE comments after 30s of upstream silence. Applied centrally in `index.ts` runAttempt for every 2xx `text/event-stream` response (covers native pass-through, converters, SDK handler) and in the passthrough handler's own SSE pipe (`passthrough.ts`). Covered by `tests/unit/sse-keepalive.test.ts`.
 
 ---
 
@@ -111,13 +111,7 @@ const anthropicModels = body.data.map((model: any) => ({
 - No `~/.claude/cache/gateway-models.json` write
 - `x-api-key` is not forwarded alongside `Authorization` on the discovery fetch
 
-**Status**: ⏳ **PENDING**
-
-**Fix**: 
-1. Add env gate `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`.
-2. New `handleAnthropicModelsDiscovery()` that: calls upstream with 3 s timeout (abort on redirect), maps to Anthropic shape (`id`, `display_name`, `description`), filters `id.toLowerCase().includes('claude') || id.toLowerCase().includes('anthropic')`, returns `object: 'list', data: [...]`.
-3. Serve this shape for **all** `/v1/models` requests when the gate is on (not just `claude-cli` UA).
-4. Forward both `Authorization` and `x-api-key` upstream.
+**Status**: ✅ **FIXED** — `handleAnthropicModelsDiscovery()` (`src/handlers/models.ts`) implements the gated (env `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) discovery path: 3 s timeout, `redirect: 'error'`, `id`/`display_name`/`description` mapping, claude/anthropic id filter (`isAnthropicModelId`/`toAnthropicModel`), `Authorization` + `x-api-key` forwarding, and fail-loud upstream errors. The ungated legacy path (`src/index.ts` `case 'models':`) now matches UA `claude-cli` **or** `claude-code` and returns the same Anthropic shape — including `description` and the claude/anthropic filter — reusing the shared helpers. The client-side cache file (`~/.claude/cache/gateway-models.json`) is Claude Code's own responsibility, not the gateway's.
 
 ---
 
@@ -189,7 +183,7 @@ Residual risk — **resolved under the scope rule**: lines 412-437 document `ens
 - `output_config.effort` → `reasoning_effort` mapped in `responses.ts` and `messages.ts`
 - **Gap**: No explicit check that **both** header and body field travel together for each pair. A converter could drop `cache_control` or `defer_loading` while the beta header still advertises the feature.
 
-**Status**: ⏳ **PENDING** — scoped to `anthropic-messages`. On that path `handleClaudeRequest` (claude.ts:105-117) forwards the body with no format conversion, so body fields survive intact and the pairs travel together by construction; the risk is the `before_upstream` transform hook (`claude.ts:117`), which can mutate the body after the header is already set.
+**Status**: ✅ **FIXED** — regression test added at `tests/unit/beta-passthrough-pairs.test.ts`: runs the full `before_upstream` hook chain (system/messages-touching builtins + per-entry maxTokens cap + header ops) on the `anthropic-messages` path and asserts `thinking`, `context_management`, `cache_control` markers, `tools[].input_schema.strict`/`defer_loading`, `output_config`, and the `anthropic-beta` header all survive unchanged.
 
 **Fix**: Add a regression test on the `anthropic-messages` path asserting that each beta header's paired body field is unchanged after the full `before_upstream` hook chain.
 
@@ -289,21 +283,21 @@ Files **not yet audited** for this analysis: `src/handlers/openai.ts`, `src/hand
 
 | # | Item | Severity | Status |
 |---|------|----------|--------|
-| 1 | Error bodies forwarded unmodified | CRITICAL | ⏳ PENDING |
-| 2 | Response headers (`retry-after`, `x-should-retry`, ratelimit) | CRITICAL | 🟡 PARTIAL — upstream pass-through ✅, own 429/503 ⏳ |
-| 3 | `ping` synthesis | CRITICAL | ⏳ PENDING |
-| 4 | `/v1/models` discovery shape + filter + gate | HIGH | ⏳ PENDING |
+| 1 | Error bodies forwarded unmodified | CRITICAL | ✅ FIXED |
+| 2 | Response headers (`retry-after`, `x-should-retry`, ratelimit) | CRITICAL | ✅ FIXED |
+| 3 | `ping` synthesis | CRITICAL | ✅ FIXED |
+| 4 | `/v1/models` discovery shape + filter + gate | HIGH | ✅ FIXED |
 | 5 | `anthropic-workspace-id` forwarding | HIGH | ✅ FIXED |
 | 6 | `x-claude-code-*` gateway hints | HIGH | ✅ FIXED (forwarding is the spec obligation) |
 | 7 | System array positional integrity | HIGH | ✅ COMPLIANT (one guard to add) |
-| 8 | Feature pass-through pairs | MEDIUM | ⏳ PENDING (test only) |
+| 8 | Feature pass-through pairs | MEDIUM | ✅ FIXED (regression test) |
 | 9 | Disable flags | MEDIUM | ⏳ PENDING |
 | 10 | `anthropic-version` forwarding | LOWER | ✅ FIXED |
 | 11 | Forward headers as open lists | LOWER | ⏳ PENDING |
 | 12 | Streaming `message_delta`/`message_stop` | LOWER | 🟡 PARTIAL |
 | 13 | Discovery timeout & redirect | LOWER | ⏳ PENDING |
 
-Net after scoping: **6 FIXED/COMPLIANT, 1 PARTIAL-and-mostly-done, 6 PENDING.**
+Net after scoping: **10 FIXED/COMPLIANT, 1 PARTIAL-and-mostly-done, 2 PENDING.**
 
 ---
 
@@ -311,13 +305,13 @@ Net after scoping: **6 FIXED/COMPLIANT, 1 PARTIAL-and-mostly-done, 6 PENDING.**
 
 All items below are scoped to `anthropic-messages` unless noted.
 
-1. **Item 1** — Error body forwarding at handler level (most user-visible breakage; affects the native path too).
-2. **Item 2 (residual)** — emit `retry-after` + `x-should-retry` from `createErrorResponse()` for the proxy's own 429/503.
-3. **Item 3** — Ping synthesis, incl. a `TransformStream` wrapper on the native pass-through (streaming reliability).
-4. **Item 4 + 13** — Model discovery shape/filter/gate plus 3 s timeout and redirect-failure (core Claude Code feature).
+1. ~~**Item 1**~~ — DONE. Error body forwarding via `UpstreamApiError` + verbatim rendering in `createErrorResponse`/`createResponsesErrorResponse`.
+2. ~~**Item 2**~~ — DONE. `retry-after` + `x-should-retry` emitted on all proxy-generated 429/503.
+3. ~~**Item 3**~~ — DONE. Ping synthesis via `wrapSseStreamWithKeepAlive`, applied centrally in runAttempt and in the passthrough handler.
+4. **Item 4** — DONE for shape/filter/gate/UA (`claude-cli` + `claude-code`). **Item 13 remains**: the 3 s cap / redirect-failure / fail-loud behavior exists only in the gated `handleAnthropicModelsDiscovery`; `handleModelsRequest` still uses the generic upstream timeout and swallows upstream failures into a config-only list.
 5. ~~**Items 5, 6, 10**~~ — DONE
 6. **Item 7 (guard)** — gate `ensure_trailing_user_message` to non-Anthropic upstreams; add the positional-integrity regression test.
-7. **Items 8, 9, 11** — Beta pass-through test, disable flags, open-list `anthropic-beta` forwarding.
+7. **Item 8** — DONE (regression test). **Items 9, 11** — disable flags, open-list `anthropic-beta` forwarding.
 8. **Item 12** — Streaming invariant tests.
 
 ---

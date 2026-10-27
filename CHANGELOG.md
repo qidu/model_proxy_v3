@@ -5,6 +5,55 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(gateway): Claude Code gateway compliance — error body forwarding, retry headers, SSE keep-alive, model discovery, beta pair regression test
+
+Implements five items from `docs/claude_code_gateway_compliance_review.md`
+(statuses updated there: now 10 FIXED/COMPLIANT, 1 PARTIAL, 2 PENDING).
+
+- **Error bodies forwarded unmodified (CRITICAL, item 1)** — new `UpstreamApiError`
+  (`src/utils/errors.ts`), a `ClaudeProxyError` subclass carrying the raw upstream body
+  plus preserved headers (`content-type`, `retry-after`, `x-should-retry`,
+  `anthropic-ratelimit-*`). `handleTargetApiError` / `handleResponsesApiError` throw it
+  whenever an upstream body was captured, and `createErrorResponse` /
+  `createResponsesErrorResponse` render that body **verbatim** with the upstream status —
+  Claude Code matches upstream error wording for capability-rejection recovery. Non-JSON
+  or missing bodies still fall back to the synthesized envelope, and the synthesized
+  message is retained for server logs. Status/type/`instanceof` semantics are unchanged,
+  so composite failover and the target-retry ladder are unaffected. Side effect: clients
+  now see the upstream's own 401 message instead of the proxy's "check the configured
+  api_key" guidance (still logged server-side).
+- **`retry-after` + `x-should-retry` on the proxy's own 429/503 (CRITICAL, item 2)** —
+  both error renderers emit the headers Claude Code reads on every 429/503, preferring a
+  captured upstream `retry-after` (HTTP-dates normalized to integer delta-seconds per
+  spec) and defaulting to 30s for purely local errors such as `OverLimitError`.
+- **SSE keep-alive synthesis (CRITICAL, item 3)** — new `wrapSseStreamWithKeepAlive()`
+  (`src/utils/sse-keepalive.ts`) injects `: ping` comment lines after 30s of upstream
+  silence (Claude Code aborts a stream after 5 min without bytes; pingless upstreams like
+  Bedrock eventstream could trip that). Applied centrally in `runAttempt` (`index.ts`)
+  for every 2xx `text/event-stream` response — covering the native pass-through,
+  converted paths, and the SDK handler — and in the passthrough handler's own SSE pipe.
+  Comment lines are opaque to the usage/tool tracking transforms.
+- **`/v1/models` discovery shape & filtering for Claude Code UAs (HIGH, item 4)** —
+  shared `isAnthropicModelId()` / `toAnthropicModel()` helpers (`src/handlers/models.ts`);
+  the ungated legacy path (`index.ts` `case 'models':`) now matches UA `claude-cli` **or**
+  `claude-code` and returns the Anthropic shape with `description` and the
+  claude/anthropic id filter, and no longer produces `Invalid Date` for entries without
+  `created`. The gated `handleAnthropicModelsDiscovery` path (env
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`, 3s timeout, `redirect: 'error'`,
+  `Authorization` + `x-api-key` forwarding) is unchanged.
+- **Feature pass-through pair regression test (MEDIUM, item 8)** —
+  `tests/unit/beta-passthrough-pairs.test.ts` runs the full `before_upstream` hook chain
+  on the `anthropic-messages` path and asserts `thinking`, `context_management`,
+  `cache_control` markers, `tools[].input_schema.strict`/`defer_loading`,
+  `output_config`, and the `anthropic-beta` header all survive unchanged.
+
+Tests: new coverage in `tests/unit/errors.test.ts` (raw-body forwarding, non-JSON
+fallback, retry headers) and `tests/unit/sse-keepalive.test.ts` (relay, ping timing,
+close, error propagation); `tests/unit/responses-stream-events.test.ts` and
+`messages-handler.test.ts` updated from the old re-wrapping expectations to verbatim
+forwarding. Verified: `npm run typecheck`, `npm run build`, and `npm run test:unit`
+(1865/1865) all pass.
+
 ### fix(dashboard): dedupe the model-test request builders — dashboard now shares `src/utils/model-test.ts` with the TUI
 
 The dashboard's `buildTestToolRequest` (`src/handlers/dashboard.ts`) was a mirrored copy

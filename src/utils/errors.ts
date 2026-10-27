@@ -74,6 +74,82 @@ export class OverLimitError extends ClaudeProxyError {
 }
 
 /**
+ * Error thrown when an upstream API returned a 4xx/5xx with a response body.
+ *
+ * Claude Code matches upstream error wording for capability-rejection
+ * recovery, so the client must receive the upstream body unmodified rather
+ * than a proxy-synthesized envelope. This class carries that raw body (plus a
+ * small bag of upstream headers worth preserving) through the throw/catch
+ * path to createErrorResponse / createResponsesErrorResponse, which render it
+ * verbatim. The synthesized `message` is still used for server-side logs and
+ * failover classification (status / instanceof ClaudeProxyError semantics are
+ * unchanged).
+ */
+export class UpstreamApiError extends ClaudeProxyError {
+  constructor(
+    message: string,
+    status: number,
+    type: string,
+    public readonly upstreamBody: string,
+    public readonly upstreamHeaders: Record<string, string> = {},
+  ) {
+    super(message, status, type);
+    this.name = 'UpstreamApiError';
+  }
+}
+
+/** Headers worth preserving from an upstream error response. */
+function captureUpstreamErrorHeaders(response: Response): Record<string, string> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    const k = key.toLowerCase();
+    if (k === 'content-type' || k === 'retry-after' || k === 'x-should-retry' || k.startsWith('anthropic-ratelimit-')) {
+      headers[k] = value;
+    }
+  });
+  return headers;
+}
+
+/** Spec requires retry-after as integer delta-seconds, never an HTTP-date. */
+function normalizeRetryAfterSeconds(raw: string): string | undefined {
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return String(Math.max(0, Math.ceil(seconds)));
+  const dateMs = Date.parse(raw);
+  if (Number.isFinite(dateMs)) return String(Math.max(0, Math.ceil((dateMs - Date.now()) / 1000)));
+  return undefined;
+}
+
+/**
+ * Default retry hint (seconds) for the proxy's own locally-generated 429/503,
+ * where no upstream retry-after exists. 30s is a conservative middle ground:
+ * local token-quota 429s rarely clear faster, and a local 503 is usually a
+ * short-lived dependency outage.
+ */
+const DEFAULT_RETRY_AFTER_SECONDS = 30;
+
+/**
+ * Claude Code reads `retry-after` (integer seconds) and `x-should-retry` on
+ * every 429/503. Emit them on the proxy's own error responses, preferring a
+ * captured upstream value when one exists.
+ */
+function applyRetryHeaders(headers: Record<string, string>, status: number, upstreamHeaders?: Record<string, string>): void {
+  if (status !== 429 && status !== 503) return;
+  const upstreamRetryAfter = upstreamHeaders?.['retry-after'];
+  const normalized = upstreamRetryAfter ? normalizeRetryAfterSeconds(upstreamRetryAfter) : undefined;
+  headers['retry-after'] = normalized ?? String(DEFAULT_RETRY_AFTER_SECONDS);
+  headers['x-should-retry'] = upstreamHeaders?.['x-should-retry'] ?? 'true';
+}
+
+function isJsonBody(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Classification of transport-layer errors thrown by `fetch()`.
  *
  * `fetch()` rejects with a plain `Error` (typically `TypeError: fetch failed`)
@@ -159,6 +235,28 @@ export function createErrorResponse(
   requestId?: string,
   customStatus?: number
 ): Response {
+  // Upstream error with a captured body: forward the upstream body unmodified
+  // (Claude Code matches upstream error wording for capability-rejection
+  // recovery). Only JSON bodies are forwarded verbatim; a non-JSON or missing
+  // body falls through to the synthesized envelope below.
+  if (error instanceof UpstreamApiError && error.upstreamBody && isJsonBody(error.upstreamBody)) {
+    const passthroughHeaders: Record<string, string> = {};
+    for (const [k, v] of Object.entries(error.upstreamHeaders)) {
+      passthroughHeaders[k] = k === 'retry-after' ? (normalizeRetryAfterSeconds(v) ?? v) : v;
+    }
+    if (!passthroughHeaders['content-type']) {
+      passthroughHeaders['content-type'] = 'application/json';
+    }
+    if (requestId) {
+      passthroughHeaders['x-request-id'] = requestId;
+    }
+    applyRetryHeaders(passthroughHeaders, error.status, error.upstreamHeaders);
+    return new Response(error.upstreamBody, {
+      status: error.status,
+      headers: passthroughHeaders,
+    });
+  }
+
   let responseStatus = customStatus ?? 500;
   let errorType = 'error';
   let message = error.message;
@@ -198,6 +296,8 @@ export function createErrorResponse(
   if (requestId) {
     headers['x-request-id'] = requestId;
   }
+
+  applyRetryHeaders(headers, responseStatus);
 
   return new Response(JSON.stringify(errorResponse), {
     status: responseStatus,
@@ -297,6 +397,12 @@ export function handleTargetApiError(
       break;
   }
 
+  if (requestInfo?.upstreamBody) {
+    // Carry the raw upstream body to the client (see UpstreamApiError). The
+    // synthesized errorMessage above is kept for logs and failover
+    // classification only.
+    throw new UpstreamApiError(errorMessage, status, errorType, requestInfo.upstreamBody, captureUpstreamErrorHeaders(response));
+  }
   throw new ClaudeProxyError(errorMessage, status, errorType);
 }
 
@@ -354,6 +460,19 @@ export function createResponsesErrorResponse(
     type = error.type;
     param = error.param;
     code = error.code;
+  } else if (error instanceof UpstreamApiError && error.upstreamBody && isJsonBody(error.upstreamBody)) {
+    // Forward the upstream error body unmodified (same rationale as
+    // createErrorResponse) with the upstream status.
+    const passthroughHeaders: Record<string, string> = {};
+    for (const [k, v] of Object.entries(error.upstreamHeaders)) {
+      passthroughHeaders[k] = k === 'retry-after' ? (normalizeRetryAfterSeconds(v) ?? v) : v;
+    }
+    if (!passthroughHeaders['content-type']) {
+      passthroughHeaders['content-type'] = 'application/json';
+    }
+    if (requestId) passthroughHeaders['x-request-id'] = requestId;
+    applyRetryHeaders(passthroughHeaders, error.status, error.upstreamHeaders);
+    return new Response(error.upstreamBody, { status: error.status, headers: passthroughHeaders });
   } else if (error instanceof ClaudeProxyError) {
     status = error.status;
     type = responsesErrorTypeForStatus(status);
@@ -370,6 +489,7 @@ export function createResponsesErrorResponse(
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (requestId) headers['x-request-id'] = requestId;
+  applyRetryHeaders(headers, status);
 
   return new Response(JSON.stringify({ error: { message, type, param, code } }), {
     status,
@@ -415,6 +535,12 @@ export function handleResponsesApiError(
       : `Upstream (${targetApiName}) rejected the API key (HTTP 401) — check the configured api_key for this route.`;
   }
 
+  if (requestInfo?.upstreamBody) {
+    // Carry the raw upstream body to the client (see UpstreamApiError). The
+    // Responses-spec envelope below would discard the upstream wording Claude
+    // Code matches on for capability-rejection recovery.
+    throw new UpstreamApiError(errorMessage, status, responsesErrorTypeForStatus(status), requestInfo.upstreamBody, captureUpstreamErrorHeaders(response));
+  }
   throw new ResponsesApiError(errorMessage, status, responsesErrorTypeForStatus(status));
 }
 

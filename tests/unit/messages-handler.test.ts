@@ -2,6 +2,7 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { handleMessagesRequest } from '../../src/handlers/messages.js';
+import { ClaudeProxyError } from '../../src/utils/errors.js';
 
 const TARGET_URL = 'https://upstream.example/v1/chat/completions';
 const ENV = { LOG_LEVEL: 'error' } as any;
@@ -376,10 +377,13 @@ describe('handleMessagesRequest', () => {
       await assert.rejects(
         postMessages({ model: 'gpt-test', messages: [{ role: 'user', content: 'hello' }] }),
         (error: any) => {
-          assert.equal(error.name, 'ClaudeProxyError');
+          // Upstream errors with a captured body surface as UpstreamApiError
+          // (a ClaudeProxyError subclass carrying the raw upstream body).
+          assert.ok(error instanceof ClaudeProxyError);
           assert.equal(error.type, 'rate_limit_error');
           assert.equal(error.status, 429);
           assert.match(error.message, /slow down/);
+          assert.equal(JSON.parse(error.upstreamBody).error.message, 'slow down');
           return true;
         },
       );

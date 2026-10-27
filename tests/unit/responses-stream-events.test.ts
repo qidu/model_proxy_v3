@@ -261,30 +261,33 @@ describe('Responses error envelope', () => {
     })) as typeof fetch;
   };
 
-  it('returns the spec envelope for /v1/responses upstream errors', async () => {
+  it('forwards the upstream error body unmodified for /v1/responses upstream errors', async () => {
     writeConfig('openai-completions');
     mockUpstreamError(429, 'slow down');
 
     const response = await postResponses({ model: 'test', input: 'hi' });
     assert.equal(response.status, 429);
-    assert.deepEqual(await response.json(), {
-      error: { message: 'slow down', type: 'too_many_requests', param: null, code: null },
-    });
+    // CRITICAL compliance: the upstream error body reaches the client verbatim
+    // (Claude Code matches upstream error wording for capability-rejection
+    // recovery), so the proxy does NOT rewrap it into the spec envelope.
+    assert.deepEqual(await response.json(), { error: { message: 'slow down' } });
+    // ...but the proxy still emits the retry headers Claude Code reads.
+    assert.match(response.headers.get('retry-after') ?? '', /^\d+$/);
+    assert.equal(response.headers.get('x-should-retry'), 'true');
   });
 
-  it('returns the spec envelope for /v1/responses upstream 400s', async () => {
+  it('forwards the upstream error body unmodified for /v1/responses upstream 400s', async () => {
     writeConfig('openai-completions');
     mockUpstreamError(400, 'bad input');
 
     const response = await postResponses({ model: 'test', input: 'hi' });
     assert.equal(response.status, 400);
     const body = await response.json();
-    assert.equal(body.error.type, 'invalid_request');
     assert.equal(body.error.message, 'bad input');
     assert.equal(body.type, undefined, 'no Anthropic top-level type field');
   });
 
-  it('keeps the Anthropic envelope on /v1/messages', async () => {
+  it('forwards the upstream error body unmodified on /v1/messages', async () => {
     writeConfig('openai-completions');
     mockUpstreamError(429, 'slow down');
 
@@ -294,9 +297,8 @@ describe('Responses error envelope', () => {
       body: JSON.stringify({ model: 'test', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
     }), env());
     assert.equal(response.status, 429);
-    const body = await response.json();
-    assert.equal(body.type, 'error');
-    assert.equal(body.error.type, 'rate_limit_error');
+    // Raw upstream body, not a proxy-synthesized Anthropic envelope.
+    assert.deepEqual(await response.json(), { error: { message: 'slow down' } });
   });
 });
 

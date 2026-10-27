@@ -245,6 +245,25 @@ export interface AnthropicModelsResponse {
 }
 
 /**
+ * Per the Claude Code gateway spec, discovery keeps only entries whose id
+ * contains `claude` or `anthropic` anywhere (case-insensitive).
+ */
+export function isAnthropicModelId(id: string): boolean {
+  const idLower = id.toLowerCase();
+  return idLower.includes('claude') || idLower.includes('anthropic');
+}
+
+/** Map one upstream model entry to the Anthropic discovery shape. */
+export function toAnthropicModel(model: any): AnthropicModel | null {
+  if (!model || typeof model.id !== 'string') return null;
+  return {
+    id: model.id,
+    display_name: model.display_name || model.id,
+    description: model.description,
+  };
+}
+
+/**
  * Check if Anthropic model discovery is enabled via environment variable
  */
 export function isAnthropicModelDiscoveryEnabled(env?: Record<string, unknown>): boolean {
@@ -343,43 +362,26 @@ export async function handleAnthropicModelsDiscovery(
     const upstreamResponse: any = await response.json();
 
     // Transform to Anthropic shape and filter
-    let models: AnthropicModel[] = [];
+    let rawModels: any[] = [];
 
     // Handle different upstream response formats
     if (upstreamResponse.data && Array.isArray(upstreamResponse.data)) {
       // OpenAI format: { object: 'list', data: [{ id, ... }] }
-      models = upstreamResponse.data
-        .filter((model: any) => model.id && typeof model.id === 'string')
-        .map((model: any) => ({
-          id: model.id,
-          display_name: model.display_name || model.id,
-          description: model.description,
-        }));
+      rawModels = upstreamResponse.data;
     } else if (Array.isArray(upstreamResponse)) {
       // Direct array format
-      models = upstreamResponse
-        .filter((model: any) => model.id && typeof model.id === 'string')
-        .map((model: any) => ({
-          id: model.id,
-          display_name: model.display_name || model.id,
-          description: model.description,
-        }));
+      rawModels = upstreamResponse;
     } else if (upstreamResponse.models && Array.isArray(upstreamResponse.models)) {
       // Some providers use { models: [...] }
-      models = upstreamResponse.models
-        .filter((model: any) => model.id && typeof model.id === 'string')
-        .map((model: any) => ({
-          id: model.id,
-          display_name: model.display_name || model.id,
-          description: model.description,
-        }));
+      rawModels = upstreamResponse.models;
     }
 
+    const models = rawModels
+      .map(toAnthropicModel)
+      .filter((model): model is AnthropicModel => model !== null);
+
     // Filter: keep only models with 'claude' or 'anthropic' in id (case-insensitive)
-    const filteredModels = models.filter((model) => {
-      const idLower = model.id.toLowerCase();
-      return idLower.includes('claude') || idLower.includes('anthropic');
-    });
+    const filteredModels = models.filter((model) => isAnthropicModelId(model.id));
 
     logger.debug(requestId, `Model discovery: ${models.length} upstream models, ${filteredModels.length} after filter`);
 
