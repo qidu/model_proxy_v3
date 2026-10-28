@@ -1,5 +1,9 @@
 # Model Proxy v3
 
+[![build](https://github.com/qidu/model_proxy_v3/actions/workflows/build.yml/badge.svg)](https://github.com/qidu/model_proxy_v3/actions/workflows/build.yml)
+[![codecov](https://codecov.io/github/qidu/model_proxy_v3/graph/badge.svg)](https://codecov.io/github/qidu/model_proxy_v3)
+![node](https://img.shields.io/badge/node-22%2B-green.svg)
+
 One proxy, five API schemas. Talk to **Claude**, **Gemini**, **OpenAI Responses**,
 and **OpenAI Chat Completions** models through a single endpoint, no matter which
 API format your client speaks.

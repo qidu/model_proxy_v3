@@ -376,9 +376,15 @@ describe('interactive TUI lifecycle', () => {
 
       stop();
       stop();
+      // The invariant is "no loads AFTER stop" — the periodic 500ms refresh may
+      // legitimately tick while the dashboard is running (slow CI runners make
+      // the interaction phase exceed one interval), so snapshot at stop rather
+      // than assuming the initial load was the only one.
+      const loadsAtStop = configLoads;
+      assert.ok(loadsAtStop >= 1, 'initial render must load config once');
       await new Promise((resolve) => setTimeout(resolve, 600));
 
-      assert.equal(configLoads, 1, 'stopped refresh timer must not reload config');
+      assert.equal(configLoads, loadsAtStop, 'stopped refresh timer must not reload config');
       assert.equal(fetchCalls, 0, 'unsupported quota providers must not contact upstream services');
       assert.equal(terminalStarts, 1);
       assert.equal(terminalStops, 1, 'idempotent cleanup must stop the terminal once');

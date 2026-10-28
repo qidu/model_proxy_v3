@@ -1342,6 +1342,7 @@ class DashboardApp {
     this.tui.start();
     await this.refresh();
     this.refreshTimer = setInterval(() => {
+      if (this.stopped) return;
       void this.refresh();
     }, 500);
     // Dedicated 1s ticker for the terminal title activity dot — independent of
