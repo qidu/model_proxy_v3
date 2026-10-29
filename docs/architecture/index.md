@@ -42,6 +42,7 @@ Design documents, architectural decisions, and planning documents for Model Prox
 - [Plan: Remote Target Retry Dispatch](./plan-remote-target-retry-dispatch.md)
 - [Plan: Split Cloudflare Worker vs Local](./plan-split-cloudflare-worker-vs-local.md)
 - [Plan: Refactor Divide Proxy for Local/Server Side](./plan-to-refactor-divide-proxy-for-local-side-and-server-side.md)
+- [Plan: Semantic Decision Layer](../plan-semantic-decision.md) — Grow `/decision` composite targeting into signals → decisions → projections, with and without a local embedding model
 
 ### Proposals
 - [Proposal: DeepSeek Harness LLM Split](./proposal-deepseek-harness-llm-split.md)
