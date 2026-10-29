@@ -848,6 +848,146 @@ Rules of the surface:
   dashboard's TOML editor does not drop the block — this is the same
   round-trip hazard `COMPOSITE_META_KEYS` exists to prevent.
 
+### 6.1 Existing composite decision — unchanged compatibility baseline
+
+This is valid current configuration and needs no `[routing]` block. It uses the
+existing `[composite]` inline-table style, keeps target selection scoped to one
+alias, and remains supported as sugar for `algorithm = "decision"` (§5.6):
+
+```toml
+[composite]
+"smart-assistant" = {"deepseek-v4-pro" = {ability = "reasoning,complex-coding,analysis"}, "deepseek-v4-flash" = {ability = "fast-coding,simple-tasks,debugging"}, decision = {model = "laya", url = "http://localhost:8765/decision", threshold = 0.6, timeout_ms = 100, context_prompts = 1}}
+```
+
+### 6.2 Variant A — judge-only policy routing
+
+This complete example uses the existing `[models.decision]` deployment as the
+classifier and adds no embedding provider. The model names follow
+`docs/getting-started/proxy_config.example.toml`; each must still resolve through
+the existing `[models.*]` or `[composite]` configuration. If a section such as
+`[models.decision]` already exists, merge these keys into it rather than adding a
+duplicate section header.
+
+```toml
+[models.decision]
+backend = "laya"
+url = "http://localhost:8765/decision"
+timeout_ms = 1000
+
+[routing]
+strategy = "priority"
+apply_to = "all"
+budget_ms = 1000
+
+[routing.signals]
+"brief_request" = {type = "keyword", keywords = ["tl;dr", "briefly", "one sentence"], mode = "any"}
+"has_tools" = {type = "structure", has_tools = true}
+"long_context" = {type = "context", min_tokens = 32000}
+"task" = {type = "decision", question = {type = "choice", instructions = "Classify the request.", criteria = {chat = "General conversation or summarization", code = "Programming, debugging, or refactoring", analysis = "Multi-step reasoning or technical analysis"}}, timeout_ms = 800}
+"difficulty" = {type = "decision", question = {type = "score", instructions = "How difficult is this request?", criteria = ["trivial", "easy", "moderate", "hard", "research-grade"]}, predicate = {gte = 3}, timeout_ms = 800}
+"needs_verification" = {type = "decision", question = {type = "noul", instructions = "Does this request require explicit verification of facts or code behavior?"}, predicate = {gte = 0.7}, timeout_ms = 800}
+
+[[routing.decisions]]
+name = "long_context"
+priority = 900
+rules = {signal = "context.long_context"}
+outcome = {route = "deepseek-v4-pro"}
+
+[[routing.decisions]]
+name = "agentic_code"
+priority = 800
+rules = {and = [{signal = "structure.has_tools"}, {signal = "decision.task:code"}]}
+on_unknown = "no_match"
+outcome = {candidates = ["deepseek-v4-pro", "deepseek-v4-flash"]}
+
+[[routing.decisions]]
+name = "difficult_analysis"
+priority = 700
+rules = {and = [{signal = "decision.difficulty"}, {signal = "decision.task:analysis"}]}
+on_unknown = "no_match"
+outcome = {route = "deepseek-v4-pro"}
+
+[[routing.decisions]]
+name = "brief_chat"
+priority = 400
+rules = {and = [{signal = "keyword.brief_request"}, {signal = "decision.task:chat"}]}
+on_unknown = "no_match"
+outcome = {route = "deepseek-v4-flash"}
+
+[[routing.decisions]]
+name = "fallback"
+priority = 100
+rules = {}
+outcome = {route = "max-m3"}
+```
+
+### 6.3 Variant A projection — derive an effort band
+
+Add this section and decision to §6.2 to combine judge scores and a local keyword
+signal. Missing or unresolved terms use their configured default (`0` here) and
+are counted in the projection report; they do not silently become negative rule
+matches.
+
+```toml
+[routing.projections.effort]
+method = "weighted_sum"
+terms = [
+  {signal = "decision.difficulty", weight = 0.30, default = 0},
+  {signal = "decision.needs_verification", weight = 0.35, default = 0},
+  {signal = "keyword.brief_request", weight = -0.35, default = 0}
+]
+bands = [
+  {lt = 0.40, emit = "effort_low"},
+  {gte = 0.40, lt = 0.75, emit = "effort_medium"},
+  {gte = 0.75, emit = "effort_high"}
+]
+
+[[routing.decisions]]
+name = "high_effort_analysis"
+priority = 750
+rules = {and = [{signal = "projection.effort_high"}, {signal = "decision.task:analysis"}]}
+on_unknown = "no_match"
+outcome = {route = "deepseek-v4-pro"}
+```
+
+### 6.4 Variant B — optional embedding signal
+
+This standalone example adds contrastive embedding classification without a
+judge question. It uses the recommended Ollama HTTP backend and otherwise keeps
+the same decision/outcome shape as Variant A. Omit `fallback` to leave unmatched
+requests on the existing model resolution path.
+
+```toml
+[routing]
+strategy = "priority"
+apply_to = "all"
+budget_ms = 300
+
+[routing.embedding]
+backend = "ollama"
+url = "http://localhost:11434"
+model = "nomic-embed-text"
+timeout_ms = 200
+dimension = 768
+cache_size = 512
+
+[routing.signals]
+"code_task" = {type = "embedding", threshold = 0.62, aggregation = "mean", candidates = ["write a function", "fix this bug", "refactor the module"], negative_candidates = ["write a poem", "summarize this email"]}
+
+[[routing.decisions]]
+name = "embedding_code"
+priority = 500
+rules = {signal = "embedding.code_task"}
+on_unknown = "no_match"
+outcome = {candidates = ["deepseek-v4-pro", "deepseek-v4-flash"]}
+
+[[routing.decisions]]
+name = "fallback"
+priority = 100
+rules = {}
+outcome = {route = "max-m3"}
+```
+
 ---
 
 ## 7. Variant A — decision model only: a complete semantic router
@@ -1221,7 +1361,7 @@ parallel once phase 0's signal interface is frozen.
    omitting it entirely. If no config is expected to want a hard failure, drop
    it and keep `match` / `no_match`.
 
-5. **Plan location and naming.** Drafted at `docs/plan-semantic-decision.md`
+5. **Plan location and naming.** Drafted at `docs/plan-semantic-routing-decision.md`
    (root `docs/`) to sit alongside the other root-level plans; rename if this
    becomes a full design document rather than a plan.
 
