@@ -1,35 +1,36 @@
-# Plan: SSD spool for large JSON request bodies
+# Plan: SSD spool for large JSON request and response bodies
 
 Status: **Draft** — design only, nothing implemented
 Date: 2026-11-02
-Scope: Reduce resident memory for slow, in-flight requests with large JSON
+Scope: Reduce resident memory for slow, in-flight exchanges with large JSON
 bodies — especially documented inline base64 images, audio, video, documents,
-files, and skill bundles — by spooling the body to disk at ingress and
-streaming it back at egress. The goal is that "in flight" stops implying "the
-full body is in memory" for every slow leg, including a long SSE response.
-Touches the Node HTTP adapter (`src/server.ts`), the routing ladder's body
-handling (`src/index.ts`), and the request handlers' upstream `fetch` call
-sites.
+files, and skill bundles — by spooling requests, finite JSON responses, and
+individual SSE events to disk and streaming them at egress. The goal is that
+"in flight" stops implying "the full body/event is in memory" for every slow
+leg. Touches the Node HTTP adapter (`src/server.ts`), the routing ladder's body
+handling (`src/index.ts`), upstream `fetch` call sites, and response/SSE
+converters.
 
 **Scope boundary:** ingress spooling is content-agnostic. Ref-based extraction
-covers the explicit, schema-qualified inline-binary positions in §9.3,
-including non-image binary payloads. Large text and unknown/base64-looking
-fields outside that allowlist still get the slow-upload benefit, but their
-parsed and serialized forms remain O(body size). No generic long-string or
-base64 detection is allowed.
+covers the explicit, schema-qualified inline-binary positions in §9.3 and the
+response positions in §5.7, including non-image binary payloads. Large text
+and unknown/base64-looking fields outside those allowlists still get the
+slow-upload/download benefit, but their parsed and serialized forms remain
+O(body/event size). No generic long-string or base64 detection is allowed.
 
 **Storage lifetime:** all disk state is scratch space for the current proxy
-process, not a persistent request store. A process/system restart aborts every
-in-flight upload, upstream send, and SSE response. Old request spills and blob
-entries are never read, resumed, replayed, or reused after restart; they are
-only deleted by safe stale-file cleanup. There is no WAL, manifest, recovery
-log, or resumable request protocol.
+process, not a persistent request or response store. A process/system restart
+aborts every in-flight upload, upstream send, and downstream response. Old
+request/response/event spills and blob entries are never read, resumed,
+replayed, or reused after restart; they are only deleted by safe stale-file
+cleanup. There is no WAL, manifest, recovery log, or resumable protocol.
 
 **Decisions recorded 2026-11-02 (§9):** spooling is **opt-in, off by default**
 (9.1); the Phase 3 lexical scanner is **deferred pending Phase 2 measurements**
 (9.2); refs are **restricted to explicit inline-binary positions** (9.3);
 Phase 0 does **not** ship ahead of Phases 1–2 — all memory work lands as one
-reviewable change.
+reviewable change; response spooling is **per JSON body or SSE event, with
+backpressure, never whole-stream accumulation** (9.5).
 
 Accepted consequence: the current multi-copy peak (§2) stays in production
 until that single change lands.
@@ -46,12 +47,12 @@ that already produces these base64 blobs, `src/utils/image-fetch.ts`),
 
 ## 1. The claim
 
-The problem is not just the allocation peak. It is **live request-body state
-kept reachable while someone else is slow** — the client uploading, the
-upstream reading the request, or an SSE response remaining open. Spooling and
-ref-based streaming are worth doing because they sever those links for the
-supported paths: resident request memory then depends on bounded stream
-buffers, gated parse concurrency, and small per-request metadata rather than
+The problem is not just the allocation peak. It is **live request/response
+body state kept reachable while someone else is slow** — the client uploading,
+the upstream reading the request, or the client reading a response/SSE stream.
+Spooling and ref-based streaming are worth doing because they sever those
+links for supported paths: resident memory then depends on bounded stream
+buffers, gated parse concurrency, and small per-exchange metadata rather than
 on minutes of peer latency.
 
 Four consequences worth stating up front:
@@ -59,20 +60,19 @@ Four consequences worth stating up front:
 1. **The offload is not circular.** On many Linux systems `/tmp` is tmpfs.
    Spool to `os.tmpdir()` and the "offload" can silently stay in RAM. §5.6.
 2. **Spooling cannot eliminate the full-parse transient.** `JSON.parse` and
-   the current converters still need O(body size) live state. A parse semaphore
-   bounds how many such transients coexist; it does not bound how much parsed
-   state each request retains afterward. §4.
-3. **SSE is a third retention window, not part of the upstream send.** Some
-   response converters retain the parsed request for token counting after
-   `fetch` has returned response headers. Separately, SSE response queues can
-   buffer output when the downstream client is slow. Request-body offload does
-   not fix that response-side buffering. §3.
-4. **"Spill" and "cache" describe different objects.** The per-request spool
-   (§5.1) is a temporary spill: it belongs to one request and is deleted when
-   no reader needs it, even if parse, retry, or identity forwarding reads it
-   more than once. The blob store behind the refs (§5.4) is a genuine two-tier
-   RAM + SSD cache with cross-request hits. Its L1 bytes count against the
-   process memory budget.
+   the current converters still need O(body/event size) live state. A shared
+   parse semaphore bounds how many such transients coexist; it does not bound
+   how much parsed state each exchange retains afterward. §4.
+3. **SSE has two different memory problems.** Some response converters retain
+   the parsed request for token counting after `fetch` returns headers, and
+   response queues/events can buffer output when the downstream client is
+   slow. Request-body offload alone fixes neither; §5.3 and §5.7 address them
+   separately.
+4. **"Spill" and "cache" describe different objects.** Request, response, and
+   per-event spills are temporary and deleted after their last reader. The
+   request blob store behind the refs (§5.4) is a genuine two-tier RAM + SSD
+   cache with cross-request hits; response blobs are per-response scratch by
+   default. The cache's L1 bytes count against the process memory budget.
 
 ---
 
@@ -168,14 +168,16 @@ return value of `passthrough.write(chunk)` without waiting for drain. A slow
 downstream client can therefore accumulate response data independently of the
 request-body copies discussed above.
 
-Response-side backpressure/spooling is out of scope for this change (§11), but
-the document must not describe SSE memory as bounded merely because it is
-chunked. Memory reports should separate:
+Response binary spooling and the required backpressure changes are in scope
+(§5.7), but chunking alone is not a memory bound. Memory reports should
+separate:
 
-- request-body representations, which this plan targets;
-- the bounded L1 blob cache, which this plan adds;
-- parse transients, which the semaphore gates;
-- SSE response queues and converter state, which remain a separate risk.
+- request-body representations and spills;
+- non-SSE response spills and per-SSE-event spills;
+- the bounded L1 request blob cache versus per-response scratch blobs;
+- parse transients, which the shared semaphore gates;
+- response queues and converter state, which must be bounded by downstream
+  backpressure rather than allowed to grow behind disk writes.
 
 ---
 
@@ -183,30 +185,34 @@ chunked. Memory reports should separate:
 
 Cannot: avoid a transient full parse under the current converter architecture.
 `fs.readFile`/`readSpoolText`, UTF-8 decoding, and `JSON.parse` still require
-O(B) live state, including for bodies whose binary payloads will be extracted
-immediately afterward. Large fields outside the §9.3 allowlist also remain
-O(B) after parse.
+O(B) live state, including for bodies/events whose binary payloads will be
+extracted immediately afterward. Large fields outside the §9.3 and §5.7
+allowlists also remain O(B) after parse.
 
-Can: make full-body residency short and concurrency-gated on supported paths,
-instead of lasting for each slow leg:
+Can: make full-body/event residency short and concurrency-gated on supported
+paths, instead of lasting for each slow leg:
 
 - during a slow upload: bounded per-request buffers plus metadata; disk holds
   the spilled remainder;
-- during parse: O(B), with at most `max_parse_concurrency` large parses;
+- during parse: O(B), with at most `max_parse_concurrency` large parses across
+  requests, responses, and events;
 - between parse and egress: small refs/metadata only after supported inline
   binary payloads have actually been detached and all full-body owners
   released;
-- during a slow upstream send: bounded chunks for identity forwarding and
-  streamed-ref egress; rehydrated string egress remains O(B);
+- during a slow upstream request send: bounded chunks for identity forwarding
+  and streamed-ref egress; rehydrated string egress remains O(B);
+- during a slow downstream response: bounded chunks plus at most one finite
+  response/event spill per active unit. SSE is processed one event at a time,
+  never accumulated as a whole stream, and downstream backpressure pauses
+  upstream reads (§5.7);
 - during a long SSE response: no full request body on paths that explicitly
-  replace it with scalar usage metadata and refs. SSE response queues are a
-  separate term and are not fixed here.
+  replace it with scalar usage metadata and refs.
 
 There is no "~0 resident" claim. Stream buffers, parsed non-allowlisted
 fields, small JSON structure, refs, the L1 cache, V8 heap overhead, external
-buffers, and response queues remain. Likewise, a fixed parse latency or
-concurrency of 2–4 is not assumed safe without measurement: the gate trades memory for queue
-delay and must be benchmarked.
+buffers, and bounded response queues remain. Likewise, a fixed parse latency
+or concurrency of 2–4 is not assumed safe without measurement: the gate trades
+memory for queue delay and must be benchmarked.
 
 > **Note:** this is why whole-request admission control is not the primary fix
 > in §8. It can bound memory by bounding request count, but a permit held for
@@ -217,38 +223,98 @@ delay and must be benchmarked.
 
 ## 5. Design
 
-### 5.0 End-to-end request-body flow
+### 5.0 End-to-end request/response flow
+
+Both diagrams describe the same stages. The flowchart emphasizes storage and
+branching; the sequence diagram emphasizes client/proxy/upstream interactions.
+
+**Flowchart view**
 
 ```mermaid
 flowchart TD
-  client["Client JSON body<br/>inline image / audio / video / document / file"] --> adapter["Ingress adapter<br/>threshold + byte caps + backpressure"]
-  adapter -->|small body| memory["Bounded RAM body"]
-  adapter -->|large body or chunked past threshold| requestSpool[("SSD: original JSON spool<br/>current process only")]
-  memory --> parse
-  requestSpool --> parse
-  parse["Parse gate (RAM)<br/>full text + parsed object<br/>O(B) transient"] --> consumers["Validate / token-count / transforms<br/>that need original bytes"]
-  consumers -->|identity passthrough| identity["Stream original JSON<br/>without full-body stringify"]
-  requestSpool --> identity
-  memory --> identity
-  consumers -->|converted route| extract["Offload allowlisted binary payloads<br/>replace inline data with BlobRefs"]
-  extract -->|base64 payload| blobSpool[("SSD: blob store<br/>original or converted base64")]
-  extract --> transform["Ref-aware transform / format conversion<br/>small JSON skeleton + BlobRefs"]
-  transform -->|new binary payloads| blobSpool
-  transform --> serializer["Ref-aware serializer<br/>small JSON chunks"]
-  blobSpool -->|chunked reads| serializer
-  identity --> upstream["Upstream fetch<br/>backpressured POST"]
-  serializer --> upstream
-  upstream -->|SSE response| sse["Long-lived SSE stream<br/>scalar usage metadata + refs only<br/>no full requestBody closure"]
-  upstream -->|request send complete| cleanup["After the last reader<br/>delete the request spool<br/>blob cache remains process-lifetime"]
+  C["Client"] --> I["Ingress adapter<br/>threshold + byte caps + backpressure"]
+  I -->|small body| M["Bounded RAM body"]
+  I -->|large body| RS["SSD: original JSON request spool"]
+  M --> P["Gated full parse<br/>validate, token-count, original-byte transforms"]
+  RS --> P
+  P -->|identity passthrough| ID["Stream original JSON<br/>without full-body stringify"]
+  M --> ID
+  RS --> ID
+  P -->|converted route| X["Offload allowlisted request binary<br/>replace inline data with BlobRefs"]
+  X --> B["SSD: request blob store"]
+  X --> T["Ref-aware conversion<br/>small JSON skeleton + BlobRefs"]
+  T --> S["Ref-aware serializer<br/>small JSON chunks"]
+  B -->|blob chunks| S
+  ID --> U["Upstream fetch<br/>backpressured POST"]
+  S --> U
+  U -->|request send complete| RC["Delete request spool<br/>after the last reader"]
+  U --> R{"Response type"}
+  R -->|large non-SSE JSON| JS["SSD: response body spool"]
+  JS --> JP["Gated parse + response transforms"]
+  JP --> JB["SSD: per-response binary scratch"]
+  JP --> JO["Backpressured client write<br/>JSON skeleton + blob chunks"]
+  JB -->|blob chunks| JO
+  JO --> C
+  JO --> JC["Delete response spool and blobs<br/>after client write"]
+  R -->|large SSE event| ES["SSD: one-event spool<br/>never the whole SSE stream"]
+  ES --> EP["Gated event parse<br/>extract response binary"]
+  EP --> EB["SSD: per-event binary scratch"]
+  EP --> EO["Backpressured client write<br/>event skeleton + blob chunks"]
+  EB -->|blob chunks| EO
+  EO --> C
+  EO --> EC["Delete event spool and blobs<br/>after client write"]
+  R -->|small JSON body or ordinary SSE event| BP["Forward with<br/>downstream backpressure"]
+  BP --> C
+  N["All disk state is process-lifetime scratch<br/>restart discards everything; no resume or replay"]
 ```
 
-There are two different disk representations, not two copies of the whole
-transformed request. The **original JSON spool** supports parsing, retries, and
-identity forwarding. The **blob store** holds allowlisted binary payloads
-extracted before or produced during conversion. Converted egress keeps only a
-small JSON skeleton plus refs in RAM and streams skeleton chunks interleaved
-with blob chunks. The full O(B) parse still happens in RAM. All disk state is
-scratch for the current process and is discarded, never resumed, after restart.
+**Sequence view**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Proxy RAM
+    participant D as SSD scratch<br/>(current process only)
+    participant U as Upstream Provider
+
+    C->>P: POST JSON with inline binary
+    opt body above threshold
+        P->>D: stream original JSON to request spool
+    end
+    P->>P: gated full parse O(B)<br/>validate, token-count, original-byte transforms
+    alt identity passthrough
+        P->>U: POST original JSON from bounded RAM or spool chunks
+    else converted route
+        P->>D: offload allowlisted binary to blob store
+        P->>P: ref-aware conversion<br/>small JSON skeleton + BlobRefs
+        P->>U: POST skeleton chunks + blob chunks
+    end
+    P->>D: delete request spool after last reader
+    U-->>P: JSON response or SSE stream
+    alt large non-SSE JSON body
+        P->>D: spool response body above threshold
+        P->>P: gated parse + response transforms
+        P->>D: offload response binary payloads
+        P-->>C: backpressured write of JSON skeleton + blob chunks
+        P->>D: delete response spool and blobs after client write
+    else large SSE event containing binary
+        P->>D: spool one large event, never whole SSE stream
+        P->>P: gated event parse + extract response binary
+        P-->>C: backpressured write of event skeleton + blob chunks
+        P->>D: delete event spool and blobs after client write
+    else small JSON body or ordinary SSE event
+        P-->>C: forward with downstream backpressure
+    end
+    Note over P,D: request, response, event, and blob files are scratch only<br/>restart discards everything; no resume or replay
+```
+
+The request path uses an **original JSON spool** for parsing, retries, and
+identity forwarding, plus a **blob store** for payloads extracted before or
+produced during conversion. The response path applies the same skeleton-plus-
+blob streaming to a finite JSON body or one SSE event. It never writes a second
+whole transformed request or accumulates a whole SSE stream. Full parses still
+happen in RAM under the shared gate. All disk state is scratch for the current
+process and is discarded, never resumed, after restart.
 
 ### 5.1 Ingress: spool, do not buffer
 
@@ -430,8 +496,9 @@ enabled = false                # opt-in per 9.1 — nothing is spooled until tru
 dir = "~/.cache/model-proxy/spool"
 threshold_bytes = 1048576      # below this, bounded in-memory path
 max_request_bytes = 10485760   # preserves the current 10 MiB default
-max_total_bytes = 2147483648   # live request spills, not the blob cache
-max_parse_concurrency = 3
+max_response_bytes = 67108864  # one JSON response body or one SSE event
+max_total_bytes = 2147483648   # live request/response/event spills, not cache
+max_parse_concurrency = 3      # shared request/response/event parse gate
 max_blob_cache_bytes = 67108864
 ttl_seconds = 600
 ```
@@ -441,7 +508,67 @@ them. Validate at startup and fail on an unusable directory (repo rule #8 — a
 spool config that silently falls back to memory is worse than no config). Warn
 explicitly if the selected filesystem is tmpfs or another RAM-backed mount.
 The configured per-request limit replaces the hardcoded cap without weakening
-chunked-body enforcement.
+chunked-body enforcement. `max_response_bytes` does not cap total SSE stream
+length; it caps each finite event, while `max_total_bytes` caps all live spills.
+
+### 5.7 Response bodies and SSE events
+
+Response offload uses the same scratch directory, parse gate, blob serializer,
+and process-lifetime rules, but the finite unit differs by response type.
+
+**Non-SSE JSON responses:**
+
+- At or below `threshold_bytes`, retain the existing bounded in-memory path.
+- Above the threshold, stream the upstream body to a per-response spool while
+  counting bytes; do not call `response.clone().text()` or buffer a second copy.
+- Identity forwarding may stream the original response spool directly without
+  parsing. A converted response uses the shared parse gate, runs consumers
+  that need original bytes, extracts response blobs, and streams the small
+  transformed JSON skeleton plus blob chunks to the client.
+- Enforce `max_response_bytes` per body. On breach or disk failure, cancel the
+  upstream body and fail explicitly; never silently truncate the response.
+
+**SSE responses:**
+
+- Frame one event at a time, preserving event boundaries and order. Small
+  events pass through with bounded buffering. If an event exceeds
+  `threshold_bytes`, spill that event while receiving it; never spool the whole
+  SSE stream before forwarding.
+- A large event is capped by `max_response_bytes` and parsed under the shared
+  gate only when inspection/conversion is required. Extract allowlisted binary
+  payloads, replace them with refs, and emit the event skeleton interleaved
+  with blob chunks. Ordinary comments, keep-alives, and non-JSON events remain
+  byte-passthrough.
+- Process events sequentially so usage/tool tracking and client event order
+  cannot change. A slow client pauses event reads from upstream; it must not
+  cause later events to accumulate in an unbounded RAM queue.
+- Delete the raw event spool and response blobs after the client write
+  completes, or on upstream/client abort. Response blobs are per-response
+  scratch and do **not** populate the cross-request blob cache by default.
+
+The initial response-binary allowlist is deliberately separate from §5.4's
+request allowlist:
+
+- Gemini response content parts with `inline_data`/`inlineData.data`, for any
+  declared MIME type. These are the model-generated images/audio/video/binary
+  parts preserved by native Gemini passthrough.
+- OpenAI Responses output items with `type: "image_generation_call"` and a
+  base64 `result`, whether encountered in a completed JSON response or an SSE
+  output-item event. Other streaming binary fields require their own exact
+  predicate and round-trip tests before being added.
+
+Claude assistant image blocks and OpenAI Chat Completions assistant image
+parts are not added: the documented schemas do not carry them. Do not use the
+request-side `source.data` predicate indiscriminately on responses.
+
+**Required backpressure changes:** remove response `tee()` branches used only
+for logging and replace them with single-pass observation. In `src/server.ts`,
+pipe the web response stream with proper Node `pipeline()` handling, or await
+socket drain in the `WritableStream.write` callback; the current ignored
+`passthrough.write()` result is not backpressure. Keep-alive injection and all
+response transforms must likewise wait for downstream demand rather than
+unconditionally enqueueing. These changes are required for response spooling
+to bound memory; disk alone cannot fix an unconsumed in-memory queue.
 
 ---
 
@@ -476,14 +603,16 @@ real backpressure to both the in-memory and spill branches.
 Phase 1 alone does **not** fix slow upstream sends or SSE request-body
 retention: full parsed objects and serialized upstream bodies still exist.
 
-### Phase 2 — egress and SSE release (§5.3 shapes 1–3)
+### Phase 2 — request/response egress and SSE release (§5.3, §5.7)
 
-Fixes the slow-upstream request-send window for identity and streamed-ref
-paths. Also removes full request bodies from SSE response closures while
-preserving token usage and other response metadata.
+Fixes the slow-upstream request-send and slow-downstream response-send windows
+for identity and streamed-ref paths. Removes full request bodies from SSE
+response closures while preserving token usage and other response metadata.
+Adds finite JSON response spooling, per-SSE-event spooling, and the required
+end-to-end downstream backpressure.
 
-Scope shapes 2–3 to the documented endpoint families that carry the §5.4
-inline-binary shapes, rather than all stringify sites at once:
+Scope request shapes 2–3 to the documented endpoint families that carry the
+§5.4 inline-binary shapes, rather than all stringify sites at once:
 
 - `/v1/messages`;
 - `/v1/chat/completions` (and its `/v1/completions` alias);
@@ -495,7 +624,10 @@ inline-binary shapes, rather than all stringify sites at once:
 Cover both SSE and non-SSE variants because their request bodies have the same
 inline payloads. Cover every supported upstream conversion, not only native
 passthrough, and audit each SSE response closure for accidental full-body
-retention. Fields outside the binary allowlist remain subject to §9.3.
+retention. Response work covers native Gemini inline-data output and OpenAI
+Responses image-generation output in both completed JSON and SSE events.
+Fields outside the request/response binary allowlists remain subject to §9.3
+and §5.7.
 
 ### Phase 3 — deferred, not approved (§9.2)
 
@@ -512,22 +644,25 @@ change. A context-free `"data":"…"` scanner is not approved.
 
 ## 7. Expected effect and measurement
 
-Let `N` be live requests, `B` body size, `C` bounded per-request stream-buffer
-memory, `P` the parse-permit count, and `R` response-side queued/converter
-state. The target is asymptotic, not an unprofiled copy multiplier:
+Let `N` be live exchanges, `B` body/event size, `C` bounded stream-buffer
+memory per active unit, `P` the shared parse-permit count, and `R`
+response-side queued/converter state. The target is asymptotic, not an
+unprofiled copy multiplier:
 
 | Window | Today | After Phase 1 | After Phase 2, supported inline-binary paths |
 |---|---|---|---|
 | Slow upload | O(N×B), including adapter/cap buffering | O(N×C) outside parse | O(N×C) outside parse |
 | Full parse | Up to O(N×B) | O(P×B), plus already-retained bodies | O(P×B), plus small refs/metadata after release |
 | Slow upstream request send | O(N×B) | O(N×B) | O(N×C) for identity/shape 3; shape 2 remains O(N×B) |
-| Long converted SSE response | O(N×B) on paths retaining `requestBody`, plus R | Same as today | Small request metadata/refs plus R, after explicit closure release |
+| Slow downstream JSON response | O(N×B) for clone/text/stringify paths | Same as today | O(N×C) outside the shared gated parse |
+| Long converted SSE response | O(N×B) on paths retaining `requestBody`, plus R | Same as today | Small request metadata/refs plus bounded R after closure release |
+| Large binary SSE event with slow client | O(N×B) for the event, plus potentially unbounded R | Same as today | O(N×C) outside gated event parse, bounded R, no whole-stream accumulation |
 
-Add the global L1 blob-cache cap to all Phase 2 totals. Under §9.3, large
-fields outside the binary allowlist still contribute O(N×B) after parse and
-during serialization; the table is not a claim of constant memory for arbitrary
-JSON. `R` can still grow with a slow SSE downstream and is outside this plan
-(§3.4, §11).
+Add the global L1 blob-cache cap to all Phase 2 totals. Under §9.3 and §5.7,
+large fields outside the binary allowlists still contribute O(N×B) after parse
+and during serialization; the table is not a claim of constant memory for
+arbitrary JSON. `R` is bounded by the Phase 2 downstream backpressure changes,
+not merely by moving queued bytes to disk.
 
 Phase 0 reduces constants only. Phases are *stages of one change*, not release
 steps: per §9.4 they ship together, so operators should evaluate the final
@@ -540,18 +675,18 @@ Measurement requirements:
   stream. RSS alone is affected by GC timing and allocator retention.
 - Record parse-gate queue delay and p50/p95/p99 end-to-end latency, not only
   memory. Tune `P` from measurements rather than assuming a 50–100 ms parse.
-- Report each payload family (image, audio, video, document/file, skill ZIP)
-  and each converted route separately from identity passthrough. Include
-  non-allowlisted large text as a control rather than generalizing its result
-  to binary refs or vice versa.
+- Report each request and response payload family separately, including Gemini
+  output blobs and OpenAI image-generation output. Measure completed JSON
+  responses, individual SSE events, and non-allowlisted large text as separate
+  cases rather than generalizing one result to all of them.
 
 Costs, stated honestly:
 
 - **Disk I/O** of spool writes/reads plus blob reads. For always-new payloads
   this is a RAM→I/O trade with added latency, and only wins when peak RAM
   matters more than that cost.
-- **Disk footprint** includes live request spills and retained L2 blobs;
-  `max_total_bytes` covers only the former.
+- **Disk footprint** includes live request/response/event spills and retained
+  L2 request blobs; `max_total_bytes` covers the spills, not the cache.
 - **Cache memory:** L1 can add up to `max_blob_cache_bytes`; it is not free
   merely because it improves dedup hits.
 - **New failure mode:** a full or slow filesystem now fails requests that used
@@ -575,13 +710,13 @@ Costs, stated honestly:
 
 ## 9. Decisions
 
-All four were settled on 2026-11-02. Each records what was chosen, not just what
-was rejected, so a later reader does not re-litigate it.
+All five were settled on 2026-11-02. Each records what was chosen, not just
+what was rejected, so a later reader does not re-litigate it.
 
 ### 9.1 On-disk inline payloads — **opt-in, off by default**
 
-`[spool] enabled = false` ships as the default; user request payloads and
-inline binary content reach disk only when an operator turns it on.
+`[spool] enabled = false` ships as the default; user request/response payloads
+and inline binary content reach disk only when an operator turns it on.
 
 Rejected: default-on above a threshold (would write user content to disk in
 every deployment, noticed or not), and an operator-created-directory-as-consent
@@ -631,6 +766,19 @@ The four zero-storage fixes do not ship ahead of Phases 1–2; all memory work i
 reviewed as one unit. Consequence accepted and recorded in the header: the
 current multi-copy peak stays in production in the meantime.
 
+### 9.5 Response spooling — **per finite body/event, in scope**
+
+Large non-SSE JSON responses and individual large SSE events are spooled under
+`max_response_bytes`, parsed under the shared gate, and streamed to the client
+with downstream backpressure. Response blobs are deleted after delivery and do
+not enter the cross-request cache by default.
+
+Rejected: accumulating an entire SSE response on disk before forwarding. That
+would delay ordinary events, grow disk usage with stream duration, and still
+leave ordering/abort semantics unclear. Also rejected: spooling while leaving
+`tee()`, unconditional `enqueue`, or ignored socket backpressure in place,
+because those queues can continue growing in RAM independently of disk usage.
+
 ---
 
 ## 10. Tests
@@ -649,14 +797,15 @@ specifically exercises rejection.
 - **Ingress caps:** body past `max_request_bytes` → `413`, no upstream call;
   aggregate spill reservations past `max_total_bytes` produce the documented
   explicit error and return to baseline after completion/abort.
-- **Parse gate:** with more large requests than permits, assert no more than P
-  reads/parses coexist, queue delay is reported, and every permit is released
-  on parse/read failure.
+- **Shared parse gate:** with more large requests, responses, and events than
+  permits, assert no more than P reads/parses coexist across all three classes,
+  queue delay is reported, and every permit is released on parse/read failure.
 - **Request rebuild:** after the cap path and a ladder rung rebuild a `Request`,
   assert the same `SpoolRef` is available and the body is not silently reread
   into memory.
-- **Disk failure:** spool directory made unwritable mid-run → explicit non-2xx,
-  log line present, no truncated body forwarded upstream.
+- **Disk failure:** spool directory made unwritable mid-run on request and
+  response paths → explicit failure and log line, with no truncated body
+  forwarded upstream or to the client.
 - **Egress, slow upstream:** upstream reading at 1 KiB/100 ms; assert forwarded
   bytes hash-equal the in-memory case. If `Content-Length` is present it is
   exact; otherwise no stale length is forwarded.
@@ -680,22 +829,34 @@ specifically exercises rejection.
   binary family and verify the parsed request is collectible after the schema
   gate and scalar metadata extraction while response forwarding continues
   correctly.
-- **SSE response backpressure (separate change):** a downstream client that
-  stops reading must not cause unbounded response queues. Until this is fixed,
-  do not use a slow-client SSE test to claim end-to-end bounded memory for the
-  request-spool feature.
+- **Non-SSE response binary round-trip:** return Gemini `inline_data`/
+  `inlineData` output and an OpenAI Responses `image_generation_call.result`
+  above the response threshold. Assert client bytes equal the in-memory
+  conversion baseline, response blobs do not enter the request cache, and all
+  response spills/blobs are deleted after delivery. A body above
+  `max_response_bytes` fails explicitly without truncated client output.
+- **SSE binary event spooling:** send ordinary events before and after a large
+  Gemini inline-data event and a large Responses image-generation event.
+  Assert event order and bytes are preserved, only the large event is spilled,
+  no whole-stream spool exists, per-event files are deleted after the client
+  write, and ordinary events do not wait behind an unbounded RAM queue.
+- **Downstream backpressure:** pause the client while upstream continues to
+  produce data. Assert Node/socket and web-stream queues stay bounded, upstream
+  reads pause after configured buffers fill, and resuming causes no dropped or
+  reordered bytes. Cover logging, keep-alive injection, converted streams, and
+  the Node adapter; no logging-only `tee()` remains.
 - **Predicate negatives and scope boundary:** Claude plain-text/URL documents,
   remote image URLs, file IDs, Gemini `fileData`, non-ZIP skill sources, large
-  text, and unknown base64-looking fields must not become refs. Assert their
-  forwarded values are unchanged; non-allowlisted large fields remain O(B)
-  after parse under §9.3.
+  text, unknown base64-looking fields, and response fields that merely reuse a
+  request-side field name must not become refs. Assert their forwarded values
+  are unchanged; non-allowlisted large fields remain O(B) after parse.
 - **Token round-trip (Phase 3):** body containing a long base64-looking *text*
   value → forwarded bytes hash-equal input.
-- **Restart is discard-only:** seed request spills and blobs from a previous
-  process, then restart. Assert no old body is parsed or forwarded, no old blob
-  produces a cache hit, no client/upstream request is resumed, and an orphan
-  older than the age threshold is removed. A freshly written file belonging to
-  a concurrently active worker is not removed.
+- **Restart is discard-only:** seed request/response/event spills and blobs
+  from a previous process, then restart. Assert no old body/event is parsed or
+  forwarded, no old blob produces a cache hit, no client/upstream exchange is
+  resumed, and an orphan older than the age threshold is removed. A freshly
+  written file belonging to a concurrently active worker is not removed.
 - **Platform:** on win32, the spool path never uses the unlinked-fd strategy and
   deletion occurs only after handles close.
 - **tmpfs detection:** a spool dir on tmpfs produces the startup warning.
@@ -706,13 +867,9 @@ Test-process hygiene: locate with `pgrep`/`lsof` then `kill`; no `pkill` (repo r
 
 ## 11. Out of scope
 
-- Response-side spooling and the SSE backpressure fixes described in §3.4.
-  Structurally similar, but **not currently bounded merely because SSE is
-  chunked**. Response queues must be measured and reported separately from the
-  request-body savings claimed here.
 - Cross-process or cross-instance sharing of the blob store.
 - Generic refs for large text, custom fields, or other positions outside the
-  explicit §9.3 inline-binary allowlist.
+  explicit §9.3 request and §5.7 response inline-binary allowlists.
 - Any change to `image_encode` sidecar semantics (`src/utils/image-fetch.ts`);
   if anything, the sidecar is the natural place to *produce* blobs instead of
   base64.
@@ -723,16 +880,18 @@ Test-process hygiene: locate with `pgrep`/`lsof` then `kill`; no `pkill` (repo r
 
 Decisions are recorded (§9); what remains is evidence.
 
-- [x] `§9.1`–`§9.4` decided and recorded (2026-11-02).
+- [x] `§9.1`–`§9.5` decided and recorded (2026-11-02).
 - [ ] Combined Phases 0–2 change landed, with before/after memory and latency
-      numbers for slow upload, slow upstream request send, and long SSE response.
+      numbers for slow upload, upstream request send, downstream JSON response,
+      and long/large-event SSE response.
 - [ ] Heap/allocation profile confirms or corrects §2's copy inventory.
 - [ ] Mid-stream SSE profiles show no full request body retained on supported
       converted paths, with token usage unchanged.
-- [ ] Response-side queue memory is reported separately; no end-to-end bounded
-      SSE claim is made until §3.4 is addressed.
-- [ ] Every §5.4 binary predicate has SSE round-trip and mid-stream retention
-      evidence, including Gemini streaming and non-image payloads; non-
-      allowlisted fields are measured separately as a control (§9.3).
+- [ ] Paused-client tests prove bounded response queues and upstream read
+      backpressure across logging, keep-alive, converters, and the Node adapter.
+- [ ] Every §5.4 request predicate has round-trip and mid-stream retention
+      evidence; every §5.7 response predicate has completed-JSON and applicable
+      SSE-event round-trip/cleanup evidence. Non-allowlisted fields are measured
+      separately as a control.
 - [ ] `CHANGELOG.md` + `README.md` updated in the same change as any
       implementation, per the repo's documentation rule.

@@ -40,7 +40,7 @@ Design documents, architectural decisions, and planning documents for Model Prox
 - [Plan: LLM as Verifier Plugin](./plan-llm-as-a-verifier-plugin.md)
 - [Plan: OPF Privacy Filter Plugin](./plan-opf-privacy-filter-plugin.md)
 - [Plan: Remote Target Retry Dispatch](./plan-remote-target-retry-dispatch.md)
-- [Plan: SSD Spool for Large JSON Request Bodies](./plan-ssd-spool-image-request-bodies.md) — Offload slow uploads/sends and long SSE request retention from RAM; schema-qualified refs for inline binary payloads
+- [Plan: SSD Spool for Large JSON Request and Response Bodies](./plan-ssd-spool-image-request-bodies.md) — Offload slow request/response bodies and individual SSE events from RAM with schema-qualified inline-binary refs and backpressure
 - [Plan: Split Cloudflare Worker vs Local](./plan-split-cloudflare-worker-vs-local.md)
 - [Plan: Refactor Divide Proxy for Local/Server Side](./plan-to-refactor-divide-proxy-for-local-side-and-server-side.md)
 - [Plan: Semantic Decision Layer](../plan-semantic-routing-decision.md) — Grow `/decision` composite targeting into signals → decisions → projections, with and without a local embedding model
