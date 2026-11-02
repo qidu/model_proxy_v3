@@ -265,7 +265,7 @@ flowchart TD
   EO --> EC["Delete event spool and blobs<br/>after client write"]
   R -->|small JSON body or ordinary SSE event| BP["Forward with<br/>downstream backpressure"]
   BP --> C
-  N["All disk state is process-lifetime scratch<br/>restart discards everything - no resume or replay"]
+  N["All disk state is process-lifetime scratch<br/>restart discards everything; no resume or replay"]
 ```
 
 **Sequence view**
@@ -305,7 +305,7 @@ sequenceDiagram
     else small JSON body or ordinary SSE event
         P-->>C: forward with downstream backpressure
     end
-    Note over P,D: request, response, event, and blob files are scratch only<br/>restart discards everything; no resume or replay
+    Note over P,D: request, response, event, and blob files are scratch only<br/>restart discards everything - no resume or replay
 ```
 
 The request path uses an **original JSON spool** for parsing, retries, and
