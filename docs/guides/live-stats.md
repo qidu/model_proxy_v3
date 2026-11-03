@@ -9,8 +9,8 @@ stats-restoration rules. Split out of the
 
 The proxy only records detailed stats and enforces token limits when **at least one**
 of `--dashboard`, `--tui`, `--agent`, or `--rpc` is enabled (or their env-var
-equivalents `DASHBOARD=true`, `TUI=true`, `AGENT=true`, `RPC=true`). In "plain proxy"
-mode (no flags), memory usage is minimal:
+equivalents `DASHBOARD=true`, `TUI=true`, `AGENT=true`, `RPC=true` — `1` is accepted
+as well as `true`). In "plain proxy" mode (no flags), memory usage is minimal:
 
 | Store | Flags set | No flags |
 |-------|-----------|----------|
@@ -100,6 +100,12 @@ Fields:
 ## Startup stats loading
 
 On startup, the proxy avoids double-counting persisted stats as follows:
+
+The retained-date window is `N` days, where `N` is the larger of the 31-day monthly
+heatmap window and the largest configured token-limit duration (`global_token_limit`,
+composite `token_limit`), so 31 days when no limits are configured. Rows dated outside
+that window are skipped entirely, their `heatmapEvents` included.
+
 - `modelStats`, `toolStats`, and `compositeAliasStates` are loaded only from the
   latest dump for each retained date because they are cumulative snapshots.
 - `modelStats` from those latest per-day dumps are summed across days to rebuild the

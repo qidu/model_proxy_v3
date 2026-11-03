@@ -9,6 +9,7 @@ import {
   getBlockedTools,
   getCompositeAliasTokenUsage,
   getModelTotalTokens,
+  getTokenHeatmapStatsDesc,
   getTokenHeatmapStatsMonthly,
   getToolUsageDumpDesc,
   isStatsPersistenceEnabled,
@@ -46,10 +47,12 @@ afterEach(() => {
 });
 
 describe('dashboard stats JSONL persistence', () => {
-  it('restores the latest model/tool snapshot and deduplicated current heatmap events', () => {
+  it('restores the latest model/tool snapshot and deduplicated heatmap events across the retention window', () => {
     const nowMs = Date.now();
     const nowSec = Math.floor(nowMs / 1000);
     const today = localDate(nowMs);
+    // 8 days back: past the 7-day weekly heatmap window, inside the 31-day retention.
+    const oldSec = Math.floor((nowMs - 8 * 24 * 60 * 60 * 1000) / 1000);
     const modelEntry = {
       model: '__restored_model__', requests: 2, failed_requests: 1,
       input_tokens: 8, cached_tokens: 1, cache_written_tokens: 0,
@@ -63,7 +66,7 @@ describe('dashboard stats JSONL persistence', () => {
       toolStats: [{ name: '__restored_tool__', agent: 'agent', req: 2, resp: 3, len: 40, blocked: 1 }],
       heatmapEvents: {
         models: { restored: '__restored_model__' },
-        sequences: [{ ts: nowSec, values: 5, id: 'restored' }],
+        sequences: [{ ts: nowSec, values: 5, id: 'restored' }, { ts: oldSec, values: 111, id: 'restored' }],
       },
       compositeAliasStates: {
         __restored_composite__: { limit: 100, duration: '1h', events: [{ ts: nowSec, tokens: 5 }] },
@@ -90,6 +93,10 @@ describe('dashboard stats JSONL persistence', () => {
     assert.equal(tool.len, 40);
     const heatmap = getTokenHeatmapStatsMonthly().filter((row) => row.values === 5);
     assert.equal(heatmap.length, 1);
+    // The 8-day-old event is kept for the monthly view but excluded from the weekly one.
+    assert.equal(getTokenHeatmapStatsMonthly().some((row) => row.values === 111), true);
+    assert.equal(getTokenHeatmapStatsDesc().some((row) => row.values === 111), false);
+    assert.equal(getTokenHeatmapStatsDesc().some((row) => row.values === 5), true);
   });
 
   it('appends a full current-day snapshot with model, tool, and heatmap data', () => {

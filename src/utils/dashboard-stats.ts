@@ -106,7 +106,8 @@ function getOrAssignModelId(model: string): string {
   return id;
 }
 
-const TOKEN_HEATMAP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;   // heatmap rendering: 7 days
+const TOKEN_HEATMAP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;   // weekly heatmap rendering: 7 days
+const TOKEN_HEATMAP_MONTHLY_WINDOW_MS = 31 * 24 * 60 * 60 * 1000; // monthly heatmap rendering: 31 days
 let TOKEN_RETENTION_WINDOW_MS = 31 * 24 * 60 * 60 * 1000; // event retention for enforcement: 31d (covers max calendar month)
 
 /**
@@ -156,16 +157,26 @@ const requestModelTimingStats = new Map<string, RequestEndpointTimingStatsEntry>
 const tokenHeatmapEvents: TokenHeatmapEvent[] = [];
 
 /**
+ * Truthiness of a boolean-shaped env var. Both spellings are accepted: server.ts's
+ * startup gates have always taken 'true' or '1', and a flag check that took only
+ * 'true' silently disagreed with them — a `TUI=1` start enabled stats persistence
+ * while every gated recorder below stayed a no-op.
+ */
+export function isEnvFlagEnabled(value: string | undefined): boolean {
+  return value === 'true' || value === '1';
+}
+
+/**
  * Returns true when any mode flag is enabled (--dashboard, --tui, --agent, --rpc).
  * When false, heatmap events, composite alias windows, agent stats, and tool stats
  * are not recorded, and global/alias token limits are not enforced.
  */
-function areModeFlagsEnabled(): boolean {
+export function areModeFlagsEnabled(): boolean {
   return (
-    process.env.DASHBOARD === 'true' ||
-    process.env.TUI === 'true' ||
-    process.env.AGENT === 'true' ||
-    process.env.RPC === 'true'
+    isEnvFlagEnabled(process.env.DASHBOARD) ||
+    isEnvFlagEnabled(process.env.TUI) ||
+    isEnvFlagEnabled(process.env.AGENT) ||
+    isEnvFlagEnabled(process.env.RPC)
   );
 }
 // Tracks the in-memory event timestamp when last heatmap delta was written.
@@ -670,7 +681,7 @@ export function loadTokenStatsFromLog(retentionDays = 30): void {
     const lines = content.split('\n').filter((l) => l.trim());
 
     // Build set of last N days (YYYY-MM-DD) for efficient lookup
-    // N = max(7d heatmap, global token limit window, max composite token limit window)
+    // N = max(31d monthly heatmap, global token limit window, max composite token limit window)
     const lastNDays = new Set<string>();
     for (let i = 0; i < retentionDays; i++) {
       const d = new Date();
@@ -1754,7 +1765,7 @@ export function getTokenHeatmapStatsDesc(): Array<{ weekday: number; hour: numbe
 }
 
 export function getTokenHeatmapStatsMonthly(): Array<{ day: number; values: number }> {
-  const cutoff = Date.now() - TOKEN_HEATMAP_WINDOW_MS;
+  const cutoff = Date.now() - TOKEN_HEATMAP_MONTHLY_WINDOW_MS;
   const buckets = new Map<number, number>();
 
   for (const event of tokenHeatmapEvents) {
@@ -2318,9 +2329,9 @@ export function createResponseToolTrackingTransformStream(
 // so is covered here.
 try {
   void (() => {
-    const tuiOwnsDumpTimer = process.env.TUI === 'true' || process.env.TUI === '1';
-    const dashboardTimer = !tuiOwnsDumpTimer && (process.env.DASHBOARD === 'true' || process.env.DASHBOARD === '1');
-    if (!process.env.DUMP && !dashboardTimer) return;
+    const tuiOwnsDumpTimer = isEnvFlagEnabled(process.env.TUI);
+    const dashboardTimer = !tuiOwnsDumpTimer && isEnvFlagEnabled(process.env.DASHBOARD);
+    if (!isEnvFlagEnabled(process.env.DUMP) && !dashboardTimer) return;
     let lastDumpTokenCount = 0;
     setInterval(() => {
       const totalTokens = [...dailyTokenStats.values()].reduce((sum, m) => sum + m.total_tokens, 0);

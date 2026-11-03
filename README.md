@@ -290,8 +290,9 @@ are documented in [`docs/guides/live-stats.md`](./docs/guides/live-stats.md).
 #### Mode-flag gating: what gets tracked
 
 The proxy only records detailed stats and enforces token limits when **at least one**
-of `--dashboard`, `--tui`, `--agent`, or `--rpc` is enabled. In "plain proxy" mode
-(no flags), memory usage is minimal:
+of `--dashboard`, `--tui`, `--agent`, or `--rpc` is enabled (the env-var equivalents
+`DASHBOARD` / `TUI` / `AGENT` / `RPC` accept `1` as well as `true`). In "plain proxy"
+mode (no flags), memory usage is minimal:
 
 | Store | Flags set | No flags |
 |-------|-----------|----------|

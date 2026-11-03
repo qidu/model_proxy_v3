@@ -68,6 +68,7 @@ import {
   recordResponseStatusCodeToEndpoint,
   recordResponseUpstream,
   createUsageTrackingTransformStream,
+  areModeFlagsEnabled,
   getCompositeAliasTokenUsage,
   recordCompositeTokenUsage,
   compositeAliasStates,
@@ -1151,12 +1152,9 @@ export default {
 
       const useConfigKey = proxyConfig.remote?.auth_passthrough_with === 'config_key';
 
-      // Global token limit check: only applies when mode flags are enabled (--dashboard/--tui/--agent/--rpc)
-      const modeFlagsEnabled =
-        process.env.DASHBOARD === 'true' ||
-        process.env.TUI === 'true' ||
-        process.env.AGENT === 'true' ||
-        process.env.RPC === 'true';
+      // Global token limit check: only applies when mode flags are enabled (--dashboard/--tui/--agent/--rpc).
+      // Shared with the stats recorders, so the counters these checks read are recorded under the same gate.
+      const modeFlagsEnabled = areModeFlagsEnabled();
       const globalTokenLimitRaw = proxyConfig.general?.global_token_limit;
       if (modeFlagsEnabled && globalTokenLimitRaw) {
         const parsedGlobal = parseHumanTokenLimit(globalTokenLimitRaw.trim());

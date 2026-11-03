@@ -7,9 +7,12 @@ import {
   getBlockedTools,
   getRequestEndpointTimingStatsDesc,
   getRequestModelTimingStatsDesc,
+  getTokenHeatmapStatsDesc,
+  getTokenHeatmapStatsMonthly,
   getUpstreamResponseToolStatsDesc,
   recordAgentStat,
   recordModelTiming,
+  recordModelUsage,
   recordRequestTiming,
   recordToolRequestChars,
   recordUpstreamResponseToolNames,
@@ -17,6 +20,7 @@ import {
 } from '../../src/utils/dashboard-stats.js';
 
 const originalDashboard = process.env.DASHBOARD;
+const originalTui = process.env.TUI;
 
 beforeEach(() => {
   process.env.DASHBOARD = 'true';
@@ -25,6 +29,8 @@ beforeEach(() => {
 afterEach(() => {
   if (originalDashboard === undefined) delete process.env.DASHBOARD;
   else process.env.DASHBOARD = originalDashboard;
+  if (originalTui === undefined) delete process.env.TUI;
+  else process.env.TUI = originalTui;
   for (const name of getBlockedTools()) unblockTool(name);
 });
 
@@ -118,5 +124,32 @@ describe('response tool tracking', () => {
     await writer.close();
     assert.equal(await outputPromise, 'data: {bad json}\n\ndata: {"choices":[]}\n\n');
     assert.equal(calls, 0);
+  });
+});
+
+describe('mode flag spelling', () => {
+  it("records heatmap events for TUI=1, the spelling the startup gates accept", () => {
+    delete process.env.DASHBOARD;
+    process.env.TUI = '1';
+
+    recordModelUsage('__flag_model__', { total_tokens: 987654 });
+
+    const weekly = getTokenHeatmapStatsDesc();
+    assert.equal(weekly.length, 1);
+    assert.equal(weekly[0].values, 987654);
+    const monthly = getTokenHeatmapStatsMonthly();
+    assert.equal(monthly.length, 1);
+    assert.equal(monthly[0].values, 987654);
+    assert.equal(monthly[0].day, new Date().getDate());
+  });
+
+  it('records no heatmap events when the flag is set to a value that is not a flag', () => {
+    delete process.env.DASHBOARD;
+    process.env.TUI = 'yes';
+
+    recordModelUsage('__flag_model__', { total_tokens: 987655 });
+
+    assert.equal(getTokenHeatmapStatsDesc().some((row) => row.values === 987655), false);
+    assert.equal(getTokenHeatmapStatsMonthly().some((row) => row.values === 987655), false);
   });
 });

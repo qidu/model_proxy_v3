@@ -5,6 +5,54 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(dashboard): a `TUI=1` / `DASHBOARD=1` start recorded no heatmap events and skipped token-limit enforcement — one shared mode-flag predicate, plus a 31-day monthly heatmap window and restore window
+
+`areModeFlagsEnabled()` (`src/utils/dashboard-stats.ts`) accepted only `'true'`, while
+`src/server.ts`'s startup gates accept `'true'` **or** `'1'`. Starting with the `=1`
+spelling therefore turned on stats persistence, the 31-day retention window and JSONL
+restore while every gated recorder stayed a no-op — so `tokenHeatmapEvents` was never
+appended to, each dump wrote `heatmapEvents: { models: {}, sequences: [] }`, and the TUI
+and dashboard heatmaps stayed empty with no error and no log line. The same `'true'`-only
+predicate in `src/index.ts` also skipped the global and composite token-limit checks, so
+under `TUI=1` those limits were **not enforced** (latent rather than immediate: the check
+is skipped, not merely unrecorded).
+
+`areModeFlagsEnabled()` is now exported from `src/utils/dashboard-stats.ts` alongside a
+shared `isEnvFlagEnabled()` value helper, and `src/index.ts` and `src/server.ts` import
+them — the recorders and the limit checks that read those recorders share one gate again.
+The module's own dump-timer gate (`TUI` / `DASHBOARD` / `DUMP`) uses the same helper, so
+`DUMP=0` no longer starts the 30-minute dump timer.
+
+Second, independent defect: `getTokenHeatmapStatsMonthly()` filtered with
+`TOKEN_HEATMAP_WINDOW_MS` (7 days) — the weekly view's constant — so the monthly panel
+could never show anything older than a week even though retention keeps 31 days. It now
+uses `TOKEN_HEATMAP_MONTHLY_WINDOW_MS` (31 days). Note: the panel buckets by
+day-of-month, and a 31-day lookback can include the same day-of-month twice at the
+window edge (e.g. day 1 of two consecutive months), which merges into one bucket.
+
+Third, independent defect: the startup restore window was too small to reach that history.
+`src/server.ts` sized `retentionDays` from the largest configured token-limit duration with
+a **7-day** baseline, and `loadTokenStatsFromLog()` skips every JSONL row dated outside
+that window — events included. With no `global_token_limit` and no composite `token_limit`
+configured, a restart therefore loaded only the last 7 days: on a 90-row log holding
+484,549,917 tokens over 8 dates, the dashboard showed 471,652,080 over 5 dates, and
+heatmap events from 8 days back were never loaded at all (so the 31-day monthly panel was
+empty too). The baseline is now 31 days, matching the monthly heatmap window and the
+in-memory event retention. It cannot weaken limit enforcement: the baseline is only ever
+raised by a configured limit duration.
+
+`recordModelUsage()` and `recordDailyToken()` were never flag-gated, so the per-model
+token counters in the JSONL were unaffected by the first defect — only `heatmapEvents`
+(and the other gated recorders) went unrecorded.
+
+Verified: `npm run typecheck` clean; `npm run test:unit` 1867/1867 (two new cases in
+`dashboard-stats-tracking.test.ts` — `TUI=1` records exactly one bucket holding the
+recorded token count, `TUI=yes` records none — plus two assertions added to the existing
+restore case in `dashboard-stats-persistence.test.ts`: an 8-day-old event is present in
+the monthly view and absent from the weekly one); a throwaway `TUI=1 PORT=7778` instance
+against the real 90-row log now reports 484,549,917 tokens across 30 models, versus
+471,652,080 before the baseline change.
+
 ### fix(gateway): Claude Code gateway compliance — error body forwarding, retry headers, SSE keep-alive, model discovery, beta pair regression test
 
 Implements five items from `docs/claude_code_gateway_compliance_review.md`

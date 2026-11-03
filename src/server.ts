@@ -12,7 +12,7 @@ import { createServer } from 'http';
 import { pathToFileURL } from 'url';
 import type { Env } from './types/shared.js';
 import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit, resolveDefaultProxyConfigPath } from './utils/config-loader.js';
-import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled, setTokenRetentionWindow } from './utils/dashboard-stats.js';
+import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled, setTokenRetentionWindow, isEnvFlagEnabled } from './utils/dashboard-stats.js';
 import { runCli } from './cli.js';
 
 // Import the Workers fetch handler
@@ -222,10 +222,10 @@ function main(): void {
     // when the dashboard is enabled (--dashboard, or --tui/--agent which imply
     // it) or the standalone DUMP timer is active. Without it, stats live purely
     // in memory, capped at the 30d retention window by recordTokenHeatmapEvent.
-    let tuiEnabled = process.env.TUI === 'true' || process.env.TUI === '1';
-    const agentEnabled = process.env.AGENT === 'true' || process.env.AGENT === '1';
-    const dumpEnabled = process.env.DUMP === 'true' || process.env.DUMP === '1';
-    const dashboardEnabled = process.env.DASHBOARD === 'true' || process.env.DASHBOARD === '1';
+    let tuiEnabled = isEnvFlagEnabled(process.env.TUI);
+    const agentEnabled = isEnvFlagEnabled(process.env.AGENT);
+    const dumpEnabled = isEnvFlagEnabled(process.env.DUMP);
+    const dashboardEnabled = isEnvFlagEnabled(process.env.DASHBOARD);
     const persistenceEnabled = dashboardEnabled || tuiEnabled || dumpEnabled;
     setStatsPersistenceEnabled(persistenceEnabled);
 
@@ -242,15 +242,16 @@ function main(): void {
 
     if (persistenceEnabled) {
       // Restore token stats from log with a retention window sized to fit the
-      // largest configured token-limit duration. Falls back to 30 days when no
-      // local TOML config is available (e.g. PROXY_CONFIG_CONSUL / PROXY_CONFIG_APOLLO mode).
+      // largest of: the 31d monthly heatmap window, and the largest configured
+      // token-limit duration. Falls back to 30 days when no local TOML config is
+      // available (e.g. PROXY_CONFIG_CONSUL / PROXY_CONFIG_APOLLO mode).
       let retentionDays = 30;
       const configPath = env.PROXY_CONFIG_PATH;
       if (configPath && !env.PROXY_CONFIG_CONSUL && !env.PROXY_CONFIG_APOLLO) {
         try {
           const cfg = loadProxyConfigFromPath(configPath);
           const durationDays = (d: string): number => Math.ceil(getWindowMs(d as '1h' | '1d' | '1w' | '1m') / (24 * 60 * 60 * 1000));
-          let maxDays = 7; // 7d heatmap baseline
+          let maxDays = 31; // 31d monthly heatmap baseline (matches TOKEN_HEATMAP_MONTHLY_WINDOW_MS / event retention)
           const globalRaw = cfg.general?.global_token_limit;
           if (globalRaw) {
             const parsed = parseHumanTokenLimit(globalRaw.trim());
