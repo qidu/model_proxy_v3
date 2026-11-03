@@ -1,7 +1,7 @@
 # Plan: SSD spool for large JSON request and response bodies
 
 Status: **Draft** — design only, nothing implemented
-Date: 2026-11-02
+Date: 2026-11-03
 Scope: Reduce resident memory for slow, in-flight exchanges with large JSON
 bodies — especially documented inline base64 images, audio, video, documents,
 files, and skill bundles — by spooling requests, finite JSON responses, and
@@ -51,18 +51,19 @@ The problem is not just the allocation peak. It is **live request/response
 body state kept reachable while someone else is slow** — the client uploading,
 the upstream reading the request, or the client reading a response/SSE stream.
 Spooling and ref-based streaming are worth doing because they sever those
-links for supported paths: resident memory then depends on bounded stream
-buffers, gated parse concurrency, and small per-exchange metadata rather than
-on minutes of peer latency.
+links for supported paths: after extraction, resident memory depends on bounded
+stream buffers and small per-exchange metadata rather than on minutes of peer
+latency. Full parse and non-ref processing are unthrottled by default, with
+optional byte admission in §5.9.
 
 Four consequences worth stating up front:
 
 1. **The offload is not circular.** On many Linux systems `/tmp` is tmpfs.
    Spool to `os.tmpdir()` and the "offload" can silently stay in RAM. §5.6.
 2. **Spooling cannot eliminate the full-parse transient.** `JSON.parse` and
-   the current converters still need O(body/event size) live state. A shared
-   parse semaphore bounds how many such transients coexist; it does not bound
-   how much parsed state each exchange retains afterward. §4.
+   the current converters still need O(body/event size) live state per exchange,
+   with no default proxy semaphore bounding materialization. Optional §5.9
+   admission adds a nominal byte budget; L1/L2 sizing alone does not. §4.
 3. **SSE has two different memory problems.** Some response converters retain
    the parsed request for token counting after `fetch` returns headers, and
    response queues/events can buffer output when the downstream client is
@@ -175,7 +176,7 @@ separate:
 - request-body representations and spills;
 - non-SSE response spills and per-SSE-event spills;
 - the bounded L1 request blob cache versus per-response scratch blobs;
-- parse transients, which the shared semaphore gates;
+- unfull-parse transients and large non-ref objects;
 - response queues and converter state, which must be bounded by downstream
   backpressure rather than allowed to grow behind disk writes.
 
@@ -185,45 +186,84 @@ separate:
 
 Cannot: avoid a transient full parse under the current converter architecture.
 `fs.readFile`/`readSpoolText`, UTF-8 decoding, and `JSON.parse` still require
-O(B) live state, including for bodies/events whose binary payloads will be
-extracted immediately afterward. Large fields outside the §9.3 and §5.7
-allowlists also remain O(B) after parse.
+O(B) live state per body/event. Large fields outside the §9.3 and §5.7
+allowlists also remain O(B) through non-ref processing. With §5.9 admission
+disabled, both can scale as O(N×B) across N exchanges.
 
-Can: make full-body/event residency short and concurrency-gated on supported
-paths, instead of lasting for each slow leg:
+Can: keep slow I/O from pinning those full bodies after disk-backed state has
+been produced:
 
 - during a slow upload: bounded per-request buffers plus metadata; disk holds
   the spilled remainder;
-- during parse: O(B), with at most `max_parse_concurrency` large parses across
-  requests, responses, and events;
-- between parse and egress: small refs/metadata only after supported inline
-  binary payloads have actually been detached and all full-body owners
-  released;
-- during a slow upstream request send: bounded chunks for identity forwarding
-  and streamed-ref egress; rehydrated string egress remains O(B);
-- during a slow downstream response: bounded chunks plus at most one finite
-  response/event spill per active unit. SSE is processed one event at a time,
-  never accumulated as a whole stream, and downstream backpressure pauses
-  upstream reads (§5.7);
+- during full parse/materialization: O(B) per exchange, with no default proxy
+  cap; optional §5.9 admission reserves nominal bytes before parsing;
+- between parse and egress: small refs/metadata after supported inline binary
+  payloads are detached; arbitrary non-ref bodies are instead written to
+  effective/attempt spills before their full objects are released;
+- during a slow upstream request send: bounded chunks for identity forwarding,
+  streamed-ref egress, and non-ref attempt-spool egress; rehydrated string
+  egress remains O(B) and is transitional;
+- during a slow downstream response: bounded chunks plus finite response/event
+  spills. SSE is processed one event at a time, never accumulated as a whole
+  stream, and downstream backpressure pauses upstream reads (§5.7);
 - during a long SSE response: no full request body on paths that explicitly
-  replace it with scalar usage metadata and refs.
+  replace it with scalar usage metadata, refs, or previously written spills.
 
-There is no "~0 resident" claim. Stream buffers, parsed non-allowlisted
-fields, small JSON structure, refs, the L1 cache, V8 heap overhead, external
-buffers, and bounded response queues remain. Likewise, a fixed parse latency
-or concurrency of 2–4 is not assumed safe without measurement: the gate trades
-memory for queue delay and must be benchmarked.
+There is no "~0 resident" claim. Stream buffers, non-allowlisted fields,
+small JSON structure, refs, the L1 cache, V8 heap overhead, external buffers,
+and bounded response queues remain. Full-parse concurrency and non-ref
+processing must be measured under real traffic; larger L1/L2 caches support
+blob retention but do not bound those allocations without optional §5.9
+admission.
 
-> **Note:** this is why whole-request admission control is not the primary fix
-> in §8. It can bound memory by bounding request count, but a permit held for
-> an entire SSE response also serializes healthy traffic behind slow streams.
-> The parse gate targets the short O(B) transient instead.
+> **Note:** whole-request admission control is not introduced (§8). Optional
+> §5.9 byte admission applies only to materialization and is released before
+> upstream/client streaming or a long-lived SSE response. Operators needing a
+> hard connection limit must apply separate connection admission.
 
 ---
 
 ## 5. Design
 
 ### 5.0 End-to-end request/response flow
+
+**What is stored on disk**
+
+| Data written to disk | Contents | Purpose |
+|---|---|---|
+| **Raw request spool** | The whole original JSON request body above `threshold_bytes`, including text and inline base64 | Backpressured upload, initial parsing, and identity passthrough |
+| **Effective spool** | The whole post-mutation JSON body only when it remains large and has not been reduced to refs | Preserve privacy/kompress/tool-erase changes across retries and rungs |
+| **Non-ref attempt spool** | One rung's whole converted/transformed JSON body after `JSON.stringify` | Release full objects before a slow upstream send |
+| **Request blob store** | Only allowlisted binary payload fields, stored as their original base64 text | Avoid retaining binary in RAM during conversion, retries, and slow upstream sends |
+| **Non-SSE response spool** | A whole large JSON response body | Avoid buffering a large upstream response in RAM |
+| **SSE event spool** | One complete large SSE event, including its JSON framing | Process a large event without accumulating the entire SSE stream |
+| **Response/event blobs** | Binary payloads extracted from responses/events | Stream binary to a slow client with backpressure |
+
+For the main converted request path containing binary:
+
+```text
+Whole raw JSON request → raw spool
+                       → parse and mutate
+                       → extract binary parts to blob store
+                       → effective small JSON skeleton + BlobRefs in RAM
+                       → stream skeleton + binary blob chunks upstream
+```
+
+An additional whole-body **effective spool is not needed** once extraction has
+reduced the effective body to a small skeleton. It is used only for large
+bodies that still contain non-ref data.
+
+Additional boundaries:
+
+- Small bodies remain in bounded RAM.
+- BlobRefs, leases, and the L2 index are metadata in RAM; binary payloads are
+  not stored in the index.
+- Response blobs are deleted after delivery rather than entering the request
+  cache.
+- Everything on local disk is process-lifetime scratch; nothing is resumed or
+  reconstructed after restart.
+- `max_total_bytes` caps request/response/event spills; `max_blob_disk_bytes`
+  separately caps the L2 request-blob cache.
 
 Both diagrams describe the same stages. The flowchart emphasizes storage and
 branching; the sequence diagram emphasizes client/proxy/upstream interactions.
@@ -235,7 +275,7 @@ flowchart TD
   C["Client"] --> I["Ingress adapter<br/>threshold + byte caps + backpressure"]
   I -->|small body| M["Bounded RAM body"]
   I -->|large body| RS["SSD: original JSON request spool"]
-  M --> P["Gated full parse<br/>validate, token-count, original-byte transforms"]
+  M --> P["full parse<br/>validate, token-count, original-byte transforms"]
   RS --> P
   P -->|identity passthrough| ID["Stream original JSON<br/>without full-body stringify"]
   M --> ID
@@ -250,14 +290,14 @@ flowchart TD
   U -->|request send complete| RC["Delete request spool<br/>after the last reader"]
   U --> R{"Response type"}
   R -->|large non-SSE JSON| JS["SSD: response body spool"]
-  JS --> JP["Gated parse + response transforms"]
+  JS --> JP["parse + response transforms"]
   JP --> JB["SSD: per-response binary scratch"]
   JP --> JO["Backpressured client write<br/>JSON skeleton + blob chunks"]
   JB -->|blob chunks| JO
   JO --> C
   JO --> JC["Delete response spool and blobs<br/>after client write"]
   R -->|large SSE event| ES["SSD: one-event spool<br/>never the whole SSE stream"]
-  ES --> EP["Gated event parse<br/>extract response binary"]
+  ES --> EP["event parse<br/>extract response binary"]
   EP --> EB["SSD: per-event binary scratch"]
   EP --> EO["Backpressured client write<br/>event skeleton + blob chunks"]
   EB -->|blob chunks| EO
@@ -281,7 +321,7 @@ sequenceDiagram
     opt body above threshold
         P->>D: stream original JSON to request spool
     end
-    P->>P: gated full parse O(B)<br/>validate, token-count, original-byte transforms
+    P->>P: full parse O(B)<br/>validate, token-count, original-byte transforms
     alt identity passthrough
         P->>U: POST original JSON from bounded RAM or spool chunks
     else converted route
@@ -293,13 +333,13 @@ sequenceDiagram
     U-->>P: JSON response or SSE stream
     alt large non-SSE JSON body
         P->>D: spool response body above threshold
-        P->>P: gated parse + response transforms
+        P->>P: parse + response transforms
         P->>D: offload response binary payloads
         P-->>C: backpressured write of JSON skeleton + blob chunks
         P->>D: delete response spool and blobs after client write
     else large SSE event containing binary
         P->>D: spool one large event, never whole SSE stream
-        P->>P: gated event parse + extract response binary
+        P->>P: event parse + extract response binary
         P-->>C: backpressured write of event skeleton + blob chunks
         P->>D: delete event spool and blobs after client write
     else small JSON body or ordinary SSE event
@@ -308,13 +348,16 @@ sequenceDiagram
     Note over P,D: request, response, event, and blob files are scratch only<br/>restart discards everything - no resume or replay
 ```
 
-The request path uses an **original JSON spool** for parsing, retries, and
-identity forwarding, plus a **blob store** for payloads extracted before or
-produced during conversion. The response path applies the same skeleton-plus-
-blob streaming to a finite JSON body or one SSE event. It never writes a second
-whole transformed request or accumulates a whole SSE stream. Full parses still
-happen in RAM under the shared gate. All disk state is scratch for the current
-process and is discarded, never resumed, after restart.
+The request path uses an **original JSON spool** for the initial parse and
+identity forwarding. After global mutations, the **effective body** (a ref
+skeleton) or a separate **effective spool** for a large non-ref body is the
+canonical state for retries/rungs. The blob store holds payloads extracted
+before or produced during conversion. Converted binary egress keeps only a
+small JSON skeleton plus refs in RAM and streams skeleton chunks interleaved
+with blob chunks. The response path applies the same model to a finite JSON
+body or one SSE event, never a whole SSE stream. Full parses happen in RAM
+without a proxy concurrency throttle. All disk state is scratch for the current process
+and is discarded, never resumed, after restart.
 
 ### 5.1 Ingress: spool, do not buffer
 
@@ -337,45 +380,79 @@ backpressured, byte-counted path:
   is released on every terminal path. On breach, return an explicit error with
   a `warn` log line. **Never** truncate silently (repo rule #8).
 
-Attach a `SpoolRef` to the request without header smuggling, and propagate it
-explicitly through **every** later `Request` rebuild. A symbol or
-`WeakMap<Request, SpoolRef>` attached only in the adapter is insufficient:
-`src/index.ts:1211` and the routing ladder construct replacement `Request`
-objects, which would otherwise lose the association.
+Attach a `SpoolRef` to the request without header smuggling, and preserve it
+through early `Request` reconstruction such as `src/index.ts:1211`. The ref
+identifies the **raw client body** for identity forwarding and original-byte
+consumers. Once global mutations produce the effective request state, converted
+rungs must use that state rather than treating the raw spool as their body
+source. A symbol or `WeakMap<Request, SpoolRef>` attached only in the adapter is
+insufficient because later `Request` objects lose the association.
 
 **Anti-pattern to avoid:** constructing `new Request(url, {body: fileStream})`
 and then calling `.json()`. undici buffers the stream entirely; that is exactly
 the behavior being escaped. The body must come off disk at the point of use.
 
-### 5.2 Parse gate and ownership
+### 5.2 Body ownership
 
-`await request.text()` becomes `await readSpoolText(ref)` for a spilled body.
-The read, decode, and parse are inside the semaphore:
+`await request.text()` becomes `await readSpoolText(rawSpoolRef)` for the
+initial spilled body:
 
 ```ts
 // src/utils/spool.ts
-const permit = await spoolSemaphore.acquire(); // max_parse_concurrency, default 3
-try {
-  const text = await readSpoolText(ref);
-  routeBody = JSON.parse(text);
-} finally {
-  permit.release();
-}
+const text = await readSpoolText(rawSpoolRef);
+routeBody = JSON.parse(text);
 ```
 
-The semaphore limits concurrent parse transients, not the lifetime of
-`routeBody`. Ownership rules are therefore part of the design:
+There is no proxy body-materialization semaphore or `max_body_concurrency`
+setting by default. Full parses and non-ref processing retain O(N×B) across N
+concurrent exchanges when §5.9 admission is disabled; L1/L2 capacity does not
+change that transient. Enabling its nominal byte budget adds pre-parse admission
+without introducing a request-count or SSE-lifetime cap.
 
-- Let the full source text become collectible immediately after parse on
-  converted routes; do not retain `bodyText` merely because it exists today.
-- Read-only routing and metadata extraction reuse `routeBody` rather than
-  parsing another copy.
+Use three explicitly different ownership states:
+
+- **Raw spool:** the immutable original client bytes. It is authoritative only
+  for identity passthrough and consumers that intentionally need original
+  bytes before mutation.
+- **Effective body:** the parsed object after privacy, kompress, tool erase,
+  and other global mutations. This is the same role as today's mutated
+  `routeBody`, and is the canonical state for every converted/ladder attempt.
+- **Attempt body:** an attempt-local object derived from the effective body,
+  followed by rung-specific model rewriting and `request_ingress` transforms.
+
+Ownership rules:
+
+- Let the full source text become collectible immediately after the initial
+  parse; do not retain `bodyText` through validation, extraction, or sidecars.
+- Binary extraction produces a small skeleton with leased BlobRefs before
+  privacy/kompress/judge and other network I/O, so those consumers do not retain
+  the binary payload.
+- An arbitrary large non-ref body remains fully resident through global
+  sidecars and `JSON.stringify` into its effective spool. Release the parsed
+  object and transient string immediately after the write. This is an O(B) per
+  exchange cost with no fixed proxy concurrency cap.
+- For a non-ref rung requiring conversion, parse the effective spool,
+  convert/apply hooks, and serialize once to an **attempt spool**. Release the
+  full objects/string before streaming that attempt spool upstream. If no
+  conversion is needed, stream the effective spool directly. No full non-ref
+  body is captured by an SSE closure. Apply the same spill-before-network rule
+  to non-ref responses and events.
+- Read-only routing and metadata extraction reuse the effective body when it is
+  in RAM rather than parsing another copy.
 - Construct at most one handler body per attempt and pass that object directly
   instead of having the handler call `.text()`/`.json()` again.
-- Per-rung transform hooks mutate their input. They need an attempt-local body
-  unless transform semantics are deliberately changed; do **not** "optimize"
-  `clone().text()` by passing shared `routeBody` into every rung. A gated parse
-  from the canonical spool is preferable to cross-rung mutation leakage.
+- After binary extraction, create an attempt body with
+  `structuredClone(effectiveBody)`: the JSON skeleton is small, and no binary
+  payload is copied. Every cloned BlobRef keeps the **same `leaseId`**; cloning
+  performs an atomic lease `retain()` that increments the L2 index's `refs`
+  count. The effective body owns its initial ref until no more attempts can be
+  created, and every attempt releases its cloned ref exactly once in `finally`.
+  Never reconstruct a converted rung by parsing the raw spool; doing so would
+  lose redaction, compression, and tool erasure.
+- Per-rung hooks mutate only the attempt body. Mutations from rung A must not
+  leak into rung B, while both inherit all effective-body mutations.
+- The raw spool is not overwritten. Raw/effective/attempt spills have
+  independent byte accounting/lifecycle within `max_total_bytes`.
 - Inline-binary extraction releases full-payload owners only after validation
   and all consumers that require original bytes have run or become ref-aware.
 
@@ -385,7 +462,11 @@ The semaphore limits concurrent parse transients, not the lifetime of
    (`passthrough.ts:222`). Stream the spool file directly: `Content-Length`
    from `stat`, body from `createReadStream`. After the schema gate, retain
    only `model`, `stream_options.include_usage`, and other required scalars.
-   Zero transformation, no full-body string at send.
+   Zero transformation, no full-body string at send. The raw spool is valid
+   here because current `/passthrough` bypasses privacy/kompress/tool-erase
+   mutations. If passthrough later gains those mutations, stream an effective
+   spool or disable this identity optimization instead of forwarding the raw
+   client body.
 2. **Converted, rehydrated.** Handlers build objects with blob refs, then
    expand refs and serialize to one full string at the send boundary. This can
    reduce intermediate copies, but the full string/send buffer is still O(B)
@@ -400,15 +481,29 @@ The semaphore limits concurrent parse transients, not the lifetime of
 
 Shapes 1 and 3 fix the slow-upstream request-send window. Shape 2 does not.
 
-**SSE release requirement for all supported converted paths:** before creating
-the response stream, calculate input usage from the original request (or use
-upstream-reported usage when that is the established behavior) and pass the
-result as a number. In particular, change `createStreamTransformer` and the
-Responses-to-Claude pump so they do not close over `requestBody` for the whole
-stream. Apply the same audit to privacy restoration, usage recording,
-conversation state, and transforms. Ref-aware code must preserve current token
-accounting: `src/utils/token-counting.ts:270-276` currently counts base64
-image/document data, so silently replacing it with a short ref would undercount.
+**Token estimation and SSE release requirement for all supported converted
+paths:** before creating the response stream, calculate input usage from the
+final effective/attempt body after sidecars and applicable hooks, then pass only
+the resulting number and other scalar metadata into the stream. In particular,
+change `createStreamTransformer` and the Responses-to-Claude pump so they do not
+close over `requestBody` for the whole stream.
+
+For non-binary text/tools, retain the existing estimator. For every extracted
+binary payload, use only its base64 character count:
+
+```ts
+binaryTokens = Math.ceil(blobBase64CharLength / charactersPerToken); // default 4
+```
+
+Base64 is ASCII, so the blob's stored byte length is its character count. Do
+not read the blob for token counting. **Ignore all fixed block metadata** for
+this binary contribution: no field labels, media/source type, data-URL prefix,
+or former image/document `+20`/`+10` overhead. This is deliberately an
+approximation and need not match the pre-ref/tiktoken result. Upstream-reported
+usage remains preferred whenever available.
+
+Apply the same full-body-release audit to privacy restoration, usage recording,
+conversation state, and transforms.
 
 ### 5.4 The store behind the refs
 
@@ -424,7 +519,23 @@ shared across requests. Neither tier is loaded or reused after a restart.
   send it once.
 - **L2 disk:** `<spool_dir>/blobs/<aa>/<bb>/<sha256>`, atomic write (tmp + rename;
   the pattern already used by `src/utils/config-loader.ts`), lazy delete on
-  expiry plus a startup sweep.
+  expiry plus a startup sweep. Total current-process L2 payload bytes are capped
+  by `max_blob_disk_bytes`, separately from request/response/event spills.
+- **L2 index, entirely in process memory:**
+  `Map<sha256, {size, lastUsed, refs}>`. It contains metadata only, never the
+  base64 payload. `size` is the blob's on-disk byte count, `lastUsed` drives
+  idle LRU/TTL, and `refs` counts active owners sharing the lease, including
+  cloned attempt refs. The index tracks the running byte total so eviction
+  does not need to `stat` every file.
+- The L2 index starts empty on every process start. Startup never scans old
+  blobs to reconstruct it and never creates cache hits from old files; safe
+  stale-file deletion is the only permitted startup operation. Thus restart
+  requires no index recovery, snapshot, WAL, or deserialization.
+- Before an L2 write, evict idle `refs = 0` entries by LRU until
+  `currentBytes + size <= max_blob_disk_bytes`. Entries with `refs > 0` are
+  pinned. If insufficient unleased bytes can be freed, fail the new cache write
+  explicitly rather than exceed the cap, delete an active blob, or silently
+  bypass accounting. L1 eviction remains independent and can still free RAM.
 - **Hash the base64 text**, not the decoded bytes. It is what the wire needs, so
   a hit needs no re-encode; exact-string dedup is enough. Skip "same image,
   different padding" — a decode pass per ingest costs more than it saves.
@@ -460,9 +571,44 @@ shared across requests. Neither tier is loaded or reused after a restart.
   semantically required, not by default on every pass.
 - Eviction/TTL convention mirrors `src/utils/conversation-store.ts`
   (insertion-ordered `Map`, lazy evict on access + opportunistic evict on
-  write) rather than introducing a second idiom.
+  write) rather than introducing a second idiom, with one exception: TTL is
+  idle time after the last lease release. L2 eviction must skip leased blobs;
+  L1 may evict their memory entries because the leased L2 file remains the
+  source for streaming.
 
 ### 5.5 Lifecycle
+
+**BlobRef leases:**
+
+- Every `BlobRef` carries a `leaseId` in addition to its blob hash, byte
+  length, and wire-format metadata. Blob creation and the initial lease become
+  visible only after the atomic tmp+rename completes. Cache lookup and lease
+  acquisition are one atomic operation, so eviction cannot win that race.
+- The lease follows the ref through conversion, retries, and serialization.
+  Cloned BlobRefs share one lease rather than creating independent rung leases:
+  `retain()` increments `refs`, each clone's `release()` decrements it exactly
+  once, and the lease manager renews that shared lease once regardless of clone
+  count. Renewal occurs at no more than `ttl_seconds / 3`, even if the
+  upstream/client has produced no new bytes recently. There is no 600-second
+  maximum request duration and no maximum total lease duration;
+  `ttl_seconds = 600` applies only after the blob becomes idle. Existing
+  request/upstream timeout and abort policies still end the affected exchange.
+- A leased L2 blob is never deleted by TTL, LRU, opportunistic cleanup, or a
+  slow upstream request send. The same protection covers a slow client write
+  of a response body or SSE event. Renewal while merely holding an idle cached
+  blob is forbidden: only a live exchange with an unconsumed ref extends it.
+- Every effective-body/attempt/response owner releases its ref in `finally`
+  after its reader finishes or aborts. Only when the shared lease reaches
+  `refs = 0` does renewal stop: for a request-cache blob, idle TTL starts then;
+  for a per-response/event scratch blob, final release schedules deletion.
+  Close file handles before unlink. A failed clone does not increment `refs`;
+  a failed attempt after `retain()` still releases exactly once.
+- Renewal failure, a missing leased file, or an expired lease must fail the
+  exchange loudly and cancel the send. Never continue with a partial blob or
+  silently fall back to an empty payload. Restart still discards all leases
+  and files; no lease is persisted or recovered.
+
+**Spill and request lifetime:**
 
 - A per-request spool has explicit owners/readers. Delete it only after parse,
   retries, and the upstream request body have finished with it — response
@@ -473,7 +619,8 @@ shared across requests. Neither tier is loaded or reused after a restart.
   dashboard counter.
 - SSE response completion should normally find no per-request upload spool
   still needed: the upstream request send has already ended. Cached blobs may
-  outlive the request only under the §5.4 cache policy.
+  outlive the request only under the §5.4 cache policy and after all leases
+  have been released.
 - Restart discards all request and cache state. Startup never parses old
   request spills, continues a client upload or upstream send, resumes an SSE
   response, or treats old blobs as cache hits. Crash leftovers are only
@@ -498,9 +645,13 @@ threshold_bytes = 1048576      # below this, bounded in-memory path
 max_request_bytes = 10485760   # preserves the current 10 MiB default
 max_response_bytes = 67108864  # one JSON response body or one SSE event
 max_total_bytes = 2147483648   # live request/response/event spills, not cache
-max_parse_concurrency = 3      # shared request/response/event parse gate
-max_blob_cache_bytes = 67108864
-ttl_seconds = 600
+max_materialized_body_bytes = 0 # optional §5.9 nominal RAM budget; 0 disables
+materialization_factor = 2.0   # conservative copy/object overhead calibration
+max_admission_queue = 64       # maximum waiting large bodies/events
+admission_timeout_ms = 30000   # maximum admission wait
+max_blob_cache_bytes = 67108864   # L1 payload bytes in RAM
+max_blob_disk_bytes = 268435456   # L2 payload bytes on disk, excluding spills
+ttl_seconds = 600              # idle TTL after last lease release, not send limit
 ```
 
 Env overrides follow the existing `SPOOL_*` convention if the loader requires
@@ -511,10 +662,20 @@ The configured per-request limit replaces the hardcoded cap without weakening
 chunked-body enforcement. `max_response_bytes` does not cap total SSE stream
 length; it caps each finite event, while `max_total_bytes` caps all live spills.
 
+**Concurrency sizing:** there is no `max_body_concurrency`. For more concurrent
+blob-heavy exchanges, advise operators to increase `max_blob_cache_bytes` (L1
+RAM) and `max_blob_disk_bytes` (L2 disk) so active blobs remain available without
+cache-cap failures. Size L1 within the host's RAM budget and L2 within available
+SSD capacity, then measure cache hit/eviction rates. These settings support blob
+retention and reuse; they do **not** limit full-parse or large non-ref memory,
+which remains O(N×B) when §5.9 admission is disabled. Operators needing a proxy
+nominal-byte budget enable `max_materialized_body_bytes` separately.
+
 ### 5.7 Response bodies and SSE events
 
-Response offload uses the same scratch directory, parse gate, blob serializer,
-and process-lifetime rules, but the finite unit differs by response type.
+Response offload uses the same scratch directory, blob serializer, and
+process-lifetime rules, but the finite unit differs by response type. There is
+no response body/event semaphore by default; §5.9 adds optional byte admission.
 
 **Non-SSE JSON responses:**
 
@@ -522,9 +683,9 @@ and process-lifetime rules, but the finite unit differs by response type.
 - Above the threshold, stream the upstream body to a per-response spool while
   counting bytes; do not call `response.clone().text()` or buffer a second copy.
 - Identity forwarding may stream the original response spool directly without
-  parsing. A converted response uses the shared parse gate, runs consumers
-  that need original bytes, extracts response blobs, and streams the small
-  transformed JSON skeleton plus blob chunks to the client.
+  parsing. A converted response is fully parsed, runs consumers that need
+  original bytes, extracts response blobs, and streams the small transformed
+  JSON skeleton plus blob chunks to the client.
 - Enforce `max_response_bytes` per body. On breach or disk failure, cancel the
   upstream body and fail explicitly; never silently truncate the response.
 
@@ -534,8 +695,8 @@ and process-lifetime rules, but the finite unit differs by response type.
   events pass through with bounded buffering. If an event exceeds
   `threshold_bytes`, spill that event while receiving it; never spool the whole
   SSE stream before forwarding.
-- A large event is capped by `max_response_bytes` and parsed under the shared
-  gate only when inspection/conversion is required. Extract allowlisted binary
+- A large event is capped by `max_response_bytes` and fully parsed when
+  inspection/conversion is required. Extract allowlisted binary
   payloads, replace them with refs, and emit the event skeleton interleaved
   with blob chunks. Ordinary comments, keep-alives, and non-JSON events remain
   byte-passthrough.
@@ -561,6 +722,17 @@ Claude assistant image blocks and OpenAI Chat Completions assistant image
 parts are not added: the documented schemas do not carry them. Do not use the
 request-side `source.data` predicate indiscriminately on responses.
 
+**Failure after response streaming begins:** before response headers, return an
+explicit non-2xx error. Once headers or any body bytes/events have reached the
+client, a renewal, disk, or parse failure must **abort the client connection**
+and emit an error log containing the request ID and failed stage. Do not emit a
+terminal success/`[DONE]` event or silently accept a truncated body. Cancel the
+upstream response and active file readers; release each shared-lease ref exactly
+once in `finally`; close file handles before deleting
+request/response/event spills and scratch blobs; and release the in-flight
+request counter. The same connection-abort rule applies to a partially written
+non-SSE response.
+
 **Required backpressure changes:** remove response `tee()` branches used only
 for logging and replace them with single-pass observation. In `src/server.ts`,
 pipe the web response stream with proper Node `pipeline()` handling, or await
@@ -569,6 +741,170 @@ socket drain in the `WritableStream.write` callback; the current ignored
 response transforms must likewise wait for downstream demand rather than
 unconditionally enqueueing. These changes are required for response spooling
 to bound memory; disk alone cannot fix an unconsumed in-memory queue.
+
+### 5.8 `auth_with_body`: external-link projection
+
+The auth sidecar must see the post-privacy/kompress/judge body, but it does not
+need to receive inline binary under an updated auth contract. When external
+link upload is explicitly configured, build a separate **auth projection**:
+text and tools keep their final mutated values, while each request `BlobRef`
+becomes a small `BlobLinkRef`:
+
+```json
+{
+  "type": "external_blob",
+  "url": "https://object-store.example/signed-download-url",
+  "sha256": "<hash of stored base64 payload>",
+  "size": 123456,
+  "media_type": "image/png",
+  "encoding": "base64"
+}
+```
+
+`external_blob` is a **new custom-defined object in the auth request only**. It
+is not defined by any Claude, OpenAI, or Gemini request schema. The proxy and
+auth service must explicitly implement and version this contract. The auth
+service must understand `external_blob` and, when it needs the content, fetch
+and hash-verify it before returning its auth decision.
+
+**Uniform replacement rule:** keep the original field path and surrounding
+metadata, but replace the inline string value with the `external_blob` object.
+Apply this rule to every allowlisted binary field, whether or not the schema has
+a native URL alternative. Do not rename the field to `source.url`, `file_url`,
+`fileUri`, or `uri` in the auth projection. Existing remote URLs/file URIs were
+never extracted and pass through unchanged. The upstream path later rehydrates
+the original inline field/value from the local BlobRef, not this auth object.
+
+For example, an original Claude image block:
+
+```json
+{
+  "type": "image",
+  "source": {
+    "type": "base64",
+    "media_type": "image/png",
+    "data": "AAAA..."
+  }
+}
+```
+
+has this auth-only projection:
+
+```json
+{
+  "type": "image",
+  "source": {
+    "type": "base64",
+    "media_type": "image/png",
+    "data": {
+      "type": "external_blob",
+      "url": "https://object-store.example/signed-url",
+      "sha256": "<hash>",
+      "size": 123456,
+      "media_type": "image/png",
+      "encoding": "base64"
+    }
+  }
+}
+```
+
+The same same-path replacement applies to Chat Completions `image_url.url`,
+`input_audio.data`, and `file.file_data`; Responses `input_image.image_url`,
+`input_file.file_data`, and inline skill `source.data`; Gemini
+`inlineData.data`/`inline_data.data`; and Interactions `input[].data`.
+
+**Schema-native inline-binary → URL mappings**
+
+These mappings describe fields already defined by the respective model APIs;
+they are not the custom auth-only `BlobLinkRef`:
+
+| API schema | Inline base64 image/binary field(s) | URL/URI field mapping | Notes |
+|---|---|---|---|
+| Chat Completions | `content[].image_url.url` (image data URL)<br/>`content[].input_audio.data` (audio)<br/>`content[].file.file_data` (file) | Image: replace in the **same** `content[].image_url.url` field with an `https://` URL.<br/>Audio: **no URL field**.<br/>File: **no URL field**. | `file.file_id` is an uploaded-file ID, not a URL. |
+| Responses | `input_image.image_url` (image data URL)<br/>`input_file.file_data` (file/document)<br/>Inline skill `source.data` (ZIP) | Image: replace in the **same** `input_image.image_url` field.<br/>File: `input_file.file_data` → `input_file.file_url`.<br/>Inline skill ZIP: **no URL field**. | `file_id` and `skill_id` are resource IDs, not URLs. |
+| Claude Messages | `image.source.data`<br/>`document.source.data` | `image.source.data` → `image.source.url`.<br/>`document.source.data` → `document.source.url`. | Change `source.type` from `base64` to `url`; document URL mapping applies to the URL PDF source variant. |
+| Gemini GenerateContent | `inlineData.data` or `inline_data.data` for image/audio/video/document | `inlineData.data` → `fileData.fileUri`.<br/>`inline_data.data` → `file_data.file_uri`. | Also map `mimeType` ↔ `mime_type`; supported URI schemes depend on the provider. |
+| Gemini Interactions | `input[].data` where `type` is `image`, `audio`, `document`, or `video` | `input[].data` → `input[].uri` for each content type. | Keep the content `type` and `mime_type`. |
+
+Only these schema-native mappings can replace inline binary with a URL on an
+upstream request, and only after an explicit product decision to make that
+change. They do not authorize sending the custom auth object upstream.
+
+- Upload each L2 blob by streaming it to the configured object store. Upload
+  and auth network I/O retain only the small ref skeleton, not the full parsed
+  request. Renew the blob's existing lease throughout upload, auth fetch, and
+  the subsequent upstream
+  send; slow external I/O must not trigger TTL deletion.
+- Serialize and send only the small auth projection to `auth_with_body`. Do not
+  rehydrate a full auth JSON string. The upstream request is unchanged in
+  semantics: it still streams the original inline base64 fields from the local
+  blobs. Never send `BlobLinkRef` objects or replacement URLs upstream unless
+  a separate product decision explicitly changes the upstream API request.
+- Require an HTTPS object store reachable by the auth service, short-lived
+  signed download URLs, a URL lifetime longer than the auth timeout, and
+  hash/size verification. Signed URLs and credentials are redacted from logs.
+  External upload is a separate opt-in because user binary content now leaves
+  the proxy host.
+- Upload, URL-generation, auth-fetch, or verification failure fails auth
+  explicitly and prevents the upstream call. Never silently fall back to an
+  empty binary field or send a broken link.
+- Best-effort delete external objects after the auth decision, and configure a
+  storage-lifecycle TTL for failure/crash leftovers. External objects are not
+  request recovery state, are never reused as a persistent proxy cache, and
+  are never resumed after restart. This temporary auth-link store does not
+  change the no-cross-process-sharing rule for the local blob cache.
+- If no external uploader is configured, preserve the existing full-body auth
+  behavior. The implementation must not silently emit refs or strip binary
+  without the auth service's explicit contract support.
+
+### 5.9 Optional byte-based materialization admission
+
+Operators who need a hard proxy-level budget for large non-ref processing can
+enable admission with `max_materialized_body_bytes`. It is **0/disabled by
+default**, so the no-body-semaphore behavior remains unchanged unless opted in.
+This is a byte budget around full-body materialization, not a total in-flight or
+SSE connection limit.
+
+```text
+Raw body is fully received into a spool
+  → read spilled size B
+  → reserve ceil(B × materialization_factor) before read/parse
+  → read + parse + validate
+  → binary reduced to refs: release reservation after extraction
+  → large non-ref: retain reservation through sidecars/conversion/stringify
+  → write effective/attempt/egress spool
+  → release full objects and reservation
+  → stream spool upstream/client with no admission held
+```
+
+Admission must start before parsing because non-ref status is unknown until the
+body has been parsed. Binary exchanges therefore use a reservation temporarily
+and release it as soon as extraction succeeds. Non-ref exchanges keep it through
+slow sidecars and serialization. A non-ref rung that starts from an effective
+spool acquires a fresh reservation before parsing/conversion and releases it
+after its attempt spool is complete. Large non-ref responses and SSE events use
+the same rule.
+
+Admission behavior:
+
+- If capacity is available, proceed immediately. Otherwise queue in arrival
+  order while the raw body remains on disk; pause upstream response/event reads
+  while their admission is waiting.
+- Bound the queue by `max_admission_queue` and each wait by
+  `admission_timeout_ms`. On timeout/overflow, return `429` or `503` with an
+  explicit error before client response headers; never begin materialization
+  after rejection.
+- On client abort, timeout, parse/validation/sidecar/disk failure, or
+  serialization failure, remove the queued waiter or release its reservation in
+  `finally`. No reservation survives restart.
+- `materialization_factor` accounts conservatively for decoded text, parsed
+  objects, and serialization copies; B alone is not an exact heap size. Start
+  with a measured factor and validate with heap profiles. The byte limit is a
+  hard cap on **nominal admitted bytes**, while actual RSS correctness depends
+  on that calibration and still needs process/host limits.
+- Queued raw spills remain under `max_total_bytes`; L1/L2 cache sizing is
+  independent. Admission is released before slow upstream/client streaming and
+  the long-lived SSE response, so it does not limit total SSE connections.
 
 ---
 
@@ -603,13 +939,15 @@ real backpressure to both the in-memory and spill branches.
 Phase 1 alone does **not** fix slow upstream sends or SSE request-body
 retention: full parsed objects and serialized upstream bodies still exist.
 
-### Phase 2 — request/response egress and SSE release (§5.3, §5.7)
+### Phase 2 — request/response egress and SSE release (§5.3, §5.7, §5.8)
 
 Fixes the slow-upstream request-send and slow-downstream response-send windows
 for identity and streamed-ref paths. Removes full request bodies from SSE
 response closures while preserving token usage and other response metadata.
 Adds finite JSON response spooling, per-SSE-event spooling, and the required
-end-to-end downstream backpressure.
+end-to-end downstream backpressure. When configured, `auth_with_body` uses the
+external-link projection in §5.8 instead of uploading a full inline-binary
+body to the auth sidecar.
 
 Scope request shapes 2–3 to the documented endpoint families that carry the
 §5.4 inline-binary shapes, rather than all stringify sites at once:
@@ -635,34 +973,38 @@ Constant memory *through* parse via a schema-aware pre-scan that rewrites only
 §5.4 binary payload runs into tokens on disk before parsing.
 
 **Status: deferred.** Do not start it. The trigger to reopen is the Phase 2
-measurement of §7: if the semaphore-gated parse transient is still the top
-allocator under real inline-binary traffic, the scanner is worth the lexing
-risk; until that number exists, it is speculation against a real behavior
-change. A context-free `"data":"…"` scanner is not approved.
+measurement of §7: if the full-parse transient is still the top allocator under
+real inline-binary traffic, the scanner is worth the lexing risk; until that
+number exists, it is speculation against a real behavior change. A context-free
+`"data":"…"` scanner is not approved.
 
 ---
 
 ## 7. Expected effect and measurement
 
-Let `N` be live exchanges, `B` body/event size, `C` bounded stream-buffer
-memory per active unit, `P` the shared parse-permit count, and `R`
-response-side queued/converter state. The target is asymptotic, not an
-unprofiled copy multiplier:
+Let `N` be live exchanges, `B` body/event size, `C` bounded stream-buffer memory
+per active unit, and `R` response-side queued/converter state. The target is
+asymptotic, not an unprofiled copy multiplier:
 
-| Window | Today | After Phase 1 | After Phase 2, supported inline-binary paths |
+| Window | Today | After Phase 1 | After Phase 2 |
 |---|---|---|---|
 | Slow upload | O(N×B), including adapter/cap buffering | O(N×C) outside parse | O(N×C) outside parse |
-| Full parse | Up to O(N×B) | O(P×B), plus already-retained bodies | O(P×B), plus small refs/metadata after release |
-| Slow upstream request send | O(N×B) | O(N×B) | O(N×C) for identity/shape 3; shape 2 remains O(N×B) |
-| Slow downstream JSON response | O(N×B) for clone/text/stringify paths | Same as today | O(N×C) outside the shared gated parse |
+| Full parse | Up to O(N×B) | O(N×B), with no proxy body semaphore | O(N×B) during parse, plus small refs/metadata after extraction |
+| Slow upstream request send | O(N×B) | O(N×B) | O(N×C) for identity/shape 3 and non-ref attempt-spool streaming; shape 2 remains O(N×B) |
+| Slow downstream JSON response | O(N×B) for clone/text/stringify paths | Same as today | O(N×C) outside full parse/serialization |
+| Large non-ref sidecars/conversion/serialization | O(N×B) | O(N×B) | O(N×B), then disk-backed I/O after object release |
 | Long converted SSE response | O(N×B) on paths retaining `requestBody`, plus R | Same as today | Small request metadata/refs plus bounded R after closure release |
-| Large binary SSE event with slow client | O(N×B) for the event, plus potentially unbounded R | Same as today | O(N×C) outside gated event parse, bounded R, no whole-stream accumulation |
+| Large binary SSE event with slow client | O(N×B) for the event, plus potentially unbounded R | Same as today | O(N×C) outside event parse, bounded R, no whole-stream accumulation |
 
-Add the global L1 blob-cache cap to all Phase 2 totals. Under §9.3 and §5.7,
-large fields outside the binary allowlists still contribute O(N×B) after parse
-and during serialization; the table is not a claim of constant memory for
-arbitrary JSON. `R` is bounded by the Phase 2 downstream backpressure changes,
-not merely by moving queued bytes to disk.
+Add the global L1 blob-cache cap and O(blob count) L2 index metadata to all
+Phase 2 totals. `max_blob_disk_bytes` limits L2 disk payload bytes, not the RAM
+index entry count. Under §9.3 and §5.7, arbitrary non-ref fields remain O(B)
+per materialized body and O(N×B) in aggregate with admission disabled. Enabling
+§5.9 instead caps nominal admitted materialization bytes at
+`max_materialized_body_bytes`, subject to `materialization_factor` calibration.
+This is not a constant-memory parse/serialization claim. `R` is bounded by the
+Phase 2 downstream backpressure changes, not merely by moving queued bytes to
+disk.
 
 Phase 0 reduces constants only. Phases are *stages of one change*, not release
 steps: per §9.4 they ship together, so operators should evaluate the final
@@ -673,8 +1015,8 @@ Measurement requirements:
 - Use heap snapshots/allocation profiles and external-buffer accounting at each
   window, including after response headers and midway through an open SSE
   stream. RSS alone is affected by GC timing and allocator retention.
-- Record parse-gate queue delay and p50/p95/p99 end-to-end latency, not only
-  memory. Tune `P` from measurements rather than assuming a 50–100 ms parse.
+- Record full-parse concurrency and p50/p95/p99 end-to-end latency, not only
+  memory. Tune L1/L2 sizes from hit/eviction rates and host RAM/SSD budgets.
 - Report each request and response payload family separately, including Gemini
   output blobs and OpenAI image-generation output. Measure completed JSON
   responses, individual SSE events, and non-allowlisted large text as separate
@@ -686,12 +1028,15 @@ Costs, stated honestly:
   this is a RAM→I/O trade with added latency, and only wins when peak RAM
   matters more than that cost.
 - **Disk footprint** includes live request/response/event spills and retained
-  L2 request blobs; `max_total_bytes` covers the spills, not the cache.
-- **Cache memory:** L1 can add up to `max_blob_cache_bytes`; it is not free
-  merely because it improves dedup hits.
-- **New failure mode:** a full or slow filesystem now fails requests that used
-  to succeed. Must surface as an explicit error with a log line, never as a
-  truncated body.
+  L2 request blobs; `max_total_bytes` caps the spills and
+  `max_blob_disk_bytes` independently caps the L2 payload cache.
+- **Cache/index memory:** L1 can add up to `max_blob_cache_bytes`, and the L2
+  index adds O(blob count) metadata in RAM. Measure both; neither is free
+  merely because it improves dedup hits or avoids filesystem `stat` calls.
+- **New failure modes:** a full/slow filesystem or an L2 cap whose entries are
+  all leased can fail requests that used to succeed. Must surface as an
+  explicit error with a log line, never as a truncated body or active-blob
+  eviction.
 
 ---
 
@@ -699,7 +1044,7 @@ Costs, stated honestly:
 
 | Alternative | Why rejected |
 |---|---|
-| Admission control over in-flight requests as the primary fix | It does bound N and can protect against overload, but a whole-request permit is held for minutes by slow uploads and SSE responses, causing queue waits for healthy traffic. The parse gate and streaming design avoid holding a memory permit for the whole request lifetime. |
+| Admission control over in-flight requests as the primary fix | It would bound N and protect against overload, but a whole-request permit is held for minutes by slow uploads and SSE responses, causing queue waits for healthy traffic. Rejected in favor of spooling/streaming plus optional §5.9 nominal-byte admission only around materialization; no whole-request/SSE permit is held. |
 | `new Request(url, { body: fileStream })` then `.json()` | undici buffers the whole stream; the memory is not saved, only relocated a layer deeper. |
 | `fs.readFile` + parse without ingress spooling | Saves nothing during the upload window, which is half the complaint. |
 | Spool to `os.tmpdir()` without checking the filesystem | A tmpfs offload remains RAM. |
@@ -730,7 +1075,7 @@ part of the implementation change.
 ### 9.2 Phase 3 scanner — **deferred pending Phase 2 measurements**
 
 Not approved, not rejected. The trigger to reopen is stated in §6, Phase 3:
-the semaphore-gated parse transient must still be the top allocator under real
+the full-parse transient must still be the top allocator under real
 inline-binary traffic. Recording it as deferred rather than rejected matters —
 the reason is "we don't have the number yet", not "we judged it unsound".
 
@@ -756,9 +1101,11 @@ failure mode invisible in output. Adding a new binary schema requires a new
 explicit predicate and consumer/round-trip tests.
 
 **Accepted limitation:** large text and custom fields outside the allowlist
-remain O(B) after parse, during converted egress, and in any retaining SSE
-closure. They still receive content-agnostic ingress spooling and identity
-passthrough streaming.
+remain O(B) per materialized body and O(N×B) in aggregate, with full parse/
+`JSON.stringify` transients and no proxy body-concurrency cap. Effective/attempt
+spills back subsequent network I/O, and no full non-ref body is retained in an
+SSE closure. They also receive content-agnostic ingress spooling and identity
+passthrough streaming. Larger L1/L2 caches do not change this non-ref cost.
 
 ### 9.4 Phase 0 timing — **hold, ship as one change**
 
@@ -769,8 +1116,8 @@ current multi-copy peak stays in production in the meantime.
 ### 9.5 Response spooling — **per finite body/event, in scope**
 
 Large non-SSE JSON responses and individual large SSE events are spooled under
-`max_response_bytes`, parsed under the shared gate, and streamed to the client
-with downstream backpressure. Response blobs are deleted after delivery and do
+`max_response_bytes`, fully parsed when required without a body semaphore, and
+streamed to the client with downstream backpressure. Response blobs are deleted after delivery and do
 not enter the cross-request cache by default.
 
 Rejected: accumulating an entire SSE response on disk before forwarding. That
@@ -797,18 +1144,80 @@ specifically exercises rejection.
 - **Ingress caps:** body past `max_request_bytes` → `413`, no upstream call;
   aggregate spill reservations past `max_total_bytes` produce the documented
   explicit error and return to baseline after completion/abort.
-- **Shared parse gate:** with more large requests, responses, and events than
-  permits, assert no more than P reads/parses coexist across all three classes,
-  queue delay is reported, and every permit is released on parse/read failure.
-- **Request rebuild:** after the cap path and a ladder rung rebuild a `Request`,
-  assert the same `SpoolRef` is available and the body is not silently reread
-  into memory.
+- **Concurrent traffic and cache sizing:** run many large binary and non-ref
+  requests/responses/events with §5.9 disabled. Assert there is no admission
+  queue, binary bodies become small ref skeletons after extraction, and full-
+  parse/non-ref O(N×B) memory is reported honestly. Measure L1/L2 hit and
+  eviction rates under increased `max_blob_cache_bytes`/`max_blob_disk_bytes`;
+  do not treat larger caches as a parse-memory bound.
+- **Optional materialization admission:** with a small
+  `max_materialized_body_bytes` and known `materialization_factor`, assert no
+  read/parse begins before reservation and nominal admitted bytes never exceed
+  the budget. Binary bodies release after extraction; non-ref bodies retain
+  admission through delayed sidecars and effective/attempt/egress-spool writes,
+  then release before network streaming. Cover per-rung reacquisition, responses,
+  and SSE events. Queue excess work in arrival order, pause upstream event reads,
+  and assert timeout/overflow returns explicit `429`/`503` before headers. Abort,
+  failure, and restart must remove waiters/release reservations exactly once;
+  queued spills remain under `max_total_bytes`.
+- **Raw/effective body lineage:** after early `Request` reconstruction, assert
+  the raw `SpoolRef` remains available for identity passthrough. Then use a
+  body containing PII, compressible text, two tools, and a binary payload; apply
+  privacy, kompress, and tool erase before two ladder rungs. Assert every
+  converted upstream body inherits all three mutations, the original PII is
+  absent, and the binary bytes still match the baseline. Instrument spool reads
+  to prove converted rungs never reconstruct from the raw spool; when disk-
+  backed effective state is required, assert they read the effective spool.
+- **Rung isolation and shared leases:** give two rungs different model rewrites
+  and `request_ingress` mutations. Assert both start from the same effective
+  body and rung A's mutations are absent from rung B. Every cloned BlobRef keeps
+  the same `leaseId`; `retain()` increments `refs` before the attempt can read,
+  each attempt releases exactly once, and no intermediate release can reach
+  `refs = 0` while the effective body or another attempt still owns a ref.
+  Assert no binary reread into memory. Identity passthrough alone hash-equals
+  the raw client body.
+- **Effective-spool serialization:** for a large non-ref body, assert
+  `JSON.stringify(effectiveBody)` runs exactly once after global mutations, the
+  effective spool contains that exact string, and the transient string is
+  released after the write. Assert per-rung parses read the effective spool and
+  inherit all mutations.
+- **Non-ref attempt-spool send:** for a large non-ref converted rung, assert
+  parsing/conversion/`JSON.stringify` produce an attempt spool containing the
+  final body. Then delay the upstream read and assert full objects/strings are
+  collectible before the wait and upstream bytes hash-equal the in-memory
+  baseline. Repeat for a large non-ref response/event and verify the client
+  write starts only after the same object release.
 - **Disk failure:** spool directory made unwritable mid-run on request and
   response paths → explicit failure and log line, with no truncated body
   forwarded upstream or to the client.
 - **Egress, slow upstream:** upstream reading at 1 KiB/100 ms; assert forwarded
   bytes hash-equal the in-memory case. If `Content-Length` is present it is
   exact; otherwise no stale length is forwarded.
+- **BlobRef lease outlives idle TTL:** with a fake clock and `ttl_seconds = 600`,
+  keep an upstream POST and a downstream response/event write alive for 1200
+  seconds, including a no-byte-progress interval above 600 seconds. Assert the
+  lease renews, L2 eviction does not delete the blob, no `ENOENT` occurs, and
+  forwarded bytes hash-equal the baseline. After the final release, assert an
+  idle cache blob expires normally and a response/event scratch blob is deleted.
+- **Lease release and failure:** abort upstream and downstream writes; assert
+  renewal stops, every lease is released, and cleanup occurs after handles
+  close. Inject renewal failure or remove a leased file; assert the exchange
+  fails explicitly and no partial/empty payload is substituted.
+- **Failure after response streaming begins:** after a partial non-SSE body or
+  an initial SSE event reaches the client, inject renewal, disk, and parse
+  failures. Assert the client observes a connection abort, an error log contains
+  request ID and stage, no success/`[DONE]` terminator is emitted, upstream reads
+  and file readers are cancelled, every shared-lease ref is released exactly
+  once, handles close before deletion, spills/scratch blobs are
+  removed, and the active-request counter returns to baseline. Inject the same
+  failures before headers and assert an explicit non-2xx response instead.
+- **L2 disk cap and RAM index:** with a small `max_blob_disk_bytes`, insert
+  enough blobs to exceed it. Assert the index's `size` sum and actual current-
+  process L2 bytes stay within the cap, `refs = 0` entries evict in LRU order,
+  `refs > 0` entries remain readable without `stat`-based index reconstruction,
+  and lease release updates `refs`. When all entries are leased and no bytes
+  can be freed, assert the new cache write fails explicitly without exceeding
+  the cap or deleting an active blob.
 - **Binary allowlist round-trip matrix:** exercise every §5.4 predicate with a
   payload above the spill threshold: Claude image and base64 PDF; Chat
   Completions image, audio, and file; Gemini image/audio/video/PDF in both
@@ -818,13 +1227,27 @@ specifically exercises rejection.
   bytes equal the in-memory conversion baseline. Run the applicable SSE and
   non-SSE variant, including Gemini `:streamGenerateContent` and
   `/v1/interactions`.
+- **`auth_with_body` link projection:** for every §5.4 binary predicate, assert
+  the auth body contains a valid `external_blob` link with matching hash/size/
+  media type and no inline base64, while its text/tools reflect the final
+  sidecar mutations. Have the auth service fetch and verify the object, then
+  assert the upstream still receives the original inline binary bytes. Without
+  an uploader, assert legacy full-body auth remains unchanged.
+- **Auth-link lease and failure:** keep upload/auth fetch alive beyond the idle
+  TTL and assert renewal prevents deletion while retaining only the small ref
+  skeleton. Inject upload, URL, auth-fetch, and hash-verification failures; assert
+  no upstream call and explicit errors. Assert signed URLs are redacted from
+  logs, external deletion/lifecycle cleanup is scheduled, and restart never
+  reuses an external object as recovery/cache state.
 - **Converted SSE lifetime:** parameterize over the binary families and
   converted endpoints above. Let the upstream request finish, then keep the
-  SSE response open with delayed events. Assert usage/input-token output
-  matches the pre-ref implementation and the stream transformer owns scalar
-  token metadata/refs, not `requestBody` or its base64 strings. Take a
-  mid-stream heap profile as integration evidence; a unit test of the
-  transformer API alone is not enough.
+  SSE response open with delayed events. Assert non-binary usage follows the
+  existing estimator, each binary contribution is exactly
+  `Math.ceil(base64CharLength / charactersPerToken)` with no fixed block
+  metadata, and upstream-reported usage wins when present. The stream
+  transformer owns scalar token metadata/refs, not `requestBody` or its base64
+  strings. Take a mid-stream heap profile as integration evidence; a unit test
+  of the transformer API alone is not enough.
 - **Passthrough SSE lifetime:** hold an identity SSE response open with each
   binary family and verify the parsed request is collectible after the schema
   gate and scalar metadata extraction while response forwarding continues
@@ -853,9 +1276,10 @@ specifically exercises rejection.
 - **Token round-trip (Phase 3):** body containing a long base64-looking *text*
   value → forwarded bytes hash-equal input.
 - **Restart is discard-only:** seed request/response/event spills and blobs
-  from a previous process, then restart. Assert no old body/event is parsed or
-  forwarded, no old blob produces a cache hit, no client/upstream exchange is
-  resumed, and an orphan older than the age threshold is removed. A freshly
+  from a previous process, then restart. Assert the L2 index is empty, no disk
+  scan/deserialization reconstructs it, no old body/event is parsed or
+  forwarded, no old blob produces a cache hit, and no client/upstream exchange
+  is resumed. An orphan older than the age threshold is removed; a freshly
   written file belonging to a concurrently active worker is not removed.
 - **Platform:** on win32, the spool path never uses the unlinked-fd strategy and
   deletion occurs only after handles close.
@@ -886,12 +1310,22 @@ Decisions are recorded (§9); what remains is evidence.
       and long/large-event SSE response.
 - [ ] Heap/allocation profile confirms or corrects §2's copy inventory.
 - [ ] Mid-stream SSE profiles show no full request body retained on supported
-      converted paths, with token usage unchanged.
+      converted paths; non-binary accounting is unchanged and binary usage uses
+      the documented payload-length estimate with upstream usage preferred.
 - [ ] Paused-client tests prove bounded response queues and upstream read
       backpressure across logging, keep-alive, converters, and the Node adapter.
+- [ ] Mid-stream renewal/disk/parse failure tests prove client connection abort,
+      error logging, upstream cancellation, and complete lease/spill cleanup
+      without a false success terminator.
 - [ ] Every §5.4 request predicate has round-trip and mid-stream retention
       evidence; every §5.7 response predicate has completed-JSON and applicable
-      SSE-event round-trip/cleanup evidence. Non-allowlisted fields are measured
-      separately as a control.
+      SSE-event round-trip/cleanup evidence. Non-ref tests separately report
+      ungated O(N×B) processing and prove object release before network I/O.
+- [ ] Optional §5.9 tests prove pre-parse byte reservation, binary early release,
+      non-ref retention through serialization, bounded queue/timeout, abort and
+      failure cleanup, and no admission held during network/SSE streaming.
+- [ ] §5.8 auth-link tests prove post-sidecar auth content, binary-free auth
+      projections, unchanged upstream inline bytes, lease renewal, failure
+      handling, URL redaction, and external-object cleanup.
 - [ ] `CHANGELOG.md` + `README.md` updated in the same change as any
       implementation, per the repo's documentation rule.
