@@ -4,6 +4,7 @@
  */
 
 import { ClaudeMessagesRequest, ClaudeTextBlock, ClaudeImageBlock } from '../types/claude.js';
+import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
 
 /**
@@ -28,10 +29,11 @@ export function convertClaudeToGeminiRequest(
                     parts.push({ text: (block as ClaudeTextBlock).text });
                 } else if (block.type === 'image') {
                     const imgBlock = block as ClaudeImageBlock;
+                    const data: unknown = imgBlock.source.data;
                     parts.push({
                         inline_data: {
                             mime_type: imgBlock.source.media_type || 'image/jpeg',
-                            data: imgBlock.source.data
+                            data: isBlobRef(data) ? rebindBlobRef(data, 'gemini-inline-data', '') : data
                         }
                     });
                 }
@@ -97,6 +99,16 @@ export function decodeDataUri(url: string): { mime_type: string; data: string } 
     return { mime_type: mime, data: raw };
 }
 
+/** Decode a data URL, or move its BlobRef to a bare-payload position without reading it. */
+export function decodeDataUriOrRef(value: string | BlobRef): { mime_type: string; data: string | BlobRef } {
+    if (!isBlobRef(value)) return decodeDataUri(value);
+    const mime = /^data:([^;,]*)/.exec(value.prefix)?.[1]?.trim();
+    return {
+        mime_type: mime || 'image/jpeg',
+        data: rebindBlobRef(value, 'gemini-inline-data', ''),
+    };
+}
+
 /**
  * Convert an OpenAI Chat Completions request body into a Gemini
  * generateContent request body. Mirrors `completionsToClaudeBody`
@@ -155,10 +167,10 @@ export async function convertCompletionsToGeminiGenerateContentBody(
                     if (pType === 'text' && typeof part.text === 'string') {
                         parts.push({ text: part.text });
                     } else if (pType === 'image_url') {
-                        const url = (part.image_url as Record<string, unknown> | undefined)?.url as string;
-                        if (typeof url !== 'string' || url === '') continue;
-                        if (url.startsWith('data:')) {
-                            parts.push({ inline_data: decodeDataUri(url) });
+                        const url: unknown = (part.image_url as Record<string, unknown> | undefined)?.url;
+                        if (typeof url !== 'string' && !isBlobRef(url)) continue;
+                        if (isBlobRef(url) || url.startsWith('data:')) {
+                            parts.push({ inline_data: decodeDataUriOrRef(url) });
                         } else {
                             // http(s) — server-side fetch with SSRF guard.
                             // Fail Loud on any error (no placeholder).

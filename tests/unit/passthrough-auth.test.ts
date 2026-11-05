@@ -72,7 +72,6 @@ async function runPassthrough(opts: {
   const res = await handlePassthroughRequest(
     new Request(`http://proxy.test${opts.path}`, { method: 'POST', body: bodyText }),
     opts.path,
-    bodyText,
     proxyConfig,
     {},
     silentLogger,

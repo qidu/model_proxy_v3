@@ -2,10 +2,11 @@
  * Converter: OpenAI Responses API format to Chat Completions format
  */
 
-import { OpenAIRequest, OpenAIMessage, OpenAIToolCall, OpenAIContent, OpenAIContentPart } from '../types/openai.js';
+import { OpenAIRequest, OpenAIMessage, OpenAIToolCall, OpenAIContent, OpenAIContentPart, OpenAIImagePart } from '../types/openai.js';
 import { Logger } from '../utils/logger.js';
 import { stringify } from '../utils/stringify.js';
 import { ValidationError } from '../utils/errors.js';
+import { isBlobRef } from '../utils/blob-refs.js';
 
 /**
  * Optional logging context passed through conversion so notable rewrites
@@ -700,10 +701,13 @@ function convertResponsesContentToCompletions(content: unknown): OpenAIContent {
       // Responses accepts image_url as either a string or {url, detail?} object.
       // Completions requires the object form — normalize.
       const url = partObj.image_url as unknown;
-      const normalized = typeof url === 'string'
+      const normalized = typeof url === 'string' || isBlobRef(url)
         ? { url }
         : (url as { url: string; detail?: 'low' | 'high' | 'auto' }) ?? { url: '' };
-      parts.push({ type: 'image_url', image_url: normalized });
+      // §5.3 shape 3: a spooled payload stays a ref in `url` and the ref-aware
+      // serializer expands it in chunks, so `OpenAIImagePart`'s declared `string` is
+      // the rehydrated shape, not the in-flight one.
+      parts.push({ type: 'image_url', image_url: normalized as OpenAIImagePart['image_url'] });
     } else if (partObj.type === 'input_file') {
       parts.push({ type: 'text', text: `[File: ${(partObj.filename as string) || 'unknown'}]` });
     }

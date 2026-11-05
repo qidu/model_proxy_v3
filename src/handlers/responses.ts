@@ -6,7 +6,7 @@
  */
 
 import { Env } from '../types/shared.js';
-import { Logger, createLogger, logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
+import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStream } from '../utils/logger.js';
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
 import { handleResponsesApiError, createResponsesErrorResponse, ResponsesApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
@@ -21,6 +21,12 @@ import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount }
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { handleGeminiRequestForMessages } from './gemini.js';
 import { completionsToClaudeBody } from './openai.js';
+import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
+import { collectBlobRefs } from '../utils/blob-refs.js';
+import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
+import { receiveResponseBody } from '../utils/spool-response.js';
+import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { getSpoolConfig } from '../utils/spool.js';
 
 /**
  * Short-lived store: tool call ID → reasoning_content string.
@@ -74,6 +80,15 @@ export async function handleResponsesRequest(
   const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
 
   const requestBody = await request.json() as Record<string, unknown>;
+  // §5.3: the egress shape is decided per sub-path, not here, and never by
+  // expanding. Every branch below is ref-aware. The three converting branches
+  // carry the ref through converters that honour `isBlobRef` instead of reading
+  // the payload as a string, and their send streams each blob at its ref's
+  // position (shape 3 — `postJsonWithSpool` re-detects the refs, and the Gemini
+  // branch's synthetic request is re-parsed by a handler that decides the same
+  // way for itself); the native Responses passthrough keeps the refs and streams
+  // at its own send. Expanding here would leave those sends nothing to stream,
+  // and the only consumer above dispatch reads scalars/text.
   logPipelineStage(activeLogger, requestId, 'inbound', '/v1/responses', requestBody);
   logPipelineHeaders(activeLogger, requestId, 'inbound', '/v1/responses', request.headers);
   const isStreaming = requestBody.stream === true;
@@ -678,10 +693,8 @@ async function handleAsAnthropicMessages(
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
   };
   logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, anthropicFetchHeaders);
-  const response = await fetch(targetUrl, {
-    method: 'POST',
+  const response = await postJsonWithSpool(targetUrl, claudeBody, {
     headers: anthropicFetchHeaders,
-    body: JSON.stringify(claudeBody),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -738,14 +751,16 @@ async function handleAsGemini(
   logger.debug(requestId, `Responses->${upstreamMode}: ${JSON.stringify(claudeBody).substring(0, 500)}`);
 
   // Build a synthetic request with Claude-format body so handleGeminiRequestForMessages can process it
+  const claudeAttempt = await createJsonEgressBody(claudeBody, 'att-');
   const claudeRequest = new Request(request.url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...Object.fromEntries(request.headers),
     },
-    body: JSON.stringify(claudeBody),
-  });
+    body: claudeAttempt.body,
+    ...(claudeAttempt.spilled ? { duplex: 'half' } : {}),
+  } as RequestInit);
 
   const claudeResponse = await handleGeminiRequestForMessages(claudeRequest, targetUrl, authHeaders, requestId, model, env, logger);
 
@@ -936,10 +951,8 @@ async function handleAsCompletions(
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
   };
   logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, completionsFetchHeaders);
-  let response = await fetch(targetUrl, {
-    method: 'POST',
+  let response = await postJsonWithSpool(targetUrl, upstreamBodyResponses, {
     headers: completionsFetchHeaders,
-    body: JSON.stringify(upstreamBodyResponses),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -1641,10 +1654,8 @@ export async function handleResponsesInputTokensRequest(
       ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
     };
     logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, countFetchHeaders);
-    let response = await fetch(targetUrl, {
-      method: 'POST',
+    let response = await postJsonWithSpool(targetUrl, countRequest, {
       headers: countFetchHeaders,
-      body: JSON.stringify(countRequest),
       signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
@@ -1690,10 +1701,8 @@ export async function handleResponsesInputTokensRequest(
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
   };
   logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, passthroughInputTokensHeaders);
-  let passthroughInputTokensResponse = await fetch(targetUrl, {
-    method: 'POST',
+  let passthroughInputTokensResponse = await postJsonWithSpool(targetUrl, passthroughBodyInputTokens, {
     headers: passthroughInputTokensHeaders,
-    body: JSON.stringify(passthroughBodyInputTokens),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -1766,10 +1775,8 @@ export async function handleResponsesCompactRequest(
       ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
     };
     logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, compactCompletionsHeaders);
-    let compactCompletionsResponse = await fetch(targetUrl, {
-      method: 'POST',
+    let compactCompletionsResponse = await postJsonWithSpool(targetUrl, completionsRequest, {
       headers: compactCompletionsHeaders,
-      body: JSON.stringify(completionsRequest),
       signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
@@ -1815,10 +1822,8 @@ export async function handleResponsesCompactRequest(
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
   };
   logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, compactPassthroughHeaders);
-  let compactPassthroughResponse = await fetch(targetUrl, {
-    method: 'POST',
+  let compactPassthroughResponse = await postJsonWithSpool(targetUrl, passthroughBodyCompact, {
     headers: compactPassthroughHeaders,
-    body: JSON.stringify(passthroughBodyCompact),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -1859,6 +1864,14 @@ async function handleAsPassthrough(
   env?: Env,
   route?: ModelRouteConfig,
 ): Promise<Response> {
+  // §5.3 shape 3, the graduate path: this branch never converts, so a body that
+  // still carries refs can be sent as a stream — the skeleton plus one blob
+  // chunk at a time, read from L2 as the upstream pulls — instead of as one
+  // expanded string. Decided once here, on the inbound body; a `before_upstream`
+  // hook below may still re-shape it (no declared transform fetches or encodes
+  // inline binary), and a ref-free body — or any request on a deployment with
+  // spooling off — sends the expanded string exactly as before.
+  const streamRefs = getSpoolConfig().enabled && collectBlobRefs(requestBody).length > 0;
   let upstreamBodyPassthrough: Record<string, unknown> = requestBody;
   if (route) {
     const hookCtx: HookContext = {
@@ -1871,15 +1884,23 @@ async function handleAsPassthrough(
   }
   // Pure passthrough: no format conversion, so upstream-request == inbound body.
   logPipelineStage(logger, requestId, 'upstream-request', targetUrl, upstreamBodyPassthrough);
+  // The exact `Content-Length` the serializer measured from the skeleton and the
+  // refs' recorded sizes (fetch cannot infer a length for a streamed body, and a
+  // stale length is worse than none), and `duplex: 'half'` — this repo's
+  // streamed-egress convention (src/handlers/passthrough.ts:271, where the plain
+  // key needs the `as RequestInit` cast a conditional spread does not).
+  const streamed = streamRefs ? createRefAwareJsonBody(upstreamBodyPassthrough) : undefined;
   const passthroughFetchHeaders = {
     'Content-Type': 'application/json',
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
+    ...(streamed ? { 'Content-Length': String(streamed.contentLength) } : {}),
   };
   logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, passthroughFetchHeaders);
   let response = await fetch(targetUrl, {
     method: 'POST',
     headers: passthroughFetchHeaders,
-    body: JSON.stringify(upstreamBodyPassthrough),
+    body: streamed ? streamed.body : JSON.stringify(upstreamBodyPassthrough),
+    ...(streamed ? { duplex: 'half' } : {}),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -1904,22 +1925,9 @@ async function handleAsPassthrough(
   }
 
   if (isStreaming) {
-    // Pure passthrough: outbound SSE == upstream-response SSE. Tee to log without
-    // disturbing the stream returned to the client.
-    const [clientStream, logStream] = response.body!.tee();
-    (async () => {
-      try {
-        const reader = logStream.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          logPipelineStage(logger, requestId, 'upstream-response', response.url || targetUrl, decoder.decode(value, { stream: true }));
-        }
-      } catch {
-        // best-effort debug logging only
-      }
-    })();
+    // Pure passthrough: outbound SSE == upstream-response SSE. §5.7: log the
+    // upstream bytes by observing the client's own path, not by teeing a second
+    // reader that would pull the stream through beside it.
     const streamOutHeaders = {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -1927,13 +1935,60 @@ async function handleAsPassthrough(
       'x-request-id': requestId,
     };
     logPipelineHeaders(logger, requestId, 'outbound', '/v1/responses', streamOutHeaders);
-    return new Response(clientStream, { status: 200, headers: streamOutHeaders });
+    return new Response(
+      response.body!.pipeThrough(
+        observeStream(logger, requestId, 'upstream-response', response.url || targetUrl, 'chunks'),
+      ),
+      { status: 200, headers: streamOutHeaders }
+    );
   }
 
-  const responseText = await response.text();
-  logPipelineStage(logger, requestId, 'upstream-response', response.url || targetUrl, responseText);
   // Pure passthrough: outbound body == upstream-response body.
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+
+  if (!response.body) {
+    logPipelineHeaders(logger, requestId, 'outbound', '/v1/responses', outHeaders);
+    return new Response('', { status: 200, headers: outHeaders });
+  }
+
+  // §5.7: receive the body bounded — above `threshold_bytes` it lives in a
+  // `responses/` spill — and forward it from there a chunk at a time. This branch
+  // never converts, so the upstream bytes are the client's bytes; the read that
+  // used to happen here was only for the trace line below, and it held a whole
+  // second copy of the body (and declared no `max_response_bytes`) for a line the
+  // default log level discards anyway. The trace re-reads the spool instead, and
+  // only when tracing is on — the convention the request side already follows
+  // (src/handlers/passthrough.ts:260).
+  const received = await receiveResponseBody(response.body);
+
+  if (logger.traceEnabled) {
+    // §5.9 byte admission, opt-in via `max_materialized_body_bytes`, taken only
+    // where something is materialized: the sole read on this branch is the trace
+    // one, so a body nobody is going to read is never charged and never refused.
+    // The body is received but not yet read, so a body that has to wait for
+    // capacity waits before any of it is materialized, and the client has no
+    // headers yet, so a refusal can still be answered. A refusal must leave
+    // neither the received bytes on disk nor a reservation on the ledger (#8).
+    let lease: AdmissionLease;
+    try {
+      lease = await admitMaterialization(received.size, request.signal);
+    } catch (error) {
+      await received.release();
+      throw error;
+    }
+    try {
+      logPipelineStage(logger, requestId, 'upstream-response', response.url || targetUrl, await received.readText());
+    } finally {
+      // The trace text is unreachable here and the client's body has not been
+      // handed out yet, so §5.9's "release before network streaming" holds: the
+      // write to the client is bounded by its own pace, not by this budget.
+      lease.release();
+    }
+  }
+
   logPipelineHeaders(logger, requestId, 'outbound', '/v1/responses', outHeaders);
-  return new Response(responseText, { status: 200, headers: outHeaders });
+  // Forwarded from the spool rather than from a materialized copy: a spilled body
+  // is re-read from disk a chunk at a time, so the client's write pace — not a
+  // buffer — bounds what the proxy holds while the response is sent.
+  return new Response(received.readStream(), { status: 200, headers: outHeaders });
 }

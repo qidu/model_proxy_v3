@@ -84,6 +84,7 @@ import {
   getTokensInWindowSince,
   recordPrivacyKeysDetected,
 } from './utils/dashboard-stats.js';
+import { attachStreamFailureReporter } from './utils/stream-failure.js';
 import { ThinkingConversionOptions } from './converters/claude-to-openai.js';
 import {
   getPrivacyFilterConfig,
@@ -97,6 +98,15 @@ import { eraseBlockedTools } from './utils/tool-blocklist.js';
 import { judgeTools } from './utils/tool-judge-sidecar.js';
 import { buildModelUsageRecordPayload, recordModelUsageToRemote } from './utils/model-usage-recorder.js';
 import { runHook, applyWriteoutBody, pipeEventTransformer, formatTransformsDebug, type HookContext } from './utils/request-transform.js';
+import { extractInlineBlobs, rehydrateInlineBlobs, releaseExtractedBlobs, type InlineExtraction } from './utils/blob-refs.js';
+import { buildAuthProjection } from './utils/auth-projection.js';
+import { uploadBlobsForAuth } from './utils/external-upload.js';
+import { getSpoolConfig } from './utils/spool.js';
+import { streamResponseEvents } from './utils/spool-events.js';
+import { attachIngressSpool, receiveIngressBody, readIngressSpoolText, type IngressSpool } from './utils/spool-ingress.js';
+import { admitMaterialization, type AdmissionLease } from './utils/spool-admission.js';
+import { createJsonEgressBody, createTextEgressBody } from './utils/spool-json.js';
+import { receiveResponseBody } from './utils/spool-response.js';
 
 let hasLoggedUpstreamConfig = false;
 
@@ -822,13 +832,28 @@ export default {
     // release is deferred onto the returned Response so server.ts can fire it when
     // the body finishes streaming, rather than when the handler returns.
     let releaseActiveRequest: (() => void) | undefined;
+    // The raw request body's spool (§5.1). Held here so the `finally` around the
+    // handler below releases it on every terminal path — including the early
+    // returns inside it — rather than once per exit.
+    let rawIngressSpool: IngressSpool | undefined;
+    // The effective body's inline-binary extraction (§5.2/§5.4), set once the
+    // body is parsed. Like the raw spool it is released in the `finally` below:
+    // the effective body owns its refs until no attempt can be created any more,
+    // and a leaked lease pins a blob against every sweep.
+    let inlineExtraction: InlineExtraction | undefined;
+    // The §5.9 body-materialization reservation, taken once the body has been
+    // received and before it is read. Released in the same `finally` as the two
+    // owners above: a leaked reservation is budget no later body can use.
+    let materializationLease: AdmissionLease | undefined;
 
     if (!hasLoggedUpstreamConfig && proxyConfig.general) {
       logger.debug(requestId, `General config: \n\tbudget_to_effort_low=${proxyConfig.general?.budget_to_effort_low}, \n\tbudget_to_effort_medium=${proxyConfig.general?.budget_to_effort_medium}, \n\tbudget_to_effort_high=${proxyConfig.general?.budget_to_effort_high}`);
       hasLoggedUpstreamConfig = true;
     }
 
-    const finalResponse = await (async (): Promise<Response> => {
+    let finalResponse: Response;
+    try {
+      finalResponse = await (async (): Promise<Response> => {
     try {
       // Handle CORS preflight
       if (request.method === 'OPTIONS') {
@@ -1173,40 +1198,44 @@ export default {
       requestStartTime = Date.now();
       releaseActiveRequest = incrementActiveRequests();
 
-      // Request body size limit (10MB).
-      // Content-Length is optional (chunked / HTTP2), so we enforce the cap
-      // by reading the body into a buffer and re-wrapping the request so that
-      // downstream code can still call request.text() / request.json() / etc.
+      // Request body: one backpressured, byte-counted receive path (§5.1).
+      // `Content-Length` is only a rejection hint — the byte counter inside
+      // `receiveIngressBody` is authoritative for every encoding, and a body
+      // past `threshold_bytes` spills to disk instead of being held in RAM while
+      // the client uploads. The body is then re-wrapped onto the request so
+      // downstream handlers can still call request.text() / request.json(), and
+      // the raw spool is re-attached across that reconstruction, which copies
+      // neither properties nor symbols (§5.1).
       {
-        const maxSizeBytes = 10 * 1024 * 1024; // 10MB
         const contentLength = request.headers.get('content-length');
-        if (contentLength && parseInt(contentLength, 10) > maxSizeBytes) {
-          logger.warn(requestId, `Request body too large (Content-Length): ${contentLength} bytes`);
-          return createErrorResponse(new Error('Request body too large'), requestId, 413);
-        }
-        if (request.body) {
-          const reader = request.body.getReader();
-          const chunks: Uint8Array[] = [];
-          let totalBytes = 0;
-          let done = false;
-          while (!done) {
-            const { value, done: readerDone } = await reader.read();
-            done = readerDone;
-            if (value) {
-              totalBytes += value.byteLength;
-              if (totalBytes > maxSizeBytes) {
-                reader.cancel();
-                logger.warn(requestId, `Request body too large: exceeded ${maxSizeBytes} bytes`);
-                return createErrorResponse(new Error('Request body too large'), requestId, 413);
-              }
-              chunks.push(value);
-            }
+        const declared = contentLength === null ? null : Number.parseInt(contentLength, 10);
+        try {
+          const spool = await receiveIngressBody(request.body, {
+            declaredLength: declared !== null && Number.isFinite(declared) ? declared : null,
+          });
+          rawIngressSpool = spool;
+          // §5.9 byte admission, opt-in via `max_materialized_body_bytes`. The
+          // reservation is taken here — body fully received, not yet read — so a
+          // body that has to wait for capacity waits before any of it is read
+          // (on disk once it spilled, in the spool's memory branch otherwise),
+          // and so the whole read + parse + serialize below happens under an
+          // admitted reservation. It is independent of `[spool] enabled`: a body
+          // the store never touches is materialized here too. With no budget
+          // configured this is a no-op.
+          materializationLease = await admitMaterialization(spool.size, request.signal);
+          if (request.body) {
+            request = new Request(request, { body: spool.readStream(), duplex: 'half' } as RequestInit);
+            attachIngressSpool(request, spool);
           }
-          // Reconstruct request with the buffered body so it remains readable.
-          const buffered = new Uint8Array(totalBytes);
-          let offset = 0;
-          for (const chunk of chunks) { buffered.set(chunk, offset); offset += chunk.byteLength; }
-          request = new Request(request, { body: buffered, duplex: 'half' } as RequestInit);
+        } catch (error) {
+          // A refusal that is not a body rejection — a §5.9 admission error, a
+          // client abort while queued — is reported as such, not as a bad body.
+          if (error instanceof ClaudeProxyError) {
+            logger.warn(requestId, `Request body not admitted: ${(error as Error).message}`);
+          } else {
+            logger.warn(requestId, `Request body rejected: ${(error as Error).message}`);
+          }
+          return createErrorResponse(error as Error, requestId);
         }
       }
 
@@ -1293,7 +1322,7 @@ export default {
         // (auth_with_model / auth_with_body). Those modes need the parsed body,
         // and decision returns before the normal post-parse auth call — so
         // run the deferred gate here, reusing the same doAuthRequest closure.
-        const decisionBodyText = await request.text();
+        const decisionBodyText = await readIngressSpoolText(request);
         if (authUrl && (authWithModel || authWithBody)) {
           let decisionModel: string | undefined;
           try {
@@ -1321,8 +1350,10 @@ export default {
         // (auth_with_model / auth_with_body). Those modes need the parsed body,
         // and passthrough returns before the normal post-parse auth call — so
         // run the deferred gate here, reusing the same doAuthRequest closure.
-        const passthroughBodyText = await request.text();
+        // The handler reads the raw body itself, so the text is only
+        // materialized here when a deferred gate needs it (§5.3).
         if (authUrl && (authWithModel || authWithBody)) {
+          const passthroughBodyText = await readIngressSpoolText(request);
           let passthroughModel: string | undefined;
           try {
             const parsed = JSON.parse(passthroughBodyText);
@@ -1336,7 +1367,6 @@ export default {
         const passthroughResponse = await handlePassthroughRequest(
           request,
           path,
-          passthroughBodyText,
           proxyConfig,
           env,
           logger,
@@ -1367,12 +1397,41 @@ export default {
           (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) ||
           ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) && (path.includes(':generateContent') || path.includes(':streamGenerateContent') || path.includes(':countTokens')))) {
         try {
-          let bodyText = await request.text();
+          let bodyText = await readIngressSpoolText(request);
           const body = JSON.parse(bodyText);
           // Keep the parsed body visible at dispatch (the ladder rebuilds a
           // fresh Request per rung from it). Same object reference — the
           // in-place privacy/kompress/erase mutations below stay reflected.
           routeBody = body;
+
+          // §5.4 inline-binary extraction. Replaces base64 payloads at the
+          // allowlisted positions with leased BlobRefs so privacy/kompress/judge
+          // and the rest of this block do not carry the binary (§5.2). Opt-in
+          // (§9.1): the store throws when the section is disabled, so gate here.
+          //
+          // Ref invariant: every consumer between this point and dispatch reads
+          // text, tools or scalars — none reads an allowlisted binary field —
+          // and `bodyText` is not read again until the auth call at the
+          // boundary. The `request_ingress` hook runs later still, inside
+          // `runAttempt`, on this same ref-bearing body: §5.4 keeps a ref a plain
+          // JSON object, so a payload position stays opaque to the engine rather
+          // than handing it a half-expanded body. From the send boundary on
+          // (below), each send decides for itself and none of them expands: a
+          // body that still carries refs is streamed, each payload read out of L2
+          // at its own offset (§5.3 shape 3), so conversion, validation and that
+          // path's hooks see the ref object at the payload position — and a body
+          // a converter re-encoded or dropped has no ref left to stream.
+          if (getSpoolConfig().enabled) {
+            inlineExtraction = await extractInlineBlobs(body);
+            if (inlineExtraction.refs > 0) {
+              logger.debug(requestId, `Spool: extracted ${inlineExtraction.refs} inline payload(s), ${inlineExtraction.bytes} byte(s) to the blob store from ${path}`);
+            }
+            // Shape 3 only: a payload JSON would escape stays inline, so this
+            // body got that much less RAM relief than its schema allows (§5.3).
+            if (inlineExtraction.skipped > 0) {
+              logger.warn(requestId, `Spool: left ${inlineExtraction.skipped} inline payload(s) in the body — JSON would escape them, so they cannot become refs`);
+            }
+          }
 
           // Extract tool stats from the already-parsed body — avoids a second
           // clone()+parse that would otherwise happen before the routing block.
@@ -1439,6 +1498,72 @@ export default {
             bodyText = JSON.stringify(body);
           }
 
+          // §5.8 external-link projection: when auth is configured to receive the
+          // body *and* an object store to upload to, hand it one external link
+          // per ref instead of the inline binary. Built here because this is the
+          // last point at which the refs are still this request's own — from
+          // dispatch on they are copied into an attempt body. A failed upload, an
+          // unreachable endpoint or a receipt that disagrees throws out of this
+          // block, so auth fails explicitly and no attempt is built (§5.8: never
+          // fall back to an empty field or send a broken link).
+          let authBodyText: string | undefined;
+          const externalUpload = getSpoolConfig().externalUpload;
+          if (externalUpload && authWithBody && authUrl && inlineExtraction && inlineExtraction.refs > 0) {
+            const links = await uploadBlobsForAuth(inlineExtraction.blobs);
+            authBodyText = JSON.stringify(buildAuthProjection(body, links).body);
+            logger.debug(requestId, `Spool: uploaded ${links.size} blob(s) and projected ${inlineExtraction.refs} ref(s) for auth_with_body from ${path}`);
+          }
+
+          // §5.3 send boundary. The refs survive it: extraction bought its RAM by
+          // keeping the payloads out of the body, and re-expanding here would put
+          // them back for every consumer downstream of routing — including the
+          // several that never read them. Each handler's send reads the refs off
+          // the body it is handed and streams each payload at its own offset
+          // (shape 3); none of them expands first.
+          // Rebuilding the text here is what the pre-boundary branches above
+          // already did for a mutated body, and it keeps `bodyText` small (refs,
+          // not payloads) for the Request branches below.
+          if (inlineExtraction && inlineExtraction.refs > 0) {
+            bodyText = JSON.stringify(body);
+          }
+
+          // The one consumer that must still see the payloads is the auth
+          // server: `auth_with_body` posts this exact text, and §5.8's projection
+          // above is its opt-in alternative. Expand a throwaway copy — the refs
+          // are small, the payloads stay in the store, and the body that keeps
+          // the leases is untouched.
+          if (authUrl && authWithBody && !authBodyText && inlineExtraction && inlineExtraction.refs > 0) {
+            const authBody = structuredClone(body);
+            const expanded = await rehydrateInlineBlobs(authBody);
+            authBodyText = JSON.stringify(authBody);
+            logger.debug(requestId, `Spool: expanded ${expanded} ref(s) for auth_with_body (no external uploader configured) from ${path}`);
+          }
+
+          // §5.9 admission lifetime: "binary reduced to refs: release after
+          // extraction". The payloads are refs in `body` and in `bodyText` from
+          // the boundary above on, so this request no longer materializes them —
+          // the store owns those bytes. Handing the reservation back here is what
+          // lets a binary request's own *response* be admitted, and its
+          // neighbours in the queue run, while the exchange is still open.
+          //
+          // A body that kept payloads inline stays charged: `skipped` counts the
+          // positions JSON would escape, so the request still materializes binary
+          // and the reservation has to keep covering it (repo rule #8 —
+          // under-charging is the one direction this budget must not fail in).
+          // So does a body with no payload at all: it materializes in full for
+          // the whole request.
+          //
+          // Known bounded remainder: the two `sdk://` branches (`claude.ts` and
+          // the OpenAI-format one in `messages.ts`) expand the body before their
+          // handler answers 501, so a payload is briefly live again with no
+          // reservation under it — bounded by the body's own admitted size, on a
+          // route that sends nothing. Every other dispatch path streams its refs
+          // (§5.3 shape 3) instead of expanding, so it never re-materializes what
+          // this release gave back.
+          if (inlineExtraction && inlineExtraction.refs > 0 && inlineExtraction.skipped === 0) {
+            materializationLease?.release();
+          }
+
           let modelName = body.model;
 
           // For generateContent/countTokens endpoint, extract model from URL if not in body
@@ -1465,8 +1590,11 @@ export default {
 
           // Deferred auth: runs after the body is parsed when either auth_with_model
           // (forwards x-resource-for) or auth_with_body (forwards the whole body) is set.
+          // With §5.8 configured, the body auth receives is the projection built at
+          // the boundary above — text and tools carry their final mutated values,
+          // every inline payload is an external link.
           if (authUrl && (authWithModel || authWithBody)) {
-            const authError = await doAuthRequest(modelName, bodyText);
+            const authError = await doAuthRequest(modelName, authBodyText ?? bodyText);
             if (authError) return authError;
           }
 
@@ -1520,12 +1648,15 @@ export default {
               logger.info(requestId, `/v1/chat/completions composite alias resolved: ${modelName} → ${resolvedModelAlias}`);
             }
 
-            // Recreate request with (possibly rewritten) body
+            // Recreate request with the final effective body; a large non-ref
+            // body spills once and streams from disk at each point of use.
+            const effectiveBody = await createTextEgressBody(bodyText, 'eff-');
             request = new Request(request.url, {
               method: request.method,
               headers: request.headers,
-              body: bodyText,
-            });
+              body: effectiveBody.body,
+              ...(effectiveBody.spilled ? { duplex: 'half' } : {}),
+            } as RequestInit);
 
             // Transform auth headers, then override with model-specific api_key if config_key mode
             modelAuthHeaders = transformAuthHeadersForUpstream(request, upstreamMode || 'openai-completions', path, requestId, env as Record<string, unknown>);
@@ -1709,20 +1840,21 @@ export default {
             const clientAddress = request.headers.get('x-client-address') || 'unknown';
             const clientPort = request.headers.get('x-client-port') || 'unknown';
 
-            compositeAttempts = routeCandidates.map(({ modelName: candidateName, route, targetConfig }) => {
+            compositeAttempts = await Promise.all(routeCandidates.map(async ({ modelName: candidateName, route, targetConfig }) => {
               logger.debug(requestId, `Composite candidate ${modelName} -> ${candidateName} via ${route.targetUrl} (${route.upstreamMode}) [client ${clientAddress}:${clientPort}]`);
 
               const upstreamModelName = route.modelAlias || candidateName;
-              const forwardedBodyText = JSON.stringify({
+              const attemptBody = await createTextEgressBody(JSON.stringify({
                 ...body,
                 model: upstreamModelName,
-              });
+              }), 'att-');
 
               const candidateRequest = new Request(request.url, {
                 method: request.method,
                 headers: request.headers,
-                body: forwardedBodyText,
-              });
+                body: attemptBody.body,
+                ...(attemptBody.spilled ? { duplex: 'half' } : {}),
+              } as RequestInit);
 
               let candidateAuthHeaders = transformAuthHeadersForUpstream(candidateRequest, route.upstreamMode, path, requestId, env as Record<string, unknown>);
 
@@ -1764,7 +1896,7 @@ export default {
                 compositeTargetConfig: compositeAliasName ? targetConfig : undefined,
                 route,
               };
-            });
+            }));
 
             const firstAttempt = compositeAttempts[0];
             targetUrl = firstAttempt.targetUrl;
@@ -1786,12 +1918,15 @@ export default {
             modelId = fixedRoute.modelId;
             forceStreaming = fixedRoute.forceStreaming || false;
 
-            // Recreate request with body
+            // Recreate request with the final effective body; a large non-ref
+            // body spills once and streams from disk at each point of use.
+            const effectiveBody = await createTextEgressBody(bodyText, 'eff-');
             request = new Request(request.url, {
               method: request.method,
               headers: request.headers,
-              body: bodyText,
-            });
+              body: effectiveBody.body,
+              ...(effectiveBody.spilled ? { duplex: 'half' } : {}),
+            } as RequestInit);
 
             // In config_key mode, apply [models.default] api_key for models
             // that fall through to the default route (no model-specific entry).
@@ -1906,19 +2041,23 @@ export default {
       // Build a RouteAttempt for a given {modelName, route} pair and a body object.
       // Shares the mode → target table with the compositeAttempts.map() block above
       // (resolveUpstreamTarget).
-      const buildRouteAttempt = (
+      const buildRouteAttempt = async (
         candidateName: string,
         route: ModelRouteConfig,
         bodyObj: Record<string, unknown>,
         forceStreamOverride?: boolean,
-      ): RouteAttempt => {
+      ): Promise<RouteAttempt> => {
         const upstreamModelName = route.modelAlias || candidateName;
-        const forwardedBodyText = JSON.stringify({ ...bodyObj, model: upstreamModelName });
+        const attemptBody = await createTextEgressBody(
+          JSON.stringify({ ...bodyObj, model: upstreamModelName }),
+          'att-',
+        );
         const candidateRequest = new Request(request.url, {
           method: request.method,
           headers: request.headers,
-          body: forwardedBodyText,
-        });
+          body: attemptBody.body,
+          ...(attemptBody.spilled ? { duplex: 'half' } : {}),
+        } as RequestInit);
 
         let candidateAuthHeaders = transformAuthHeadersForUpstream(candidateRequest, route.upstreamMode, path, requestId, env as Record<string, unknown>);
         if (route.apiKey && (route.section === 'free' || route.section === 'FREE' || route.explicitApiKey || useConfigKey)) {
@@ -2036,19 +2175,19 @@ export default {
         for (let batchStart = 0; batchStart < panelTargets.length; batchStart += batchSize) {
           const batch = panelTargets.slice(batchStart, batchStart + batchSize);
           // Panel calls are always non-streaming so bodies can be buffered for aggregation
-          const batchBodies = batch.map(t =>
+          const batchBodies = await Promise.all(batch.map(t =>
             buildRouteAttempt(t.modelName, t.route, { ...bodyObj, stream: false })
-          );
-          // Attach fusion depth header to prevent recursive expansion.
-          // Re-serialize body text (not stream) so Node.js fetch doesn't require duplex: 'half'.
-          const batchTexts = await Promise.all(batchBodies.map(a => a.request.text()));
-          const batchAttempts = batchBodies.map((a, i) => ({
+          ));
+          // Attach fusion depth header to prevent recursive expansion without
+          // reading the attempt body back into a string.
+          const batchAttempts = batchBodies.map((a) => ({
             ...a,
             request: new Request(a.request.url, {
               method: a.request.method,
               headers: new Headers({ ...Object.fromEntries(a.request.headers.entries()), 'x-fusion-depth': '1' }),
-              body: batchTexts[i],
-            }),
+              body: a.request.body,
+              duplex: 'half',
+            } as RequestInit),
           }));
 
           const timeoutMs = options.panel_timeout_ms;
@@ -2119,15 +2258,15 @@ export default {
           ];
           const judgeBodyObj = { ...bodyObj, messages: judgeMessages, stream: false };
 
-          const judgeAttempt = buildRouteAttempt(plan.judge.modelName, plan.judge.route, judgeBodyObj);
-          const judgeBodyText = await judgeAttempt.request.text();
+          const judgeAttempt = await buildRouteAttempt(plan.judge.modelName, plan.judge.route, judgeBodyObj);
           const judgeAttemptWithDepth = {
             ...judgeAttempt,
             request: new Request(judgeAttempt.request.url, {
               method: judgeAttempt.request.method,
               headers: new Headers({ ...Object.fromEntries(judgeAttempt.request.headers.entries()), 'x-fusion-depth': '1' }),
-              body: judgeBodyText,
-            }),
+              body: judgeAttempt.request.body,
+              duplex: 'half',
+            } as RequestInit),
           };
 
           try {
@@ -2178,15 +2317,15 @@ export default {
         ];
         const synthBodyObj = { ...bodyObj, messages: synthMessages };
         // stream: pass through from the original request for the synth (client-visible) stage
-        const synthAttempt = buildRouteAttempt(plan.synth.modelName, plan.synth.route, synthBodyObj);
-        const synthBodyText = await synthAttempt.request.text();
+        const synthAttempt = await buildRouteAttempt(plan.synth.modelName, plan.synth.route, synthBodyObj);
         const synthAttemptWithDepth = {
           ...synthAttempt,
           request: new Request(synthAttempt.request.url, {
             method: synthAttempt.request.method,
             headers: new Headers({ ...Object.fromEntries(synthAttempt.request.headers.entries()), 'x-fusion-depth': '1' }),
-            body: synthBodyText,
-          }),
+            body: synthAttempt.request.body,
+            duplex: 'half',
+          } as RequestInit),
         };
 
         const synthResp = await runAttempt(synthAttemptWithDepth);
@@ -2250,12 +2389,15 @@ export default {
           const transformed = runHook('request_ingress', { body: parsedBody, headers: attemptAuthHeaders }, hookCtx);
           // Builtins/ops mutate `body` in place, so `transformed.body` keeps the
           // same reference as `parsedBody` — an identity check can't detect the
-          // change. Always rebuild the request from the (possibly mutated) body.
+          // change. Rebuild from the (possibly mutated) body; a large result gets
+          // its own attempt spill rather than a retained string.
+          const transformedBody = await createJsonEgressBody(transformed.body, 'att-');
           attemptRequest = new Request(attemptRequest.url, {
             method: attemptRequest.method,
             headers: attemptRequest.headers,
-            body: JSON.stringify(transformed.body),
-          });
+            body: transformedBody.body,
+            ...(transformedBody.spilled ? { duplex: 'half' } : {}),
+          } as RequestInit);
           attemptAuthHeaders = transformed.headers;
         }
 
@@ -2424,6 +2566,19 @@ export default {
             throw new Error(`Unsupported handler type: ${attemptHandlerType}`);
         }
 
+        // §5.7 SSE egress: frame one event at a time before the response
+        // consumers below see the stream, so an event past `threshold_bytes`
+        // spills instead of accumulating in their buffers, and one past
+        // `max_response_bytes` fails explicitly instead of streaming unbounded.
+        // Gated on `[spool] enabled`: with spooling off the relay is the
+        // upstream bytes unframed.
+        if (response.ok && response.body && getSpoolConfig().enabled) {
+          const streamContentType = response.headers.get('content-type') || '';
+          if (streamContentType.includes('text/event-stream')) {
+            response = new Response(streamResponseEvents(response.body), response);
+          }
+        }
+
         if (attemptModelId) {
           if (response.status >= 400) {
             recordModelFailedRequest(attemptModelId);
@@ -2438,32 +2593,77 @@ export default {
         if (response.ok && attemptModelId) {
           const contentType = response.headers.get('content-type') || '';
           if (contentType.includes('application/json')) {
-            try {
-              const responseForStats = response.clone();
-              const payload = await responseForStats.json();
-              const usage = extractUsageFromResponsePayload(payload);
-              if (usage) {
-                recordModelUsage(attemptModelId, usage);
-                if (modelUsageRecordUrl) {
-                  recordModelUsageToRemote(
-                    modelUsageRecordUrl,
-                    buildModelUsageRecordPayload(
-                      requestId, path, endpointUserKey, attemptModelId, usage, response.status,
-                      modelUsageRecordBody ? payload : undefined,
-                    ),
-                    logger,
-                    modelUsageOneTimeAuthCode,
-                    sidecarForwardedHeaders,
-                  );
-                }
-                if (compositeAliasName && usage.total_tokens) {
-                  recordCompositeTokenUsage(compositeAliasName, attemptModelId, usage.total_tokens);
-                }
+            // §5.7: the stats read must not cost a second copy of the body.
+            // `response.clone().json()` does — a clone holds every remaining
+            // byte while it is parsed, so an image response pays for its whole
+            // base64 payload twice. With the spool on, the body goes through the
+            // same bounded receive path as every other response (spilled past
+            // `threshold_bytes`, capped by `max_response_bytes`) and the client's
+            // copy is streamed back out of that spool at its own pace.
+            let payload: unknown;
+            let havePayload = false;
+            if (getSpoolConfig().enabled && response.body) {
+              const received = await receiveResponseBody(response.body);
+              // §5.9 byte admission, opt-in via `max_materialized_body_bytes`:
+              // the parse below is the materialization the budget is for. The
+              // charge is the received byte count, never a `Content-Length`
+              // guess. A refusal must leave neither bytes on disk nor a
+              // reservation (rule #8).
+              let lease: AdmissionLease;
+              try {
+                lease = await admitMaterialization(received.size, request.signal);
+              } catch (error) {
+                await received.release();
+                throw error;
               }
-              const toolNames = extractToolNamesFromResponsePayload(payload);
-              recordUpstreamResponseToolNames(toolNames, attempt.agent);
-            } catch {
-              // ignore stats extraction failures
+              try {
+                payload = JSON.parse(await received.readText());
+                havePayload = true;
+              } catch {
+                // Advertised as JSON but is not: the bytes are forwarded as they
+                // are and no stats are read from them.
+              } finally {
+                // The materialized text is unreachable once this scope ends and
+                // the client has not been handed the body yet, so §5.9's "release
+                // before network streaming" holds, as on the request path. The
+                // spool becomes the stream's.
+                lease.release();
+              }
+              response = new Response(received.readStream(), response);
+            } else {
+              try {
+                payload = await response.clone().json();
+                havePayload = true;
+              } catch {
+                // ignore stats extraction failures
+              }
+            }
+            if (havePayload) {
+              try {
+                const usage = extractUsageFromResponsePayload(payload);
+                if (usage) {
+                  recordModelUsage(attemptModelId, usage);
+                  if (modelUsageRecordUrl) {
+                    recordModelUsageToRemote(
+                      modelUsageRecordUrl,
+                      buildModelUsageRecordPayload(
+                        requestId, path, endpointUserKey, attemptModelId, usage, response.status,
+                        modelUsageRecordBody ? payload : undefined,
+                      ),
+                      logger,
+                      modelUsageOneTimeAuthCode,
+                      sidecarForwardedHeaders,
+                    );
+                  }
+                  if (compositeAliasName && usage.total_tokens) {
+                    recordCompositeTokenUsage(compositeAliasName, attemptModelId, usage.total_tokens);
+                  }
+                }
+                const toolNames = extractToolNamesFromResponsePayload(payload);
+                recordUpstreamResponseToolNames(toolNames, attempt.agent);
+              } catch {
+                // ignore stats extraction failures
+              }
             }
           } else if (contentType.includes('text/event-stream')) {
             // For streaming responses, intercept the SSE stream to capture token usage
@@ -2556,8 +2756,9 @@ export default {
           };
 
           // Body ops: buffered JSON rewrite (mirrors applyAfterUpstream shape).
-          // Note: stats extraction above used response.clone() so its body is
-          // already consumed — applyWriteoutBody works on the original here.
+          // Note: stats extraction above already read the body. With the spool on
+          // it re-wrapped that read as `response` (§5.7), so what this consumes is
+          // that body, not a second read of the upstream stream.
           // For streams: skip buffered JSON rewrite (would break streaming) and
           // let pipeEventTransformer handle per-event rewriting below.
           if (!writeoutCtx.streaming) {
@@ -2627,7 +2828,7 @@ export default {
           const maxTargetRetries = entry.retry ?? proxyConfig.remote?.max_target_retries ?? DEFAULT_MAX_TARGET_RETRIES;
           const route = descriptorToRoute(entry, proxyConfig);
           modelUsageOneTimeAuthCode = entry.otac ?? baseOtac;
-          let attempt = buildRouteAttempt(entry.target, route, bodyObj);
+          let attempt = await buildRouteAttempt(entry.target, route, bodyObj);
           let outcome: AttemptOutcome | undefined;
 
           // Axis 2: same-target retry (retry_on).
@@ -2655,7 +2856,7 @@ export default {
             const backoffMs = Math.min(250 * 2 ** n, 2000);
             const waitMs = retryAfterMs !== undefined ? Math.min(retryAfterMs, 2000) : backoffMs;
             if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
-            attempt = buildRouteAttempt(entry.target, route, bodyObj); // Request bodies are single-use
+            attempt = await buildRouteAttempt(entry.target, route, bodyObj); // Request bodies are single-use
           }
 
           lastOutcome = outcome;
@@ -2787,6 +2988,33 @@ export default {
       return createErrorResponse(error as Error, requestId);
     }
     })();
+    } finally {
+      // Both owners are returned here on every terminal path — success, error,
+      // and each early return inside the handler (repo rule #8: a leaked
+      // reservation is budget nothing can reclaim, and a leaked blob lease pins
+      // a payload against every sweep).
+      //
+      // The extraction's leases are released from its own list, not by walking
+      // the body: a ref a client forged into a field of its own must not make
+      // this teardown throw on a hash the request never leased.
+      if (inlineExtraction) releaseExtractedBlobs(inlineExtraction);
+      // §5.9: the reservation covers what this request materialized — the raw
+      // receive copy, the decoded text, the parsed object, the serialization
+      // copies — so it is returned here, the one point where all of them are
+      // unreachable, and before the response body streams to the client
+      // (server.ts consumes that stream after this handler returns), which is
+      // §5.9's "no admission held during network/SSE streaming".
+      //
+      // A body whose binary became refs was already released at the send
+      // boundary (§5.9's "binary reduced to refs: release after extraction"), so
+      // for those requests this is the idempotent backstop, not the release
+      // itself; the only thing such a request still materializes after that
+      // release is the `sdk://` branches' expansion, which the boundary notes.
+      materializationLease?.release();
+      // The raw body is read before the response is produced, so this is the one
+      // place that returns the spill reservation.
+      await rawIngressSpool?.release();
+    }
 
     // Defer the in-flight decrement until the response body has finished
     // streaming to the client. server.ts consumes this release when it's done
@@ -2797,6 +3025,10 @@ export default {
     if (releaseActiveRequest) {
       attachActiveRequestRelease(finalResponse, releaseActiveRequest);
     }
+    // §5.7: the Node adapter owns the response pipeline, but not the request id
+    // or a logger. Hand it the one call it needs to report a body that fails
+    // after the headers have gone out; an ordinary client hang-up stays silent.
+    attachStreamFailureReporter(finalResponse, logger, requestId, path);
     return finalResponse;
   },
 };

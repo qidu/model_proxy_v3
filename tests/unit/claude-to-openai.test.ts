@@ -108,6 +108,33 @@ describe('convertClaudeToOpenAIRequest — messages', () => {
     ]);
   });
 
+  it('carries a §5.4 ref through as a re-prefixed ref instead of stringifying it', () => {
+    // §5.3 shape 3: the converted position has to hold something the serializer
+    // recognizes. The ref's own `prefix` is `''` (a Claude `source.data` is bare
+    // base64), so the conversion has to rebuild the data URL it used to
+    // interpolate — otherwise this field would be `[object Object]` upstream.
+    const ref = {
+      $spoolBlob: true, kind: 'claude-source-data', hash: 'a'.repeat(64), size: 48, prefix: '',
+    };
+    const req = {
+      model: 'm',
+      max_tokens: 1,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: ref } },
+        ],
+      }],
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToOpenAIRequest(req, 'gpt');
+    assert.deepEqual((out.messages[0].content as any)[1], {
+      type: 'image_url',
+      image_url: { url: { $spoolBlob: true, kind: 'claude-source-data', hash: 'a'.repeat(64), size: 48, prefix: 'data:image/png;base64,' } },
+    });
+  });
+
   it('emits tool_result as a preceding tool message, other content as user', () => {
     const req = {
       model: 'm',

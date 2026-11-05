@@ -81,11 +81,26 @@ function capture(argv: string[], env: Partial<Env>): { code: number | null; out:
   const origErr = process.stderr.write;
   process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
   process.stderr.write = ((chunk: unknown) => { err.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  // The parser reports config errors through `console.*`, which the unit setup
+  // intercepts (tests/setup/silent-logs.ts) before it can reach the stderr
+  // write patched above — so capture at the console level too, or the
+  // assertions below see an empty stream.
+  const origConsole = { log: console.log, info: console.info, warn: console.warn, error: console.error };
+  const toOut = (...args: unknown[]) => { out.push(`${args.map(String).join(' ')}\n`); };
+  const toErr = (...args: unknown[]) => { err.push(`${args.map(String).join(' ')}\n`); };
+  console.log = toOut;
+  console.info = toOut;
+  console.warn = toErr;
+  console.error = toErr;
   try {
     return { code: runCli(argv, env as Env), out: out.join(''), err: err.join('') };
   } finally {
     process.stdout.write = origOut;
     process.stderr.write = origErr;
+    console.log = origConsole.log;
+    console.info = origConsole.info;
+    console.warn = origConsole.warn;
+    console.error = origConsole.error;
   }
 }
 

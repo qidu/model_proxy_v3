@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import handler from '../../src/index.js';
 import { clearProxyConfigCache } from '../../src/utils/config-loader.js';
 import { clearModelCache } from '../../src/handlers/models.js';
+import { BLOB_REF_MARKER } from '../../src/utils/blob-refs.js';
+import { evictIdleBlobs, getBlobStoreStats, resetBlobStore } from '../../src/utils/blob-store.js';
+import { getSpoolConfig, requestSpillDir, responseSpillDir } from '../../src/utils/spool.js';
+import { getLiveSpillBytes, SpoolBody } from '../../src/utils/spool-body.js';
+import { countClaudeRequestTokens } from '../../src/utils/token-counting.js';
 import type { Env } from '../../src/types/shared.js';
 
 const realFetch = globalThis.fetch;
@@ -21,6 +26,35 @@ function env(extra: Partial<Env> = {}): Env {
     ALLOWED_ORIGINS: 'https://client.example',
     ...extra,
   };
+}
+
+/**
+ * The text the upstream actually received, whichever egress shape carried it:
+ * passthrough egress streams the raw client bytes (§5.3), while a converted
+ * egress serializes its own body to one string at the send boundary.
+ */
+async function sentBodyText(init: RequestInit | undefined): Promise<string> {
+  const body = init?.body;
+  if (typeof body === 'string') return body;
+  assert.ok(body instanceof ReadableStream, `expected a streamed upstream body, got ${Object.prototype.toString.call(body)}`);
+  return await new Response(body).text();
+}
+
+/** Parse an SSE body into its named event frames. */
+function parseSseEvents(raw: string): Array<{ event: string; data: any }> {
+  const events: Array<{ event: string; data: any }> = [];
+  for (const block of raw.split('\n\n')) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+    let event = '';
+    let dataStr = '';
+    for (const line of trimmed.split('\n')) {
+      if (line.startsWith('event: ')) event = line.slice(7);
+      else if (line.startsWith('data: ')) dataStr = line.slice(6);
+    }
+    if (dataStr) events.push({ event, data: JSON.parse(dataStr) });
+  }
+  return events;
 }
 
 beforeEach(() => {
@@ -213,6 +247,295 @@ api_key = "dashboard-secret"
     assert.deepEqual(body.content, [{ type: 'text', text: 'plain ok' }]);
   });
 
+  it('spools an inline image and sends the original bytes upstream', async () => {
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[spool]
+enabled = true
+dir = ${JSON.stringify(join(tempDir, 'spool'))}
+`, 'utf8');
+    clearProxyConfigCache();
+    resetBlobStore();
+
+    const image = Buffer.alloc(4096, 0xab).toString('base64');
+    let upstreamText = '';
+    let statsAtSend = { diskEntries: 0, diskBytes: 0 };
+    let bodyReads = 0;
+    // Sampled at the send: the property is about the request body, and the stats
+    // read of the response (§5.7, `index.ts`) reads a spool of its own afterwards.
+    let bodyReadsAtSend = -1;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamText = await sentBodyText(init);
+      bodyReadsAtSend = bodyReads;
+      // Sampled while the request is in flight: the payload must really be in the
+      // store (extraction ran) and still leased (nothing released it early).
+      statsAtSend = getBlobStoreStats();
+      return new Response(JSON.stringify({
+        id: 'chat-image', object: 'chat.completion', created: 1, model: 'test',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'seen' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const originalReadBytes = SpoolBody.prototype.readBytes;
+    SpoolBody.prototype.readBytes = async function (this: SpoolBody, ...args: any[]) {
+      bodyReads += 1;
+      return await originalReadBytes.apply(this, args);
+    } as typeof originalReadBytes;
+    let response: Response;
+    try {
+      response = await handler.fetch(new Request('http://proxy/v1/messages', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'test',
+          max_tokens: 32,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: 'what is this' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: image } },
+            ],
+          }],
+        }),
+      }), env());
+    } finally {
+      SpoolBody.prototype.readBytes = originalReadBytes;
+    }
+
+    assert.equal(bodyReadsAtSend, 1, 'only the initial routing parse materializes the raw spool; request reconstruction does not');
+    assert.equal(response.status, 200);
+    assert.equal(statsAtSend.diskEntries, 1, 'the payload was in the blob store while the request was in flight');
+    assert.equal(statsAtSend.diskBytes, image.length);
+    assert.equal(
+      upstreamText.includes(BLOB_REF_MARKER),
+      false,
+      'no ref may reach the upstream — the send boundary expands them all',
+    );
+    assert.ok(
+      upstreamText.includes(image),
+      'the boundary restored the exact base64 the client sent',
+    );
+    const body = await response.json() as { content: Array<{ type: string; text: string }> };
+    assert.deepStrictEqual(body.content, [{ type: 'text', text: 'seen' }]);
+
+    // The handler's `finally` gave the effective body's lease back, so the blob
+    // is idle and the next sweep may reclaim it.
+    assert.equal(
+      await evictIdleBlobs(Date.now() + (getSpoolConfig().ttlSeconds * 1000) + 1000),
+      1,
+      'the request released its lease',
+    );
+    assert.equal(getBlobStoreStats().diskBytes, 0);
+  });
+
+  it('releases the large non-ref effective spill before dispatch and keeps only the attempt spill at upstream send', async () => {
+    const spoolDir = join(tempDir, 'spool');
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[spool]
+enabled = true
+dir = ${JSON.stringify(spoolDir)}
+threshold_bytes = 256
+`, 'utf8');
+    clearProxyConfigCache();
+    resetBlobStore();
+
+    const padding = `large non-ref ${'x'.repeat(1024)}`;
+    let filesAtUpstream: string[] = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const spillDir = requestSpillDir(getSpoolConfig());
+      filesAtUpstream = existsSync(spillDir) ? readdirSync(spillDir) : [];
+      const upstreamBody = JSON.parse(await sentBodyText(init)) as { messages: Array<{ content: Array<{ type: string; text: string }> }> };
+      assert.deepEqual(upstreamBody.messages[0].content, [{ type: 'text', text: padding }], 'the attempt inherits the effective body byte-for-byte');
+      return new Response(JSON.stringify({
+        id: 'chat-nonref', object: 'chat.completion', created: 1, model: 'test',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'seen' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const response = await handler.fetch(new Request('http://proxy/v1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'test', max_tokens: 32, messages: [{ role: 'user', content: [{ type: 'text', text: padding }] }] }),
+    }), env());
+
+    assert.equal(response.status, 200);
+    assert.ok(filesAtUpstream.some((name) => name.startsWith('att-')), `the upstream send must read an attempt spill, saw ${filesAtUpstream}`);
+    assert.equal(filesAtUpstream.some((name) => name.startsWith('eff-')), false, `the effective spill must be consumed before dispatch, saw ${filesAtUpstream}`);
+    const spillDir = requestSpillDir(getSpoolConfig());
+    assert.deepEqual(existsSync(spillDir) ? readdirSync(spillDir) : [], [], 'raw, effective, and attempt spills are all gone after the exchange');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('gives two fallback rungs isolated disk-backed attempts over the same effective body', async () => {
+    const spoolDir = join(tempDir, 'spool');
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[composite]
+"combo" = {"rung-a" = {primary = true}, "rung-b" = {fallback = 1}}
+
+[spool]
+enabled = true
+dir = ${JSON.stringify(spoolDir)}
+threshold_bytes = 256
+`, 'utf8');
+    clearProxyConfigCache();
+    resetBlobStore();
+
+    const padding = `rung-shared ${'x'.repeat(1024)}`;
+    const sentModels: string[] = [];
+    const filesAtEachSend: string[][] = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const spillDir = requestSpillDir(getSpoolConfig());
+      filesAtEachSend.push(existsSync(spillDir) ? readdirSync(spillDir) : []);
+      const upstreamBody = JSON.parse(await sentBodyText(init)) as { model: string; messages: Array<{ content: Array<{ text: string }> }> };
+      sentModels.push(upstreamBody.model);
+      assert.deepEqual(upstreamBody.messages[0].content, [{ type: 'text', text: padding }], 'each rung inherits the same effective body');
+      if (sentModels.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'first rung failed' } }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        id: 'chat-rung-b', object: 'chat.completion', created: 1, model: 'rung-b',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'second ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const response = await handler.fetch(new Request('http://proxy/v1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'combo', max_tokens: 32, messages: [{ role: 'user', content: [{ type: 'text', text: padding }] }] }),
+    }), env());
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(sentModels, ['rung-a', 'rung-b'], "rung A's model rewrite must not leak into rung B");
+    assert.equal(filesAtEachSend.length, 2);
+    assert.ok(filesAtEachSend.every((names) => names.some((name) => name.startsWith('att-'))), `each send must use its own attempt spill: ${JSON.stringify(filesAtEachSend)}`);
+    const spillDir = requestSpillDir(getSpoolConfig());
+    assert.deepEqual(existsSync(spillDir) ? readdirSync(spillDir) : [], [], 'both attempt spills and the raw/effective state are gone');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('leaves an inline image alone when the spool is not configured', async () => {
+    resetBlobStore();
+    const image = Buffer.alloc(4096, 0xcd).toString('base64');
+    let upstreamText = '';
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamText = await sentBodyText(init);
+      return new Response(JSON.stringify({
+        id: 'chat-image-off', object: 'chat.completion', created: 1, model: 'test',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'seen' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const response = await handler.fetch(new Request('http://proxy/v1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'test',
+        max_tokens: 32,
+        messages: [{
+          role: 'user',
+          content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: image } }],
+        }],
+      }),
+    }), env());
+
+    // §9.1: with no `[spool]` section nothing is stored and the request is
+    // byte-for-byte the request the proxy has always sent.
+    assert.equal(getSpoolConfig().enabled, false);
+    assert.equal(response.status, 200);
+    assert.equal(getBlobStoreStats().diskEntries, 0);
+    assert.ok(upstreamText.includes(image));
+  });
+
+  it('reports SSE input usage counted from the effective body before the response stream exists', async () => {
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[spool]
+enabled = true
+dir = ${JSON.stringify(join(tempDir, 'spool'))}
+`, 'utf8');
+    clearProxyConfigCache();
+    resetBlobStore();
+
+    const image = Buffer.alloc(4096, 0xab).toString('base64');
+    const clientBody = {
+      model: 'test',
+      max_tokens: 32,
+      stream: true,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is this' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: image } },
+        ],
+      }],
+    };
+
+    let upstreamText = '';
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamText = await sentBodyText(init);
+      return new Response([
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'seen' }, index: 0, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ delta: {}, index: 0, finish_reason: 'stop' }] })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join(''), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }) as typeof fetch;
+
+    const response = await handler.fetch(new Request('http://proxy/v1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify(clientBody),
+    }), env({ LOCAL_TIKTOKEN: 'true' }));
+
+    assert.equal(response.status, 200);
+    // The body still carries a ref at the send boundary and the converted egress
+    // streams it (§5.3 shape 3), so the client's exact base64 reaches upstream
+    // without the expanded body ever existing.
+    assert.ok(upstreamText.includes(image), 'the boundary restored the exact client base64');
+
+    const events = parseSseEvents(await response.text());
+    const messageStart = events.find(e => e.event === 'message_start');
+    const options = { useLocalCounting: true, tokenizer: null };
+    const withoutImage = countClaudeRequestTokens({
+      ...clientBody,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'what is this' }] }],
+    } as any, options);
+
+    // The count now comes off the ref, not the text: the §5.3 rule is
+    // `Math.ceil(base64 chars / charactersPerToken)` for the payload with every
+    // fixed block cost dropped, so it is the ref's recorded `size` over 4 — a
+    // number the body does not hold as a string — plus the text-only count.
+    // Asserting the exact sum is what proves the payload was measured by its
+    // recorded length rather than read.
+    assert.equal(
+      messageStart!.data.message.usage.input_tokens,
+      Math.ceil(image.length / 4) + withoutImage,
+      'input usage is the §5.3 ref count over the effective body, image included',
+    );
+    assert.ok(withoutImage > 0, 'the text-only count must be non-zero for the sum to mean anything');
+  });
+
   it('dispatches Decision requests with verbatim body and configured auth', async () => {
     writeFileSync(configPath, `
 [models.decision]
@@ -298,7 +621,12 @@ openres = { base = "https://openres.example", mode = "open-responses", key = "op
     assert.equal(response.status, 200);
     assert.equal(await response.text(), '{"id":"resp_passthrough"}');
     assert.equal(seenUrl, 'https://openres.example/v1/responses');
-    assert.equal(seenInit?.body, JSON.stringify(body));
+    assert.equal(await sentBodyText(seenInit), JSON.stringify(body));
+    assert.equal(
+      new Headers(seenInit?.headers).get('content-length'),
+      String(new TextEncoder().encode(JSON.stringify(body)).byteLength),
+      'the upstream must get an exact byte length for the streamed body',
+    );
     assert.equal(new Headers(seenInit?.headers).get('authorization'), 'Bearer openres-key');
   });
 
@@ -324,7 +652,12 @@ claude = { base = "https://passthrough.example", mode = "anthropic-messages", ke
     assert.equal(response.status, 200);
     assert.equal(await response.text(), '{"id":"msg_passthrough"}');
     assert.equal(seenUrl, 'https://passthrough.example/v1/messages?trace=1');
-    assert.equal(seenInit?.body, JSON.stringify(body));
+    assert.equal(await sentBodyText(seenInit), JSON.stringify(body));
+    assert.equal(
+      new Headers(seenInit?.headers).get('content-length'),
+      String(new TextEncoder().encode(JSON.stringify(body)).byteLength),
+      'the upstream must get an exact byte length for the streamed body',
+    );
     assert.equal(new Headers(seenInit?.headers).get('x-api-key'), 'passthrough-key');
   });
 
@@ -547,5 +880,316 @@ base_url = "http://localhost:11434"
     assert.deepEqual(upstreamBody, payload);
     const responseBody = await response.json() as { content: Array<{ type: string; text: string }> };
     assert.deepEqual(responseBody.content, [{ type: 'text', text: 'buffered ok' }]);
+  });
+});
+
+describe('§5.7 SSE event framing on the response egress', () => {
+  // The framing sits between the handler's converted SSE body and the client, so
+  // these tests drive it through a real `/v1/messages` request with an
+  // openai-completions upstream and inspect what the client and the spool see.
+  const SPOOL_DIR_NAME = 'spool';
+
+  function writeConfig(args: { enabled: boolean; extra?: string }): void {
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[spool]
+enabled = ${args.enabled ? 'true' : 'false'}
+dir = ${JSON.stringify(join(tempDir, SPOOL_DIR_NAME))}
+${args.extra ?? ''}
+`, 'utf8');
+    clearProxyConfigCache();
+    resetBlobStore();
+  }
+
+  /** File names currently in `<spool>/events`, or `[]` when the dir is absent. */
+  function eventSpills(): string[] {
+    const dir = join(tempDir, SPOOL_DIR_NAME, 'events');
+    return existsSync(dir) ? readdirSync(dir).sort() : [];
+  }
+
+  /** One OpenAI chat-completions chunk carrying `text` as a content delta. */
+  function deltaChunk(text: string): string {
+    return `data: ${JSON.stringify({ choices: [{ delta: { content: text }, index: 0, finish_reason: null }] })}\n\n`;
+  }
+
+  const STOP_CHUNK = `data: ${JSON.stringify({ choices: [{ delta: {}, index: 0, finish_reason: 'stop' }] })}\n\n`;
+  const DONE_CHUNK = 'data: [DONE]\n\n';
+
+  /** Stub the upstream with a fixed SSE body and return it for byte comparisons. */
+  function stubSseUpstream(raw: string): void {
+    globalThis.fetch = (async () => new Response(raw, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })) as typeof fetch;
+  }
+
+  /**
+   * Stub the upstream with an SSE body delivered one event per `pull`, which is
+   * how a real upstream streams it, and so the relay is mid-stream at every
+   * event boundary rather than holding the whole response in one chunk already
+   * closed. Whether the proxy cancels the upstream is asserted at the primitive
+   * level instead (`spool-events.test.ts`), because a stub's own `cancel` cannot
+   * observe it: the converter drains a body this short into itself before the
+   * framing sees the oversized event, so the stub has already closed and a
+   * closed stream has no cancel to call.
+   */
+  function stubStreamedSseUpstream(parts: string[]): void {
+    let index = 0;
+    const encoder = new TextEncoder();
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index >= parts.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoder.encode(parts[index++]!));
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })) as typeof fetch;
+  }
+
+  function messagesRequest(): Request {
+    return new Request('http://proxy/v1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'test',
+        max_tokens: 32,
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+  }
+
+  /** Every `data.text` the client received, in order, concatenated. */
+  function streamedText(raw: string): string {
+    let out = '';
+    for (const block of raw.split('\n\n')) {
+      const dataLine = block.split('\n').find(line => line.startsWith('data: '));
+      if (!dataLine) continue;
+      const payload = JSON.parse(dataLine.slice(6));
+      if (payload.type === 'content_block_delta' && payload.delta?.type === 'text_delta') {
+        out += payload.delta.text;
+      }
+    }
+    return out;
+  }
+
+  it('frames without changing a byte: the client stream is identical with the spool on and off', async () => {
+    const raw = deltaChunk('alpha ') + deltaChunk('beta') + STOP_CHUNK + DONE_CHUNK;
+
+    // §9.1/decision: disabled means no framing at all — the relay is exactly
+    // today's bytes.
+    writeConfig({ enabled: false });
+    stubSseUpstream(raw);
+    const off = await handler.fetch(messagesRequest(), env());
+    assert.equal(off.status, 200);
+    const offBody = await off.text();
+
+    writeConfig({ enabled: true });
+    stubSseUpstream(raw);
+    const on = await handler.fetch(messagesRequest(), env());
+    assert.equal(on.status, 200);
+    const onBody = await on.text();
+
+    // Framing is a relay, not a rewrite: same bytes, same event order. (The
+    // handler's OpenAI→Claude conversion is what makes this stream differ from
+    // the upstream bytes; framing must not add to that difference.) The message
+    // id is generated per request, so it is normalized before the comparison.
+    const withoutRequestId = (text: string) => text.replace(/req_\d+_[0-9a-f-]+/g, 'req_normalized');
+    assert.equal(
+      withoutRequestId(onBody),
+      withoutRequestId(offBody),
+      'the enabled relay forwards the identical byte sequence',
+    );
+    assert.equal(streamedText(onBody), 'alpha beta', 'event order and payloads survive framing');
+    assert.deepEqual(eventSpills(), [], 'events below threshold_bytes never spill');
+  });
+
+  it('spills an event above threshold_bytes while the client is paused, and deletes it after delivery', async () => {
+    const big = 'x'.repeat(256 * 1024);
+    writeConfig({ enabled: true, extra: 'threshold_bytes = 4096\n' });
+    stubSseUpstream(deltaChunk(big) + STOP_CHUNK + DONE_CHUNK);
+
+    const response = await handler.fetch(messagesRequest(), env());
+    assert.equal(response.status, 200);
+    assert.ok(response.body);
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let liveSpills: string[] | null = null;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(next.value!);
+      // The oversized event is streamed out of its spill a chunk at a time, so
+      // once the client has begun receiving it the rest is still on disk — that
+      // is the event-bound window §5.7 asks for, and it must not be empty.
+      if (liveSpills === null && Buffer.concat(chunks).includes('event: content_block_delta')) {
+        liveSpills = eventSpills();
+      }
+    }
+    const body = Buffer.concat(chunks).toString('utf8');
+
+    assert.ok(liveSpills, 'the client must have received the oversized event');
+    assert.equal(liveSpills!.length, 1, `expected one live event spill, saw ${liveSpills!.length}`);
+    assert.ok(liveSpills![0]!.startsWith('evt-'), `spill names its writer, got ${liveSpills![0]}`);
+
+    assert.deepEqual(eventSpills(), [], 'the event spill is deleted once its last byte is written');
+    assert.equal(streamedText(body).length, big.length, 'the whole oversized event reached the client');
+    assert.equal(streamedText(body), big, 'and it reached it unmodified and in order');
+  });
+
+  it('caps one event at max_response_bytes instead of streaming it unbounded', async () => {
+    const big = 'y'.repeat(32 * 1024);
+    writeConfig({ enabled: true, extra: 'max_response_bytes = 8192\n' });
+    stubStreamedSseUpstream([deltaChunk(big), STOP_CHUNK, DONE_CHUNK]);
+
+    const response = await handler.fetch(messagesRequest(), env());
+    assert.equal(response.status, 200);
+    assert.ok(response.body);
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let failure: unknown;
+    try {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        chunks.push(next.value!);
+      }
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.ok(failure, 'an event past max_response_bytes must fail the stream, not truncate it');
+    assert.match(String(failure), /SSE event body too large/);
+    const partial = Buffer.concat(chunks).toString('utf8');
+    assert.ok(!partial.includes('message_stop'), 'no terminal event is emitted for a failed stream');
+    assert.deepEqual(eventSpills(), [], 'the aborted event leaves no spill behind');
+  });
+
+  it('does not frame when the spool is disabled, even for an event past max_response_bytes', async () => {
+    const big = 'z'.repeat(32 * 1024);
+    // `max_response_bytes` is configured but the spool is off: with spooling off
+    // there is nothing to spill and no per-event copy to pay for.
+    writeConfig({ enabled: false, extra: 'max_response_bytes = 8192\n' });
+    stubSseUpstream(deltaChunk(big) + STOP_CHUNK + DONE_CHUNK);
+
+    const response = await handler.fetch(messagesRequest(), env());
+    assert.equal(response.status, 200);
+    const body = await response.text();
+
+    assert.equal(streamedText(body), big, 'the oversized event is relayed untouched');
+    assert.deepEqual(eventSpills(), [], 'no framing, so no event spill can exist');
+  });
+});
+
+describe('§5.7 spooling of the JSON stats read', () => {
+  // `runAttempt` (index.ts) parses a completed JSON response once for usage and
+  // tool-name stats. §5.7 forbids paying for that with `response.clone()` — the
+  // clone holds every remaining byte while it is parsed — so with the spool on
+  // the body goes through the bounded receive path and the client's copy streams
+  // back out of the same spool.
+  const SPOOL_DIR_NAME = 'spool';
+
+  function writeConfig(args: { enabled: boolean; extra?: string }): void {
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[spool]
+enabled = ${args.enabled ? 'true' : 'false'}
+dir = ${JSON.stringify(join(tempDir, SPOOL_DIR_NAME))}
+${args.extra ?? ''}
+`, 'utf8');
+    clearProxyConfigCache();
+    resetBlobStore();
+  }
+
+  /** File names currently in `<spool>/responses`, or `[]` when the dir is absent. */
+  function responseSpills(): string[] {
+    const dir = responseSpillDir(getSpoolConfig());
+    return existsSync(dir) ? readdirSync(dir).sort() : [];
+  }
+
+  /** One OpenAI chat-completions response whose only content is `text`. */
+  function chatCompletion(text: string): string {
+    return JSON.stringify({
+      id: 'chat-json-spill', object: 'chat.completion', created: 1, model: 'test',
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    });
+  }
+
+  function messagesRequest(): Request {
+    return new Request('http://proxy/v1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'test',
+        max_tokens: 32,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+  }
+
+  it('spills the body past threshold_bytes, never clones it, and streams the same bytes back', async () => {
+    const long = 'the quick brown fox '.repeat(256);
+    const upstreamBody = chatCompletion(long);
+    assert.ok(Buffer.byteLength(upstreamBody, 'utf8') > 4096, 'the fixture has to cross the threshold');
+    writeConfig({ enabled: true, extra: 'threshold_bytes = 1024\n' });
+    globalThis.fetch = (async () => new Response(upstreamBody, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch;
+
+    let clones = 0;
+    const originalClone = Response.prototype.clone;
+    Response.prototype.clone = function (this: Response) {
+      clones += 1;
+      return originalClone.call(this);
+    } as typeof originalClone;
+    let response: Response;
+    try {
+      response = await handler.fetch(messagesRequest(), env());
+    } finally {
+      Response.prototype.clone = originalClone;
+    }
+
+    assert.equal(response.status, 200);
+    assert.equal(clones, 0, '§5.7: the stats read must not clone the body');
+    assert.equal(responseSpills().length, 1, 'the body is on disk, not held as a second copy');
+
+    const body = await response.json() as { content: Array<{ type: string; text: string }> };
+    assert.deepEqual(body.content, [{ type: 'text', text: long }], 'the client gets the upstream text unchanged');
+    assert.deepEqual(responseSpills(), [], 'the spill is released once the client has drained it');
+    assert.equal(getLiveSpillBytes(), 0, 'the disk reservation went back with the file');
+  });
+
+  it('fails a body past max_response_bytes explicitly instead of truncating it', async () => {
+    writeConfig({ enabled: true, extra: 'threshold_bytes = 512\nmax_response_bytes = 2048\n' });
+    globalThis.fetch = (async () => new Response(chatCompletion('x'.repeat(8192)), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch;
+
+    const response = await handler.fetch(messagesRequest(), env());
+
+    assert.equal(response.status, 500, 'an oversized response fails as SpoolResponseTooLargeError, not as a truncated 200');
+    const payload = await response.json() as { type: string; error: { type: string; message: string } };
+    assert.equal(payload.type, 'error');
+    assert.equal(payload.error.type, 'processing_error');
+    assert.match(payload.error.message, /Response body too large/);
+    assert.deepEqual(responseSpills(), [], 'the refused body leaves no spill behind');
+    assert.equal(getLiveSpillBytes(), 0);
   });
 });

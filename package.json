@@ -17,7 +17,7 @@
     "build:native": "npx --yes --package=node@22 node scripts/build-sea.js",
     "start": "node dist/server.js",
     "server": "tsx src/server.ts",
-    "test:unit": "node --experimental-global-webcrypto --import tsx --test tests/unit/**/*.test.ts",
+    "test:unit": "node --experimental-global-webcrypto --import tsx --import ./tests/setup/silent-logs.ts --test tests/unit/**/*.test.ts",
     "prepublishOnly": "npm run build && npm run test:unit"
   },
   "dependencies": {

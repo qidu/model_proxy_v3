@@ -13,6 +13,11 @@ import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
+import { collectBlobRefs, rehydrateInlineBlobs } from '../utils/blob-refs.js';
+import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
+import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { receiveResponseBody } from '../utils/spool-response.js';
+import { getSpoolConfig } from '../utils/spool.js';
 
 /**
  * Handle native Claude API request (pass-through)
@@ -34,6 +39,21 @@ export async function handleClaudeRequest(
     const requestBody = isSdkUrl(targetUrl) ? await request.clone().json() as Record<string, unknown> : await request.json() as Record<string, unknown>;
     // Parse request body
     //const requestBody = await request.json() as Record<string, unknown>;
+    // §5.3 egress shape. Shape 2 (the default, and every other handler today):
+    // the send boundary forwards refs, not payloads — put the inline payloads
+    // back before anything reads this body. Shape 3 (this route's send, below):
+    // the refs stay and the send streams each payload at the offset its ref
+    // occupies, so the expanded body never exists. Which one this request takes
+    // is decided here and used there, because a body expanded here has no refs
+    // left to stream. `enabled` gates the walk, so a deployment with spooling off
+    // (§9.1) pays nothing: with no extraction pass there can be no ref. The
+    // `sdk://` branch below is handed the parsed body itself, so it stays on
+    // shape 2.
+    const streamRefs = !isSdkUrl(targetUrl) && getSpoolConfig().enabled &&
+        collectBlobRefs(requestBody).length > 0;
+    if (!streamRefs) {
+        await rehydrateInlineBlobs(requestBody);
+    }
     logPipelineStage(activeLogger, requestId, 'inbound', '/v1/messages (native)', requestBody);
     logPipelineHeaders(activeLogger, requestId, 'inbound', '/v1/messages (native)', request.headers);
 
@@ -122,12 +142,29 @@ export async function handleClaudeRequest(
     // Pass through to native Claude API
     activeLogger.debug(requestId, `Sending to upstream: ${JSON.stringify(upstreamBody).substring(0, 500)}`);
     logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, upstreamBody);
-    const upstreamHeaders = { 'Content-Type': 'application/json', ...addForwardedHeaders(authHeaders, request) };
+    // §5.3 shape 3, the graduate path: a body that still carries refs is sent as
+    // a stream — the skeleton plus one blob chunk at a time, read from L2 as the
+    // upstream pulls — instead of as one expanded string. Two things come with
+    // it: the exact `Content-Length` the serializer measured from the skeleton
+    // and the refs' recorded sizes (fetch cannot infer a length for a streamed
+    // body, and a stale length is worse than none), and `duplex: 'half'` (this
+    // repo's streamed-egress convention, src/handlers/passthrough.ts:271 — that
+    // call needs the `as RequestInit` cast only because its `duplex` is a plain
+    // key; a conditional spread skips the excess-property check). A ref-free body
+    // — and every request on a deployment with spooling off — sends the expanded
+    // string exactly as before.
+    const streamed = streamRefs ? createRefAwareJsonBody(upstreamBody) : undefined;
+    const upstreamHeaders = {
+        'Content-Type': 'application/json',
+        ...addForwardedHeaders(authHeaders, request),
+        ...(streamed ? { 'Content-Length': String(streamed.contentLength) } : {}),
+    };
     logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, upstreamHeaders);
     let response = await fetch(targetUrl, {
         method: 'POST',
         headers: upstreamHeaders,
-        body: JSON.stringify(upstreamBody),
+        body: streamed ? streamed.body : JSON.stringify(upstreamBody),
+        ...(streamed ? { duplex: 'half' } : {}),
         signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
@@ -179,25 +216,49 @@ export async function handleClaudeRequest(
         });
     }
 
-    // Non-streaming JSON response: read a clone of the body for pipeline logging
-    // only; the original response.body is returned to the client. Token usage and
-    // tool names are recorded centrally in index.ts.
-    if (response.body) {
-        const cloned = response.clone();
+    // §5.7: receive the body bounded — above `threshold_bytes` it lives in a
+    // `responses/` spill — and forward it from there a chunk at a time. This
+    // branch never converts, so the upstream bytes are the client's bytes; the
+    // clone read here existed only for the two trace lines below and cost a whole
+    // second copy of the body (§5.7: "do not call `response.clone().text()` or
+    // buffer a second copy"), pulled as fast as the upstream could send it
+    // whatever pace the client kept. The trace re-reads the spool instead, and
+    // only when tracing is on — the convention the identity egresses already
+    // follow (src/handlers/responses.ts:1962).
+    const received = response.body ? await receiveResponseBody(response.body) : null;
+
+    if (received && activeLogger.traceEnabled) {
+        // §5.9 byte admission, opt-in via `max_materialized_body_bytes`, taken only
+        // where something is materialized: the sole read on this branch is the trace
+        // one, so a body nobody is going to read is never charged and never refused.
+        // The body is received but not yet read, so a body that has to wait for
+        // capacity waits before any of it is materialized, and the client has no
+        // headers yet, so a refusal can still be answered. A refusal must leave
+        // neither the received bytes on disk nor a reservation on the ledger (#8).
+        let lease: AdmissionLease;
         try {
-            const text = await cloned.text();
+            lease = await admitMaterialization(received.size, request.signal);
+        } catch (error) {
+            await received.release();
+            throw error;
+        }
+        try {
+            const text = await received.readText();
             logPipelineStage(activeLogger, requestId, 'upstream-response', targetUrl, text);
             // Native pass-through: outbound body to the client is identical to upstream response body.
             logPipelineStage(activeLogger, requestId, 'outbound', '/v1/messages (native)', text);
-        } catch {
-            // failed to read body; nothing to do
+        } finally {
+            lease.release();
         }
     }
 
     // Return response as-is (pass-through)
     const finalOutboundHeaders = sanitizeUpstreamResponseHeaders(response);
     logPipelineHeaders(activeLogger, requestId, 'outbound', '/v1/messages (native)', finalOutboundHeaders);
-    return new Response(response.body, {
+    // Forwarded from the spool rather than from a materialized copy: a spilled body
+    // is re-read from disk a chunk at a time, so the client's write pace — not a
+    // buffer — bounds what the proxy holds while the response is sent.
+    return new Response(received ? received.readStream() : null, {
         status: response.status,
         headers: finalOutboundHeaders,
     });

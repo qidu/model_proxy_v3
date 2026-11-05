@@ -1238,6 +1238,47 @@ describe('applyWriteoutBody', () => {
 });
 
 describe('pipeEventTransformer (writeout SSE)', () => {
+  const FLAG_SET: TransformSet = {
+    name: 'writeout_set',
+    schema: 'openai-completions',
+    response_egress: { ops: [{ op: 'set', path: 'flag', value: true }] },
+  };
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * An SSE source that counts how many times it is read and records the reason it was
+   * cancelled, so a test can observe plan §5.7's two response-side rules: reads happen
+   * only while a consumer waits, and a client disconnect reaches upstream.
+   * `highWaterMark: 0` — a read happens only when someone actually asks for a chunk.
+   */
+  function makeCountingSseSource(chunks: string[]): {
+    stream: ReadableStream<Uint8Array>;
+    pulls: () => number;
+    cancelReason: () => unknown;
+  } {
+    const encoder = new TextEncoder();
+    let index = 0;
+    let pulls = 0;
+    let cancelled: unknown;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        if (index >= chunks.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoder.encode(chunks[index++]));
+      },
+      cancel(reason) {
+        cancelled = reason;
+      },
+    }, { highWaterMark: 0 });
+    return { stream, pulls: () => pulls, cancelReason: () => cancelled };
+  }
+
   it('fast-path: returns null when no transforms declare response_egress', () => {
     const set: TransformSet = {
       name: 'before_only',
@@ -1266,18 +1307,16 @@ describe('pipeEventTransformer (writeout SSE)', () => {
     const out = pipeEventTransformer(stream, ctx);
     assert.ok(out !== null);
     const text = await new Response(out!).text();
-    assert.ok(text.startsWith('data: '));
-    assert.ok(text.includes('"b":1'), 'should have renamed a to b');
-    assert.ok(!text.includes('"a":1'), 'original key should be gone');
-    assert.ok(text.includes('[DONE]'), 'sentinel should pass through unchanged');
+    // Exact equality rather than `includes`: renaming moves the key to the end, and
+    // the byte-for-byte framing pins the sentinel to exactly one emission.
+    assert.equal(text, 'data: {"x":"y","b":1}\n\ndata: [DONE]\n\n');
   });
 
-  it('drops events when transformer returns null', async () => {
-    // Custom transformer that drops everything — simulate by giving no builtins,
-    // but using a built-in that "removes" via renaming to a nonexistent field
-    // is not what we want. Instead, use a set whose op removes the event root
-    // key: a rename into nothing still leaves JSON, so we test drop explicitly
-    // via buildEventTransformer's null path: stand up a direct call.
+  // Renamed from "drops events when transformer returns null": that is not what it
+  // asserts, and not what the code can do. `transformSseEvent` honours a null return
+  // as "drop", but `buildEventTransformer`'s result never returns null — every op
+  // yields a body — so the drop branch has no reachable producer to test through.
+  it('buildEventTransformer returns a transformer that keeps the event', async () => {
     const { buildEventTransformer } = await import('../../src/utils/request-transform.js');
     const set: TransformSet = {
       name: 'noop_set',
@@ -1308,6 +1347,83 @@ describe('pipeEventTransformer (writeout SSE)', () => {
     assert.equal(events.length, 2);
     assert.ok(events[0].includes('"flag":true'));
     assert.ok(events[1].includes('"flag":true'));
+  });
+
+  it('emits the `data: [DONE]` sentinel exactly once', async () => {
+    const ctx = makeWriteoutCtx([FLAG_SET]);
+    const stream = new ReadableStream({
+      start(c) { c.enqueue(new TextEncoder().encode('data: {"x":1}\n\ndata: [DONE]\n\n')); c.close(); },
+    });
+    const out = pipeEventTransformer(stream, ctx);
+    assert.ok(out !== null);
+    const text = await new Response(out!).text();
+    // The sentinel is not a payload, so it falls through the data-less branch and is
+    // re-emitted verbatim — exactly once. The transformer used to also enqueue it
+    // from the `[DONE]` branch itself, so every upstream sentinel reached the client
+    // twice.
+    assert.equal(text, 'data: {"x":1,"flag":true}\n\ndata: [DONE]\n\n');
+    assert.equal(text.match(/\[DONE\]/g)?.length, 1, 'sentinel must appear exactly once');
+  });
+
+  it('neither duplicates nor loses an event split across two upstream chunks', { timeout: 15000 }, async () => {
+    const ctx = makeWriteoutCtx([FLAG_SET]);
+    // The first chunk ends mid-event: the transform must read on rather than stall or
+    // re-emit the partial event.
+    const source = makeCountingSseSource(['data: {"a":1,', '"x":2}\n\ndata: [DONE]\n\n']);
+    const out = pipeEventTransformer(source.stream, ctx);
+    assert.ok(out !== null);
+    const text = await new Response(out!).text();
+    assert.equal(text, 'data: {"a":1,"x":2,"flag":true}\n\ndata: [DONE]\n\n');
+    assert.equal(source.pulls(), 3, 'exactly one upstream read per chunk, plus the one that sees the end');
+  });
+
+  it('reads upstream only while the consumer is waiting, in order', { timeout: 15000 }, async () => {
+    const ctx = makeWriteoutCtx([FLAG_SET]);
+    const ids = [1, 2, 3, 4, 5];
+    const source = makeCountingSseSource(ids.map((i) => `data: {"x":${i}}\n\n`));
+    const out = pipeEventTransformer(source.stream, ctx);
+    assert.ok(out !== null);
+    const reader = out!.getReader();
+    const decoder = new TextDecoder();
+
+    const first = await reader.read();
+    assert.equal(decoder.decode(first.value, { stream: true }), 'data: {"x":1,"flag":true}\n\n');
+    assert.equal(source.pulls(), 1, 'the first frame must not read ahead of it');
+
+    // The consumer stalls. Plan §5.7: a slow client "must not cause later events to
+    // accumulate in an unbounded RAM queue", so with no read pending the transform
+    // must not touch upstream — however long the stall lasts.
+    await delay(50);
+    assert.equal(source.pulls(), 1, 'a stalled consumer must not cause upstream reads');
+
+    let rest = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      rest += decoder.decode(value, { stream: true });
+    }
+    const expected = ids.slice(1).map((i) => `data: {"x":${i},"flag":true}\n\n`).join('');
+    assert.equal(rest, expected, 'every remaining event, in order, once the consumer resumes');
+    assert.equal(source.pulls(), 6, 'one read per frame, plus the one that ends the source');
+  });
+
+  it('forwards a consumer cancel to upstream and stops reading it', { timeout: 15000 }, async () => {
+    const ctx = makeWriteoutCtx([FLAG_SET]);
+    const source = makeCountingSseSource(['data: {"x":1}\n\n', 'data: {"x":2}\n\n', 'data: {"x":3}\n\n']);
+    const out = pipeEventTransformer(source.stream, ctx);
+    assert.ok(out !== null);
+    const reader = out!.getReader();
+    const first = await reader.read();
+    assert.equal(new TextDecoder().decode(first.value), 'data: {"x":1,"flag":true}\n\n');
+    assert.equal(source.pulls(), 1);
+
+    // A client that hangs up mid-stream must stop upstream too, not leave it draining
+    // into a stream nobody reads.
+    const reason = new Error('client disconnected');
+    await reader.cancel(reason);
+    assert.equal(source.cancelReason(), reason, 'the disconnect reason must reach upstream');
+    await delay(20);
+    assert.equal(source.pulls(), 1, 'a cancelled stream must not read on');
   });
 });
 

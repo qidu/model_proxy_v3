@@ -999,6 +999,16 @@ export async function applyWriteoutBody(
  * `response_egress` ops (fast path). Events whose transformer returns null are
  * dropped. Other events are re-emitted as `data: <json>\n\n`. Non-data lines and
  * blank-line-terminated comments are passed through verbatim.
+ *
+ * Plan §5.7: "Keep-alive injection and all response transforms must likewise wait
+ * for downstream demand rather than unconditionally enqueueing", and a slow client
+ * "must not cause later events to accumulate in an unbounded RAM queue". So this is
+ * a pull-driven stream with `highWaterMark: 0`: a pull reads upstream only while a
+ * consumer is waiting, transforms that one chunk's events, and hands over exactly
+ * one of the resulting byte chunks; whatever that chunk produced beyond it waits for
+ * the consumer's next read. The detached `start()` loop this replaces enqueued every
+ * event the upstream sent as it arrived, so a slow client's whole remaining response
+ * stayed in this stream's queue.
  */
 export function pipeEventTransformer(
   responseBody: ReadableStream<Uint8Array>,
@@ -1009,71 +1019,95 @@ export function pipeEventTransformer(
 
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const reader = responseBody.getReader();
+  // Bytes produced from upstream chunks that the consumer has not taken yet, and
+  // the tail of an event that spans two reads.
+  const ready: Uint8Array[] = [];
   let buffer = '';
+  let sourceDone = false;
+  let cancelled = false;
 
-  return new ReadableStream({
-    async start(controller) {
-      const reader = responseBody.getReader();
-      try {
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          // SSE events are delimited by blank line.
-          const events = buffer.split('\n\n');
-          buffer = events.pop() ?? '';
-          for (const ev of events) {
-            if (!ev.trim()) continue;
-            const transformed = transformSseEvent(ev, transformer, ctx, controller, encoder);
-            if (transformed === null) continue; // dropped
-            // `transformSseEvent` already pushed bytes when applicable
-          }
-        }
-        // flush trailing buffer
-        if (buffer.trim()) {
-          transformSseEvent(buffer, transformer, ctx, controller, encoder);
-        }
-        controller.close();
-      } catch (e) {
-        controller.error(e);
+  /**
+   * Read and transform upstream until at least one byte is ready or the source
+   * ends. A pull that produced nothing must read on, or the stream would stall on
+   * an event that a chunk boundary cut in half; and it is only ever called while a
+   * consumer read is pending, so reading on cannot accumulate.
+   */
+  const fill = async (): Promise<void> => {
+    while (ready.length === 0 && !sourceDone) {
+      const { value, done } = await reader.read();
+      if (done) {
+        sourceDone = true;
+        // A final event the source closed without its terminating blank line.
+        if (buffer.trim()) transformSseEvent(buffer, transformer, ctx, ready, encoder);
+        buffer = '';
+        return;
       }
+      buffer += decoder.decode(value, { stream: true });
+      // SSE events are delimited by blank line.
+      const events = buffer.split('\n\n');
+      buffer = events.pop() ?? '';
+      for (const ev of events) {
+        if (!ev.trim()) continue;
+        transformSseEvent(ev, transformer, ctx, ready, encoder);
+      }
+    }
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (ready.length === 0) await fill();
+      // The consumer withdrew while this pull was reading: enqueueing or closing
+      // now would throw on a stream that is already cancelled.
+      if (cancelled) return;
+      const next: Uint8Array | undefined = ready.shift();
+      if (next === undefined) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(next);
     },
-  });
+    cancel(reason) {
+      // A client that disconnects must stop the upstream too, not leave it draining
+      // into a stream nobody reads (plan §5.7's client-disconnect rule).
+      cancelled = true;
+      return reader.cancel(reason);
+    },
+  }, { highWaterMark: 0 });
 }
 
+/**
+ * Transform one SSE event — the text between blank-line delimiters, delimiter
+ * excluded — and push its bytes onto `out`: exactly one entry per event, or none
+ * when the transformer drops it.
+ */
 function transformSseEvent(
   eventText: string,
   transformer: EventTransformer,
   ctx: HookContext,
-  controller: ReadableStreamDefaultController<Uint8Array>,
+  out: Uint8Array[],
   encoder: TextEncoder,
-): null | undefined {
+): void {
   // Find the data: line(s); multi-data events are concatenated as a JSON array by spec
   // but most providers use one data: line per event. We treat single-line events.
   const lines = eventText.split('\n');
   const dataParts: string[] = [];
-  const otherLines: string[] = [];
-  let terminated = false;
   for (const line of lines) {
-    if (line.startsWith('data:')) {
-      // data: payload (no space) or "data: payload" (single space).
-      const payload = line.startsWith('data: ') ? line.slice(6) : line.slice(5);
-      if (payload === '[DONE]') {
-        // Sentinel — always pass through unchanged so clients terminate cleanly.
-        controller.enqueue(encoder.encode(`${line}\n\n`));
-        continue;
-      }
-      dataParts.push(payload);
-    } else if (line === '') {
-      terminated = true;
-    } else {
-      otherLines.push(line);
-    }
+    if (!line.startsWith('data:')) continue;
+    // data: payload (no space) or "data: payload" (single space).
+    const payload = line.startsWith('data: ') ? line.slice(6) : line.slice(5);
+    // The sentinel is not a payload, so it is never parsed or transformed: it goes
+    // out verbatim with the rest of a data-less event, below.
+    if (payload === '[DONE]') continue;
+    dataParts.push(payload);
   }
   if (dataParts.length === 0) {
-    // Comments / event: / id: lines — pass through verbatim
-    controller.enqueue(encoder.encode(`${eventText}\n\n`));
-    return undefined;
+    // Comments / event: / id: lines, and a `[DONE]` sentinel — pass through
+    // verbatim so clients terminate cleanly. (The previous version emitted a
+    // sentinel-only event here *and* from the sentinel branch above, so every
+    // upstream `[DONE]` reached the client twice.)
+    out.push(encoder.encode(`${eventText}\n\n`));
+    return;
   }
   // Parse the data payload (assume JSON; non-JSON falls through unchanged).
   const json = dataParts.join('\n');
@@ -1081,14 +1115,11 @@ function transformSseEvent(
   try {
     parsed = JSON.parse(json);
   } catch {
-    controller.enqueue(encoder.encode(`${eventText}\n\n`));
-    return undefined;
+    out.push(encoder.encode(`${eventText}\n\n`));
+    return;
   }
   const next = transformer(parsed, ctx);
-  if (next === null) return null; // dropped
+  if (next === null) return; // dropped
   const reSerialized = `data: ${JSON.stringify(next)}`;
-  controller.enqueue(encoder.encode(`${reSerialized}\n\n`));
-  void terminated;
-  void otherLines;
-  return undefined;
+  out.push(encoder.encode(`${reSerialized}\n\n`));
 }

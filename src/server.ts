@@ -13,6 +13,7 @@ import { pathToFileURL } from 'url';
 import type { Env } from './types/shared.js';
 import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit, resolveDefaultProxyConfigPath } from './utils/config-loader.js';
 import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled, setTokenRetentionWindow, isEnvFlagEnabled } from './utils/dashboard-stats.js';
+import { consumeStreamFailureReporter } from './utils/stream-failure.js';
 import { runCli } from './cli.js';
 
 // Import the Workers fetch handler
@@ -68,23 +69,82 @@ export function buildNodeEnv(source: NodeJS.ProcessEnv = process.env): NodeEnv {
   };
 }
 
+/**
+ * The request body as a pull-driven stream, plus the drain that releases the
+ * upload once the handler is done with it.
+ *
+ * Attaching a `data` listener on its own — the shape this replaced — puts Node's
+ * readable into flowing mode, so a client can push its whole body into the
+ * stream's queue no matter how slowly the handler reads it: no backpressure at
+ * all (plan §5.1). Here the stream is paused again immediately and only `pull`
+ * resumes the socket, so one chunk is released per read the handler makes and
+ * the upload is bounded by the handler's consumption rather than by RAM.
+ *
+ * `drain()` stops delivering socket events into the stream and lets the rest of
+ * the upload run into the void. It runs once the handler has returned, for the
+ * paths that answer without ever reading the body (auth rejection, dashboard,
+ * OPTIONS): a response can only reach a client that is not still blocked
+ * writing a body nobody will read.
+ */
+export function createNodeBodyStream(
+  req: import('http').IncomingMessage,
+): { stream?: ReadableStream<Uint8Array>; drain: () => void } {
+  if (['GET', 'HEAD'].includes(req.method || '')) {
+    return { drain: () => {} };
+  }
+
+  let ended = false;
+  let detached = false;
+  let onData: ((chunk: Buffer) => void) | undefined;
+  let onEnd: (() => void) | undefined;
+
+  const drain = (): void => {
+    if (detached) return;
+    detached = true;
+    if (onData) req.off('data', onData);
+    if (onEnd) req.off('end', onEnd);
+    // The 'error' listener stays attached: removing it would turn a late socket
+    // error into an uncaught exception.
+    req.resume();
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      onData = (chunk: Buffer) => {
+        if (ended || detached) return;
+        controller.enqueue(chunk);
+        // That chunk satisfies the read this was pulled for, so hold the socket
+        // here until the handler asks for the next one.
+        if (controller.desiredSize !== null && controller.desiredSize <= 0) req.pause();
+      };
+      onEnd = () => { ended = true; controller.close(); };
+      const onError = (error: Error) => { ended = true; controller.error(error); };
+      req.on('data', onData);
+      req.on('end', onEnd);
+      req.on('error', onError);
+      // Attaching 'data' put the readable into flowing mode; pause it again so
+      // the first chunk is released by the first `pull`, not before it.
+      req.pause();
+    },
+    pull() {
+      req.resume();
+    },
+    cancel() {
+      drain();
+    },
+  }, { highWaterMark: 0 });
+
+  return { stream, drain };
+}
+
 export function createNodeRequestHandler(
   env: NodeEnv,
   fetchHandler: (request: Request, env: NodeEnv) => Promise<Response> = handler.fetch,
 ) {
   return async (req: import('http').IncomingMessage, res: import('http').ServerResponse) => {
+    const body = createNodeBodyStream(req);
     try {
       const url = new URL(req.url || '/', `http://${req.headers.host}`);
-
-      const bodyStream = ['GET', 'HEAD'].includes(req.method || '')
-        ? undefined
-        : new ReadableStream({
-            start(controller) {
-              req.on('data', (chunk) => controller.enqueue(chunk));
-              req.on('end', () => controller.close());
-              req.on('error', (err) => controller.error(err));
-            },
-          });
 
       // Get client connection info from Node.js socket
       const clientAddress = req.socket.remoteAddress || 'unknown';
@@ -98,9 +158,9 @@ export function createNodeRequestHandler(
       const requestInit: any = {
         method: req.method,
         headers,
-        body: bodyStream,
+        body: body.stream,
       };
-      if (bodyStream) {
+      if (body.stream) {
         requestInit.duplex = 'half';
       }
       const request = new Request(url.toString(), requestInit);
@@ -108,15 +168,19 @@ export function createNodeRequestHandler(
       const response = await fetchHandler(request, env);
 
       // Release the in-flight request counter once the body has fully streamed to
-      // the client (or immediately for non-streaming responses). The release is
+      // the client (or immediately when there is no body to send). The release is
       // once-guarded in dashboard-stats, so wiring it to several completion paths
       // (stream close/abort, pipe error, client disconnect) can't double-count.
       const release = consumeActiveRequestRelease(response) ?? (() => {});
 
-      // Handle streaming vs non-streaming responses differently.
-      // For streaming, tee the stream so we can pipe one branch to the client
-      // while leaving the other available for reading (e.g. .text()).
-      // For non-streaming, read the full body and write all at once.
+      // §5.7: a body that fails after the headers are on the wire aborts the
+      // connection, so this reporter is the only record of it. It is silent for
+      // an ordinary client hang-up.
+      const reportStreamFailure = consumeStreamFailureReporter(response);
+
+      // Streaming vs non-streaming: both write the headers and pipe the body, so
+      // the client's pace reaches the sender rather than a buffer. The SSE branch
+      // additionally releases on client close (a safety net it has always had).
       const contentType = response.headers.get('content-type') || '';
       const isStreaming = contentType.includes('text/event-stream');
 
@@ -125,34 +189,43 @@ export function createNodeRequestHandler(
         // response without consuming the body via .text(), which avoids the
         // "headers already sent" error when the stream body was already locked.
         res.writeHead(response.status, nodeResponseHeaders(response));
-        const { PassThrough } = await import('stream');
-        const passthrough = new PassThrough();
-        passthrough.pipe(res);
+        // Plan §5.7: `pipeline()` is what makes the upstream feel the client's
+        // pace. Writing into a PassThrough and ignoring the false it returns on a
+        // full buffer let a slow client pull the whole remaining response into
+        // memory, and on a client disconnect left the upstream body un-cancelled.
+        const { Readable } = await import('stream');
+        const { pipeline } = await import('stream/promises');
         // Safety net: if the client disconnects mid-stream, release here too.
         res.on('close', release);
-        response.body.pipeTo(new WritableStream({
-          write(chunk) {
-            passthrough.write(chunk);
-          },
-          close() {
-            passthrough.end();
-            release();
-          },
-          abort(err) {
-            passthrough.end();
-            release();
-          },
-        })).catch(() => {
-          passthrough.end();
-          release();
-        });
+        pipeline(Readable.fromWeb(response.body as any), res)
+          // A genuine failure here surfaces to the client as a destroyed
+          // connection instead of the silently truncated body the old
+          // `passthrough.end()` produced, and the reporter logs it with the
+          // request id and stage. A client disconnect is the ordinary case and
+          // stays silent (see utils/stream-failure.ts).
+          .catch((error) => reportStreamFailure?.(error))
+          .finally(() => release());
         return;
       }
 
-      const responseBody = await response.clone().text();
       res.writeHead(response.status, nodeResponseHeaders(response));
-      res.end(responseBody);
-      release();
+
+      if (!response.body) {
+        res.end();
+        release();
+        return;
+      }
+
+      // Plan §5.7 requires the same `pipeline()` here as on the SSE path: the
+      // old `await response.clone().text()` held a second full copy of every
+      // non-SSE body (a spooled response included) for as long as the client
+      // took to accept it. Piping gives the upstream — or the response spool —
+      // the client's write pace instead.
+      const { Readable } = await import('stream');
+      const { pipeline } = await import('stream/promises');
+      pipeline(Readable.fromWeb(response.body as any), res)
+        .catch((error) => reportStreamFailure?.(error))
+        .finally(() => release());
     } catch (error) {
       console.error('Server error:', error);
       // Only write headers if they haven't been sent yet
@@ -160,6 +233,11 @@ export function createNodeRequestHandler(
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Internal server error' }));
       }
+    } finally {
+      // The handler has already read whatever part of the body it wants (the
+      // spool releases the raw body before it returns), so the remaining upload
+      // is discarded from here on.
+      body.drain();
     }
   };
 }
@@ -204,6 +282,20 @@ function main(): void {
     console.error('[FATAL] --rpc cannot be combined with AGENT or TUI: all three own stdout.');
     process.exit(2);
   }
+
+  // A stray rejection from a response stream must not kill the proxy. Node's
+  // TransformStream clears its cancel algorithm when a transformer calls
+  // `controller.terminate()` — which streaming.ts does on `[DONE]` — and any
+  // later cancel of that readable then throws from inside `pipeTo`'s own
+  // shutdown, where the throw is not ours to catch: it escapes as an unhandled
+  // rejection, and under Node's default that is fatal. A client that hangs up
+  // mid-stream is enough to reach it, so without this the whole proxy dies with
+  // one client's disconnect. Report loudly and keep serving instead; the request
+  // itself already failed on its own path.
+  process.on('unhandledRejection', (reason) => {
+    const detail = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+    process.stderr.write(`[ERROR] unhandled rejection, proxy kept running: ${detail}\n`);
+  });
 
   const server = createServer(createNodeRequestHandler(env));
   let stopTui: (() => void) | undefined;

@@ -5,7 +5,7 @@
  * chat.completions delta chunks and asserting on the emitted Claude event
  * sequence: message_start, content_block_start/delta/stop, tool_use blocks,
  * reasoning_content thinking blocks (with synthetic signature), stop_reason
- * mapping, upstream usage capture, and the unexpected-end flush path.
+ * mapping, upstream usage capture, and loud upstream/parse/EOF failures.
  *
  * Run with: npx tsx --test tests/unit/streaming.test.ts
  */
@@ -14,7 +14,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createStreamTransformer } from '../../src/converters/streaming.js';
-import { SYNTHETIC_THINKING_SIGNATURE } from '../../src/converters/openai-to-claude.js';
+import { SYNTHETIC_THINKING_SIGNATURE, TokenCountingConfig } from '../../src/converters/openai-to-claude.js';
+import { countTokensWithTiktoken, getTiktokenTokenizer } from '../../src/utils/token-counting.js';
 
 interface ClaudeEvent { event: string; data: any; }
 
@@ -23,12 +24,14 @@ async function runTransformer(sseLines: string[], opts?: {
   requestId?: string;
   includeThinking?: boolean;
   flushInsteadOfDone?: boolean;
+  inputTokens?: number;
+  tokenCounting?: TokenCountingConfig;
 }): Promise<ClaudeEvent[]> {
   const transformer = createStreamTransformer(
     'model-a',
     opts?.requestId ?? 'req-1',
-    undefined,
-    undefined,
+    opts?.inputTokens,
+    opts?.tokenCounting,
     opts?.includeThinking ?? false,
   );
   const stream = new TransformStream<Uint8Array, Uint8Array>(transformer as any);
@@ -49,13 +52,20 @@ async function runTransformer(sseLines: string[], opts?: {
   // The transformer calls controller.terminate() on [DONE], which closes the
   // writable side out from under us. Swallow the resulting "already closed"
   // errors on write/close — the readable side still drains every event.
-  try {
-    for (const line of sseLines) await writer.write(enc.encode(line));
-    await writer.close();
-  } catch (e: any) {
-    if (e?.code !== 'ERR_INVALID_STATE') throw e;
-  }
-  await readAll;
+  const writeAll = (async () => {
+    try {
+      for (const line of sseLines) await writer.write(enc.encode(line));
+      await writer.close();
+    } catch (e: any) {
+      if (e?.code !== 'ERR_INVALID_STATE') throw e;
+    }
+  })();
+
+  // A transform failure rejects both sides. Settling both promises before
+  // rethrowing keeps the expected failure from escaping as test-process activity.
+  const [writeOutcome, readOutcome] = await Promise.allSettled([writeAll, readAll]);
+  if (readOutcome.status === 'rejected') throw readOutcome.reason;
+  if (writeOutcome.status === 'rejected') throw writeOutcome.reason;
 
   return parseClaudeSse(raw);
 }
@@ -244,23 +254,101 @@ describe('createStreamTransformer — usage', () => {
   });
 });
 
-describe('createStreamTransformer — flush on unexpected end', () => {
-  it('closes open blocks and emits message_delta/message_stop when stream ends without [DONE]', async () => {
-    // No DONE line: the stream closes and the flush() path must finalize.
-    const events = await runTransformer([oa({ content: 'partial' })]);
-    assert.equal(events[0].event, 'message_start');
-    assert.ok(events.some(e => e.event === 'content_block_stop' && e.data.index === 0));
+describe('createStreamTransformer — input usage from the caller (§5.3)', () => {
+  it('carries the caller-supplied input tokens into message_start and message_delta', async () => {
+    // The transformer holds no request body: the input count arrives as a
+    // scalar parameter and must be reported verbatim when upstream reports none.
+    const events = await runTransformer([oa({ content: 'x' }), finalThenDone('stop')], {
+      inputTokens: 4242,
+    });
+    const ms = events.find(e => e.event === 'message_start');
+    assert.equal(ms!.data.message.usage.input_tokens, 4242);
     const md = events.find(e => e.event === 'message_delta');
-    assert.ok(md, 'message_delta emitted on flush');
-    assert.equal(md!.data.delta.stop_reason, 'end_turn');
-    assert.equal(events[events.length - 1].event, 'message_stop');
+    assert.equal(md!.data.usage.input_tokens, 4242);
   });
 
-  it('flush reports tool_use stop_reason when a tool call was in progress', async () => {
-    const events = await runTransformer([
-      oa({ tool_calls: [{ index: 0, id: 'c', function: { name: 'n', arguments: '{}' } }] }),
-    ]);
+  it('defaults to 0 input tokens when the caller supplies none', async () => {
+    const events = await runTransformer([oa({ content: 'x' }), finalThenDone('stop')]);
+    const ms = events.find(e => e.event === 'message_start');
+    assert.equal(ms!.data.message.usage.input_tokens, 0);
     const md = events.find(e => e.event === 'message_delta');
-    assert.equal(md!.data.delta.stop_reason, 'tool_use');
+    assert.equal(md!.data.usage.input_tokens, 0);
+  });
+
+  it('still prefers upstream-reported prompt tokens over the caller estimate', async () => {
+    const usageChunk = `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 100, completion_tokens: 20 } })}\n\n`;
+    const events = await runTransformer([oa({ content: 'x' }), usageChunk, finalThenDone('stop')], {
+      inputTokens: 4242,
+    });
+    // message_start is emitted before any upstream usage is known, so it reports
+    // the estimate; the final message_delta reports the authoritative upstream count.
+    const ms = events.find(e => e.event === 'message_start');
+    assert.equal(ms!.data.message.usage.input_tokens, 4242);
+    const md = events.find(e => e.event === 'message_delta');
+    assert.equal(md!.data.usage.input_tokens, 100);
+    assert.equal(md!.data.usage.output_tokens, 20);
+  });
+
+  it('counts output tokens with tiktoken when counting is enabled, without a request body', async () => {
+    // Output counting used to be gated on a request body being present as well
+    // as on the config; the body is gone, so the config alone must suffice.
+    const events = await runTransformer([oa({ content: 'hello world' }), finalThenDone('stop')], {
+      inputTokens: 7,
+      tokenCounting: { enabled: true, modelName: 'o200k_base' },
+    });
+    const tokenizer = await getTiktokenTokenizer('o200k_base');
+    const expected = countTokensWithTiktoken('hello world', { tokenizer, useLocalCounting: true });
+    assert.ok(expected > 0, 'tokenizer produced a non-zero reference count');
+    const md = events.find(e => e.event === 'message_delta');
+    assert.equal(md!.data.usage.output_tokens, expected);
+    assert.equal(md!.data.usage.input_tokens, 7);
+  });
+
+  it('leaves output tokens at 0 when counting is disabled', async () => {
+    // A modelName is supplied deliberately: the disabled flag alone must gate
+    // output counting, not a failure to resolve a tokenizer.
+    const events = await runTransformer([oa({ content: 'hello world' }), finalThenDone('stop')], {
+      inputTokens: 7,
+      tokenCounting: { enabled: false, modelName: 'o200k_base' },
+    });
+    const md = events.find(e => e.event === 'message_delta');
+    assert.equal(md!.data.usage.output_tokens, 0);
+  });
+});
+
+describe('createStreamTransformer — upstream failure', () => {
+  it('errors instead of emitting message_delta/message_stop when stream ends without [DONE]', async () => {
+    await assert.rejects(
+      runTransformer([oa({ content: 'partial' })]),
+      /Upstream SSE stream ended before \[DONE\]/,
+    );
+  });
+
+  it('errors on unexpected EOF even when a tool call was in progress', async () => {
+    await assert.rejects(
+      runTransformer([oa({ tool_calls: [{ index: 0, id: 'c', function: { name: 'n', arguments: '{}' } }] })]),
+      /Upstream SSE stream ended before \[DONE\]/,
+    );
+  });
+
+  it('errors on malformed upstream JSON instead of skipping it and reporting success', async () => {
+    await assert.rejects(
+      runTransformer(['data: {bad json}\n\n', DONE]),
+      /Invalid JSON in upstream SSE data/,
+    );
+  });
+
+  it('propagates an upstream read failure without finalizing the Claude stream', async () => {
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(oa({ content: 'partial' })));
+        controller.error(new Error('upstream reset'));
+      },
+    });
+    const transformed = source.pipeThrough(new TransformStream(
+      createStreamTransformer('model-a', 'req-1') as any,
+    ));
+
+    await assert.rejects(new Response(transformed).text(), /upstream reset/);
   });
 });

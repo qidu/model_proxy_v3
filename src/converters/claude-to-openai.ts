@@ -5,6 +5,7 @@
 import { ClaudeMessagesRequest, ClaudeTokenCountingRequest, ClaudeContent, ClaudeContentBlock, ClaudeTool, ThinkingConfigParam } from '../types/claude.js';
 import { OpenAIRequest, OpenAITokenCountingRequest, OpenAIMessage, OpenAIToolCall } from '../types/openai.js';
 import { stringify } from '../utils/stringify.js';
+import { isBlobRef } from '../utils/blob-refs.js';
 
 /**
  * Recursively cleans a JSON Schema to make it compatible with target APIs like Google Gemini.
@@ -52,10 +53,16 @@ function convertClaudeContentToOpenAI(content: ClaudeContent): OpenAIMessage['co
         if (block.type === 'text') {
             return { type: 'text' as const, text: block.text };
         } else if (block.type === 'image') {
+            const prefix = `data:${block.source.media_type};base64,`;
+            const data: unknown = block.source.data;
             return {
                 type: 'image_url' as const,
                 image_url: {
-                    url: `data:${block.source.media_type};base64,${block.source.data}`
+                    // §5.3 shape 3: a spooled payload stays a ref, re-prefixed with the
+                    // data URL this line used to build, so it streams in chunks at the
+                    // converted position and rehydrates to exactly the string the
+                    // interpolation produced.
+                    url: isBlobRef(data) ? { ...data, prefix } : `${prefix}${data}`
                 }
             };
         }

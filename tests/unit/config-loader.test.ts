@@ -14,7 +14,8 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -53,6 +54,8 @@ import {
   type TransformSet,
 } from '../../src/utils/config-loader.js';
 import { UPSTREAM_MODES } from '../../src/utils/upstream-modes.js';
+import { getBlobStoreStats } from '../../src/utils/blob-store.js';
+import { SPOOL_DEFAULTS, SpoolConfigError, getSpoolConfig, setSpoolConfig } from '../../src/utils/spool.js';
 import type { Env } from '../../src/types/shared.js';
 
 // ---------------------------------------------------------------------------
@@ -1835,6 +1838,98 @@ timeout_ms = 40000
     assert.deepEqual(roundTripped.fetch, { image_encode: 'localhost:34567', timeout_ms: 40000 });
   });
 
+  it('preserves [spool] across parse→serialize→parse', () => {
+    const original = `
+[spool]
+enabled = true
+dir = "~/spool"
+threshold_bytes = 1048576
+max_request_bytes = 10485760
+max_response_bytes = 67108864
+max_total_bytes = 2147483648
+max_materialized_body_bytes = 0
+materialization_factor = 2.5
+max_admission_queue = 64
+admission_timeout_ms = 30000
+max_blob_cache_bytes = 67108864
+max_blob_disk_bytes = 268435456
+ttl_seconds = 600
+external_upload_url = "https://auth.example/internal/blobs"
+external_upload_token = "tok-abc123"
+external_upload_timeout_ms = 5000
+external_url_min_lifetime_s = 600
+`;
+    const parsed = parseSimpleToml(original);
+    // Every key must survive parsing — a dropped limit silently changes the
+    // spool's memory ceiling (§5.6), so this is compared in full.
+    assert.deepEqual(parsed.spool, {
+      enabled: true,
+      dir: '~/spool',
+      threshold_bytes: 1048576,
+      max_request_bytes: 10485760,
+      max_response_bytes: 67108864,
+      max_total_bytes: 2147483648,
+      max_materialized_body_bytes: 0,
+      materialization_factor: 2.5,
+      max_admission_queue: 64,
+      admission_timeout_ms: 30000,
+      max_blob_cache_bytes: 67108864,
+      max_blob_disk_bytes: 268435456,
+      ttl_seconds: 600,
+      external_upload_url: 'https://auth.example/internal/blobs',
+      external_upload_token: 'tok-abc123',
+      external_upload_timeout_ms: 5000,
+      external_url_min_lifetime_s: 600,
+    });
+    const roundTripped = parseSimpleToml(serializeProxyConfigToml(parsed));
+    assert.deepEqual(roundTripped.spool, parsed.spool);
+  });
+
+  it('accepts the [spool] external-upload keys as bare unquoted strings too', () => {
+    const parsed = parseSimpleToml(`
+[spool]
+enabled = true
+external_upload_url = https://auth.example/internal/blobs
+`) as any;
+    assert.equal(parsed.spool.external_upload_url, 'https://auth.example/internal/blobs');
+    assert.deepEqual(parsed._validationErrors ?? [], []);
+  });
+
+  it('reports a quoted numeric [spool] key instead of accepting it as a string', () => {
+    const parsed = parseSimpleToml(`
+[spool]
+enabled = true
+threshold_bytes = "1024"
+`) as any;
+    assert.equal(parsed.spool?.threshold_bytes, undefined);
+    const errors = parsed._validationErrors ?? [];
+    assert.ok(
+      errors.some((e: { path: string }) => e.path === 'spool.threshold_bytes'),
+      `expected a validation error for the quoted numeric key, got ${JSON.stringify(errors)}`,
+    );
+  });
+
+  it('reports an unknown [spool] key instead of silently dropping it', () => {
+    const parsed = parseSimpleToml(`
+[spool]
+enabled = true
+threshold = 1024
+`) as any;
+    assert.equal(parsed.spool?.enabled, true);
+    assert.equal(parsed.spool?.threshold, undefined);
+    const errors = parsed._validationErrors ?? [];
+    assert.ok(
+      errors.some((e: { path: string }) => e.path === 'spool.threshold'),
+      `expected a validation error for the unknown [spool] key, got ${JSON.stringify(errors)}`,
+    );
+  });
+
+  it('does not create a [spool] section for a config that never mentions one', () => {
+    const parsed = parseSimpleToml('[fetch]\ntimeout_ms = 1000\n');
+    assert.equal(parsed.spool, undefined);
+    assert.doesNotMatch(serializeProxyConfigToml(parsed), /\[spool\]/);
+  });
+
   it('preserves transform headers.set and headers.remove across parse→serialize→parse', () => {
     const original = `
 [transforms.add_upstream_header]
@@ -3066,5 +3161,153 @@ describe('[models.EMBEDDING].upstream_mode validation', () => {
       !warnings.some((w: { path: string }) => w.path === 'models.default.upstream_mode'),
       `expected no warning for [models.default], got ${JSON.stringify(warnings)}`
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [spool] — startup resolution through loadProxyConfig (§5.6)
+// ---------------------------------------------------------------------------
+// parseSimpleToml reading the section is not enough: the spool must be resolved
+// and installed at startup, and an unusable directory must stop the process.
+// These cases go through the real loadProxyConfig path for that reason.
+
+describe('[spool] startup resolution', () => {
+  let dir = '';
+
+  const load = async (toml: string): Promise<ProxyConfig> => {
+    const configPath = join(dir, 'proxy.toml');
+    writeFileSync(configPath, toml, 'utf8');
+    clearProxyConfigCache();
+    return loadProxyConfig({ PROXY_CONFIG_PATH: configPath, LOG_LEVEL: 'error' } as unknown as Env);
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mpv3-spool-startup-'));
+  });
+
+  afterEach(() => {
+    clearProxyConfigCache();
+    setSpoolConfig(SPOOL_DEFAULTS);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('leaves a config with no [spool] section on the disabled defaults and creates nothing', async () => {
+    const target = join(dir, 'spool-default');
+    await load('[models.default]\nupstream_mode = "openai-completions"\n');
+
+    const spool = getSpoolConfig();
+    assert.equal(spool.enabled, false);
+    assert.equal(spool.thresholdBytes, SPOOL_DEFAULTS.thresholdBytes);
+    assert.equal(existsSync(target), false);
+  });
+
+  it('installs the resolved config and prepares the directory when enabled', async () => {
+    const target = join(dir, 'spool-enabled');
+    await load(`
+[spool]
+enabled = true
+dir = "${target}"
+threshold_bytes = 4096
+ttl_seconds = 30
+`);
+
+    const spool = getSpoolConfig();
+    assert.equal(spool.enabled, true);
+    assert.equal(spool.dir, target);
+    assert.equal(spool.thresholdBytes, 4096);
+    assert.equal(spool.ttlSeconds, 30);
+    // Untouched keys still carry their §5.6 defaults.
+    assert.equal(spool.maxRequestBytes, SPOOL_DEFAULTS.maxRequestBytes);
+    assert.equal(existsSync(target), true, 'an enabled spool must prepare its directory at startup');
+  });
+
+  it('sweeps blob files left by an earlier process at startup, but never rebuilds the index from them', async () => {
+    const target = join(dir, 'spool-blobs');
+    const hash = (text: string): string => createHash('sha256').update(text).digest('hex');
+    const staleHash = hash('stale blob');
+    const bucket = join(target, 'blobs', staleHash.slice(0, 2), staleHash.slice(2, 4));
+    mkdirSync(bucket, { recursive: true });
+    const stale = join(bucket, staleHash);
+    const fresh = join(bucket, hash('fresh blob'));
+    writeFileSync(stale, 'stale blob');
+    writeFileSync(fresh, 'fresh blob');
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, twoHoursAgo, twoHoursAgo);
+
+    await load(`
+[spool]
+enabled = true
+dir = "${target}"
+`);
+
+    assert.equal(existsSync(stale), false, 'a blob older than the age threshold belongs to a process that is gone');
+    assert.equal(readFileSync(fresh, 'utf8'), 'fresh blob', 'a recent blob may belong to a worker starting alongside this one');
+    assert.deepEqual(
+      getBlobStoreStats(),
+      { cacheBytes: 0, cacheEntries: 0, diskBytes: 0, diskEntries: 0 },
+      'startup must never turn an old blob file into a cache hit (§5.4)',
+    );
+  });
+
+  it('refuses to start on an unusable spool directory instead of falling back to memory', async () => {
+    const blocker = join(dir, 'not-a-dir');
+    writeFileSync(blocker, 'file');
+    await assert.rejects(
+      () => load(`
+[spool]
+enabled = true
+dir = "${blocker}"
+`),
+      (error: unknown) => {
+        assert.ok(error instanceof SpoolConfigError, `expected SpoolConfigError, got ${String(error)}`);
+        assert.equal((error as SpoolConfigError).fatal, true);
+        assert.match((error as SpoolConfigError).message, /exists but is not a directory/);
+        return true;
+      },
+    );
+    assert.equal(getSpoolConfig().enabled, false, 'a failed startup must not leave a half-configured spool');
+  });
+
+  it('refuses to start on an invalid limit', async () => {
+    await assert.rejects(
+      () => load('[spool]\nenabled = true\nthreshold_bytes = -1\n'),
+      (error: unknown) => {
+        assert.ok(error instanceof SpoolConfigError, `expected SpoolConfigError, got ${String(error)}`);
+        assert.match((error as SpoolConfigError).message, /threshold_bytes must be a positive integer/);
+        return true;
+      },
+    );
+  });
+
+  it('installs the §5.8 external uploader from the config file', async () => {
+    const target = join(dir, 'spool-external');
+    await load(`
+[spool]
+enabled = true
+dir = "${target}"
+external_upload_url = "https://auth.example/internal/blobs"
+external_upload_token = "tok-abc123"
+external_upload_timeout_ms = 5000
+external_url_min_lifetime_s = 600
+`);
+
+    assert.deepEqual(getSpoolConfig().externalUpload, {
+      uploadUrl: 'https://auth.example/internal/blobs',
+      token: 'tok-abc123',
+      uploadTimeoutMs: 5000,
+      urlMinLifetimeSeconds: 600,
+    });
+  });
+
+  it('refuses to start on an uploader the spool cannot feed', async () => {
+    await assert.rejects(
+      () => load(`[spool]\nenabled = false\nexternal_upload_url = "https://auth.example/blobs"\n`),
+      (error: unknown) => {
+        assert.ok(error instanceof SpoolConfigError, `expected SpoolConfigError, got ${String(error)}`);
+        assert.match((error as SpoolConfigError).message, /requires enabled = true/);
+        return true;
+      },
+    );
+    assert.equal(getSpoolConfig().externalUpload, null, 'a failed startup must not leave a half-configured uploader');
   });
 });

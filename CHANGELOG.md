@@ -5,6 +5,2817 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(spool): §5.7 streams the native `/v1/messages` non-SSE response from its spill
+
+The native `anthropic-messages` egress in `src/handlers/claude.ts` was the last non-streaming
+branch on the `/v1/messages` front door that copied a successful response body in full: it never
+converts, so the upstream bytes are the client's bytes, and the `response.clone()` it took existed
+only to feed two `logPipelineStage` lines that return immediately unless tracing is on. That read
+pulled the body into RAM as fast as the upstream could send it, whatever pace the client kept —
+§5.7's "do not call `response.clone().text()` or buffer a second copy" verbatim.
+
+- The body is now received bounded with `receiveResponseBody` and forwarded from there:
+  `max_response_bytes` applies to it (the upstream cancelled on breach, a 500 `processing_error`
+  to the client), a body past `threshold_bytes` lives in a `responses/` spill, and the client is
+  answered from `received.readStream()`, so a spilled body is re-read from disk a chunk at a time
+  and the client's read pace — not a buffer — bounds what the proxy holds while it is sent.
+  `sanitizeUpstreamResponseHeaders` still strips `content-length`, so the forward restates none.
+- The trace lines re-read that spill and only when `logger.traceEnabled`; one §5.9
+  `admitMaterialization` lease wraps that single read, is released in `finally` before the stream
+  is handed to the client, and a refusal releases the received body before it is thrown, so the
+  refusal leaves neither bytes on disk nor a reservation on the ledger (#8). A body nobody will
+  read is never charged and never refused.
+- The cap applies with `enabled = false` — the seventh follower of the stated rule. The
+  gated-vs-ungated conflict recorded in the Gemini and `:countTokens` entries is unchanged.
+- Reported, not fixed: the `!response.ok` branch above still reads the upstream error body with
+  `await response.text()`, an unbounded copy on the error path; and `src/handlers/messages.ts`
+  keeps two logging-only `response.clone()` reads (`:487`, `:811`) behind `LOG_LEVEL=debug` plus a
+  `test_tool` request, each appending to `/tmp/test_model.log` under a `catch {}` that swallows the
+  failure — the remaining shape §5.7's "no logging-only `tee()`" names. Both are outside this
+  increment's branch.
+- 11 tests in `tests/unit/claude-response-spool.test.ts`: the sub-threshold and over-threshold
+  forwards are byte-identical (indented, non-ASCII fixture) with the upstream status and headers
+  intact and no restated `content-length`; a cap breach is a 500 `processing_error` with the
+  upstream cancelled and nothing on disk; a client abort mid-body frees the spill and the ledger;
+  `enabled = false` forwards byte-identically and still enforces the cap; both trace lines carry
+  the upstream payload verbatim and leave the body unchanged; an SSE response still passes straight
+  through; and the lease's three states are pinned — trace off, the budget is never consulted and
+  nothing is admitted; over budget, 503 `over_limit_error` with the spill released; exactly at
+  budget, served with nothing admitted while the client reads. `Response.prototype.clone` is
+  patched for the file: the call count is zero on every path.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit`
+**2369/2369** (0 skipped, 0 todo, 0 cancelled) — 2358 of those before this increment's 11.
+
+### feat(spool): effective and attempt bodies stream from request spills before slow upstream sends
+
+Large non-ref request bodies no longer have to stay as strings while routing, retries, or a
+converted upstream send is slow. `src/utils/spool-json.ts` keeps the existing small-body string
+path, writes an oversized final JSON body to the request spill store, and streams it back with an
+exact `Content-Length`; when conversion preserved BlobRefs, its shared POST path uses the §5.3
+serializer instead of spooling a ref skeleton.
+
+- **Effective bodies.** Default and model-route request reconstruction uses
+  `createTextEgressBody(bodyText, 'eff-')`, so the post-mutation body is read from disk at the
+  point a handler needs it instead of rebuilt into RAM.
+- **Attempt bodies.** Composite candidates, auth-ladder retries, fusion panel/judge/synthesis
+  requests, `request_ingress` rewrites, and the phase-scoped handler conversion sends use
+  `createJsonEgressBody` / `postJsonWithSpool` with `att-` spills. A pre-send fetch failure
+  cancels the stream and returns its reservation.
+- **Rung isolation and lineage.** Tests prove the effective spill is gone before dispatch, an
+  `att-` spill is live during the upstream read, two fallback rungs get independent attempts over
+  the same effective body without model-rewrite leakage, and no spill or ledger bytes remain after
+  success or failure.
+- **Coverage.** `tests/unit/spool-json.test.ts` covers small/large bodies, exact UTF-8 lengths,
+  caps, cancel-before-send, fetch rejection, one-time serialization, and a 12-predicate request
+  matrix streamed byte-identically through the shared POST path. `index-routing.test.ts` covers
+  effective/attempt lineage and two-rung isolation; `messages-ref-streaming.test.ts` covers a
+  large non-ref converted attempt against its string-path baseline.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit`
+**2358/2358** (0 skipped, 0 todo, 0 cancelled).
+
+### feat(spool): §5.7 spools the `/v1/messages`-via-`:generateContent` and `:countTokens` non-SSE responses
+
+The two readers left in `src/handlers/gemini.ts`. The claude-format branch of
+`handleGeminiNonStreamingResponse` is the gap the native-Gemini entry reported:
+`response.text()` → `JSON.parse` → convert, with no `max_response_bytes` at all.
+`handleGeminiCountTokensRequest` was the same shape one function up, relaying the
+upstream body as a string.
+
+- The converted branch now calls `receiveJsonResponse<Record<string, unknown>>`
+  — the helper the `/v1/chat/completions` increment promoted into
+  `src/utils/spool-response.ts` — so the body is received with
+  `max_response_bytes` enforced (the upstream cancelled on breach), parsed once
+  under a §5.9 lease, and the spill released before the client is answered. The
+  upstream-response trace line still shows the raw upstream bytes, read from that
+  same spill; the outbound line still shows the converted message.
+- The branch's own `catch` annotated everything it caught as
+  `Failed to convert Gemini response: …`. A spool breach (500 `processing_error`)
+  and an admission refusal (503 `over_limit_error`) already carry the status and
+  type the client switches on, so the `catch` now rethrows a `ClaudeProxyError`
+  unchanged and only wraps genuine conversion failures (repo rule #8). A test
+  pins the type, the status, and that the message does not carry the conversion
+  prefix.
+- No `createConvertedResponseBody` here, for the reason already recorded for this
+  converter: `convertGeminiGenerateContentToClaude` collects `part.text` only, so
+  an `inlineData` part is gone before any converted value exists to extract from.
+  The test fixture carries one, and the assertion is that the client receives the
+  text alone.
+- `:countTokens` became §5.7's identity shape: `receiveResponseBody` then
+  `new Response(received.readStream(), …)`. The body is a `{ totalTokens }`
+  object, so nothing on §5.7's response allowlist can be in it, there is nothing
+  to extract, and — as before this change — no trace line reads it.
+- The cap applies with `enabled = false` on both, the fifth and sixth followers of
+  the stated rule (`enabled` decides whether disk is used, not whether the body is
+  bounded). The gated-vs-ungated conflict flagged in the Gemini entry is
+  unchanged and still unreconciled.
+- Reported, not fixed: both functions' `!ok` exits (`await response.text()` on a
+  non-2xx reply) are still unbounded, like every other handler's. They carry the
+  upstream's error envelope, not a §5.7-allowlisted payload.
+- Tests: `tests/unit/gemini-converted-response-spool.test.ts`, 10 cases. The
+  converted path: a sub-threshold body converted to the exact Claude message the
+  fixture implies (indented non-ASCII text preserved, `inlineData` dropped,
+  clock-derived `id` masked), no spill, and `Response.prototype.clone` patched and
+  asserted unused; a spilled body whose spill is already gone when the answer
+  exists; a breach failing `SpoolResponseTooLargeError` with the upstream
+  cancelled and the error type intact; the cap enforced with `enabled = false`;
+  the trace reading the spill without changing the answer; the §5.9 refusal
+  (one nominal byte short of the budget → 503, no spill, no reservation) and the
+  admitted counterpart releasing its lease before the client reads. The identity
+  path: a spilled `:countTokens` body forwarded byte-identically and freed by the
+  client's read, a breach cancelling the upstream, and `enabled = false` writing
+  nothing to disk.
+- 2357 unit tests pass (2347 before, +10); `tsc --noEmit` clean; `npm run build`
+  clean.
+
+### feat(spool): §5.7 spools the non-SSE `/v1/chat/completions` response — converted and identity
+
+The last Phase‑2 endpoint family whose non-streaming exit still read its upstream
+body unbounded. `/v1/chat/completions` — and `/v1/completions`, which routes to the
+same handler — answers from three upstream modes without streaming, and none of
+them was bounded: the `anthropic-messages` branch called `response.text()` and
+parsed it, the `gemini-generatecontent` branch did the same, and the
+`openai-responses` branch piped the upstream body straight to the client through
+an `observeStream` transform, so a passthrough response had no cap at all.
+
+- `src/utils/spool-response.ts`: `receiveJsonResponse` moved here from
+  `src/handlers/messages.ts`, unchanged, and is now exported. It was written there
+  as a private helper with one caller; this increment brings three more, so it is
+  defined once rather than copied (repo rule #4). `messages.ts` imports it and its
+  nine cases still pass unmodified. The *other* inline copies of the same
+  receive-and-materialize sequence (five sites: `index.ts`'s stats read,
+  `spool-events.ts`, `passthrough.ts`, `gemini.ts` twice, `responses.ts`) are
+  untouched: each is shaped for its own handler and folding them together is a
+  larger change than this increment, so it is proposed rather than done.
+- The two converted branches now use that helper: receive with
+  `max_response_bytes` enforced, §5.9 lease on the received size, parse once, spill
+  released in `finally` before the client is answered. The cap applies with
+  `enabled = false`, the fourth follower of the stated rule (`enabled` decides
+  whether disk is used, not whether the body is bounded); the gated-vs-ungated
+  conflict flagged in the Gemini entry is unchanged and still unreconciled.
+- Deliberately no `createConvertedResponseBody` on either, and the reasons differ:
+  a Claude body's image blocks are not on §5.7's response allowlist (only Gemini
+  `inline_data` and Responses `image_generation_call` are), and the Gemini branch
+  never has an allowlisted position to extract because
+  `convertGeminiGenerateContentToClaude` keeps only `part.text` and drops
+  `inline_data` before any converted value exists
+  (`src/converters/gemini-to-claude.ts:189-200`, pre-existing). The second reason is
+  now pinned by a test case rather than left to the comment: a Gemini response
+  carrying both a text part and an `inlineData` part reaches the client as the text
+  alone.
+- The `openai-responses` branch became §5.7's identity shape:
+  `receiveResponseBody` then `new Response(received.readStream(), …)`, with the
+  trace line reading that same spool under a §5.9 lease instead of the old
+  `observeStream` transform. Two consequences, stated rather than hidden: the body
+  is now fully received before the client sees its first byte (exactly what
+  `/passthrough` has done since its own increment), and an upstream error body past
+  `max_response_bytes` is answered 500 instead of being forwarded — the identity
+  egresses' existing behaviour. No extraction here either: identity forwarding
+  relays whatever the upstream sent, including an `image_generation_call` result
+  the client's own route asked for as-is.
+- §5.9 note: on the converted branches the request's lease is held across the send,
+  so the response is admitted beside it — the behaviour the `/v1/messages`
+  increment introduced and pinned in `tests/unit/index-admission.test.ts`. Those
+  pins already budget both sides, so nothing moved here.
+- Reported, not fixed: the two converted branches' `!ok` exits
+  (`await upstreamResponse.text()` on a non-2xx reply) are still unbounded, like the
+  `/v1/messages` error exits. They carry the upstream's error envelope, not a
+  §5.7-allowlisted payload.
+- Tests: `tests/unit/chat-completions-response-spool.test.ts`, 10 cases. The
+  converted path: a sub-threshold body converted exactly, writing no spill and never
+  calling `Response.prototype.clone` (patched and asserted); a spilled one on disk
+  mid-receive for exactly `chunks[0].byteLength` bytes and gone before the answer
+  exists, with that answer equal to the un-spooled baseline; a body past
+  `max_response_bytes` failing `SpoolResponseTooLargeError` (500
+  `processing_error`) with a spill provably live at the breach and the upstream
+  cancelled; the cap enforced with `enabled = false`; the Gemini branch's
+  `inline_data` drop pinned. The identity path: a spilled body forwarded
+  byte-identically from the spool and freed once the client has taken it, the cap
+  enforced with spilling off, and the §5.9 pair — a trace read one byte short of
+  `ceil(bytes × factor)` refused as 503 `over_limit_error` with no spill and no
+  queue slot, an admitted one forwarded unchanged with the lease returned. 2347
+  unit tests pass (2337 before, +10); `tsc --noEmit` clean; `npm run build` clean.
+
+### feat(spool): §5.7 spools the non-SSE `/v1/messages` response, the last unbounded reader on that family
+
+Every non-streaming exit of the `/v1/messages` handler read its upstream body with
+`await response.text()`: the two Claude-client conversions that target an OpenAI
+upstream (an `openai-completions` one and an `openai-responses` one) and the
+already-OpenAI branch's conversion. Those bytes were held whole, twice — the
+string, then the parsed object — with no `max_response_bytes` anywhere on the
+path, which for a converted response carrying an image is the payload §5.7's
+allowlist cares about surviving intact.
+
+- `src/handlers/messages.ts`: all three now go through one new helper,
+  `receiveJsonResponse`, which receives with `receiveResponseBody(response.body)`
+  — spilled past `threshold_bytes`, capped by `max_response_bytes` — takes a §5.9
+  `admitMaterialization` lease on the received size, parses the body once, and
+  releases both lease and spill in `finally`. The client is sent the *converted*
+  body, never these bytes, so nothing of the spool survives the call: `readText()`
+  leaving a live spool readable is not relied on here.
+- The cap applies with `enabled = false`, following the stated rule that
+  "`enabled` only decides whether disk is used" — the third branch to do so, after
+  the Interactions egress and the native Gemini one, and consistent with
+  `passthrough.ts`/`responses.ts`. The conflict flagged in the Gemini entry is
+  unchanged and still unreconciled: the SSE framing and the router's stats read
+  gate the same receive on `enabled`. This increment adds a third follower of the
+  general rule rather than resolving it.
+- The receive sits outside `handleNonStreamingResponse`'s converting `try`/`catch`
+  on purpose: that catch re-wraps everything as `Failed to convert response: …`, so
+  a `SpoolResponseTooLargeError` raised inside it would have lost its 500
+  `processing_error` type. `handleNonStreamingResponse` gained a trailing
+  `signal?: AbortSignal` and both call sites pass `request.signal`. Behaviour
+  change stated rather than hidden: an upstream body that is not valid JSON now
+  surfaces as the parser's `SyntaxError` (still 500) instead of the conversion
+  wrapper's message.
+- No `createConvertedResponseBody` on this path, deliberately: §5.7's response
+  allowlist covers Gemini `inline_data` and Responses `image_generation_call`
+  only — Claude assistant image blocks are not on it — so a converted
+  `/v1/messages` response has no payload to extract, and calling the extractor
+  would be a no-op step added for symmetry.
+- §5.9 consequence, stated because it is new on this route: for a body with
+  nothing to extract the request's lease is held across the send, so its own
+  response is now admitted beside it and a budget sized to the request alone
+  refuses that response 503 `over_limit_error` after `admission_timeout_ms`. The
+  Gemini Interactions egress already behaves this way (its case asserts the 503);
+  the plan's "large non-ref responses use the same rule" is what makes it a rule.
+  Three pins in `tests/unit/index-admission.test.ts` moved for it and say so in
+  place: the disabled-store case, the queue/timeout case and the parse-failure
+  case now budget the request's charge *plus* its response's (the second case
+  keeps discriminating because the queued body's charge exceeds the response's).
+- Reported, not fixed: the upstream *error*-body reads at the same handler's three
+  error exits (`await response.text()` on a non-2xx upstream reply) are still
+  unbounded. They carry the upstream's error envelope, not a §5.7-allowlisted
+  payload, and are copied verbatim into the client's error, so bounding them is a
+  change to error reporting rather than a spool change.
+- Tests: `tests/unit/messages-response-spool.test.ts`, 9 cases. A sub-threshold
+  body is served exactly as the conversion produces it, writes no spill file, and
+  never calls `Response.prototype.clone` (patched and asserted); a spilled one is
+  on disk mid-receive for exactly `chunks[0].byteLength` bytes, the spill is gone
+  by the time the client's answer exists, and that answer is byte-equal to the
+  un-spooled baseline. A body past `max_response_bytes` fails
+  `SpoolResponseTooLargeError` (500 `processing_error`) with a spill provably live
+  at the breach, the upstream body cancelled and no file or reservation left;
+  the cap is asserted enforced with `enabled = false`; an unparseable body raises
+  `SyntaxError` holding no spill. Both `openai-responses` egresses are covered for
+  the cap too, for a Claude-format and an OpenAI-format client. The §5.9 pair
+  pins a refusal one byte short of `ceil(bytes × factor)` as 503
+  `over_limit_error` with no upstream call and no spill, and an admitted body
+  served unchanged with the lease returned. 2337 unit tests pass (2328 before,
+  +9); `tsc --noEmit` clean; `npm run build` clean.
+
+### feat(spool): §5.7 spools the native Gemini `:generateContent` response — the inline-data egress
+
+§5.7's response allowlist names one payload above all others: the `inlineData`
+image, audio or video part a native Gemini model generates. That is precisely the
+body the proxy was reading whole. `handleGeminiNonStreamingResponse` did
+`await response.text()` and handed the resulting string to `new Response`, so a
+base64 payload existed twice in RAM — the string, plus the response's own copy of
+it — with no `max_response_bytes` anywhere on the path.
+
+- `src/handlers/gemini.ts`: the native branch is now `relayNativeGeminiResponse`,
+  which receives the upstream body with `receiveResponseBody(response.body)` —
+  spilled past `threshold_bytes`, capped by `max_response_bytes` — and answers the
+  client with `new Response(received.readStream(), …)`, so the client's own pace
+  bounds what the proxy holds. The branch still never parses, so the upstream
+  bytes are the client's bytes: `status` and the `Content-Type`/`x-request-id`
+  headers are unchanged and the `inlineData` part crosses byte-identical.
+- Moving the native branch out of the enclosing converting `try`/`catch` is part
+  of the change, not tidying: that catch re-wraps everything into a generic
+  `Error`, so a `SpoolResponseTooLargeError` raised on the new path would have
+  lost its 500 and its `processing_error` type on the way out.
+- The trace line is the only read this branch performs, so the §5.9 lease is
+  taken only when `traceEnabled` materializes the body, and it is released in
+  `finally` before the client's copy is handed out — a body nobody reads is never
+  charged and never refused. `readText()` leaves a live spool readable, so the
+  trace read does not consume the bytes the client is about to receive.
+- **The cap applies with `enabled = false`, and here the codebase disagrees with
+  itself.** This branch follows the rule stated for the response path —
+  "`max_response_bytes` is enforced whether or not spooling is enabled, matching
+  ingress: the cap is a body bound, `enabled` only decides whether disk is used" —
+  as the Interactions branch in the same file, `passthrough.ts` and
+  `responses.ts` already do, so a response past the cap now fails 500
+  `processing_error` instead of being forwarded. Two later wirings gate the same
+  receive on `getSpoolConfig().enabled` instead: the SSE framing (where the reason
+  is different — gating avoids a per-event copy, not the cap) and the router's
+  stats read, whose entry argues that routing the disabled case through the
+  receive "would newly cap bodies the disabled spool is documented to treat
+  exactly as before". Both readings are written down and they cannot both be
+  right. This increment follows the general stated rule; the conflict is flagged
+  rather than resolved, and flipping this branch to the gated reading is one
+  condition.
+- Not covered here, and reported as a gap rather than fixed: the `claude-format`
+  branch of the same function still does `await response.text()` with no cap. It
+  routes through `convertGeminiGenerateContentToClaude`, which keeps only
+  `part.text` and silently drops every `inlineData` part, so it cannot carry a
+  §5.7-allowlisted payload today — that silent image loss is pre-existing and left
+  as it is.
+- Tests: `tests/unit/gemini-response-spool.test.ts`, 9 cases. A sub-threshold body
+  and a spilled one are both byte-identical to the upstream by sha256 with the
+  `inlineData` payload intact (the fixture is indented and non-ASCII, so a
+  re-serialize or a re-encode would fail it); the spilled one is charged to the
+  ledger for exactly its length, with `Response.prototype.clone` patched and
+  asserted never called, the file and the reservation gone once the client has
+  read it; a client abort frees the spill; a body past `max_response_bytes` fails
+  `SpoolResponseTooLargeError` (500 `processing_error`) with the upstream body
+  cancelled and no partial spill; `enabled = false` forwards byte-identically and
+  writes nothing, while still enforcing the cap; and tracing reads the body back
+  out of the spill without changing a byte the client receives. The §5.9 pair pins
+  that the budget is the trace read's: a charge one byte short of the budget is
+  refused 503 `over_limit_error` with tracing on and served 200 with it off.
+  2328 unit tests pass (2319 before, +9); `tsc --noEmit` clean; `npm run build`
+  clean.
+
+### feat(spool): §5.7 spools the router's JSON stats read instead of cloning the body
+
+§5.7's "do not call `response.clone().text()` or buffer a second copy" had one
+live exemption left: `runAttempt` in `src/index.ts` read every completed
+`application/json` response with `response.clone().json()` for the usage and
+tool-name stats. A clone keeps every remaining byte of the upstream body alive
+while the clone is parsed, so a response carrying an image paid for its whole
+base64 payload twice — the one copy the plan calls out by name, on the path that
+runs for every non-streaming JSON response.
+
+- `src/index.ts`: with `[spool] enabled = true` the stats read now uses the same
+  bounded receive path as the other response egresses — `receiveResponseBody`
+  (spills past `threshold_bytes`, capped by `max_response_bytes`) plus one
+  `readText()` parse — and the client's copy is `received.readStream()` over that
+  same spool, with `status` and headers preserved. The §5.9
+  `admitMaterialization` lease is taken on the received byte count after the
+  body is in hand, released in `finally` before the body is handed to the
+  client, and a refusal releases the received body first, so nothing is
+  charged during the client's read (same shape as `passthrough.ts` /
+  `gemini.ts`).
+- With the spool off, the pre-spool `response.clone().json()` path is unchanged.
+  This is deliberate rather than blended: §5.7 is the spool's behaviour, and
+  `receiveSpooledBody` enforces `max_response_bytes` whether or not `enabled` is
+  set, so routing the disabled case through it would newly cap bodies the
+  disabled spool is documented to treat exactly as before. Consequence, stated
+  rather than hidden: the response-side admission charge exists only while the
+  spool is on (the request-side charge is unaffected).
+- A body advertised as JSON that does not parse is forwarded as it is and
+  yields no stats, exactly as the clone path did; the error is not swallowed
+  because there is none — the bytes reach the client either way.
+- Behaviour change, from §5.7's "on breach cancel upstream and fail explicitly,
+  never truncate": a JSON response body past `max_response_bytes` now fails with
+  `SpoolResponseTooLargeError` (500 `processing_error`) instead of being parsed
+  and forwarded whole. It surfaces as the attempt's failure, which the target
+  ladder classifies as retryable (5xx), the same as the other response egresses'
+  cap errors.
+- Tests: two new cases in `tests/unit/index-routing.test.ts` — a response past
+  `threshold_bytes` whose body is on disk (one file in `responses/`) with
+  `Response.prototype.clone` patched and asserted never called, the client's
+  text byte-identical, the spill and its disk reservation gone after the read;
+  and a body past `max_response_bytes` failing 500 `processing_error` with no
+  spill left behind. Two existing pins moved for the new wiring, both stated in
+  place: `tests/unit/index-admission.test.ts`'s "holds the configured charge
+  across the sidecars" now budgets the request's charge *plus* its response's
+  (the response draws on the same §5.9 ledger now, and one byte less queues it),
+  and `tests/unit/index-routing.test.ts`'s spool-image case samples its
+  `SpoolBody.readBytes` counter at the send, since the response's stats read is
+  a spool read of its own after it. 2319 unit tests pass; `tsc --noEmit` clean.
+
+### feat(spool): §5.4 token counting understands a ref wherever it sits, so the last live shape-2 rung streams
+
+§5.9's per-rung rule — "a non-ref rung that starts from an effective spool
+acquires a fresh reservation before parsing/conversion and releases it after its
+attempt spool is complete" — cost one re-materialization that the rest of the
+implementation had already made unnecessary: `messages.ts`'s already-OpenAI
+branch expanded its refs as its first act, and only because the token counter
+could not count them where they were. Closing that consumer contract removes the
+expansion rather than charging for it, so the last live request-body
+re-materialization is gone.
+
+- `src/utils/token-counting.ts`: the `default:` branch of the block counter — a
+  block with no Claude `type` discriminator, i.e. a Chat `image_url`, a Gemini
+  `inline_data` or a Responses `image`-slice — now counts every ref it holds by
+  §5.3's own rule (`Math.ceil(ref.size / charactersPerToken)`, `ref.size` being
+  the payload's base64 character length) *on top of* the block's JSON text, which
+  measures the ref's metadata object instead. Without it the payload counted as
+  nothing: the invisible undercount §9.3 rejects, and one that
+  `estimateInputTokens` turns into a zero for the whole request.
+- **Behaviour change, surfaced rather than blended (rule 5).** `refuseUncountedRefs`
+  is deleted: a refusal became a counted approximation. The reasoning, recorded
+  because it is the one place this increment weakens a guard — the refusal was
+  never loud on a live path. Both callers of `countClaudeRequestTokens`
+  (`src/converters/openai-to-claude.ts`, `src/handlers/messages.ts`) wrap it in
+  `try/catch → 0`, so refusing an untyped ref produced a silent zero rather than
+  an error. A *malformed* ref still fails loud: `countRefTokens` asserts the shape
+  first (`assertRefShape`), so `{size: 1.5}` throws `BlobStoreError` — pinned by
+  test.
+- `src/handlers/messages.ts`: the already-OpenAI branch no longer calls
+  `rehydrateInlineBlobs`. The body keeps the ref in the field the client spelled
+  it in, the ingress hook sees it, and the send re-detects refs on the outgoing
+  body (`postJsonWithSpool`) and streams each payload at its own offset — §5.3
+  shape 3. The only expansion left in that handler is the `sdk://` branch, which
+  answers 501 before its handler reads the body.
+- Tests: `tests/unit/token-counting.test.ts` — the refusal case replaced by three:
+  the same ref counted at three positions (Chat `image_url`, Gemini
+  `inline_data`, Responses `inline`), an exact structural assertion that the count
+  is `ceil(size/4)` plus the block's own text and nothing else; a growth assertion
+  that two refs of equal JSON length but different recorded size differ by exactly
+  one token (sizes 4000/4004, so the JSON text stays the same length); and a
+  malformed ref still throwing `BlobStoreError`. `tests/unit/messages-ref-streaming.test.ts`
+  — the already-OpenAI shape-2 case replaced by a shape-3 one: the streamed body
+  is byte-identical to the same send with the payload inline, `Content-Length` is
+  the exact byte count, `duplex: 'half'`, no ref marker upstream, and the payload
+  lands back in the field the client wrote (`image_url.url`).
+- Two suites that had pinned the removed behaviour were updated to the measured
+  one, not the other way round: `tests/unit/transform-ref-matrix.test.ts` row 19
+  (already-OpenAI rung under a `before_upstream` rename) and
+  `tests/unit/request-ingress-transform-refs.test.ts` case 1 (`request_ingress`
+  op that leaves the ref in place) both flip `streamed` to `true`. The ingress
+  suite's drop case stays `false` and is now named as the one measured instance of
+  the matrix header's open cell (Rule B — shape decided from the outgoing body —
+  with a transform that removes every ref), which the converting Rule-B sends
+  still leave unmeasured.
+- Comments corrected where they documented the expansion that is gone:
+  `src/index.ts` (4 sites), `src/utils/blob-refs.ts`, `src/utils/ref-serializer.ts`,
+  `src/utils/spool-admission.ts` ("§5.9's per-rung re-acquisition has no caller
+  today"), and the headers of the two suites above plus
+  `tests/unit/handler-ref-expansion.test.ts` and
+  `tests/unit/responses-ref-streaming.test.ts`. Stale `src/index.ts` line
+  references in three files were re-anchored to the extraction pass (`:1424`) and
+  the `request_ingress` hook (`:2388`).
+- One expectation left where it was: no handler-level assertion that reported
+  input tokens are ref-derived. The mocked upstream supplies its own `usage`, so
+  the local count is not observable through the response — the counter's own suite
+  is the evidence, and an end-to-end version of it is not available yet.
+
+### test(spool): §5.4 transform contracts — a payload position is opaque, and a refused path is reported
+
+§5.4's mandate — "validation, token counting, privacy filtering, compression, and
+transforms either run before extraction or understand refs" — read as a contract
+rather than as prose, and pinned where nothing pinned it. No production behaviour
+changed: this is the evidence, plus two comments that no longer described the
+code they sat on.
+
+- `tests/unit/request-ingress-transform-refs.test.ts`, 8 cases:
+  - The load-time schema refuses every §5.4 payload position by position, not by
+    an incidental error: `messages[].content[].source.data`,
+    `messages[].content[].image_url.url` and `contents[].parts[].inline_data.data`
+    each yield exactly one `unknown path` against their own schema, while the
+    nearest legal neighbours (the `messages[].content` subtree, and a scalar
+    beside it) validate clean. `$response.choices[].message.role` reaches the
+    *other* branch — listed by the schema but not walkable by the engine — so both
+    messages are live and a reader can tell which one fired.
+  - Refused is not blocked, and that is the part worth knowing: `parseSimpleToml`
+    records the errors (`config_errors`) instead of throwing, so the op reaches the
+    engine anyway, where a deep `set` writes a literal key
+    (`message['content[].source.data']`) beside an untouched payload. A transform
+    can therefore neither read nor write a payload — the §5.4 property holds, but
+    by degradation rather than by enforcement.
+  - `request_ingress` runs on a body that is already refs. Measured through the
+    real proxy against a mocked upstream: with spooling on the store holds the
+    payload at the moment of the send (`diskEntries === 1`) even when the ingress
+    op discarded the only ref, and the upstream bytes are byte-identical to the
+    same run with spooling off — both for an op that leaves the ref alone and for
+    one that replaces its container. Stated in the file's header rather than left
+    implied: a hypothetical pre-hook rehydration is indistinguishable from
+    outside, so the ordering rests on `src/index.ts:1424` → `:2388` plus that
+    send-time count, not on a black-box difference.
+- Comments corrected to match the sends they describe: `src/index.ts` (the ref
+  invariant now names the `request_ingress` hook, which runs *between* extraction
+  and the handler, and the shape-3 sends that keep their refs, instead of
+  claiming every handler expands) and `src/handlers/responses.ts` (the three
+  converting branches no longer "expand the refs back into payloads as their first
+  act" — they carry the ref through `isBlobRef`-aware converters and the send
+  streams it; `postJsonWithSpool` re-detects, and the Gemini branch's synthetic
+  request is re-parsed by a handler that decides for itself).
+- Reported rather than fixed, pending a decision (rule 5):
+  `src/utils/request-transform.ts:496-499` still says the validator accepts
+  payload-level paths — it does not, now that `isPathWalkable` exists. Two
+  unrelated defects found while establishing the above and left alone: a TOML
+  inline op cannot `map_value` a JSON number (the inline parser reads quoted
+  values only, and the comparison is a strict `===`), and an unquoted inline
+  scalar is coerced to `""` rather than erroring.
+
+### feat(spool): §5.9 gives the request reservation back once its binary is refs
+
+§5.9's admission lifetime, read literally for the first time: "binary reduced to
+refs: release after extraction". The request lease used to be held from the
+receive of the body to the request's `finally`, so under a
+`max_materialized_body_bytes` sized for one body at a time, an image request
+could not admit *its own response* — the reservation it was still holding was
+the response's competition, and the exchange timed out at `admission_timeout_ms`
+into a 503.
+
+- `src/index.ts` returns `materializationLease` at the send boundary, once
+  `bodyText` and the parsed body carry refs instead of payloads rather than after
+  the response has been built. The condition is
+  `inlineExtraction.refs > 0 && inlineExtraction.skipped === 0`: a body that kept
+  a payload inline because JSON would escape it (§5.3's `skipped`) still
+  materializes binary and stays charged, and a body with no allowlisted payload
+  materializes in full for the whole request — under-charging is the one
+  direction this budget must not fail in (repo rule #8).
+- The release is a request-path release only. The `finally` keeps its call as the
+  idempotent backstop for every other path (parse failure, refusal, early
+  return), so nothing depends on reaching the boundary.
+- Known uncharged remainder, stated rather than left implicit: the three §5.3
+  shape-2 branches (`claude.ts`, and `messages.ts`'s sdk-URL and already-OpenAI
+  paths) expand refs back into their parsed body, so on those routes a payload is
+  live again with no reservation under it. It is bounded by the body's own
+  admitted size, and §5.9's per-rung re-acquisition is what removes it.
+  `src/utils/spool-admission.ts`'s wiring-status comment now names that and the
+  four response-side callers. (Superseded by the §5.4 token-counting entry above:
+  the already-OpenAI path keeps its refs and streams them, so two of those three
+  branches are gone — only the `sdk://` branches expand.)
+- `tests/unit/index-admission.test.ts`: the charge is sampled at the upstream
+  call for a ref-bearing image body (0 — the payloads are refs by then, and the
+  payload still reached the upstream) against a same-budget body with nothing to
+  extract (held in full); and end to end on `/v1/interactions` with a Gemini
+  route, where a budget of exactly one request's charge now admits that
+  request's own response (200, converted body intact) where a non-ref body of the
+  same shape still queues and is refused 503 `over_limit_error` after 60 ms.
+
+### test(spool): §10 request-predicate round-trip matrix, every front door × upstream mode
+
+The request half of §10's "Binary allowlist round-trip matrix", and the evidence
+§12 asks for: "Every §5.4 request predicate has round-trip and mid-stream
+retention evidence". No production code changed — the rows below are what the
+converted egress already does, now pinned.
+
+- `tests/unit/request-ref-matrix.test.ts`: 27 new cases driving the real
+  front-door handlers (`/v1/messages`, `/v1/chat/completions`,
+  `/v1/interactions`, `/v1beta/models/*:generateContent`, `/v1/responses` and
+  its `/compact` and `/input_tokens` sub-paths) against every upstream mode each
+  can be converted to — 26 combinations plus one above-threshold case.
+- Each row runs the *same* request twice: once with the payloads spilled to real
+  refs through a live spool, once with spooling off so the converter sees the
+  client's own bytes. `streamed upstream bytes equal the in-memory conversion
+  baseline` (§10) is asserted as exact string equality of the two upstream
+  bodies, so a serializer that dropped, re-escaped, reordered or truncated a
+  payload fails even though the JSON still parses. The ref run must also contain
+  no `BLOB_REF_MARKER`, carry each payload the client sent, and release its
+  leases.
+- The egress shape is asserted per row, not inferred: a streamed send must
+  declare `Content-Length` equal to its exact byte count and `duplex: 'half'`;
+  a non-streamed send must declare neither. 24 of the 26 rows are §5.3 shape 3;
+  the two `interactions→{anthropic-messages,openai-responses}` rows are shape 2
+  because `convertGeminiInteractionsToOpenAI` drops the Gemini parts before any
+  send. Six rows carry payloads a converter discards (Claude `document` blocks,
+  Chat `input_audio`/`file`, Responses `input_file`/inline skill on some
+  targets, and all Gemini parts on those two OpenAI-family targets); each is
+  asserted absent from *both* runs, so the loss is pinned as converter-level and
+  cannot start hiding behind the spool. Those are pre-existing data-loss bugs,
+  reported here rather than fixed (repo rule #8).
+- §10's "a payload above the spill threshold" is covered per position by
+  `tests/unit/blob-refs.test.ts`'s 12-position matrix and end to end by the last
+  case here: a payload above `threshold_bytes` and several 64 KiB read chunks
+  wide, on a path whose converter rewrites the envelope into a `data:` URL — so
+  the emitted JSON has to hold a prefix the ref does not, one chunk at a time.
+- Verified by mutation: adding one byte to the serializer's text emission fails
+  25 of the 27 rows (the two survivors are exactly the shape-2 rows, whose refs
+  never reach the serializer — an independent confirmation of that diagnosis).
+
+### feat(spool): §5.7 identity non-SSE response egress on `/v1/responses`
+
+The `/v1/responses` passthrough branch now forwards its non-streaming upstream
+body from a bounded spool instead of reading it whole. §5.7's "identity
+forwarding may stream the original response spool directly without parsing" and
+"do not call `response.clone().text()` or buffer a second copy".
+
+- `src/handlers/responses.ts` (`handleAsPassthrough`): the non-SSE tail used to
+  `await response.text()`, log it, and hand that same string back as the client
+  body — a full extra copy of the response, held for a trace line the default
+  log level discards, with no `max_response_bytes` on the path. The body is now
+  received with `receiveResponseBody` (spilling above `threshold_bytes`, capped
+  by `max_response_bytes`) and the client gets `received.readStream()`: the
+  write pace, not a buffer, bounds what the proxy holds. `Content-Length` is
+  still not declared — the client response headers are unchanged.
+- The pipeline trace re-reads the spool and only when `logger.traceEnabled`, so
+  the `UPSTREAM-RESP` body line is byte-for-byte what it was and tracing off
+  costs no read at all. This is the convention the request side already follows
+  (`src/handlers/passthrough.ts`).
+- §5.9 admission (`max_materialized_body_bytes`, off by default) is taken around
+  that trace read and nowhere else: the lease is acquired after the body is
+  received and released in `finally` before the client is handed the stream, and
+  a refusal releases the received body and throws `AdmissionOverBudgetError`
+  (503 `over_limit_error`) with no spill and no reservation left behind. A
+  response nobody reads is never charged and never refused.
+- A bodyless upstream response (`response.body === null`) keeps returning an
+  empty body without touching the spool; the streaming branch, the error path
+  and the header set are untouched.
+- Tests: 11 new cases in `tests/unit/responses-response-egress.test.ts` — bytes
+  below and above `threshold_bytes` forwarded identically (sha256 against the
+  upstream bytes, with a non-ASCII, indented fixture so re-serialization would
+  show), a non-JSON upstream body forwarded verbatim, the spill charged while in
+  flight and gone after the last byte, the trace body still logged in full and
+  the client body unchanged by that read, a bodyless response, a body past
+  `max_response_bytes` failing with `SpoolResponseTooLargeError` (500
+  `processing_error`) and cancelling the upstream body, a client abort freeing
+  the spill, a spill that ends short reporting `SpoolWriteError` without sending
+  a byte, and the three admission cases (not charged when unread, refused one
+  nominal byte past the budget, held at exactly `ceil(bytes × factor)` across the
+  trace read and released before the client reads). Six of the eleven fail
+  against the previous implementation, which is what says they are about this
+  change.
+- Scope: this is the identity half of §5.7's non-SSE response egress, on the one
+  branch that never converts. `/v1/responses/compact` already hands the upstream
+  stream straight through without reading it, so it has no copy to remove and no
+  materialization for `max_materialized_body_bytes` to admit; it is left alone
+  deliberately. The converted egresses that still read whole response bodies —
+  `responses.ts`'s three conversions, `messages.ts`, `openai.ts`, `gemini.ts`'s
+  other branches — remain unwired, and the P1 item "Extend shape-3 to remaining
+  request conversions" is still open.
+
+### feat(spool): §5.7 converted non-SSE response egress
+
+A converted response whose payloads were extracted now leaves the proxy as the
+JSON skeleton interleaved with the payload's blob chunks, instead of one
+`JSON.stringify` of everything. §5.7's "a converted response is fully parsed,
+runs consumers that need original bytes, extracts response blobs, and streams
+the small transformed JSON skeleton plus blob chunks to the client".
+
+- `src/utils/spool-response.ts` gains `createConvertedResponseBody(value)`
+  (`ConvertedResponseBody`): it takes the already-transformed value — the
+  handler keeps owning receive, admit, parse and its consumers, as
+  `passthrough.ts` does — extracts the §5.7 response allowlist into a
+  per-response `ResponseBlobStore`, and returns either the plain JSON string
+  (nothing extracted, or `[spool] enabled = false`) or the skeleton stream with
+  the exact `Content-Length` the serializer measured. Extraction failure, or a
+  payload `JSON.stringify` would have to escape, leaves the bytes unchanged.
+- `src/utils/ref-serializer.ts` gains an optional `onDrained` hook on
+  `createRefAwareJsonBody`: it runs exactly once on every terminal path (last
+  byte handed over, consumer cancel, short body, failed blob read) and only
+  after the generator's read handle is closed — the §5.5 ordering — so the
+  egress releases its refs and deletes the scratch store there. The SSE path
+  passes no hook and is unchanged.
+- First caller: `src/handlers/gemini.ts`'s Interactions non-streaming egress.
+  The upstream body is received through `receiveResponseBody` (§5.7's
+  `max_response_bytes` cap), admitted with one `admitMaterialization(size,
+  signal)` lease that is released in `finally` before the client write (the
+  body is released first when admission refuses), parsed, converted, and sent
+  with `Content-Length` only when it is a stream. The error path and the
+  streaming branch are untouched.
+- Tests: 7 new cases in `tests/unit/spool-response.test.ts` — a 200 KB Gemini
+  inline image delivered byte for byte (sha256 equal to the pre-extraction
+  serialization, exact `Content-Length`, several chunks, no `$spoolBlob` marker
+  on the wire), the scratch file named for the payload's sha256 and sized to it
+  while in flight and gone after the last byte, cancel mid-payload deleting it,
+  a payload-free response staying a plain string, two identical payloads as one
+  file and two leases, a deleted scratch file failing the body instead of
+  sending bytes without it, an ineligible (escaped) payload staying inline and
+  round-tripping, and `enabled = false` returning the plain string without ever
+  constructing the store. `getBlobStoreStats()` stays at zero throughout: a
+  response payload never reaches the cross-request cache.
+- Scope: this is the converted response mechanism plus its first caller (Gemini
+  Interactions). The remaining egresses that still read whole response bodies —
+  `src/handlers/responses.ts`'s three conversions (its identity passthrough's
+  non-SSE branch streams its spool unparsed since the entry above),
+  `src/handlers/messages.ts`, `src/handlers/openai.ts`,
+  `src/handlers/gemini.ts`'s other branches, and the smaller handlers — are not
+  wired yet; no converter in `src/` constructs a Responses `image_generation_call`
+  item, so the identity passthrough is where that payload actually arrives today.
+
+### feat(spool): §5.7 binary payload extraction in the SSE event pipeline
+
+A spilled SSE event is now inspected for the response allowlist (Gemini
+`inlineData.data`, Responses `image_generation_call.result`), its payload moved
+into a per-event scratch blob, and the event written back out as the original
+envelope interleaved with the payload's chunks. §5.7's "extract allowlisted
+binary payloads, replace them with refs, and emit the event skeleton interleaved
+with blob chunks", applied to the one event that actually spilled — never to the
+stream.
+
+- `src/utils/spool-events.ts` gains `locateEventPayload` (the byte span of a
+  single-line JSON `data:` payload), `spliceEvent` (prefix from the event text,
+  payload chunks from the store, suffix from the event text, then cleanup), and
+  `prepareEvent`, called from the pull loop for each spilled event. Only the
+  payload's own span is replaced, so the envelope — `event:`, `id:`, comments,
+  spacing, terminator — and every byte outside the payload are the upstream byte
+  by construction; the client receives the same base64 it would have received
+  unspooled. Small events, `\r` line endings, two-`data:`-line events, non-UTF-8
+  bytes and non-JSON data all replay their spill unread, byte for byte.
+- Cleanup order follows §5.5: the serializer's file handle is closed
+  (`reader.cancel()`) before the refs are released, the event spill returned to
+  the ledger and the store's scheduled unlinks awaited. A client disconnect
+  mid-event, a failed read or a failed parse all take the same path; `dispose()`'s
+  `leaked` count is reported when a lease is still held.
+- Admission: one `admitMaterialization(size)` lease per parsed event, taken before
+  the event is read into memory and released once its payloads are on disk
+  (payload chunks are read back from the store, not held). Waiting for a lease
+  inside the pull loop also stops upstream reads while queued (§5.9). A refusal
+  aborts the stream as §5.7 requires.
+- `src/utils/ref-serializer.ts` accepts an optional `readChunks` provider, so the
+  §5.3 serializer is reused for this egress against the scratch store instead of a
+  second serializer — and a response payload is never looked up in the
+  cross-request cache.
+- Tests: 5 new cases in `tests/unit/spool-events.test.ts` — a large Gemini event
+  among ordinary ones (scratch blob named by payload sha256 and sized to it,
+  envelope chunk byte-exact, event + `[DONE]` byte-identical, both files gone
+  afterwards), the Responses `image_generation_call` event keeping its `event:`
+  line, a spilled event with nothing allowlisted replayed from its spill with no
+  scratch blob, a disconnect mid-extracted-event leaving neither file, and a
+  materialization budget that refuses the parse (503 `over_limit_error`, upstream
+  cancelled, no `[DONE]`, nothing left on disk).
+- Honest scope note: on the identity SSE paths the consumers downstream
+  (`usage`/tool tracking) still see whole events, so this is the §5.7 pipeline as
+  specified and the groundwork for a ref-serving egress, not a heap reduction on
+  those paths today.
+
+### feat(spool): §5.7 per-response scratch blob store
+
+Response and SSE-event binary payloads no longer have a path into the §5.4
+cross-request cache. §5.7 says they are per-response scratch, deleted when the
+response ends.
+
+- New `src/utils/response-blobs.ts`: `ResponseBlobStore`, one instance per response body
+  (or per event) — content-addressed by the payload's sha256 and deduped *within* the
+  store, files named `<prefix><store-id>-<hash>.blob` directly inside the already-swept
+  `responses/`/`events/` spill directories, so the startup sweep needs no second layout.
+  `release()` is synchronous and schedules the unlink (§5.5); `dispose()` awaits those
+  deletions, removes whatever was still leased, never throws, and reports
+  `{deleted, failed, leaked}` — `leaked` counts leases, so a payload held by two broken
+  refs reports two. Construction refuses when `[spool] enabled = false`.
+- `src/utils/blob-refs.ts` gains a `RefStorage` seam (`put`/`release`/`read`) with
+  `CACHE_STORAGE` over the existing cache. `extractResponseBlobs(body, storage)` now
+  takes the store as a **required** argument, so a response payload cannot reach the
+  cross-request cache by forgetting one; `rehydrateInlineBlobs` and
+  `releaseExtractedBlobs` take it as an optional last argument defaulting to the cache.
+  One extraction algorithm, one release contract, two stores.
+- The exact-length chunked read moved to `src/utils/spool-chunks.ts` and is shared by
+  the cache (`readBlobChunks`) and the scratch store (`readChunks`) — "close file
+  handles before unlink" is the same contract in both. `spillDir` is exported from
+  `spool-body.ts` so the scratch store reuses the ensured-directory registry.
+- Tests: new `tests/unit/response-blobs.test.ts` (11) covers the completion path,
+  abort/leak reporting, write failure with no partial file or index entry, a truncated
+  file refused instead of served, a failed deletion reported, dispose idempotency,
+  `resp-blob-`/`evt-blob-` scope isolation, two live responses never sharing a file, and
+  the disabled-spool refusal. The §5.7 block in `tests/unit/blob-refs.test.ts` now runs
+  through the scratch store and asserts the cache stays empty.
+
+### test(logger): silence the proxy's own log lines in the unit suite
+
+`npm run test:unit` interleaved the proxy's log into TAP output, so a green run still printed
+`[ERROR]`/`[WARN]` lines produced by deliberate fixtures (a 500 stub, a `chmod 0o500` blob dir)
+and the log alone could not be told apart from a real failure.
+
+- `src/utils/logger.ts` gains a `silent` level (`LOG_LEVELS.silent = 4`, above every emit
+  threshold) admitted by the level whitelist, so `createLogger` suppresses all five levels at it.
+- New `tests/setup/silent-logs.ts`, imported by the `test:unit` script via `--import`, defaults
+  `LOG_LEVEL` to `silent`; `node --test` runs each file in its own process, so the default reaches
+  every suite, and child processes that inherit the env.
+- That module also drops the shapes written straight to `console.*` (`config-loader`,
+  `key-store`, the blob store, the dashboard) and the ~20 suites that pin `LOG_LEVEL: 'error'` in
+  their env object, which beats the default. A suite that asserts on log content installs its own
+  `console.*` hook on top and still sees every line.
+- Measured over the 426-suite / 2218-test run: 188 noisy lines → 0. `LOG_LEVEL=debug npm run
+  test:unit` restores all of them (565), and `LOG_LEVEL=silent` is explicit.
+- `tests/unit/cli.test.ts`'s `capture()` now redirects `console.*` alongside
+  `process.stdout`/`stderr.write`: the parser reports config errors through `console.error`, so
+  the stream-level patch alone saw an empty stream once the setup intercepted it.
+
+### fix(spool): P0 spill accounting, streamed ingress reconstruction, and loud SSE failures
+
+P0 cleanup for the spool work:
+
+- A write failure no longer leaks the current chunk's `max_total_bytes` reservation: the
+  receive loop tracks charged bytes separately from the file offset, removes the partial spill,
+  and cancels its producer. New injected-failure tests cover request, response, and SSE-event
+  spills.
+- Request reconstruction no longer calls `readBytes()` into a whole in-memory body. The rebuilt
+  `Request` carries a pull-driven spill stream, and `/passthrough` sends a fresh stream directly
+  from the raw spill with its exact length. A delayed-upstream test proves 64 KiB read bounds,
+  byte identity, and only one whole-body read for the schema/routing pass.
+- A spilled SSE event that ends short during delivery now cancels upstream as well as erroring
+  the client stream and cleaning its file/reservation. OpenAI SSE conversion errors on malformed
+  JSON or EOF before `[DONE]`; Responses-to-Claude conversion errors on malformed JSON, an
+  upstream read failure, `response.failed`, or EOF before `response.completed`, without a clean
+  close or a false `message_stop`.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit`
+**2211/2211** (0 skipped, 0 todo, 0 cancelled).
+
+### feat(spool): shape 3 graduates the `/v1/responses` passthrough send (plan §5.3 shape 3)
+
+Thirty-third increment: `src/handlers/responses.ts` no longer expands every request at the top of
+`handleResponsesRequest`. The expansion moved down into the three converting sub-handlers, which need
+it, and the native Responses passthrough — the handler's default branch — keeps its refs and streams
+the body out of L2 the way `claude.ts:154` and the native `/v1/chat/completions` send already do.
+
+- **One decision per sub-path, not per handler.** `handleAsPassthrough` decides once, on the inbound
+  body: `streamRefs = getSpoolConfig().enabled && collectBlobRefs(requestBody).length > 0`. The
+  decision precedes the `before_upstream` hook, matching `claude.ts`; the serializer then runs on the
+  post-hook body, so a hook that re-shaped the body is still described by the exact
+  `Content-Length` measured from what actually goes out (and a hook that removed the refs just
+  produces a plain-JSON stream). Spooling off or a ref-free body costs one boolean and one walk.
+- **`handleAsAnthropicMessages`, `handleAsGemini` and `handleAsCompletions` expand as their first
+  act** (`await rehydrateInlineBlobs(requestBody)`), replacing the single expansion that used to sit
+  above the dispatch. This is a correctness requirement, not an optimization, and it was measured
+  with those three expansions removed: the `openai-completions` branch relays the ref object itself
+  as `image_url.url` (`{"$spoolBlob":true,…}` where the data URL belongs), while the
+  `anthropic-messages` branch and both gemini modes fail to decode it and drop the image part — the
+  same silent drop recorded for the same two converters in increment 32, left unfixed there and here
+  as an unrelated change.
+- **Emission follows `claude.ts` exactly**: exact `Content-Length` from the serializer in a
+  conditional spread, `body: streamed ? streamed.body : JSON.stringify(upstreamBodyPassthrough)`, and
+  a conditional `duplex: 'half'` — a conditional spread skips the excess-property check, so no
+  `as RequestInit` cast is needed. Nothing else in the branch changes: the passthrough never converts,
+  so the upstream bytes and the `!ok` error path are untouched. One consequence worth naming: the
+  error report's `JSON.stringify(requestBody)` preview now shows a small ref object where it used to
+  show the payload, which is the same trade every graduated send already makes.
+- **The passthrough is the default branch, so the gate is the endpoint, not a mode list**: the
+  mode-gate case drives `openai-responses`, the `open-responses` alias (canonicalized upstream, but
+  this handler's own dispatch sees both spellings) and no mode at all.
+- **Tests** (`tests/unit/responses-ref-streaming.test.ts`, seven cases against a live spool): byte
+  identity with the shape-2 reference plus the exact byte-count `Content-Length`, `duplex: 'half'`
+  and no ref marker upstream; three refs landing at their own positions across both `input_image`
+  spellings (direct string and Chat-style `{url}` object) and a bare `input_file`; a payload larger
+  than `BLOB_STREAM_CHUNK_BYTES` reassembled whole; a ref-free body staying on the string path with
+  the spool enabled; a missing blob failing the send with `BlobStoreError`; the three passthrough
+  mode spellings; and one case per converting mode asserting the string path, no ref upstream, the
+  real payload interpolated, and byte equality with the same request sent with no ref at all.
+  Falsification: restoring the top-level expansion fails four of the seven, and removing the three
+  converting branches' expansion fails exactly the converting-mode case.
+- **Docs.** `ref-serializer.ts`'s caller list names this send; `tests/unit/handler-ref-expansion.test.ts`
+  keeps its responses case (it drives `openai-completions`, one of the modes that still expands) and
+  its header now says where the passthrough's coverage moved.
+- **Still caller-less.** `extractResponseBlobs` (§5.7's response side) and `cloneInlineBlobs`.
+
+### feat(spool): shape 3 graduates the native `/v1/chat/completions` send (plan §5.3 shape 3)
+
+Thirty-second increment: `src/handlers/chat-completions.ts` now decides once per request between the
+shape-2 expansion and the shape-3 stream, and its native send streams a ref-bearing body the way
+`src/handlers/claude.ts:154` and the converted sends in `src/handlers/messages.ts` already do.
+Previously every request through this handler expanded the payloads first and sent one large string —
+the shape-2 cost the plan says shape 3 exists to remove.
+
+- **One decision, at the body parse** (`src/handlers/chat-completions.ts:84`):
+  `streamRefs = !CONVERTING_UPSTREAM_MODES.has(upstreamMode ?? '') && getSpoolConfig().enabled &&
+  collectBlobRefs(parsedBody).length > 0`, and the expansion moved inside `if (!streamRefs)`. A body
+  expanded there has no refs left to stream, so the send site reuses the one flag. Spooling off, a
+  converting mode, or a body without a ref costs one boolean and one walk, and takes the string path
+  unchanged.
+- **Why the mode conjunct, and what it prevents (measured, not assumed).** The three branches whose
+  converters read the payload as a string — `anthropic-messages`, `openai-responses`,
+  `gemini-generatecontent` — must stay shape 2. With the conjunct removed and a ref-bearing body,
+  `completionsToResponsesBody` forwards the ref object itself upstream as `image_url.url`
+  (`{"$spoolBlob":true,…}` where the data URL belongs), while `completionsToClaudeBody` and
+  `convertCompletionsToGeminiGenerateContentBody` fail to decode it as a data URI and drop the part,
+  so the client's image reaches the upstream as nothing at all. The gate is therefore a correctness
+  requirement, not an optimization. Those two converters' silent drop of an undecodable image part is
+  pre-existing; it is recorded here rather than changed, which would be an unrelated fix.
+- **Emission follows `claude.ts` exactly**: the exact `Content-Length` from the serializer in a
+  conditional spread (fetch cannot infer a length for a streamed body), `body: streamed ?
+  streamed.body : JSON.stringify(parsedBody)`, and a conditional `duplex: 'half'` — a conditional
+  spread skips the excess-property check, so no `as RequestInit` cast is needed. The body is measured
+  after the `stream_options.include_usage` rewrite above it, so the declared length describes the
+  body that actually goes out.
+- **No validation change was needed**, unlike increment 30: `validateOpenAICompletionsRequest` never
+  inspects `image_url.url` (the Chat allowlist positions are all strings it does not bound), so a ref
+  passes validation and reaches the send.
+- **Tests** (`tests/unit/chat-completions-ref-streaming.test.ts`, six cases against a live spool):
+  byte identity with the shape-2 reference plus the exact byte-count `Content-Length`, `duplex:
+  'half'` and no ref marker upstream; two refs landing at their own positions, data URL prefix and
+  all; a payload larger than `BLOB_STREAM_CHUNK_BYTES` reassembled whole; a ref-free body staying on
+  the string path with the spool enabled; a missing blob failing the send with `BlobStoreError`; and
+  one case per converting mode asserting the string path, no ref upstream, the real payload
+  interpolated, and byte equality with the same request sent with no ref at all. Falsification:
+  forcing the gate off fails exactly two of the six (byte identity and the chunked payload — the
+  position-only case passes either way by design), and dropping the mode conjunct fails exactly the
+  converting-mode case.
+- **Docs.** `ref-serializer.ts`'s caller list names this send; `tests/unit/handler-ref-expansion.test.ts`
+  loses its chat case (the endpoint's native send is no longer shape 2, so the shape-2 file's header
+  now says where that coverage moved) — the graduation itself is what made it fail, with
+  `[object ReadableStream]` in place of the body.
+- **Out of scope, deliberately.** `/v1/completions` is an alias onto this handler but is not in the
+  §5.4 extraction gate in `src/index.ts`, so a request on that path can never carry a ref.
+- **Still caller-less.** `extractResponseBlobs` (§5.7's response side) and `cloneInlineBlobs`. (§5.4's
+  ref-aware leaf count was corrected off this list: `token-counting.ts` counts a Claude image/document
+  ref from its recorded size and refuses a ref in a block it has no position to count.)
+
+### feat(spool): §5.7's event pipeline reaches production — SSE is framed per event on both egresses
+
+Thirty-first increment: `streamResponseEvents` stops being a tested-but-caller-less primitive. SSE
+responses are now framed one event at a time on the way out, at both places a streaming response
+leaves this process: the attempt loop in `src/index.ts` and the `/passthrough/*` SSE branch in
+`src/handlers/passthrough.ts` (which returns early from that loop and so is not covered by it). Both
+are gated on `[spool] enabled` (§9.1/decision: with spooling off there is nothing to spill, and the
+relay stays today's bytes rather than paying a copy per event).
+
+- **Why this candidate.** Checked against the three the request named. (a) *Effective/attempt
+  spools*: the plan defines both (§5.2's table, and the per-rung steps at §5.5), but there is no
+  module, no config key and no code — it is the outstanding Phase-1/§5.2 item, and what it needs
+  first is a decision about threading a reservation through the transformation rungs, not a wiring
+  change. (b) *Converted response streaming*: `extractResponseBlobs` is written and tested but needs
+  per-response scratch-blob semantics decided first, which is likewise a design question rather than
+  an increment. (c) *The SSE-event pipeline*: `streamResponseEvents` was complete, unit-tested and
+  would have been dead code in `src/`. It also closes the defect §5.7 names in the live path — today
+  a large event accumulates in each consumer's buffer — and it needed no new decision.
+- **Placement is the point on the main path.** In `src/index.ts` the wrapper goes in immediately
+  after dispatch and *before* the consumers below it: the usage and tool-tracking `TransformStream`s
+  (whose `remainder` used to accumulate a whole event), the keep-alive wrapper, and the
+  `response_egress` transforms — plus the debug `response.clone()` / `.json()` path, which does not
+  exist for `text/event-stream` but is the reason framing has to precede the branch rather than
+  follow it. The response is rebuilt as `new Response(streamResponseEvents(response.body), response)`,
+  so status and headers are carried through and a client-visible header cannot drift.
+- **Passthrough needed its own wiring, for the reason the file exists.** `/passthrough/*` handles its
+  own egress and returns before the attempt loop's consumers, so the framing is inserted at the
+  `sseSource` it hands to `wrapSseStreamWithKeepAlive`, ahead of the usage tracker. One shared
+  primitive, two call sites, no duplicated logic.
+- **Tests, and the falsification that says they bite.** `tests/unit/index-routing.test.ts` gains a
+  `§5.7 SSE event framing on the response egress` suite of four cases driven through a real
+  `/v1/messages` request with an openai-completions upstream: the client stream is byte-identical
+  with the spool on and off (with the per-request message id normalized) while event order and
+  payloads survive; an event above `threshold_bytes` has a live spill on disk while the client is
+  reading it and no spill after; an event past `max_response_bytes` fails the stream with
+  `SpoolResponseTooLargeError`, emits no terminal `message_stop`, and leaves no spill; and with the
+  spool off an equally oversized event is relayed untouched with no framing. `passthrough-egress.test.ts`
+  gains the same pair for the other egress (byte identity on/off, and the cap rejecting mid-stream).
+  Disabling either wiring fails exactly three of these six — the spill case and the two cap cases —
+  while byte identity and the disabled control still pass, which is what makes them properties rather
+  than tautologies. The frame stream is `highWaterMark: 0` and pull-driven, so the spills are observed
+  *during* delivery rather than after.
+- **Fixture note.** The route-suite upstream is a progressive body (one event per `pull`) rather than
+  a single buffered chunk, which is how a real upstream streams: `[DONE]` cannot arrive in the same
+  chunk as an earlier event. Whether the proxy cancels the upstream on breach is asserted at the
+  primitive level in `spool-events.test.ts` instead, because a stub's `cancel` cannot observe it —
+  the converter drains a body that short into itself before the framing sees the oversized event, so
+  the stub has already closed and a closed stream has no cancel to call.
+- **A pre-existing fatal, found and then made non-fatal (user decision: "log, don't die").** While
+  testing this, a stray `TypeError: controller[kState].cancelAlgorithm is not a function` was traced
+  to `controller.terminate()` at `src/converters/streaming.ts:344` — the converted Claude bodies call
+  it after the terminal `message_stop`, and Node clears a TransformStream's cancel algorithm when it
+  does. A later cancel of that readable then throws *inside* `pipeTo`'s own shutdown, where the throw
+  is not this code's to catch; it escapes as an unhandled rejection, which is fatal under Node's
+  default. It reproduces with spooling **off** on a buffered upstream, so it predates this increment,
+  and one client hanging up mid-stream is enough to reach it. `src/server.ts`'s `main()` now installs
+  a `process.on('unhandledRejection')` that writes the stack to stderr (`process.stderr.write`,
+  because TUI mode reassigns `console.error`) and keeps serving; the request itself has already
+  failed on its own path. Accepted tradeoff, stated plainly: the process no longer dies on *any*
+  stray rejection, and the underlying `terminate()`/`pipeTo` hazard is still there, logged rather
+  than removed.
+- **Known limitation, not hidden.** A disk failure while reading back a spooled event errors the
+  returned stream but does not cancel upstream. The two failure paths §5.7 does name — the cap
+  breach and an exhausted spill budget — are covered, because `receiveSpooledBody` cancels the event
+  stream it was handed on its way out and that reaches `cancelSource`; both are asserted. Closing the
+  read-back gap would need a way to inject a spill read failure to test it, so it is recorded here
+  rather than added untested.
+- **Docs.** `spool-events.ts` names its two callers and no longer claims the response side is
+  callable-but-unwired; `src/utils/spool.ts`'s header no longer says the response/SSE keys are not
+  read by any path, and names where `threshold_bytes`/`max_response_bytes` are now read;
+  `src/utils/spool-admission.ts`'s header no longer claims "this module has no caller yet" — it names
+  the two call sites (`src/index.ts` before the request body is parsed, `src/handlers/passthrough.ts`
+  around its materialized response body) that the twenty-first and twenty-second increments added.
+- **Still caller-less.** `extractResponseBlobs` (§5.7's response side) and `cloneInlineBlobs`. (§5.4's
+  ref-aware leaf count was corrected off this list: `token-counting.ts` counts a Claude image/document
+  ref from its recorded size and refuses a ref in a block it has no position to count.)
+
+### feat(spool): shape 3 reaches the converted egress — `messages.ts` streams instead of expanding (plan §5.3 shape 3)
+
+Thirtieth increment: shape 3 stops being a native-`/v1/messages`-only path. `src/handlers/messages.ts`
+now decides once per request between the shape-2 expansion and the shape-3 stream, and its two
+converted sends — the OpenAI Completions one and the OpenAI Responses one — stream a ref-bearing
+body the way `claude.ts:154` already did. Previously every request through this handler ran the
+Claude→OpenAI conversion over rehydrated payloads and sent one large string, which is exactly the
+shape-2 cost the plan says shape 3 exists to remove ("shapes 1 and 3 fix the slow-upstream
+request-send window; shape 2 does not").
+
+- **One decision, at the body parse** (`src/handlers/messages.ts:232`). `streamRefs = !isSdkUrl(targetUrl) && getSpoolConfig().enabled && collectBlobRefs(requestBody).length > 0`, and the
+  expansion moved inside `if (!streamRefs)`. A body expanded here has no refs left to stream, so
+  both sends reuse the same flag. Spooling off, an `sdk://` target, or a body without a ref costs one
+  boolean and one walk, and takes the string path unchanged.
+- **The converter had to learn to carry a ref, re-prefixed.** `convertClaudeContentToOpenAI` used to
+  splice `` `data:${media_type};base64,${data}` `` into `image_url.url`; a ref there would have been
+  stringified as `[object Object]`. A Claude `source.data` is *bare* base64, so its ref carries
+  `prefix: ''` — the converted position needs the data URL back: `{ ...ref, prefix }`. One ref in,
+  one ref out, so the lease accounting is unchanged, and the serializer emits `"<prefix>"` plus the
+  payload bytes, byte-identical to the interpolation. Flipping the branch to `data` without
+  re-prefixing fails four of the new cases — the re-prefix is load-bearing, not cosmetic.
+- **The already-OpenAI branch stays shape 2, deliberately.** A request with `isOpenAIFormat` and no
+  Claude-format tools goes upstream as the client spelled it, and its `image_url`/`inline_data`/
+  `input_image` refs are positions `token-counting.ts` refuses to guess at (`refuseUncountedRefs`).
+  Leaving them in place would make `estimateInputTokens`' catch degrade the whole count to 0 (§9.3's
+  miscount), so that branch expands at entry (`messages.ts:297`) and the count stays honest.
+- **What the §5.3 shape-3 eligibility rule buys here.** The converted Responses position
+  (`input[].content[].image_url.url`, object form) is on the allowlist because
+  `completionsMessagesToResponsesInput` copies `part.image_url` by reference, so the re-prefixed ref
+  survives at that path. `JSON_VERBATIM_PAYLOAD` is what makes the declared `Content-Length` exact:
+  the skeleton's bytes plus each ref's recorded `size`, measured without reading a blob.
+- **Validation had to accept a ref where it looks for a payload** (`src/utils/validation.ts`). The
+  Claude-format path validates *before* conversion, on the ref-bearing body, so a spooled image was
+  rejected as `…source.data is required for base64 images`. The new `sourceDataSize` helper reads a
+  ref's recorded `size` (`assertRefShape` first, so a malformed ref is refused rather than measured)
+  and falls back to the field's own length, and both the image and document branches bound by it.
+  That is the size the extraction recorded, not `JSON.stringify(ref).length` — the new test asserts a
+  ref whose recorded `size` exceeds the cap is rejected while a small one passes, which a
+  field-as-text bound could not distinguish.
+- **Tests.** `tests/unit/messages-ref-streaming.test.ts` (new, 8 cases) is the plan's interesting
+  path: the conversion sits between the ref and the send. Both converted sends are asserted
+  byte-for-byte against the shape-2 string path for the same request, with multi-byte text in the
+  skeleton so `Content-Length` is pinned as bytes rather than characters; two refs land at their own
+  positions in order; a payload larger than `BLOB_STREAM_CHUNK_BYTES` crosses the chunk boundary; a
+  ref-free control still sends a string with no `Content-Length` and no `duplex`; a spooled image is
+  accepted through validation; the already-OpenAI branch is asserted *not* to stream; and a blob
+  missing from L2 rejects the send with `BlobStoreError` instead of putting a truncated body on the
+  wire (repo rule #8). `claude-to-openai.test.ts` gains the ref-through-the-converter case and
+  `validation.test.ts` the ref-size cases. The graduated case left
+  `tests/unit/handler-ref-expansion.test.ts`, whose mock only records `String(init?.body)` and so
+  cannot see a stream; that file is the shape-2 suite and its header now says which paths left it.
+- **Consequence, stated rather than hidden:** input usage for a spooled request through this handler
+  now follows the §5.3 rule — `Math.ceil(base64 chars / 4)` for the payload with fixed block metadata
+  dropped — instead of the tiktoken count over the inline string. The plan sanctions the difference
+  ("an approximation and need not match the pre-ref/tiktoken result"), and
+  `tests/unit/index-routing.test.ts` now asserts the reported usage equals exactly that sum, which is
+  what proves the payload was measured from the ref's recorded length rather than read.
+
+### feat(spool): first ref-aware egress — the native `/v1/messages` send streams the refs (plan §5.3 shape 3)
+
+Twenty-ninth increment: shape 3 gets its first caller. `src/handlers/claude.ts`'s native
+`/v1/messages` send is the one place where a ref-bearing body is no longer expanded: the refs stay,
+and the send streams the JSON out of L2 — skeleton bytes, then each blob read a chunk at a time at
+the offset its ref occupies — so the expanded body never exists. Source: `upstream_mode =
+anthropic-messages` (the `case 'messages'` dispatch in `src/index.ts`).
+
+- **One decision, at the top of the handler.** `streamRefs` is computed where the shape-2 expansion
+  already lived — `!isSdkUrl(targetUrl) && getSpoolConfig().enabled && collectBlobRefs(requestBody).length > 0`
+  — and the send site reuses it, because a body expanded there has no refs left to stream. `enabled`
+  gates the walk, so a deployment with spooling off (§9.1) pays one boolean and a ref-free body
+  (the common case) takes the string path unchanged. The `sdk://` branch stays on shape 2: it is
+  handed the parsed body object itself, and `handleSdkAnthropicRequest` is a 501 stub.
+- **What the send does.** `createRefAwareJsonBody(upstreamBody)` returns the stream *and* the exact
+  byte length, measured from the skeleton plus each ref's recorded `size` without reading a blob;
+  that value goes out as `Content-Length` (fetch cannot infer a length for a streamed body, and a
+  stale one is worse than none, §5.3), and `duplex: 'half'` is spread in only on that path. No
+  `as RequestInit` cast is needed here, unlike `src/handlers/passthrough.ts:271`: a conditional
+  spread avoids the excess-property check that a plain `duplex` key trips.
+- **Byte identity is the property, and it is asserted against the other path.** The new tests send
+  the same request twice — once with a live spool (refs stream) and once with spooling off (the
+  expanded string) — and compare the bytes the fetch call actually carried. That catches a
+  serializer that dropped, re-escaped, reordered or truncated a payload, which a
+  parses-back-to-the-right-JSON assertion would not. The fixture's skeleton carries multi-byte text
+  on purpose, so `Content-Length` is pinned as a byte count rather than a character count.
+- **Five cases, none vacuous.** Byte identity + exact `Content-Length` + `duplex: 'half'` + no
+  `$spoolBlob` in the bytes; two refs in one body landing at their own positions in order; a payload
+  larger than `BLOB_STREAM_CHUNK_BYTES` (64 KiB) reassembled against the reference, so the chunk
+  boundary is actually crossed; the negative control, a ref-free body with spooling *on*, still
+  sent as a string with no `Content-Length` we set and no `duplex`; and a ref whose blob is gone
+  from the store, which must reject the send with `BlobStoreError` rather than put a truncated or
+  ref-bearing body on the wire (repo rule #8). Removing the `createRefAwareJsonBody` line fails
+  exactly four of them — the fifth is the negative control and passes either way.
+- **The mock had to learn to drain a stream.** `tests/unit/handler-ref-expansion.test.ts`'s
+  `String(init?.body)` recorded `"[object ReadableStream]"` once the handler streamed, which is the
+  falsification that found the claude.ts case there. That file is the shape-2 suite, so its claude
+  case moved to `tests/unit/claude-ref-streaming.test.ts` rather than being taught to drain; its
+  ref-free case stays, because a body with no ref takes this handler's shape-2 fallback.
+- **Consequences, stated rather than hidden.** 1) A native `/v1/messages` request on a spooling
+  deployment now pays one extra full walk of the parsed body (`collectBlobRefs`) before the send.
+  2) The `Sending to upstream:` debug line, the `upstream-request` trace line and the upstream-error
+  preview now show a small `$spoolBlob` object where an allowlisted payload used to be — smaller,
+  and the payload is no longer printed. 3) The audit that cleared this: none of the ten
+  `request-transform.ts` builtins or five ops reads an allowlisted payload position (they read
+  `type`, `role`, `id`, `tool_use_id`, schemas, `system` blocks, headers, `model`, `input`), so
+  `before_upstream` on a ref-bearing body is behaviourally safe — only its trace output changes.
+- **Docs.** `ref-serializer.ts`'s header no longer says it has no production caller: it names this
+  send, and states that graduation is per handler, in the handler. `blob-refs.ts`'s header now says
+  the same about the shape-2/shape-3 fork, and README's spool section records the native
+  `/v1/messages` send as the graduated one.
+- **Still caller-less.** `extractResponseBlobs` (§5.7's response side) and `cloneInlineBlobs` — next,
+  and unchanged by this increment. (`streamResponseEvents` has since gained its callers at both
+  egresses in the thirty-first increment.)
+
+### feat(spool): refs cross the send boundary, handlers expand, plan §5.3 (shape 2)
+
+Twenty-eighth increment: the §5.3 send boundary stops putting the payloads back. Until now
+`src/index.ts` rehydrated every ref at the boundary, so the extraction's RAM relief ended one step
+after it began: routing, the attempt builders, conversion, `before_upstream`, the privacy/kompress
+passes and the `new Request(…, { body: bodyText })` rebuilds all carried the full binaries again.
+The boundary now keeps the refs — which are plain JSON data — and each dispatch handler calls
+`rehydrateInlineBlobs` on its parsed body as its first act.
+
+- **Why the handlers and not the boundary.** Dispatch runs *after* it, once per attempt and once per
+  rung of the retry ladder, and one composite or fusion alias's body can map to several modes — so
+  the boundary cannot know which mode, let alone which handler, is about to read the body. A
+  dispatch-site expansion would instead pay a second full-body parse and re-serialize on every
+  attempt. Doing it in the handler costs one walk of the body it has already parsed, and it is the
+  last point that still precedes every consumer of the payloads: conversion, the request validators,
+  the `before_upstream` hook and the upstream send all see original bytes. This is the caller order
+  chosen with the user (§5.3 shape 3, Q1).
+- **Expansion must precede validation, and now provably does.** `validateClaudeMessage` refuses a
+  non-string where it expects the base64 payload (`…source.data is required for base64 images`), so
+  a ref surviving into a Claude-format request would 400 every spooled image. Disabling the
+  expansion in `claude.ts` and `messages.ts` makes exactly the two expected new tests fail, the
+  second with that validator message verbatim — the ordering is a load-bearing property, not a
+  claim.
+- **Nine parse sites, six files.** `claude.ts` (`/v1/messages` native), `messages.ts`,
+  `gemini.ts` (Interactions and `:generateContent` — the latter also serves
+  `handleGeminiRequestForMessages`, which merely delegates), `openai.ts` (`:generateContent`),
+  `responses.ts` (`/v1/responses`, `input_tokens`, `compact`) and `chat-completions.ts`. The
+  `chat-completions.ts` call sits *outside* the `try` whose `catch` reports "Invalid JSON body", so a
+  blob-store failure reports itself instead of being relabelled a client parse error. No other parse
+  site can see a ref: extraction is gated on the endpoints listed at `src/index.ts:1389`, which is
+  also why `/v1/messages/count_tokens` cannot — see the consequence below.
+- **The auth server is the one pre-dispatch consumer that must see the old bytes.** §5.8's
+  projection covers this when an uploader is configured. Without one, the auth block now expands a
+  `structuredClone` of the body into `authBodyText` and `doAuthRequest` posts
+  `authBodyText ?? bodyText`. `structuredClone` shares nothing with the original, so the leases stay
+  with the body that owns them, and the clone takes no lease of its own — the test asserts the sweep
+  still finds the blob evictable after the request.
+- **Consequences, stated rather than hidden.** 1) A route's `request_ingress` transforms and the
+  `LOG_LEVEL=debug` `test_model.log` dump run per attempt on the ref-bearing text, so an operator's
+  transform that reads an image field now sees a `$spoolBlob` object, and the dump prints refs where
+  it printed base64. 2) The handler's own inbound debug log has the same property — it is emitted
+  after the expansion, so it prints payloads; the pre-handler ones do not. 3) `N` attempts mean `N`
+  expansions, i.e. `N` blob-store reads of the same payload (each rung rebuilds its body from
+  `bodyText`); the ladder has no cache for this. 4) `countRefTokens` stays unreachable:
+  `/v1/messages/count_tokens` is not in the extraction gate, so its handler can never receive a ref.
+  Graduating it would mean extending the gate and letting `validateClaudeTokenCountingRequest` accept
+  refs — a decision not taken here.
+- **Docs corrected where the seam move made them false.** `blob-refs.ts`'s header and
+  `rehydrateInlineBlobs`'s doc now describe the handler-owned expansion; `ref-serializer.ts`'s
+  "wiring means the boundary has to stop rehydrating" note became "a ref-aware handler streams
+  instead of expanding"; and §5.9's reason for not releasing the materialization lease at extraction
+  now cites the handler's re-materialization, which is what keeps that reasoning true.
+
+`tests/unit/handler-ref-expansion.test.ts` is new: 10 cases driving the real exported handlers with
+a ref-bearing `Request` built by the real `extractInlineBlobs` against a live temp-dir store and a
+stubbed `fetch` that records the raw upstream body text. Each case asserts a ref really was
+extracted (`refs === 1`, `skipped === 0`) and that the serialized request really carries the marker,
+so none can pass vacuously, then asserts the payload is back at the exact position the handler reads
+(`messages[0].content[1].source.data`, `image_url.url`, `contents[0].parts[1].inline_data.data`, …).
+The Claude-format case is titled for the validator ordering above; the last case pins the no-op —
+a ref-free body is left untouched and the marker never appears.
+`tests/unit/index-auth-projection.test.ts` grew the no-uploader carve-out: the auth body must carry
+no marker, and the post-request sweep must still expire the blob (a lease leaked by the clone would
+keep it alive). Reverting the clone's expansion fails that test.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2169/2169**
+(0 skipped, 0 todo, 0 cancelled), +10 over the 2159 baseline.
+
+Byte-identity holds by construction: the JSON round trip through `bodyText` and the attempt builders
+already happened before this increment, so the upstream bytes are what they were. The next increment
+is shape 3's first wired route — `/v1/messages` with `upstream_mode = anthropic-messages` streaming
+its body through `createRefAwareJsonBody` instead of expanding it.
+
+### feat(spool): §5.8's wiring at the shape-2 boundary, plan §5.8
+
+Twenty-seventh increment: `auth_with_body` now hands the auth server external links instead of inline
+binaries. The three §5.8 pieces that landed caller-less (`InlineExtraction`, `uploadBlobsForAuth`,
+`buildAuthProjection`) meet at the §5.3 shape-2 boundary in `src/index.ts`, between the erase step
+and the rehydration — the last point at which the refs exist and the first point at which the body
+is final.
+
+- **Upload before rehydration, project, then send the projection.** The block runs only when an
+  uploader is configured, `auth_with_body` is on, auth is configured and the body actually extracted
+  refs; it uploads, builds the projection from the returned `hash → url` map, and stores the
+  projection text in `authBodyText`. The deferred `doAuthRequest` then sends
+  `authBodyText ?? bodyText`, so auth receives text and tools with their final post-erase values and
+  every inline payload as an `external_blob` link, while model resolution and every attempt builder
+  still read the rehydrated `routeBody` with the original bytes. §5.8's "if no external uploader is
+  configured, preserve the existing full-body auth behavior" is the `externalUpload === null` case,
+  which skips the block entirely.
+- **The upload list comes from the leases, not from a body walk.** `InlineExtraction` gained
+  `blobs`, the *distinct* blobs behind the extraction's leases in first-lease order (deduped, unlike
+  `hashes`, which is one entry per ref so the owner can release repeats). Uploading from the body
+  would also find a `$spoolBlob` ref a client forged into a field of its own, and would upload a
+  blob this request never leased; uploading from the leases cannot. It also makes the caller
+  independent of the walk order and gives the uploader exactly the identity and stored length it
+  must declare.
+- **The leases are already held.** §5.8's "renew the blob's existing lease throughout upload, auth
+  fetch, and the subsequent upstream send" needs no new code: the request's extraction lease lives
+  until the handler's `finally`, and the idle sweep only expires `refs === 0` however long a live
+  lease is held. The new suite samples a sweep inside each stub (upload, auth, upstream) and gets
+  `[0, 0, 0]`, then gets `1` from the same sweep after the request — so the zeros are a property of
+  the lease and not of a sweep that never fires.
+- **Failure is auth failing, not a substitute body.** An unreachable endpoint, a non-2xx, a receipt
+  that disagrees with what was sent or a projection that finds no link all throw out of this block,
+  before `doAuthRequest` runs: the auth server is never asked to validate a link-less body, and no
+  attempt is built. `ExternalUploadError` and `AuthProjectionError` are `ClaudeProxyError`
+  subclasses, so they exit through the existing `createErrorResponse` (500 `processing_error`, or
+  504 `upstream_timeout` for the uploader's own abort) with the endpoint's status and no echoed
+  signed URL, token or endpoint body.
+- **One honest cost, stated rather than hidden:** a forged ref is only refused when the projection
+  walks the body, which is *after* the real blob has been uploaded — so that request uploads one
+  object it will not use. The test asserts the upload count and the release, and the object expires
+  through the store's lifecycle rule, consistent with the "no proxy delete" decision.
+
+Also fixed: the projection was serialized as `JSON.stringify(buildAuthProjection(body, links))`,
+which stringifies the `{ body, refs, bytes }` wrapper rather than the projected body — the auth
+server would have received a JSON envelope around the request instead of the request. Typecheck and
+build both pass either way; the mutation check (reverting the line) fails 2 of the new suite's 7
+tests.
+
+`tests/unit/index-auth-projection.test.ts` is new: 7 cases driving the real handler with a stubbed
+`fetch` that separates the upload, auth and upstream calls. They pin the upload's wire contract
+(`PUT`, `Content-Length` and `X-Blob-Sha256` over the stored base64 text, the streamed body
+byte-for-byte), that auth receives the link and *not* the payload while upstream receives the
+payload and neither the link nor the signed URL, the sweep evidence above (in-flight `[0, 0, 0]`,
+`[1]` after), the rejected upload and the disagreeing receipt (500, no auth call, no upstream call,
+lease released), the no-uploader and `auth_with_body`-off paths (no `PUT`; a `GET` with no body),
+two refs to one payload (one `PUT`, both links), and a client-forged ref (500 naming the hash, one
+`PUT` for the real lease only). `tests/unit/blob-refs.test.ts` grew the `blobs` field (6 whole-record
+expectations plus a deduped-list assertion).
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `tests/unit/index-auth-projection.test.ts`
+7/7; `tests/unit/blob-refs.test.ts` 29/29; `npm run test:unit` **2159/2159** (0 skipped, 0 todo,
+0 cancelled), +7 over the 2152 baseline.
+
+With this, §5.8 is complete apart from the "best-effort delete external objects after the auth
+decision" the user's "no proxy delete" decision replaced. The next increment is the response side:
+§5.7's `extractResponseBlobs` and the first caller of the §5.3 shape-3 serializer.
+
+### feat(spool): the §5.8 external uploader, plan §5.8
+
+Twenty-sixth increment: the transport the previous increment's keys were waiting for.
+`src/utils/external-upload.ts` exports `uploadBlobsForAuth(blobs)`, which streams each distinct L2
+blob to the configured endpoint and returns the `hash → signed URL` map that `buildAuthProjection`
+takes as its `links` argument. Like the three increments before it, it lands **caller-less**: the
+§5.3 shape-2 wiring is the next increment.
+
+- **One `PUT` per distinct blob, to the endpoint's own contract.** Two refs to one payload are one
+  stored object (§5.4), so a repeated hash uploads once; two different sizes for one hash throw
+  rather than picking one. The body is the stored base64 text itself — no JSON envelope, no
+  re-encoding — streamed 64 KiB at a time, with an exact `Content-Length`, `X-Blob-Sha256`,
+  `X-Blob-Size`, `Content-Type: application/octet-stream`, and `Authorization: Bearer` only when
+  `external_upload_token` is set. Uploads run one at a time: bounded connections, and a failure
+  stops before the next blob leaves the host.
+- **Every field of the answer is checked before the URL is used.** The endpoint answers
+  `{ url, sha256, size, expires_in }`; the proxy requires an absolute `https:` URL with no embedded
+  credentials, a `sha256` equal to the uploaded hash (case-insensitively — it is hex, so case is the
+  endpoint's), a `size` equal to the uploaded length, and an `expires_in` at or above
+  `external_url_min_lifetime_s`. §5.8: "Never silently fall back to an empty binary field or send a
+  broken link."
+- **Redaction is a property of the module, not of its caller.** The signed URL carries its own
+  credentials, and these errors end up in logs, so the URL, the token, the configured endpoint and
+  the endpoint's error body are never echoed — the non-2xx message states the status alone, and
+  transport failures go through `classifyTransportError`, whose messages are already free of
+  hostnames and ports. Tests put a signed URL in an endpoint's error body and a credential in a
+  returned link and assert neither reaches the message.
+- **A blob that cannot be read fails before the request exists.** `readBlobChunks` is a lazy async
+  generator, so its index, expiry, file-open and on-disk-length checks would otherwise run only when
+  the peer drains the body — an unknown hash could "succeed" by sending nothing. The body helper is
+  async and pulls the opening chunk before `fetch` is called, so the refusal happens in the
+  pre-flight instead. Backpressure comes from `pull` (one chunk per unit of demand, §5.7's
+  convention), a short stream errors rather than passing off a short body as the declared length,
+  and `cancel` closes the L2 handle.
+- **The timeout is ours, so the message can state it.** One `AbortController` and a per-blob timer
+  (`external_upload_timeout_ms`, `unref`'d so a settled request leaves no pending timer) abort the
+  upload; because that signal has exactly one source, an abort is reported as
+  `timed out after N ms` (504, `upstream_timeout`) instead of being guessed at from an `AbortError`.
+- **No proxy-side delete after the auth decision.** The proxy uploads and forgets; objects expire
+  only through the store's own bucket lifecycle rule, which the operator configures. This is a
+  decision taken with the user (2026-11-04) and it knowingly diverges from §5.8's "best-effort
+  delete external objects after the auth decision" — the twenty-fifth increment's forward pointer
+  listed that delete as part of this module, and this is where it was dropped. §5.8's other
+  requirements hold unchanged: nothing here is persisted, cached or resumed, so external objects are
+  never request recovery state.
+- **Leases belong to the caller (§5.5).** This module reads blobs and never retains or releases one.
+  A held lease keeps `refs > 0` and the idle sweep only expires `refs === 0`, so §5.8's "renew the
+  blob's existing lease throughout upload, auth fetch, and the subsequent upstream send" is
+  satisfied by holding it — slow external I/O cannot become a TTL deletion. The wiring increment
+  owns taking and releasing it across upload, auth and send.
+- **An unconfigured uploader is a refusal, not an empty map.** §5.8: "If no external uploader is
+  configured, preserve the existing full-body auth behavior." A caller that reached the uploader
+  anyway is misconfigured, so `externalUpload === null` throws without opening a request — an empty
+  map would have silently produced a link-less auth body.
+
+`src/utils/external-upload.ts` is new (it reuses `readBlobChunks`/`LeasedBlob` from `blob-store.ts`,
+`ClaudeProxyError`/`classifyTransportError` from `errors.ts`, and `getSpoolConfig` from `spool.ts`;
+`UploadableBlob` is `Pick<LeasedBlob, 'hash' | 'size'>` rather than a new interface, since §5.8 keeps
+exactly the "small ref skeleton" in memory across external I/O).
+`tests/unit/external-upload.test.ts` is new: 17 cases in four blocks — the request (one PUT per
+distinct blob with the exact header set and streamed body, the omitted bearer, the empty input, the
+unconfigured refusal, the two-size refusal, the unreadable blob with no partial map), receipt
+verification (foreign hash, wrong size, hash case, the lifetime boundary at 59/60/61 with a
+non-integer, a non-2xx whose body is asserted absent, non-JSON, a non-object answer, and the
+`http:` / non-URL / embedded-credential / empty-URL links), failures (the timeout's status and type
+with no retry, and an `ECONNREFUSED` classified to 502 `upstream_unreachable` with the endpoint
+asserted absent), and one test against a real `node:http` server that inspects the received method,
+headers and byte-for-byte body — the framing a stubbed `fetch` cannot prove. Mutation gate: deleting
+the explicit `Content-Length` from the request headers fails two of the 17, including the real-server
+one.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `tests/unit/external-upload.test.ts`
+17/17; `npm run test:unit` **2152/2152** (0 skipped, 0 todo, 0 cancelled), +17 over the 2135
+baseline.
+
+The module is inert until it is wired: nothing calls `uploadBlobsForAuth`, so configuring the
+uploader today still cannot change a request, and `README.md`'s `[spool]` bullet says so. The wiring
+at the §5.3 shape-2 boundary in `src/index.ts` — upload from the still-extracted body's hashes
+*before* the rehydration, build the projection from the returned map, hold the leases through the
+upstream send, and fail auth explicitly on any upload failure — is the next increment.
+
+### feat(spool): external uploader config surface, plan §5.8
+
+Twenty-fifth increment: the `[spool]` keys that opt into §5.8's external uploader, and the
+validation that keeps them from half-existing. No upload happens yet — the transport lands next —
+so this increment's job is to make the decision explicit and checkable at startup.
+
+- **Four keys, all under the existing `[spool]` section.** `external_upload_url` names the HTTPS
+  endpoint that will receive each spooled blob and answer with a short-lived signed download URL;
+  `external_upload_token` is an optional bearer for it; `external_upload_timeout_ms` (30000) bounds
+  one blob upload and `external_url_min_lifetime_s` (900) is the shortest signed-URL lifetime the
+  uploader will accept. The proxy uploads and stores no object-store credentials and signs nothing
+  itself — the endpoint does the signing, which is why the keys stop there.
+- **The absent state is the load-bearing one.** §5.8: "If no external uploader is configured,
+  preserve the existing full-body auth behavior." `SpoolConfig.externalUpload` is therefore
+  `SpoolExternalUploadConfig | null`, and only the absence of `external_upload_url` produces
+  `null`. A token, timeout or lifetime on its own throws rather than resolving to a null uploader
+  the operator did not ask for.
+- **HTTPS only, and the message never quotes the value.** The blob and its signed URL cross the
+  public network, so any other protocol is refused with the protocol it found; a URL that embeds
+  credentials (`https://user:pass@…`) is refused too, because it would land in the plaintext config
+  file and in any error that echoed it — `external_upload_token` is the key for that. The error
+  names the key and nothing else, and a test asserts the credential is absent from the message.
+- **Configured without `enabled = true` is a startup error**, checked before the spool directory is
+  touched: the uploader's whole input is spooled blobs, and a disabled spool produces none. A test
+  asserts the directory was not created by the refused attempt.
+- **The lifetime floor is 60 s and is a floor, not a check.** The plan asks for a signed URL that
+  outlives the auth fetch it is handed to; `src/index.ts`'s `doAuthRequest` issues its `fetch` with
+  no timeout and no `AbortSignal`, so there is nothing to compare against. Rather than invent an
+  auth timeout, the resolver refuses lifetimes under a minute and accepts the rest on the
+  operator's word, which the README says in as many words. This was a decision taken with the user,
+  not a reading of the plan.
+- **Parser and serializer, not just the resolver.** `external_upload_url` and
+  `external_upload_token` are quoted `[spool]` values, so a new `SPOOL_STRING_KEYS` set (alongside
+  the existing `SPOOL_NUMERIC_KEYS`, for the same parse-time-typo reason) admits them in both the
+  quoted and unquoted branches; the two numbers join `SPOOL_NUMERIC_KEYS`; and the serializer writes
+  the strings after `dir` and the numbers in its existing loop, so a dashboard save round-trips all
+  four. The token is serialized verbatim, matching `api_key`: that function writes the operator's
+  own config file, which already holds secrets in plaintext — §5.8's redaction applies to logs.
+
+`src/utils/spool.ts` gains `SpoolExternalUploadConfig`, the `externalUpload` field on
+`SpoolConfig`, `EXTERNAL_UPLOAD_DEFAULTS`, `EXTERNAL_URL_MIN_LIFETIME_FLOOR_S`, and the
+`resolveExternalUpload` / `positiveIntegerSetting` helpers; `src/utils/config-loader.ts` gains the
+keys on `ProxyConfig.spool`, `SPOOL_STRING_KEYS`, and the parse/serialize wiring.
+`tests/unit/spool.test.ts` grows a §5.8 block (10 test cases: the URL-only default resolution, URL
+normalization with a trimmed token, the three orphan-key refusals, non-HTTPS, non-URL, empty,
+embedded credentials with the credential asserted absent, empty token, non-positive and fractional
+timeout, the lifetime floor boundary at 59/60/61, and the disabled-spool refusal with its
+no-side-effect assertion) plus a default-state case, and `tests/unit/config-loader.test.ts` extends
+the full-key round-trip with the four keys and adds a startup case for the installed uploader
+beside the refusal one.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `tests/unit/spool.test.ts` 64/64 and
+`tests/unit/config-loader.test.ts` 227/227; `npm run test:unit` **2135/2135** (0 skipped, 0 todo,
+0 cancelled), +15 over the 2120 baseline.
+
+The keys are inert: nothing reads `getSpoolConfig().externalUpload` yet, so setting them today
+cannot change a request. `README.md`'s `[spool]` bullet documents them and says so. The uploader
+module — streaming L2 upload, signed-URL validation, hash/size verification, best-effort delete
+after the auth decision, the lease renewal across upload/auth/send, and the wiring at the §5.3
+shape-2 boundary ahead of the rehydration — is the next increment.
+
+### feat(spool): auth_with_body external-link projection, plan §5.8
+
+Twenty-fourth increment: the §5.8 projection itself. `src/utils/auth-projection.ts` exports
+`buildAuthProjection(body, links)`, which returns a deep copy of the request body with every
+request `BlobRef` replaced — at the same field path, keeping the surrounding metadata — by the
+custom `external_blob` object the auth service is contracted to fetch and verify: `type`,
+`url`, `sha256`, `size`, `media_type`, `encoding: 'base64'`. Text and tools keep their final
+post-sidecar values, and everything that was never a ref passes through untouched.
+
+- **The projection is a copy, never the caller's body.** §5.8: "The upstream request is
+  unchanged in semantics: it still streams the original inline base64 fields from the local
+  blobs." Replacing the body's own refs would destroy the payloads before the upstream send and
+  could put a link object — or a replacement URL — in front of a model API, which the plan
+  allows only under a separate product decision that has not been made.
+- **Same path, no renaming.** Claude `source.data` becomes the object while `source.type` stays
+  `"base64"` and `source.media_type` stays; Chat `image_url.url`, `input_audio.data` and
+  `file.file_data`, Responses `input_image.image_url`, `input_file.file_data` and the inline
+  skill's `source.data`, Gemini `inlineData.data`/`inline_data.data` and Interactions `input[].data`
+  are all replaced in place. No field is renamed to `source.url`, `file_url`, `fileUri` or `uri`.
+  The `data:` prefix is dropped from the auth body, and the media type it stated moves into the
+  link: `media_type` is the ref's own prefix first, then the media-type sibling the schema puts
+  beside the payload (`media_type`, `mime_type`, `mimeType`), then `null`. Chat `input_audio`
+  gets `null` — its `format: "wav"` is a container name, not a media type, and reading one out of
+  it would be a guess the auth service would then verify against nothing.
+- **The link source is a hash→URL map, not a callback.** §5.8's upload is streaming network I/O,
+  so it cannot be a synchronous seam; with a `ReadonlyMap` this module stays pure and
+  synchronous and the upload is a separate, plainly ordered step its caller owns. The map is
+  keyed by hash because two refs to one payload are one stored object, and the caller chooses
+  the key set: §5.2's extraction `hashes` list names the blobs *this* request leased, where
+  walking the body would also find a client-forged ref and upload a blob the request never
+  owned.
+- **Fail closed, in the right order.** A ref with no link, an empty URL, a non-URL and a
+  non-HTTPS URL each throw an `AuthProjectionError` — §5.8's "Never silently fall back to an
+  empty binary field or send a broken link". `assertRefShape` runs *before* the map is
+  consulted, so a forged ref's bogus `size` can never be stated as fact in a link that the auth
+  service would treat as verified metadata. Signed URLs are never echoed into an error message:
+  they carry their own credentials, and §5.8 redacts those from logs.
+- **The walk is marker-based and holder-aware**, following `collectBlobRefs`/`restoreRefs` in
+  `blob-refs.ts`: a ref is a leaf, each holder is asked for its own media-type sibling, and a
+  single `Object.entries` loop covers arrays and objects.
+
+`tests/unit/auth-projection.test.ts` is new (11 tests). The §10 matrix item runs over all twelve
+allowlisted positions of the same body `blob-refs.test.ts` uses, with links built from real
+`extractInlineBlobs`-produced refs over real L2 blobs, and asserts per position a
+`deepStrictEqual` against the exact link object — which also pins that no extra field, such as
+the ref's own marker, leaks into the auth request — plus the three `null` media types, the
+surviving metadata, no payload and no `data:` prefix anywhere in the auth JSON, and that the
+request body is byte-identical to its pre-projection self and still rehydrates to the exact
+client input. The §10 sidecar sentence is its own test: text and tools mutated after extraction
+arrive in the projection as the mutated values, beside a link. The rest cover pass-through of
+remote URLs and file URIs, a no-ref body, one upload serving two refs, and four refusal cases —
+no upload, four unusable URL forms with the URL asserted absent from every message, the shape
+check preceding the map, and a hash with no link beside refs that have one.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; the new file 11/11 stable over three
+runs; `npm run test:unit` **2120/2120** (0 skipped, 0 todo, 0 cancelled), +11 over the 2109
+baseline.
+
+Not wired yet, and deliberately so: this increment is the contract, not the transport. There is
+no production caller, because §5.8's remaining half is the opt-in uploader (config surface,
+streaming L2 upload, short-lived signed URLs, hash/size verification, best-effort delete after
+the auth decision, log redaction, and the "if no external uploader is configured, preserve the
+existing full-body auth behavior" gate). That increment also owns the wiring, and the wiring has
+a constraint worth stating here: `src/index.ts`'s §5.3 shape-2 boundary rehydrates `bodyText`
+before the deferred `doAuthRequest` reads it, so the projection has to be built *at* that
+boundary, from the still-extracted body, ahead of the rehydration. `README.md` is deliberately
+unchanged: no config surface was added.
+
+### feat(spool): mid-stream response-failure reporting, plan §5.7
+
+Twenty-third increment: §5.7's "failure after response streaming begins" now has the evidence half it
+was missing. Both response tails in `src/server.ts` ended in `.catch(() => {})`, which swallowed a
+rejected `pipeline()` whole (rule #8) — and the Node adapter owns the pipeline but has neither a logger
+nor the request id. `src/utils/stream-failure.ts` is the one call it needs: `src/index.ts` attaches a
+reporter to the response while `requestId`, `logger`, `path` and `finalResponse` are all in scope, and
+the adapter consumes it in the `.catch`.
+
+- **Two meanings of a tail rejection, and only one of them is silent.** A client hang-up rejects the
+  pipeline with `code: 'ERR_STREAM_PREMATURE_CLOSE'`; that is the ordinary case and it logs nothing.
+  Every other rejection is reported, because swallowing a genuine upstream or disk failure is the worse
+  outcome and a false log line is far cheaper than a missing one. The classification was established
+  empirically rather than assumed: with a source error after the first chunk the pipeline rejects with
+  the source's own error and the client observes an aborted connection either way, and `res.destroyed`
+  is `true` in both cases — so the error code is the only usable signal, and the silent set is exactly
+  that one code.
+- **The line carries the request id, the stage and the cause**:
+  `[req_…] [ERROR] [OUT] <endpoint>: response stream failed after headers were sent: <message>`. The
+  stage label is `PIPELINE_STAGE_LABEL.outbound` from `src/utils/logger.ts`, which this increment
+  `export`s instead of letting the new module keep a second copy of `'OUT'`.
+- **A non-`Error` rejection is reported too**, by `String(error)` — the adapter can reject with
+  anything, and "not an Error" is not a reason to drop the record.
+- **A second symbol smuggle rather than a shared metadata map.** The mechanism mirrors
+  `ACTIVE_REQUEST_RELEASE` in `src/utils/dashboard-stats.ts` exactly: the handler attaches a closure the
+  adapter cannot build itself, the adapter consumes it once. The two paths keep separate symbols because
+  they have nothing in common beyond "the server needs a closure the handler owns", and a general
+  metadata map would be an abstraction for two callers (rule #2).
+- **The failure report is not on the cleanup path.** `release()` still runs in the `.finally`, so the
+  in-flight counter unwinds whether the body succeeded, failed or was cut off; the reporter is
+  observation only, and it never throws out of the `.catch`.
+
+The visible change is a behavior change for the client, and it is the right one: a body that fails
+mid-write now destroys the connection instead of quietly ending, which is what the old
+`passthrough.end()` failure mode produced — a silently truncated body the client could read as a
+complete one.
+
+`tests/unit/stream-failure.test.ts` is new (5 tests). Two unit tests pin the exact log line (request
+id, `[OUT]` stage, endpoint, the spill's own byte counts) and that a second consume returns
+`undefined`, and that the `ERR_STREAM_PREMATURE_CLOSE` rejection logs nothing at all; a third pins that
+a bare string rejection is still reported. The first end-to-end test is the §12 item itself: a real
+16 MiB upstream body spilled above a 64-byte `threshold_bytes`, truncated to 0 by the client the moment
+the first chunk arrives, so every later spill read comes up short while a genuine partial body has
+already been delivered. It asserts the client saw an aborted connection (`incoming.complete === false`
+plus an `aborted`/`ECONNRESET` socket error) with a byte count strictly between 0 and the body size, the
+received prefix's sha256 against the same prefix of the source pattern, exactly one `[ERROR]` line
+matching the expected shape, an empty `responses/` directory, `getLiveSpillBytes() === 0` and the
+in-flight count back at its baseline — so the failing case is proven to release its spill and its
+reservation, not merely to log. The second end-to-end test covers the silent half: an SSE upstream that
+yields one frame and never closes, destroyed by the client mid-stream, must log no `[ERROR]` line at all
+while still cancelling upstream. The file's `afterEach` asserts both ledgers are empty, so a leak fails
+loudly there instead of widening a later test.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2109/2109** (0
+skipped, 0 todo, 0 cancelled), +5 over the 2104 baseline.
+
+Two things flagged rather than changed. The reporter is attached to every response in `src/index.ts`
+although only responses the adapter actually pipelines can use it; attaching it conditionally would mean
+`src/index.ts` knowing which routes stream, which it currently does not need to. And the SSE half of
+§12's item is covered only from the client-disconnect direction: whether a mid-body *upstream* error is
+turned into a terminal `response.failed` event by `src/handlers/messages.ts`'s own catch is unverified,
+and building a test on unverified handler behaviour would be guesswork.
+
+`README.md` is deliberately unchanged: the increment adds no config surface, and the README's spool
+bullet already says a spooled response body is freed once the client has taken every byte, aborted, or
+the read failed — which is exactly what the failing case now proves.
+
+### feat(spool): ref-aware token estimation, plan §5.3
+
+Twentieth increment: §5.3's **binary token contribution** — how many tokens a payload contributes once
+the spool has replaced it with a `BlobRef` — is now implemented in `src/utils/token-counting.ts`. The
+`image` and `document` branches recognise a ref at `source.data` and count it by the §5.3 rule instead
+of interpolating it into the label text (where it would have arrived as `data: [object Object]` and
+counted as nothing), and the fallback branch refuses a ref it has no binary position for.
+
+- **The rule is exactly `ceil(size / charactersPerToken)`.** The ref's `size` is the base64 character
+  count, which is also the blob's byte count because base64 is ASCII, so the arithmetic needs no read.
+- **The blob is deliberately never read, and the tokenizer is skipped.** Reading the payload to
+  tokenize it would undo the extraction that produced the ref; the same reasoning rules out tiktoken,
+  even when a tokenizer is configured.
+- **Every fixed block cost is dropped**: the field labels, the media/source type, the `data:` prefix,
+  and the former image `+20` / document `+10` overhead. A ref'd image and a ref'd document of the same
+  payload length therefore count the same.
+- **The result need not match the same body counted inline.** §5.3 accepts that this is an
+  approximation of a number that no longer has exact meaning, and upstream-reported usage still wins
+  whenever it is present.
+- **Every other allowlisted position is refused, not measured.** A Chat `image_url`, a Gemini
+  `inline_data` part or a Responses inline file is not a Claude content block, so it reaches the
+  `JSON.stringify(block)` fallback — where a ref would be counted as its own metadata object, the
+  invisible undercount §9.3 rejects. Those blocks now throw an `[spool]`-prefixed error naming the
+  block type and the number of refs. The guard is scoped to that one branch on purpose: the `image` and
+  `document` branches count refs, `text`/`thinking`/`tool_use`/`web_search_result` read names no
+  allowlisted position writes (a ref there can only be one a client forged), and `tool_result` recurses
+  into its nested blocks, which are guarded in turn.
+- **A malformed ref throws instead of counting `NaN`.** `assertRefShape` runs before the arithmetic, so
+  a fractional `size` or a missing `prefix` is an error rather than a count that silently becomes `NaN`
+  for the whole request.
+- **This increment lands caller-less, and that is expected.** Refs do not survive the §5.3 shape-2
+  send boundary — `src/index.ts` rehydrates the body before handler dispatch — and the only
+  `countClaudeRequestTokens` callers pass Claude-shaped bodies from the live request. So the branch is
+  a consumer contract ready for shape 3, in the same state as §5.2's clone, §5.4's leaf count, §5.7's
+  and §5.9's primitives. It also means no production count changes today.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2094/2094** (0
+skipped, 0 todo, 0 cancelled), +10 over the 2084 baseline. The new `describe` in
+`tests/unit/token-counting.test.ts` (10 tests) asserts the exact `1000` for a 4000-byte payload on both
+`image` and `document` (so neither surcharge survives) and their equality, exact counts under
+`charactersPerToken: 4/10` against a text block that keeps its `+5` overhead, a dangling hash counting
+fine against an empty store (no read), a 4000-char payload counting `1000` where the same text through a
+one-token-per-character tokenizer counts `4000` (no tiktoken), the `BlobStoreError` for a fractional
+`size` and a missing `prefix`, the refusal of a Chat and a Gemini position naming `'image_url'` and
+`'untyped'`, a ref nested in `tool_result.content` contributing its binary count, the same contribution
+inside `countClaudeRequestTokens`, and one real `extractInlineBlobs` round-trip where the recorded
+`size` is the base64 length and the count is `ceil(size / 4)`. Two mutations were checked against the
+suite: hardcoding the divisor to `4` or adding the image `+20` back fails eight of the ten tests, and
+dropping the `inlinePayloadRef` lookup, the `assertRefShape` call or the fallback guard fails all ten.
+
+Two things flagged rather than changed. `tests/unit/token-counting.test.ts`'s existing coverage of the
+inline `+20`/`+10` surcharges asserts only `img > doc` — too weak to catch a swapped constant (rule #7);
+the new tests assert exact values and the old one is left alone (rule #3). And the guard's loudness ends
+at `src/handlers/messages.ts`, whose `estimateInputTokens` catches any counting failure and returns `0`,
+so a refused ref degrades that endpoint's answer rather than reporting the error. That catch-to-0 is
+pre-existing and unchanged here, but it means the guard is only as loud as its eventual wiring.
+
+`README.md` is deliberately unchanged: the change adds no config surface and no observable behavior
+while refs cannot reach a token counter.
+
+### feat(spool): byte admission around the materialized response body, plan §5.9
+
+Twenty-second increment: §5.9's nominal RAM budget now also covers the **non-SSE response body** on the
+`/passthrough/*` identity path. `src/handlers/passthrough.ts` calls `admitMaterialization` once the
+upstream body has been received and holds the lease across `readText()` and the usage parse.
+`src/utils/spool-admission.ts` is unchanged.
+
+- **Where the reservation is taken.** After `receiveResponseBody` resolves and before `readText()`, the
+  same "receive, then reserve before read" order as the request path (increment 21) — a response's size
+  is not knowable before it has been received, so this is the earliest point at which the budget can be
+  consulted at all. The charge is `received.size`, the bytes actually received, never the
+  `Content-Length` the upstream claimed.
+- **What the wait bounds, and what it does not.** The wait happens with the body already received: on
+  disk for a body above `threshold_bytes`, in the spool's memory branch below it. So for a spilled body
+  this is §5.9's "queue while the raw body remains on disk", and for a small body the receive copy
+  already exists when the reservation is taken — the budget cannot un-materialize it, only bound the
+  parse, the usage record and the re-serialization that follow. §5.9's "pause upstream response reads
+  while their admission is waiting" is therefore **not** implemented: the receive loop has to finish
+  before there is a size to admit against. Whether the receive loop itself should hold a speculative
+  reservation from the first chunk is a design question, not an oversight.
+- **Release before the client's stream exists.** The lease is released in a `finally` around the read,
+  the trace logs and the usage parse, and `new Response(received.readStream(), …)` is built afterwards —
+  so no budget is held while the proxy writes to the client, whose pace is not the proxy's to bound
+  (§5.9: "stream spool upstream/client with no admission held"). This is a deliberate difference from
+  the request path, where the lease is held to the request's `finally`: the request body re-materializes
+  at the §5.3 shape-2 send boundary, whereas the response body here is handed out as a stream over the
+  spill and is never materialized again.
+- **A refusal gives the spill back.** `received.release()` runs before the `AdmissionOverBudgetError` is
+  rethrown. Without it a refused response would leave its bytes on disk and its `max_total_bytes`
+  reservation held (rule #8): the spill has no other owner once the handler gives up. At the handler
+  boundary the refusal is an `AdmissionOverBudgetError` (`status` 503, `type` `over_limit_error`); the
+  route-level catch turns it into the standard error envelope, like the request path.
+- **Budget arithmetic the operator now has to get right.** The request's own lease is still held while
+  the response is received and parsed (it is released in `src/index.ts`'s request-end `finally`), so
+  `max_materialized_body_bytes` has to cover request + response nominal bytes together. A budget sized
+  for one body admits the request and then refuses the answer, after the upstream work is paid for.
+  Per-rung reacquisition (§5.9's "reacquire at each rung") is the fix and is still open.
+
+Not in this increment: SSE responses are still unadmitted — the streaming branch relays upstream
+`pipeThrough` without ever materializing the whole body, which is what §5.9 asks for, and
+`streamResponseEvents` (the path that would admit per event) remains caller-less. The upstream **error**
+body on the non-OK branch (`!response.ok` → `response.text()`) is also left alone: it is read for a log
+preview and for `handleTargetApiError`, and refusing it would replace the upstream's own 4xx/5xx with a
+503 about the proxy's budget, which is a behavior change nobody asked for. That read is unbounded and
+stays a known gap.
+
+Tests: `tests/unit/passthrough-response.test.ts` gains a `passthrough non-SSE response, byte admission
+(§5.9)` block. The exact charge is pinned by sampling the ledger from inside the usage-record fetch —
+which runs in the materialized window — against a budget equal to `ceil(bytes × 2)`; the same fixture
+with one byte less budget must refuse with `over_limit_error` and `/exceed max_materialized_body_bytes/`,
+leaving `spillFiles()` empty and `getLiveSpillBytes()` and `getAdmittedBytes()` at 0 (a leak would show
+on both ledgers). A third case pins independence from `[spool] enabled` (budget enforced, nothing
+spilled), and a fourth pins that the configured `materialization_factor` is what decides: the same
+budget refuses the same bytes at factor 3 and admits them at factor 2, byte for byte. The suite's
+`afterEach` now asserts the admission ledger is empty too, so a leaked lease fails loudly in a later
+test rather than silently widening the budget.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` 2104/2104 (0 skipped,
+0 todo, 0 cancelled) — +4 over the 2100 baseline.
+
+`README.md`'s `[spool]` bullet is corrected rather than left standing: it claimed response bodies "are
+not spooled yet (Phase 2), so `enabled = true` does not change response-side memory", which stopped
+being true when the §5.7 non-SSE path landed, and it documented none of the §5.9 knobs. It now states
+what the response side does, and names `max_materialized_body_bytes`, `materialization_factor`,
+`max_admission_queue` and `admission_timeout_ms` with their defaults.
+
+### feat(spool): byte admission wired into the request path, plan §5.9
+
+Twenty-first increment: §5.9's nominal RAM budget is now **enforced by the request path**. `src/index.ts`
+calls `admitMaterialization` once the raw body has been received and holds the lease until the request's
+`finally`, so the controller from increment 19 is no longer caller-less. `src/utils/spool-admission.ts`
+is unchanged.
+
+- **Where the reservation is taken, and why there.** Immediately after `receiveIngressBody` resolves and
+  *before* `spool.readBytes()` rebuilds the request. Three sites were weighed: (a) here, (b) after the
+  whole receive block, (c) in the routing parse block, which is where §5.9's pseudo-code puts it
+  ("reserve … before read/parse"). Only (a) reserves before the first materialization: at (c) the text
+  has already been read and parsed, so the reservation would be taken after the allocation it exists to
+  bound, and at (b) the rebuild copy is made uncharged. (a) also keeps admission independent of
+  `[spool] enabled` — the receive path materializes a body whether or not the store writes it, so a
+  reservation placed inside the §5.4 extraction block (which is gated on `enabled`) would have
+  silently disabled itself in the store-off configuration §9.1 makes the default.
+- **The charge is the raw received size.** `spool.size` is the byte count the client sent, which is
+  §5.9's `B`; `materialization_factor` (default 2.0) is the conservative guess at decoded text plus
+  parsed objects plus serialization copies on top of it. Extraction shrinking the body does not shrink
+  the charge — the reservation is taken before extraction is known.
+- **Held to the request-end `finally`, not released after extraction — a deliberate narrowing of
+  §5.9.** The plan's pseudo-code releases the reservation "binary reduced to refs: release after
+  extraction". That is not done, because §5.3 shape 2 rehydrates every ref at the send boundary: a
+  binary body carries its full payload bytes again before the request ends, so an early release would
+  leave exactly the largest allocation of exactly the requests this budget exists for uncharged — 30
+  concurrent 200 MB image bodies would show a zero ledger at their peak. One rule, hold until the
+  request's objects are unreachable, then covers both this case and the non-ref case §5.9 already
+  describes that way. Flagged as open: if the plan is meant literally, this is the deviation to
+  revisit.
+- **The release still precedes client streaming, which is what §5.9's "no admission held during
+  network/SSE streaming" protects.** The `finally` runs before `server.ts` consumes the returned
+  Response's body, so neither a slow client nor a long-lived SSE response holds a reservation while it
+  streams, and the budget is not a cap on concurrent SSE connections.
+- **Every refusal is a loud `503 over_limit_error`, and no path leaks a reservation.** An admission
+  error is a `ClaudeProxyError`, so the receive block's `createErrorResponse` maps it to its own status
+  and type, and the block's log line is split so a refusal is reported as `Request body not admitted: …`
+  rather than as a bad body (rule #8). A body that never parses releases through the same `finally`; the
+  test proves it with a follow-up request whose charge exactly equals the whole budget, which is
+  admitted — a leaked reservation would have made it queue and time out.
+- **Flagged, pre-existing and not changed here.** That refusal path emits the Anthropic-shaped error
+  envelope for `/v1/responses` too, while the outer catch branches to `createResponsesErrorResponse`;
+  the parse-block catch has the same shape. Also worth knowing before tuning: with the store off (the
+  default) nothing spills, so §5.9's "queue while the raw body remains on disk" is only literal for a
+  body past `threshold_bytes` — a below-threshold body queues with its bytes in the spool's memory
+  branch.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2100/2100** (0
+skipped, 0 todo, 0 cancelled), +6 over the 2094 baseline. `tests/unit/index-admission.test.ts` (new, 6
+tests) drives the real handler, since the wiring is what is under test: a body one nominal byte over
+the budget is refused 503 `over_limit_error` before anything is sent or extracted (0 upstream calls, 0
+blob-store entries, ledger 0), with the store both on and off; a `materialization_factor` of 3 is
+observed as the exact `ceil(bytes × 3)` charge sampled *inside* the upstream fetch, i.e. while the
+parsed body and its serialization are both live; with the store off the resolved config is asserted
+`enabled === false` and the charge is still `ceil(bytes × 2)`; a second body arriving while the first
+holds the whole budget queues and is refused `admission timed out after 60 ms` without reaching the
+upstream, and the first request's release then leaves the ledger at 0; a body that fails to parse
+releases; and for a `stream: true` request the ledger is sampled after the handler returns and before
+the client reads the body — 0, with the stream then intact through `event: message_stop`. Rule #7: the
+refusal tests assert the envelope structurally (top-level `type: 'error'` carrying
+`error.type: 'over_limit_error'`), which is the shape `createErrorResponse` actually produces; the
+ordering assertions (charge held at send time, ledger 0 before the body is read) are direct
+observations of the ledger, not re-statements of the code under test.
+
+### feat(spool): optional byte admission, plan §5.9
+
+Nineteenth increment: §5.9's **nominal materialization admission** — the operator's hard RAM budget
+around full-body materialization — now exists as `src/utils/spool-admission.ts`
+(`admitMaterialization`, `AdmissionLease`, `getAdmittedBytes`, `getAdmissionQueueDepth`,
+`resetAdmission`). It lands **caller-less**, like the two increments before it: §5.9 reserves *before*
+the request path reads and parses a body, and threading that reservation through the transformation
+rungs — with §5.9's reacquisition for a rung that starts from an effective spool — and releasing it
+before network streaming is its own change. The config surface for it already existed (§5.6), so no
+config work was needed: `max_materialized_body_bytes`, `materialization_factor`, `max_admission_queue`
+and `admission_timeout_ms` were parsed and defaulted but had no consumer until now.
+
+- **Off by default, and independent of `[spool] enabled`.** `max_materialized_body_bytes = 0` (the
+  default) admits everything with no ledger, no queue and no wait, so the no-body-semaphore behavior
+  is what runs unless an operator opts in (§9.1). When a budget *is* set it is enforced even with
+  `enabled = false` — `enabled` decides whether bytes go to disk, the budget decides how many of them
+  may be materialized at once, exactly as the per-body caps behave.
+- **The reservation is `ceil(bytes × materialization_factor)`.** The factor, not the byte count, is
+  the conservative guess at decoded text plus parsed objects plus serialization copies, and it is what
+  the ledger charges — `getAdmittedBytes()` never exceeds the budget, and a batch of admitted bodies
+  cannot add up past it.
+- **A hard cap in arrival order, with no queue jumping.** A body is admitted only from the head of the
+  queue: a 100-byte body is not admitted past a waiting 900-byte one even though it would fit in the
+  bytes free right now, because "first body that fits" is how a byte budget starves its own queue. A
+  body with a 0-byte reservation (an empty body) is the one exception — it takes nothing from anyone, so
+  it never waits and never holds a queue slot.
+- **Bounded wait, bounded queue, refusal before anything is materialized.** Waiting is bounded by
+  `admission_timeout_ms` and the queue by `max_admission_queue`, and both refusals arrive before the
+  caller has read a byte, so they can still be answered as a response. A client abort (`AbortSignal`)
+  drops a queued waiter and rejects with the caller's own reason. A waiter that times out is taken out
+  of the queue and the next waiter is re-checked immediately, so the head it frees is not lost.
+- **Decisions taken here.** (1) Every refusal is `503 over_limit_error`, like the spill and blob
+  capacity errors — §5.9 allows 429 or 503, and one status for the whole byte-budget family keeps the
+  answer independent of the direction the body travels, since the budget covers requests, responses and
+  SSE events alike (the direction-dependent cap errors elsewhere are *parameters* for exactly that
+  reason). (2) A body whose nominal reservation exceeds the whole budget is refused at once
+  (`AdmissionOverBudgetError`) rather than queued: no wait can admit it, and reporting it as a timeout
+  30 s later would be a false report of what happened (§5.9's "never begin materialization after
+  rejection"). All three refusals are loud and typed — `AdmissionOverBudgetError`,
+  `AdmissionQueueFullError`, `AdmissionTimeoutError`.
+- **A lease is released exactly once, and a reset strands nothing.** Leases are idempotent, so a
+  `finally` that runs after a successful path cannot double-credit the ledger, and the ledger throws on
+  underflow instead of clamping it. `resetAdmission()` — what a restart means for admission, since no
+  reservation survives one (§5.9) — voids outstanding leases through a generation counter, so a lease
+  from before the reset gives nothing back, and *rejects* the waiters it strands rather than leaving
+  their promises pending.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2084/2084** (0
+skipped, 0 todo, 0 cancelled), +12 over the 2072 baseline. `tests/unit/spool-admission.test.ts` (new, 12
+tests) covers the disabled budget charging nothing and queueing nothing regardless of body size, the
+exact `ceil(bytes × factor)` charge including a fraction that rounds up, the cap held under an
+interleaved sequence of admissions and releases (600+400 admitted, then 250+250 queued, then drained
+head-first), a small body pinned behind a waiting large one, the over-budget refusal naming the budget
+with the queue left empty, the queue-full refusal leaving the two waiters ahead untouched,
+`AdmissionTimeoutError` after 20 ms with the freed head admitting the waiter behind it, client abort
+delivering the caller's own reason with the queue and ledger intact, an already-aborted signal
+rejecting without queueing, an empty body admitted immediately despite a waiting queue, and
+double-release plus reset semantics (idempotent release, voided leases, stranded waiters rejected).
+Two mutations were checked against the suite: letting a fitting body jump the queue fails the
+arrival-order test and the timeout-drain test, and removing the post-timeout drain fails the timeout
+test — so the two properties the wiring will depend on are actually pinned.
+
+Still outstanding from §5.9: the wiring itself — reserving in `src/index.ts` before the ingress read and
+parse, retaining through sidecars/serialization for non-ref exchanges while releasing right after
+extraction for binary ones, reacquiring per rung, pausing upstream response/event reads while waiting,
+and releasing before network streaming. `README.md` is deliberately unchanged: the knob is parsed but
+inert until that wiring lands, and documenting a budget that does nothing yet would misdescribe the
+proxy's behavior.
+
+### feat(spool): per-event SSE framing and spill, plan §5.7
+
+Eighteenth increment: §5.7's SSE path — "frame one event at a time, spill an event above
+`threshold_bytes` to disk while receiving it, and enforce `max_response_bytes` per event" — now exists as
+`src/utils/spool-events.ts` (`streamResponseEvents`), together with the `events/` spill directory it
+writes to. The increment lands **caller-less**: the primitive is pinned by tests of its own before the SSE
+handler is rewired onto it, so the framing and the spill cannot regress unnoticed while that wiring is
+decided.
+
+- **Each event is received through the shared loop.** `receiveSpooledBody` is called once per event with
+  `subdir: events/`, `filePrefix: 'evt-'`, `maxBytes: max_response_bytes` and
+  `TooLargeError: SpoolResponseTooLargeError`, so the capacity ledger, the reservation, the spill file
+  and the breach error class are the ones the request and response directions already use — no second
+  copy of the loop (rule #4).
+- **The framing is byte-exact, and the delimiter belongs to the event.** An event ends at a blank line
+  (`\n\n`), and those two bytes are emitted as part of it, so the concatenation of what the client
+  receives is byte-identical to the upstream stream. Framing is done on bytes rather than on decoded
+  text: an invalid-UTF-8 payload survives, and no `event:`/`id:`/`[DONE]` line is lost to a JSON
+  re-serialize.
+- **A blank line split across two chunks still frames.** The module carries whether the last byte it
+  handed out was `\n`, so a chunk that *starts* with `\n` completes the delimiter and only that one byte
+  closes the event. Without the carry, a chunk boundary between the two newlines either never closes the
+  event or closes it early — the case the chunk-size-1 test pins.
+- **At most one event is on disk at a time.** The event currently being received may be spilled (above
+  `threshold_bytes`); its bytes are handed over only once it is complete, and the spill is deleted as the
+  bytes leave. Disk use is therefore bounded by one event, not by the length of the response: this is a
+  per-event spool, not an accumulation of the SSE response on disk, which §9.5 rejects.
+- **A response-side breach is 500 `processing_error`, and enforcement is independent of `enabled`.** As
+  on the response path, the client's request was legal, so a cap breach is not a 4xx; `enabled` gates
+  *spilling* only, never the cap. A breach is propagated as a rejected read, so it errors the stream for
+  the consumer instead of truncating the response — and because the failure then lands after streaming
+  has begun, no terminal `data: [DONE]` is emitted for it.
+- **Backpressure at both levels.** The framed-event stream and the returned stream are both pull-driven
+  `ReadableStream`s at `highWaterMark: 0`, one `enqueue` per pull, so a stalled client stops the upstream
+  reads rather than letting later events queue in RAM. A client cancel forwards the reason upstream and
+  releases the spill of the event being written.
+- **`events/` is swept like the other spill directories.** `spool.ts` now declares
+  `EVENT_SPILL_SUBDIR`/`eventSpillDir` alongside the request and response directories, and
+  `sweepStaleSpills` covers all three, so a spill left behind by a killed process is collected at the
+  next startup like any other.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2072/2072** (0 skipped,
+0 todo, 0 cancelled), +9 over the 2063 baseline. `tests/unit/spool-events.test.ts` (new, 9 tests) covers
+byte-exact relay at chunk sizes 1/2/3/7/40/all (length + sha256 + text, so no boundary is lost), framing
+with spilling disabled and nothing written to disk, an event the upstream never terminated, the spill
+landing on disk with the exact event's bytes charged to `max_total_bytes` and then deleted, only one
+event on disk at a time over four oversized events, a client cancel reaching the upstream with the spill
+removed, an event exactly at the cap passing while one byte past it raises `SpoolResponseTooLargeError`
+(500 `processing_error`), an event breaching the cap mid-stream aborting with `data: kept\n\n` delivered
+and no `[DONE]`, and a stalled client causing zero further upstream reads. `tests/unit/spool.test.ts`'s
+aggregate sweep test now spans all three spill directories (3 removed, 1 kept).
+
+Still outstanding from §5.7: the SSE handler wired onto this primitive, and the same
+"abort rather than emit a terminal `[DONE]`" rule applied at the handler level. Open question surfaced for
+the wiring: should per-event framing and the per-event cap apply when `[spool] enabled = false`, and must
+CRLF-framed streams be recognized (the module currently matches the forwarding family's `\n\n`, unlike
+`dashboard-stats.ts`, which normalizes `\r\n`)?
+
+### fix(spool): demand-driven SSE event transform, plan §5.7
+
+Seventeenth increment: the last response transform that still "unconditionally enqueue[ed]" —
+`pipeEventTransformer` in `src/utils/request-transform.ts`, which rewrites each `data: {...}` event of
+the writeout (`response_egress`) SSE stream — now waits for downstream demand, and its double-emitted
+`data: [DONE]` sentinel is fixed. It was a detached `start()` loop reading upstream as fast as the
+upstream could send and enqueueing every event into its own queue, so a client slower than the upstream
+left the rest of the response sitting in RAM, exactly as §5.7 describes.
+
+- **Pull-driven, `highWaterMark: 0`.** One `pull` reads upstream only while a consumer is waiting,
+  transforms that chunk's events, and hands over exactly one byte chunk; whatever the chunk produced
+  beyond it waits for the consumer's next read. `fill()` loops rather than reading once, because a chunk
+  boundary that cuts an event in half produces no complete event — a single read would stall the stream
+  there.
+- **`data: [DONE]` is emitted exactly once.** The sentinel is not a payload, so it is never parsed or
+  transformed; it flows through the data-less branch and is re-emitted verbatim, byte-faithful to its
+  original spelling. The old code enqueued it from the sentinel branch *and* then re-emitted the whole
+  event from the data-less branch, so every upstream sentinel reached the client twice. The dead
+  `terminated`/`otherLines` locals (both `void`ed) went with it.
+- **A client disconnect reaches upstream.** The stream gained a `cancel(reason)` that forwards the reason
+  to `reader.cancel(reason)`. The old source had no `cancel` handler, so a consumer cancel never touched
+  upstream and the detached loop only happened to stop when its next `controller.enqueue` threw into the
+  already-cancelled stream — with that error swallowed by the `catch` (rule #8).
+- **Upstream failures still surface.** With no `catch` around the read, a rejected `reader.read()` errors
+  the output stream and reaches the consumer as a rejection, rather than being folded into a value that
+  nobody observes.
+- **Opt-in, unchanged in scope.** The fast path still returns `null` when no transform declares
+  `response_egress`, so nothing is wrapped on routes that do not use it; `src/index.ts:2611` remains the
+  only production call site.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2063/2063** (0 skipped,
+0 todo, 0 cancelled), +4 over the 2059 baseline. `tests/unit/request-transform.test.ts` gained four
+tests: the sentinel appears exactly once (exact output equality); an event split across two upstream
+chunks is neither duplicated nor lost, with exactly one upstream read per chunk; a consumer that stalls
+after the first frame causes no further upstream reads however long it waits, and resuming yields every
+remaining event in order; and a consumer cancel delivers the disconnect reason upstream and stops the
+reads. Swapping the old implementation back in fails all five touched tests — `not ok 2` (the
+strengthened rename test: the sentinel arrives twice), `not ok 5–8` — the old transform reads two chunks
+before the consumer's first read resolves, then after the stall has drained the source. A separate probe
+against the old file confirmed the cancel bug directly: the reason never reached upstream
+(`<never cancelled>`) and the loop died on an enqueue into the cancelled stream. The new file was then
+restored byte-identically (`diff` clean). One pre-existing test was renamed: "drops events when
+transformer returns null" asserted `notEqual(dropped, null)` and called `buildEventTransformer` directly,
+so it now says what it checks — and the null-drop branch it claimed to cover is in fact unreachable, since
+every op yields a body and no builtin returns `null`.
+
+Still outstanding from §5.7: SSE per-event framing/spill with `max_response_bytes` enforced per event,
+"abort the connection rather than emit a terminal `[DONE]`" when the failure lands after streaming has
+begun, and the `events/` spill subdirectory wired into `sweepStaleSpills`. (The framing/spill and the
+sweep landed in the eighteenth increment, above; the handler-level abort is still outstanding.)
+
+### fix(spool): demand-driven keep-alive injection, plan §5.7
+
+Sixteenth increment: §5.7's last named requirement — "Keep-alive injection and all response transforms
+must likewise wait for downstream demand rather than unconditionally enqueueing" — is met for the
+keep-alive wrapper, on the default SSE path. `wrapSseStreamWithKeepAlive` read upstream from a detached
+`start()` loop and enqueued every chunk as it arrived, with a `setInterval` that enqueued pings into the
+same queue. When the client was slower than the upstream, the wrapper's own queue therefore held the rest
+of the response in RAM — pings included — and the read loop never paused; a probe against the old shape
+grew past 4 GB. Disk cannot bound that queue, which is exactly why the plan names it.
+
+- **`src/utils/sse-keepalive.ts` is now a pull-driven stream with `highWaterMark: 0`.** Each `pull`
+  produces exactly one thing: the next upstream chunk if it arrives within the remaining silence window,
+  otherwise a ping. Nothing reads upstream except a pending downstream read, so the client's pace is the
+  only thing that pulls the response forward.
+- **Ready data wins the race with the ping deadline.** The pull computes
+  `waitMs = max(0, lastChunkAt + intervalMs - Date.now())` and races a parked upstream read against that
+  deadline — a chunk the source has already queued settles in a microtask, the deadline only in a timer
+  phase — so `intervalMs <= 0` cannot starve the upstream or emit an immediate ping per pull.
+- **A parked read is never lost or unobserved.** `pending` is cleared only when its outcome is consumed,
+  so a chunk that arrives while a ping window is open is forwarded by the next pull, in order. The read's
+  rejection is folded into a `ReadOutcome` value and handed to `controller.error()` when it is consumed:
+  an unobserved rejection (Node's default `--unhandled-rejections=throw`) would otherwise take the process
+  down before the consumer asked for anything, so the failure still surfaces loudly (rule #8).
+- **A withdrawn consumer is respected.** A `cancelled` flag stops a pull that was parked across a ping
+  from enqueueing or closing on a stream the consumer has already cancelled.
+- **The race timer stays ref'd, deliberately unlike `src/rpc.ts:300`.** That poller unrefs because its
+  work must not keep the process alive on its own; our timer is the only thing that can settle a read a
+  pull is already holding, so unref'ing it let an idle event loop walk away from a waiting consumer —
+  which is how the first run of the new tests reported `cancelled`, not `ok`. It is cleared as soon as
+  the read wins, so it never outlives one interval.
+- **Both call sites are on the default path** — `src/index.ts:2578` (central SSE branch) and
+  `src/handlers/passthrough.ts:350` (piped after the usage-tracking transform) — so this bounds memory
+  whether or not spooling is enabled.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2059/2059** (0 skipped,
+0 todo), +1 over the 2058 baseline. `tests/unit/sse-keepalive.test.ts` gained three tests: a stalled
+consumer stops upstream reads (a source with `highWaterMark: 0` counts the reads the wrapper asked for —
+`1` while stalled, `5` after resuming, and the remaining frames arrive in order and unchanged); a silence
+of two and a half intervals yields exactly one ping, on demand, and the next ping waits a fresh interval
+rather than being already queued; and an upstream error raised while the consumer is stalled reaches the
+consumer as a rejection instead of an unhandled one. Swapping the old implementation back in gives
+`ok 1–4`, `not ok 5`, `not ok 6` and a cancelled 7 — the two backpressure tests fail loudly against it —
+after which the new file was restored byte-identically (`diff` clean). The four pre-existing tests pass
+unchanged. `tests/unit/server.test.ts` gained one integration test that puts the wrapper in the real
+egress chain (`Response` body → `Readable.fromWeb` → `pipeline` → socket) and reads it in stages: every
+byte arrives in order, exactly once, and the response terminates, so a `highWaterMark: 0` body cannot
+deadlock a paused real client. That test is a regression guard on ordering, completeness and termination,
+not on backpressure — the old implementation passes it too; the backpressure property is pinned at the
+stream level, where it is deterministic rather than dependent on kernel send-buffer sizes.
+
+Still unconditional: `pipeEventTransformer` in `src/utils/request-transform.ts` remains a `start`-driven
+detached loop (opt-in via a `response_egress` transform), and it double-emits `data: [DONE]`. Both are
+next.
+
+### feat(spool): the §5.7 non-SSE identity response path, end to end
+
+Fifteenth increment: the identity half of §5.7's non-SSE responses now has a production caller. "Above
+the threshold, stream the upstream body to a per-response spool while counting bytes; do not call
+`response.clone().text()` or buffer a second copy. Identity forwarding may stream the original response
+spool directly without parsing." `receiveResponseBody` was written in the previous increment and was
+caller-less; `SpoolBody.readStream()`, `src/handlers/passthrough.ts` and `src/server.ts` complete it, so
+`threshold_bytes` and `max_response_bytes` are enforced on the live passthrough response path.
+
+- **`SpoolBody.readStream()` in `src/utils/spool-body.ts`** is the accessor §5.7 needed: it hands the
+  body out a chunk at a time — `BLOB_STREAM_CHUNK_BYTES`, the 64 KiB the blob store already streams
+  with, reused rather than re-declared (rule #4) — so the client's socket, not a buffer, sets the pace.
+  The stream takes ownership of the spool: the spill is released (file removed, `max_total_bytes`
+  reservation returned) when the last byte has been read or the stream is cancelled, while `release()`
+  stays idempotent so a caller may still release on its own terminal path.
+- **Release before the stream reports completion.** `controller.close()` resolves the consumer's pending
+  read immediately, so releasing after it let `await response.arrayBuffer()` return while the spill was
+  still reserved and still on disk. The new suite caught exactly that (`getLiveSpillBytes()` non-zero
+  after a completed read, spill file still present); the order is now `await finish(); controller.close()`.
+  The spilled path closes its read handle before releasing, because `release()` removes the file.
+- **A short spill fails loudly.** A spill that ends before its byte count would otherwise be forwarded
+  as a whole body; the read raises `SpoolWriteError` instead (rule #8), and the failure path closes the
+  handle and releases like every other terminal path.
+- **The request side still may not use it.** `readStream()` exists for a client-socket consumer only;
+  §5.1 rejects `new Request(url, {body: fileStream})` followed by `.json()` because undici buffers that
+  stream in full, so ingress keeps reading bytes at the point of use. The module header says so.
+- **`src/handlers/passthrough.ts` forwards the spool.** The non-SSE branch receives the upstream body
+  with `receiveResponseBody(response.body)` and answers with `new Response(received.readStream(), …)`.
+  Parsing for usage recording is now the one remaining copy of the body, and `max_response_bytes` caps
+  it: a breach cancels the upstream body and fails 500 `processing_error` rather than truncating.
+- **`src/server.ts` pipes the non-SSE path too.** The old `await response.clone().text()` held a second
+  full copy of every non-SSE body — a spooled response included — for as long as the client took to
+  accept it; `pipeline(Readable.fromWeb(response.body), res)` with `release()` in `finally` gives the
+  upstream, or the response spool, the client's write pace. A bodyless response still takes the
+  `res.end()` fast path.
+- **Responses are treated as unknown-length.** Upstream `Content-Length` is stale after undici's
+  automatic decompression, so it is not passed as `declaredLength`: no early rejection, and the body
+  buffers only to `threshold_bytes` before spilling.
+- **`max_response_bytes` is enforced whether or not spooling is enabled**, matching ingress: the cap is
+  a body bound, `enabled` only decides whether disk is used. Behaviour change, deliberate: a response
+  over the 64 MiB default now fails 500 `processing_error` instead of being forwarded.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2055/2055** (0
+skipped, 0 todo) — exactly +6 over the 2049 baseline. Six new tests in
+`tests/unit/passthrough-response.test.ts` pin the identity contract: a sub-threshold body arrives
+byte-for-byte (sha256 equal, so a parse-and-re-serialize would fail it) with every stale body header
+dropped and no spill; a body above `threshold_bytes` lands in `responses/`, is charged to the ledger for
+as long as it is live, and is byte-identical to the upstream with both the file and the reservation gone
+once the client has read it; usage is still recorded from a spilled response (11/22/33 under the request's
+model); a body past `max_response_bytes` throws `SpoolResponseTooLargeError` with status 500 and type
+`processing_error`, cancels the upstream body, and leaves no partial spill; cancelling the body mid-read
+frees the spill, which is what the Node adapter does on client disconnect; and a spill truncated on disk
+fails the read with `SpoolWriteError` and hands the client not one byte. The request-side egress suite,
+`spool-response.test.ts` and `server.test.ts`'s 15 tests pass unchanged.
+
+Mutation gate: the spilled `cancel` release, the end-of-body release, the EOF branch, the short-read
+guard, the in-memory chunk source, the handler's `receiveResponseBody` call and the adapter's non-SSE
+`release()` were each neutralized in turn; each was caught by a named test, with the originals restored
+and `diff -q`-verified against their snapshots. No survivors this increment.
+
+Surfaced, not settled (repo rule #5): (a) the adapter keeps its two branches — the SSE branch's extra
+`res.on('close', release)` safety net is not added to the non-SSE branch, because `tests/unit/server.test.ts`
+pins `releaseCount === 1` from an unguarded callback and merging would double-call it; (b) the identity
+path still parses the full body only to record usage, which is the one copy §5.7 leaves in place — a
+streaming usage tap would remove it but is a separate decision.
+
+### feat(spool): non-SSE response spooling, and the receive loop shared with ingress (§5.7)
+
+Fourteenth increment: §5.7's response body path. "At or below `threshold_bytes`, retain the existing
+bounded in-memory path. Above the threshold, stream the upstream body to a per-response spool while
+counting bytes… Enforce `max_response_bytes` per body. On breach or disk failure, cancel the upstream
+body and fail explicitly; never silently truncate the response." `receiveResponseBody(body)` now
+delivers that, writing to a `responses/` spill directory under the spool root and bounding the body by
+`max_response_bytes` rather than by the request limit.
+
+- **The receive loop is written once.** §5.1 and §5.7 ask the same thing of a body — bound it, spill it
+  past `threshold_bytes`, charge it to `max_total_bytes`, cancel the upstream on failure — so the loop
+  moved to a new `src/utils/spool-body.ts` and takes exactly the four genuinely per-direction values
+  (`subdir`, `filePrefix`, `maxBytes`, `bodyLabel`, plus the direction's `TooLargeError` class).
+  `receiveIngressBody` is now a wrapper over it. The ledger, the capacity reservation and the error
+  classes deliberately stayed shared: a second copy of the ledger is how one direction quietly stops
+  being charged to `max_total_bytes`.
+- **Ingress's public surface is unchanged,** including the `SpoolBody` class, which `spool-ingress.ts`
+  re-exports as `IngressSpool` (`instanceof IngressSpool` is asserted by the ingress suite, so the
+  re-export is a value re-export, not a type-only one).
+- **The sweep now covers every spill directory.** `RESPONSE_SPILL_SUBDIR` and `responseSpillDir` are
+  exported from `src/utils/spool.ts`, and `sweepStaleSpills` iterates both directories with one
+  aggregate count. `SpoolSweepResult` gained no field: `dirMissing` was re-defined as "no spill
+  directory existed at all" (`dirsSeen === 0`), which is what the existing result shape already meant
+  and keeps the pinned `deepEqual` honest.
+- **A response cap breach maps to 500 `processing_error`, not 413.** `SpoolResponseTooLargeError`
+  follows the in-module convention for spool-side failures (`src/utils/ref-serializer.ts`,
+  `src/utils/blob-store.ts`), which is also §5.7's framing — a cap breach and a disk failure are the
+  same kind of failure. A 413 was rejected as a false report: the client's request was legal. The
+  ingress direction keeps its 413, because there the body *is* the client's request.
+- **No production caller yet.** `receiveResponseBody` is not wired into any handler, so
+  `threshold_bytes` and `max_response_bytes` remain unenforced on the live response path. Identity
+  streaming and the converted/streamed paths, the streaming read accessor, per-response cleanup on
+  client abort, and §5.7's SSE per-event framing are the next increment.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2049/2049** (0
+skipped, 0 todo) — exactly +8 over the 2041 baseline. Five new tests in
+`tests/unit/spool-response.test.ts`: the body is bounded by `max_response_bytes` and not by the
+request limit; one byte past the cap fails both by declared `Content-Length` and by byte count, with
+no partial spill left behind; a body above `threshold_bytes` lands in `responses/` as `resp-<uuid>.body`
+byte-for-byte (sha256 equal) while `requests/` is never created, with the ledger returning to zero on
+release; the prefix is preserved when an unknown-length body crosses the threshold mid-stream (the
+file holds exactly the body, nothing double-written); and a mid-stream breach cancels the upstream,
+removes the partial spill and leaves the ledger at zero. Two new tests in `tests/unit/spool.test.ts`
+cover the sweep blast radius: a stale request spill, a stale response spill and a fresh response spill
+under one call (`removed === 2`, `keptRecent === 1`, the fresh file byte-intact), and `dirMissing`
+reported only when neither spill directory exists. The ingress suite's 78 tests and `spool.test.ts`'s
+53 pass unchanged across the extraction.
+
+Mutation gate: the response subdir, the `resp-` file prefix, the `Response` body label, the response
+cap expression, the `TooLargeError` class, the sweep's directory list, the `dirMissing` expression, the
+threshold-crossing prefix write and the release guard were each neutralized in turn; each was caught by
+a named test, with the original restored and `diff -q`-verified against its snapshot. No survivors this
+increment.
+
+### feat(spool): the §5.7 response-binary allowlist, as a second predicate set
+
+Thirteenth increment: §5.7's response-binary allowlist. "The initial response-binary allowlist is
+deliberately separate from §5.4's request allowlist": Gemini response content parts with
+`inline_data`/`inlineData.data`, for any declared MIME type (the model-generated image/audio/video
+parts native Gemini passthrough preserves), and Responses output items with
+`type: "image_generation_call"` and a base64 `result`, "whether encountered in a completed JSON
+response or an SSE output-item event". New export `extractResponseBlobs(body)` in
+`src/utils/blob-refs.ts`, returning the existing `InlineExtraction`.
+
+- **A second finder, not a second module.** The eligibility rule (`JSON_VERBATIM_PAYLOAD`, so §5.3's
+  shape-3 exact `Content-Length` holds), the all-or-nothing replacement loop, the walk, the unwind and
+  the per-ref lease accounting are shared machinery, so they now live in one `extract(body, find)`
+  and take the finder as a parameter: `positionsFor` (§5.4) and `positionsForResponse` (§5.7). Only the
+  positions differ — including the `skipped` count for ineligible payloads, which is reported for
+  responses exactly as for requests.
+- **One kind name is shared; one is new.** `gemini-inline-data` is the one position both allowlists
+  read, because the field *is* the shape on both sides: a Gemini content part declares no request or
+  response discriminator, so `inline_data` identifies it in `contents[].parts[]` and
+  `candidates[].content.parts[]` alike. `responses-image-generation-result` is new; `result` is read
+  with form `'bare'` because the documented schema is bare base64 (a data-URL value would still
+  round-trip exactly, since prefix plus payload reproduces the field byte for byte). `result` is
+  `null` until a call completes, and a non-string is not a payload, so an in-progress item extracts
+  nothing.
+- **The request positions are *not* reused.** §5.7: "Claude assistant image blocks and OpenAI Chat
+  Completions assistant image parts are not added: the documented schemas do not carry them. Do not
+  use the request-side `source.data` predicate indiscriminately on responses." A test feeds a
+  response-shaped body holding exactly those positions plus four `image_generation_call`s with a
+  `null`, an empty, a numeric and a URL `result`: `extractResponseBlobs` yields `refs: 0` and leaves
+  the body unchanged, while the same body through `extractInlineBlobs` takes the three request
+  positions and still not the generated-image results — so the two allowlists are demonstrably
+  different sets, neither absorbing the other.
+- **No production caller yet.** This is the primitive §5.7 names; response *spooling* — threshold,
+  per-event spill, `max_response_bytes`, abort and sweep semantics — is a later increment, as is any
+  further response binary field, which §5.7 requires to arrive with "their own exact predicate and
+  round-trip tests".
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2041/2041** (0
+skipped). Three new tests in `tests/unit/blob-refs.test.ts`: the four-position round-trip matrix (both
+Gemini spellings in `candidates`, plus a `result` in a completed `output[]` and one inside a nested SSE
+output-item event object — the walk reaches the event without a special case), asserting per-position
+kind/size/empty-prefix, byte-identical rehydration on a clone, and that a response's blobs are
+scratch: four leases released and four blobs evicted to zero; the request/response contrast above; and
+the same `inline_data` part read through either allowlist to the same hash — one blob under two leases.
+
+Mutation gate: falling back to the request finder, dropping the `image_generation_call` predicate,
+reading `result` with the data-URL form, dropping the Gemini predicate from the response finder,
+renaming the shared Gemini kind, and dropping the ineligible-payload count were each neutralized in
+turn; each was caught by a named test, with the original restored and `diff -q`-verified. No
+survivors this increment.
+
+### perf(streaming): single-pass response observation and real socket backpressure (plan §5.7)
+
+Twelfth increment: §5.7's "Required backpressure changes" landed. "Remove response `tee()` branches used
+only for logging and replace them with single-pass observation. In `src/server.ts`, pipe the web response
+stream with proper Node `pipeline()` handling, or await socket drain in the `WritableStream.write`
+callback; the current ignored `passthrough.write()` result is not backpressure." Both halves are done:
+no logging-only `tee()` remains in `src/` (§12's criterion), and the Node adapter no longer ignores
+backpressure.
+
+- **`observeStream(logger, requestId, stage, endpoint, format)` in `src/utils/logger.ts`** returns a
+  `TransformStream<Uint8Array, Uint8Array>` that logs as the chunk passes through. It sits beside
+  `logPipelineStage` because it is the same concern and every affected handler already imports from
+  that module. Seven sites in five files now use it: `messages.ts` (raw upstream + outbound),
+  `gemini.ts` (raw upstream + outbound), `chat-completions.ts` ×2, `responses.ts`.
+- **The cost being removed was real, not stylistic.** `logPipelineStage` returns immediately when
+  `!logger.traceEnabled`, but every tee site forked the body and decoded every chunk *before* calling
+  it — so at the default log level each response paid a second reader plus a full decode pass for a
+  line that was then discarded. Worse, the log branch of a `tee()` reads as fast as it can, so whenever
+  the client was slower than the upstream the tee's unread queue held the whole remaining response in
+  RAM. A tap on the client's own path costs no copy, and `traceEnabled` is now read before any decode.
+- **`format` is required, not defaulted.** The seven sites held two conventions — `'sse-lines'` (four:
+  one trace per complete `data: ` line, other lines ignored, `[DONE]` skipped) and `'chunks'` (three:
+  the whole decoded chunk). A default would have let a converted site silently inherit the other
+  site's convention; each site names its own and keeps it.
+- **A trace failure becomes one `debug` line and nothing more.** The observer sits on the client's only
+  path, where a throw would abort a response the tee'd branch could not have touched; the test feeds a
+  logger whose `trace` throws and asserts every byte still reaches the client plus one report per
+  failure.
+- **`src/server.ts` SSE path: `pipeline()` replaces the `PassThrough`.** `passthrough.write(chunk)`'s
+  return value was ignored, so a slow client pulled the rest of the response into the PassThrough's
+  memory, and on a client disconnect nothing cancelled the upstream web stream — it drained to nothing.
+  `pipeline(Readable.fromWeb(response.body), res)` gives real backpressure and cancels the upstream body
+  when the client hangs up. `release()` keeps its two paths (socket `close`, pipeline `finally`) behind
+  the existing once-guard.
+- **Three behaviour changes, deliberate.** (a) Observation now stops when the client disconnects,
+  where the detached tee loop kept reading to the end. (b) `messages.ts` and `gemini.ts` no longer emit
+  `Error logging raw chunks: …` — that line only ever reported the logging branch's own failure, which
+  no longer exists. (c) An upstream failure mid-stream now destroys the connection instead of ending the
+  response cleanly: the old `passthrough.end()` produced a silently truncated body that looked complete
+  to the client. A final `data: ` line that never receives a newline is now logged at flush rather than
+  dropped with the buffer (unreachable for well-formed SSE, which ends every event in one, but it is no
+  longer a silent drop).
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2038/2038** (0
+skipped). Eight new tests: seven in `tests/unit/logger.test.ts` — bytes and chunk boundaries forwarded
+unchanged with trace off (fed invalid UTF-8, which any decode round trip would mangle), zero
+`TextDecoder.decode` calls with trace off (counted by subclassing the decoder, the same "assert the work
+did not happen, not just the output" idiom as the existing `toJSON` counter), one trace per complete
+`data: ` line with other lines and `[DONE]` skipped, a line split across two chunks logged once in full
+and not before it terminates, the unterminated tail logged at flush, `'chunks'` logging each chunk
+verbatim, and a throwing `trace` leaving the client stream intact — and one in
+`tests/unit/server.test.ts`: a client that hangs up mid-stream must cancel the upstream body and not
+leak the in-flight count, which legacy `pipe()` fails.
+
+Mutation gate: removing the `traceEnabled` gate, dropping the partial-line buffer, keeping `[DONE]`,
+logging every line instead of only `data: `, dropping the flush tail, rethrowing trace failures, and
+replacing `pipeline()` with legacy `pipe()` were each neutralized in turn; each was caught by a named
+test, with the originals restored and `diff -q`-verified. No survivors this increment.
+
+Surfaced, not settled (repo rule #5): `docs/architecture/design_passthrough_mode.md` §8.2 proposes a
+`tee()` for passthrough usage recording, explicitly mirroring the logging tee removed here. It is a
+usage recorder rather than logging, so §5.7 does not forbid it — but the same eager-reader cost applies,
+and whether it should reuse the observer is a decision for the user.
+
+### feat(spool): ref-aware JSON serializer — §5.3 shape 3 primitives
+
+Eleventh increment: the primitives that let a ref-bearing request body go upstream as ordinary JSON
+without ever expanding it into one in-RAM string. New module `src/utils/ref-serializer.ts` exports
+`createRefAwareJsonBody(value, { chunkBytes? })` → `{ body: ReadableStream<Uint8Array>, contentLength }`.
+It satisfies §5.3's shape-3 requirement — "a ref-aware serializer emits ordinary JSON chunks and
+reads each blob file in chunks at the exact ref position… recompute an exact `Content-Length` from
+skeleton bytes plus blob sizes, or omit it — never forward a stale length."
+
+- **The wire bytes are the expanded body.** A ref is replaced, at its exact position, by the blob's
+  base64 text read through `readBlobChunks` (64 KiB default), so what the upstream receives is
+  byte-identical to `JSON.stringify(rehydratedBody)` — the shape-2 answer — while the body in hand
+  still holds the ref. `BLOB_REF_MARKER` never appears in the output; the first test asserts that
+  literally, then rehydrates the same body and asserts byte equality with the streamed text.
+- **`contentLength` is computed, not guessed.** A first, retention-free measuring walk sums
+  `event.ref.size` for refs and `Buffer.byteLength(event.text, 'utf8')` for the rest; the stream then
+  walks the same tree again on `pull`. If the two disagree at the end (`written !== contentLength`)
+  the stream is *errored*, never closed short — a truncated body that claims full length is the one
+  failure mode this increment exists to prevent. A blob whose file is gone after the length was
+  declared errors the same way.
+- **Exactness has a precondition, and it is now enforced upstream of it.** A serializer that emits
+  raw payload text can only be byte-exact for payloads `JSON.stringify` would pass through verbatim,
+  so `positionsFor`'s `add()` in `src/utils/blob-refs.ts` now requires
+  `JSON_VERBATIM_PAYLOAD = /^[\x20\x21\x23-\x5b\x5d-\x7e]+$/` (printable ASCII less `"` and `\`) on
+  `prefix + payload`. An ineligible payload — one containing an escape, a control character or a
+  non-ASCII byte — stays inline with its bytes unchanged and is counted in `InlineExtraction.skipped`
+  and logged, so a payload that is not extracted is reported rather than silently mishandled.
+- **`assertRefShape(ref)` runs before any blob is read,** so a malformed ref (a non-string prefix, a
+  non-integer or negative size) is a `BlobStoreError` up front rather than a corrupted body later. A
+  value that does not carry `BLOB_REF_MARKER` is not a ref and is serialized as an ordinary object;
+  that distinction is what the marker exists for.
+- **Streaming does not promote into L1.** The chunked read is deliberately the store's
+  non-promoting path, so streaming a 1 MiB image through the serializer does not evict the LRU. This
+  rests on a test contrast (`readBlob(hashB).source === 'l1'` still holds after `hashA` was chunk-read)
+  and on a faithful mutation of that property being caught — not on a comment.
+- **No production caller yet.** Wiring one requires passing `contentLength` and `duplex: 'half'` at
+  the send boundary in `src/index.ts`, which today rehydrates for shape 2 and therefore forbids refs
+  from surviving it — the opposite invariant to shape 3, which needs them to survive to the
+  serializer. That is a conflict between two documented shapes, not a gap in this module: repo rule
+  #5 says surface it and wait, so the boundary decision is pending rather than guessed. The module
+  header says so, and the §5.2 attempt-body clone remains caller-less for the same reason.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2030/2030**
+(0 skipped). Seven new tests in `tests/unit/ref-serializer.test.ts`: the expanded-bytes/exact-length
+triple above (including that a 4096-byte blob arrives in exactly four 1024-byte reads); every JSON
+rule reproduced with the builtin as the reference (a `toJSON` hook replacing its own value, object
+keys JSON has no text for, array `undefined`/function/symbol → `null`, `BigInt` refused); malformed
+ref, cycle, `BigInt` and non-object root all refused *before* a byte is emitted; a ref whose size
+disagrees with the file erroring the stream instead of sending a short body; a body mutated during
+the send erroring rather than forwarding the stale length; a dangling ref erroring after the length
+was already declared; and a mid-blob `cancel()` closing the stream without erroring and leaving the
+blob on disk.
+
+Mutation gate on this increment's logic: the eligibility predicate, the `written !== contentLength`
+check, the `streamed !== ref.size` check, the `chunkBytes` guard, the on-disk-size disagreement and
+the short-read guard were each neutralized in turn and each was caught by a named test, with the
+originals restored and `diff -q`-verified. Two honest notes. (a) One mutation survived: clamping the
+read length with `Math.min(chunkBytes, onDisk - offset)` → `chunkBytes` changes nothing observable
+for a regular file — a short read at the tail returns the tail and a read past EOF returns 0 — so it
+is an equivalent mutant; only the allocation size differs, and no behavioural test can kill it.
+(b) Two properties are asserted structurally rather than by test: the file descriptor closed in the
+async generator's `finally` on `cancel()` is not observable from a POSIX test, and
+`readBlobChunks`'s idle-expiry branch needs a TTL that cannot be reached without a `Date.now`-stubbing
+idiom this repo does not have. Both are stated here rather than covered by a claim the tests do not
+make.
+
+### feat(spool): SSE input usage resolved before the response stream exists (plan §5.3)
+
+Tenth increment: the two SSE closures that retained a request body no longer do. §5.3's release
+requirement — "before creating the response stream, calculate input usage from the final effective
+body … pass only the resulting number and other scalar metadata into the stream" — is met by
+`createStreamTransformer` and the Responses-to-Claude pump.
+
+- **`createStreamTransformer(model, requestId, inputTokens, tokenCountingConfig?, includeThinking?)`.**
+  The third parameter used to be the request body, which the transformer counted from on the first
+  chunk. It is now the count itself, resolved by the caller before the stream exists. This is the
+  point of the change rather than a style preference: the transformer lives as long as the
+  downstream send, so closing over the body pinned it for the whole client read — and after the
+  §5.3 shape 2 send boundary rehydrates the refs, that body holds every inline base64 payload in
+  full. A number cannot pin a body; the release is structural, not a matter of discipline.
+- **`handleResponsesStreamAsClaude`** hoists the same count above its `TransformStream`, and the
+  pump's `inputTokens` now starts from that estimate. It stays a `let`: the `response.completed`
+  event still replaces it with upstream usage.
+- **Both sites' counting gates are preserved, not blended** (repo rule #5). `createStreamTransformer`
+  counted only under `tokenCountingConfig?.enabled`; the Responses pump counted whenever a body was
+  handed in, never consulting the config. Each keeps its own gate — the asymmetry is pre-existing
+  and is now stated in a comment at each site rather than silently unified.
+- **The audit was a read, not an assumption.** Every other SSE closure in the tree was checked and
+  takes no request body: the Claude→OpenAI, gemini and responses transformers are built from
+  `(model, requestId)`, and the usage/tool tracking, PII-restore mapping and passthrough paths are
+  response-side. The plan names two sites; there are two sites.
+- **Two behaviour changes, deliberate.** (a) A tokenizer-initialization failure no longer resets a
+  successfully computed input count to 0 — the output tokenizer is what that step prepares, and the
+  input count is now settled before it runs. (b) The output tokenizer initializes whenever counting
+  is enabled; it used to additionally require a request body to be present, which the transformer no
+  longer receives.
+- **Cost accepted.** Counting now runs on the request path before the `Response` exists rather than
+  lazily on the first chunk. It is the same single pass over the body per request as before, just
+  earlier, and it fails the same way: a counting error degrades to 0, as it always did.
+- **What the tests can and cannot show.** The count's *value* is testable and is pinned; the
+  *lifetime* improvement is a property of the signature and is not observable from a test — the
+  handler parses its own copy of the request body, so no test can mutate a live body mid-stream to
+  distinguish counting-before-the-stream from counting-during-it. The claim here is the signature,
+  not a measurement.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2018/2018**
+(0 skipped, up from 2012). Five new tests in `tests/unit/streaming.test.ts` under
+`createStreamTransformer — input usage from the caller (§5.3)`: a handed-in count of 4242 appears in
+`message_start.usage.input_tokens` and survives into `message_delta` when upstream reports no usage
+(so the value is carried, not recomputed); no third argument yields 0; upstream-reported
+`prompt_tokens` still wins in `message_delta` (4242 up front, 100 at the end); with counting enabled
+and **no** body the output count equals an independently computed tiktoken count of the text delta;
+and with counting disabled it stays 0 — that last case passes a real `modelName` on purpose, so it
+fails on the gate rather than on a tokenizer that never resolved. One new end-to-end test in
+`tests/unit/index-routing.test.ts`: a streaming `/v1/messages` request with `[spool] enabled`, a
+4096-byte base64 PNG and `LOCAL_TIKTOKEN=true` against an SSE upstream reports a
+`message_start.usage.input_tokens` equal to `countClaudeRequestTokens` over the effective body and
+strictly greater than the same count with the image removed, while the upstream text still carries
+the exact base64 — the count comes from the post-rehydration body, image included. One assertion
+added to an existing `tests/unit/messages-handler.test.ts` Responses-SSE test pins the pump's
+pre-stream estimate likewise. Mutation-checked rather than trusted: six mutations — the
+`handleStreamingResponse` count forced to 0, `estimateInputTokens` forced to `return 0`, the
+Responses pump's estimate forced to 0, `buildFinalUsage` dropping the caller's count, and the
+tokenizer-init gate forced off and forced on — each fail at least one test (one, one, one, two, one
+and one respectively), and the tree was diffed against a backup after every mutation to prove none
+leaked.
+
+### feat(spool): the ref layer's first caller — extraction, one send boundary, one release (plan §5.2/§5.3/§5.4)
+
+Ninth increment: `src/utils/blob-refs.ts` stops being store-first and caller-less. With `[spool]
+enabled = true`, the `/v1/messages`-family request path now extracts its allowlisted inline binaries
+into blob refs before privacy/kompress/judge-run, expands them back to the client's exact bytes at a
+single send boundary, and gives the leases back in the request handler's `finally`. The three
+`bodyText = JSON.stringify(body)` sites and every attempt builder are untouched: refs exist only
+inside that window, so no conversion handler, attempt builder, or serializer can ever emit one.
+
+- **Why the boundary sits where it does (and not somewhere "cleaner").** §5.8 forbids changing
+  full-body auth behavior absent an explicit auth-service contract, and the deferred auth call is the
+  first read of `bodyText` after the parse — so the window is parse → privacy → kompress → judge
+  sidecar → erase, and the boundary goes immediately after the erase step, before auth, model
+  resolution and routing. The alternative — making `buildRouteAttempt` and the synchronous composite
+  `map` ref-aware — was rejected: it is a wide change whose failure mode is a ref silently reaching
+  an upstream. Verified by reading, not assumed: every consumer in that window reads text, tools or
+  scalars, and never an allowlisted binary field.
+- **The owner releases from its own lease list, not from a walk of the body.**
+  `InlineExtraction` gained `hashes: string[]` (one entry per applied ref, repeats included) and a
+  new `releaseExtractedBlobs(extraction)` releases exactly those. `releaseInlineBlobs(body)` walks
+  the tree, so a `$spoolBlob` marker a client forged into a field of its own would make the
+  handler's teardown throw on a hash the request never leased — after it had already given back the
+  real lease on the way there, leaving a dangling ref and a blob that can be swept mid-request. A
+  test pins that derailment as the reason the list exists.
+- **Opt-in at the call site.** Extraction is gated on `getSpoolConfig().enabled` (§9.1, off by
+  default); with no `[spool]` section the request path is exactly what it was, which the routing test
+  asserts rather than assumes.
+- **Failures need no new handling.** `BlobCapacityError` (503) and `BlobStoreError` (500) already
+  extend `ClaudeProxyError`, so the routing block's existing re-raise gives them the right status and
+  type; `extractInlineBlobs` restores the body and releases what it took before rethrowing.
+- **Costs accepted, and now documented.** The boundary re-serializes the request text even when
+  nothing mutated (`JSON.parse`/`stringify` is JSON-equivalent, not byte-identical — `1.0` becomes
+  `1`; the same rewrite already happens when privacy/kompress/erase fire). Extraction has no size
+  floor — §5.4 sets none, and `threshold_bytes` governs only the §5.1 ingress spill — so every
+  allowlisted payload is written to L2, read back at the boundary and then idle-evictable: write-mostly
+  churn unless a payload repeats, in which case the L1/L2 hit pays for it.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2012/2012** (0
+skipped, up from 2005). Five new tests in `tests/unit/blob-refs.test.ts` under
+`the effective body release list`: the list is one entry per applied ref in application order (two
+refs to one payload are two entries of one hash, three leases released, both blobs then
+idle-evictable); an extraction whose body holds a forged ref releases its one real lease and leaves
+that blob idle; a test showing why a walk is the wrong release (the forged ref derails
+`releaseInlineBlobs` only after it has already given back the real lease, so the blob is swept while
+the body still names it and rehydration then refuses); a zero-ref extraction returning
+`{refs: 0, bytes: 0, hashes: []}` and releasing nothing; and a second release of the same extraction
+throwing `BlobStoreError` rather than undercounting. Two new end-to-end tests in
+`tests/unit/index-routing.test.ts`: a `/v1/messages`
+request carrying a 4096-byte base64 PNG, via the real config loader with a `[spool]` section, gets
+its payload into the store while in flight (sampled inside the stubbed `fetch`: one entry, the exact
+byte count), sends upstream text with **no** `$spoolBlob` marker and the **exact** original base64,
+converts the response back, and releases the lease by the time the response returns (the next idle
+sweep deletes the blob and reports zero bytes); and the same request with no `[spool]` section
+leaving `enabled` false, the store empty, and the payload intact — §9.1. The test file's
+`sentBodyText` now accepts a serialized body as well as a streamed one, since a converted egress
+sends a string where passthrough egress streams bytes. Mutation-checked rather than trusted: four
+mutations of the two source files — the send boundary removed, the extraction gate forced off, the
+lease release removed, and the release list emptied — each fail at least one test (one, one, one and
+three respectively), and the tree was diffed against a backup after every mutation to prove none
+leaked.
+
+### feat(spool): the §5.2 attempt body — a copy that shares the blob's lease (plan §5.2/§5.5)
+
+Eighth increment: the clone that gives every attempt its own body without copying the payload.
+New `cloneInlineBlobs` in `src/utils/blob-refs.ts`; still **store-first and caller-less**, the last
+primitive §5.3's converted egress shapes need.
+
+- **`structuredClone` plus one `retain()` per ref.** `cloneInlineBlobs(body)` deep-copies the
+  extracted body and takes one more owner on each blob the copy still names, so two attempts — or an
+  original and a converted re-send — never share mutable state or a single release. The body is
+  copied *before* any lease is taken, so a body `structuredClone` refuses (a function, a class
+  instance) refuses here with nothing to undo; a ref that names no blob refuses the whole clone and
+  the leases already taken are given back. A caller never receives a half-leased copy.
+- **No `leaseId`, and no renewal timer — a documented deviation from §5.5's literal wording.** The L2
+  index already counts owners per blob (`refs`), so a ref's `hash` *is* its lease identity and a
+  `leaseId` would be a second counter over the same lifetime; renewal is structural for the same
+  reason, since `isIdleExpired` requires `refs === 0` and both `retainBlob` and `releaseBlob` set
+  `lastUsed = Date.now()` — a blob held by a live exchange can never be expired, LRU-evicted,
+  TTL-swept, or freed by `reserveDiskBytes`, so a renewal timer would be a provable no-op. Both
+  module headers now say this instead of "not here yet".
+- **One release-with-warning idiom.** `undo`'s per-lease failure collection moved into
+  `releaseQuietly(hashes, context)` and `undo` now uses it, so the extraction rollback and the clone
+  rollback report leftovers the same way: `console.warn` naming each hash, never replacing the error
+  that sent the caller there (repo rule #8 — said out loud, not swallowed).
+- **`src/utils/blob-store.ts`** gained one comment paragraph saying where the lease accounting lives.
+  No code changed there.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2005/2005**
+(0 skipped, up from 2000). Five new tests in `tests/unit/blob-refs.test.ts` under
+`§5.2 attempt body clones`: two refs to one payload clone into two independent objects naming the
+same hash, one blob file and one payload on disk, the body's two leases released while the clone
+still pins the blob through an idle sweep past `ttl_seconds`, then the clone's own rehydration
+returning the shared payload twice and its release letting the same sweep delete the file; the copy
+proven not to alias the original (mutating a ref's kind, a nested filename, and the model leaves the
+source body's `'chat-file-data'`, `undefined` and `'claude'` intact, and each side releases exactly
+once); a body with nothing to clone coming back as a plain deep copy with the store still empty; a
+body holding a function refusing with `DOMException`/`DataCloneError` and no lease taken; and a
+two-ref body where one ref is forged refusing with `BlobStoreError` and releasing the lease it did
+take (the real ref then releases and the sweep deletes the blob). Mutation-checked rather than
+trusted — eight mutations; seven fail at least one test (one per refusal path, one for the retain
+loop, and one that empties `undo`'s rollback after the `releaseQuietly` refactor, which is what
+proves the refactor is still covered), and the eighth — collecting refs from `body` instead of
+`clone` — is equivalent by construction, since the clone is a deep copy of the same tree and both
+collect the same refs in the same order. The tree was diffed against a backup after every mutation
+to prove none leaked.
+
+### feat(spool): the allowlist ref layer — inline binary out of the body, exact bytes back (plan §5.4/§9.3)
+
+Seventh increment of `docs/architecture/plan-ssd-spool-image-request-bodies.md`: the predicates that
+decide which inline payloads become blobs, and the pass that puts them back. New file
+`src/utils/blob-refs.ts`. Like §5.4, it is **store-first and has no production caller yet** — it is
+the prerequisite for §5.3's converted egress shapes 2–3.
+
+- **The §5.4 allowlist, one predicate per position.** Each is keyed on the shape's documented
+  discriminator rather than on a field name: Claude Messages `type: "image" | "document"` with a
+  `source.type: "base64"` (`source.data`); Chat Completions `image_url.url` (only when it is a
+  base64 `data:` URL), `input_audio.data`, and `file.file_data` (bare base64 *or* a data URL);
+  Gemini any `inline_data`/`inlineData` part's `data` — both spellings, since the part carries no
+  type — and Responses `input_image.image_url` (the spec's string form *and* the `{url}` object form
+  this repo's own converter relays), `input_file.file_data`, and an inline skill's `source.data`
+  (only when `media_type: application/zip`). §9.3's ban is honoured literally: **no** long-base64
+  heuristic, and no extraction based only on a field called `data`, `url` or `file_data`. Claude
+  `text`/`url` document sources, `file_id`s, remote URLs, Gemini `file_data`/`fileData` (a URI), and
+  a `data:` URL that is not in the `;base64,` form are all left exactly as the client sent them.
+- **A ref is an object, not a sentinel string.** `{$spoolBlob: true, kind, hash, size, prefix}`
+  replaces the field's string, so a consumer that is not ref-aware fails loudly — `source.data` is
+  no longer a string — instead of quietly measuring a placeholder (§9.3, repo rule #8). The marker
+  is a *string* key on purpose: §5.2 keeps one body per attempt and clones it with
+  `structuredClone`, which drops symbol keys. A client object that happens to carry
+  `hash`/`size`/`prefix` is **not** a ref, and neither is a marker without a hash.
+- **Byte-exact rehydration.** Only the payload goes to the blob; `prefix` records the original
+  `data:<media-type>;base64,` text (`''` for bare base64), so `rehydrateInlineBlobs` reproduces the
+  field value character for character. A `data:` URL is never decoded and re-encoded — which is why
+  the `decodeDataUri` idiom in `src/converters/claude-to-gemini.ts`, which re-encodes URL-encoded
+  payloads, is deliberately not reused here.
+- **All-or-nothing, with the leases to match.** Extraction takes one lease per ref (`putBlob`), and
+  `releaseInlineBlobs` gives back exactly one per *ref* — two refs to one payload are two owners of
+  one blob. If a payload cannot be stored, the applied replacements are undone, their leases
+  released, and the store's error rethrown, so a caller never receives a half-extracted body or
+  leaks a lease. Extraction is idempotent: a second pass reports `{refs: 0, bytes: 0}`.
+- **Identification and validation are separate steps.** `isBlobRef` only *identifies* — marker plus a
+  string hash — because a body's contents are client-controlled, and a guard that also validated
+  would silently ignore a forged ref instead of reporting it. `readRef` validates the `prefix`/`size`
+  it is about to concatenate (a missing prefix would otherwise forward a payload with the literal
+  text `undefined` glued to it), and the store validates the hash's exact shape before it becomes a
+  path. A ref whose blob is gone, or whose recorded size disagrees with the blob's, throws rather
+  than substituting different bytes.
+- **`src/utils/blob-store.ts`** gained one comment: the "no production caller yet" clause now names
+  `blob-refs.ts` as the module holding the allowlist predicates, so neither file read alone claims
+  the other's work. No code changed there.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **2000/2000**
+(0 skipped, up from 1986). New file `tests/unit/blob-refs.test.ts` (14 tests): a twelve-cell matrix
+over the eight ref kinds — both Gemini spellings, both `input_image` forms, and `file.file_data` as
+bare base64 and as a data URL — with payloads above `threshold_bytes`, asserting the ref count, one
+blob file per payload, the `12 × 1052672` byte accounting, a sub-4 KiB skeleton for 12 MiB of
+payload, byte-for-byte rehydration on a `structuredClone` copy, the recorded kind and data-URL
+prefix at each position, then release and idle eviction; every §9.3 negative left byte-identical
+with nothing stored (including a URL-encoded non-base64 data URL, which must not be decoded); dedup
+as one blob under two leases, with a second owner pinning it past the body's release;
+all-or-nothing rollback under a 96-byte disk cap, with the two partial leases provably given back
+(both entries evictable afterwards); and refusal of a forged hash (`../../../etc/passwd`), a size
+mismatch, a deleted `prefix`, a dangling blob, a disabled spool, and a client object that merely
+looks like a ref. Mutation-checked rather than trusted — thirteen mutations; apart from the three
+walker guards below, each fails at least one test. M1 (`isBlobRef`'s marker check) survived the
+first pass, which is what the look-alike test was added for; dropping the hash check, the
+prefix/size validation, the size comparison, the rollback, the remote-URL guard, the
+`source.type`/`media_type` conditions, or a position's data-URL form each fails a test immediately.
+Three `continue` guards — "a ref is a leaf for this walk", one per walker — survive mutation by
+construction: a ref holds only scalars, so walking into one is a no-op. They are kept as the explicit
+statement of that invariant, not as tested behaviour, and deleting them would be equally
+indistinguishable by test. One trap worth recording: `resolveSpoolConfig` reads **snake_case** TOML
+keys, so the new helper is typed `Partial<SpoolTomlConfig>` and its overrides are TOML spellings — a
+camelCase override is ignored in silence, and the test would have measured the default cap instead
+of the one it names. The sibling `blob-store.test.ts` still annotates its helper
+`Partial<SpoolConfig>` while passing snake_case keys; that type lie is not copied here.
+
+### feat(spool): the RAM + SSD two-level blob store (plan §5.4)
+
+Sixth increment of `docs/architecture/plan-ssd-spool-image-request-bodies.md`: the cache that will
+sit behind refs. New file `src/utils/blob-store.ts` — content-addressed by the sha256 of the blob's
+**base64 text** (not of the decoded bytes, so a hit needs no re-encode and exact-string dedup is
+enough), with the two tiers §5.4 asks for:
+
+- **L1 (RAM)** — `Map<hash, {b64, bytes, lastUsed}>` capped by total *bytes*
+  (`max_blob_cache_bytes`, 64 MiB) with least-recently-used eviction. Admission is best effort: a
+  payload larger than the whole L1 budget is never promoted, and L1 eviction never touches the L2
+  file.
+- **L2 (SSD)** — `<spool_dir>/blobs/<aa>/<bb>/<sha256>`, written under a temp name and renamed into
+  place so a blob becomes visible only once it is whole (files 0600, buckets 0700), capped by
+  `max_blob_disk_bytes` (256 MiB).
+- **A metadata-only index** — `Map<hash, {size, lastUsed, refs}>` with a running byte total, so
+  eviction never `stat`s the disk. It starts empty on every process start and is **never** scanned
+  or reconstructed: a file left by an earlier run can never turn into a cache hit, and the single
+  reader of those files is the startup sweep, which only deletes them.
+- **Fail loud (repo rule #8).** Before an L2 write the store evicts idle `refs = 0` entries by LRU
+  and, if nothing unleased can be freed, throws `BlobCapacityError` (503, `over_limit_error`) rather
+  than exceeding the budget or deleting an active blob. An indexed blob that is missing or shorter
+  than its recorded size throws `BlobStoreError` (500, `processing_error`) rather than sending a
+  partial payload — a truncated file is reported as "N bytes on disk but indexed as M". Blob paths
+  are guarded by a `/^[0-9a-f]{64}$/` check, so a traversal-shaped hash (`../../etc/passwd`) is
+  refused before it reaches the filesystem.
+- **Leases now, §5.5 later.** The index counts the owners sharing a blob's lease (`refs`, with
+  `retainBlob` / `releaseBlob`), and a leased blob is never expired, evicted, or deleted. The
+  `leaseId`, renewal and keep-alive rules of §5.5 are deliberately **not** here — they land with the
+  conversion paths that consume these refs, along with the §5.4/§9.3 allowlist predicates that
+  decide which inline payloads become blobs at all. **This module therefore has no production
+  caller yet** (the store-first split of this step).
+- **Idle TTL, not wall-clock.** Expiry reuses the `src/utils/conversation-store.ts` idiom
+  (insertion-ordered `Map`, evict on access plus opportunistic evict on write) with one difference:
+  the TTL is *idle* time measured from the last release, so an exchange still holding a ref is never
+  expired even if it is old. L1 may drop a leased blob's RAM copy — the L2 file is authoritative and
+  stays readable; L2 eviction drops the L1 copy with it.
+- **`sweepStaleBlobs()` wired into startup** in `src/utils/config-loader.ts`, next to the §5.5 spill
+  sweep and with mirrored logging. It walks the blob tree two levels deep, deletes regular files
+  older than the same age threshold (a worker starting alongside this one may still be writing), and
+  reports — never follows — anything it declines to remove (a subdirectory, a symlink, a name that
+  is not a blob hash, an unlink failure) with its reason. It never populates the index. The
+  `Spool active:` startup line now also prints `maxBlobDiskBytes`.
+- **`src/utils/spool.ts`** had a header paragraph claiming this module owned the whole spool
+  surface; it now points at `blob-store.ts` and states what is actually live (the §5.1 ingress
+  path), which would otherwise have been a comment contradicting the code.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **1986/1986**
+(0 skipped, up from 1964). New file `tests/unit/blob-store.test.ts` (21 tests): layout and byte
+identity (the hash is the sha256 of the base64 text, the file's content is that text, 0600 in a 0700
+bucket, `readBlob` reports `source: 'l2'`); dedup as one file and one write (mtime unchanged,
+`diskBytes: 100`, `diskEntries: 1`, a double release throws "no active lease to release"); tmp +
+rename leaves no temp name behind; the traversal guard over six hash shapes; a disabled spool
+refuses `putBlob` with a plain `Error`, not a `BlobStoreError`, and creates no directory; the L1 LRU
+by asserted read sequence (`l2, l1, l1, l2, l2`) with `cacheBytes` under the cap and the L2 index
+untouched; an oversized payload never promoted; a leased blob's RAM copy evicted while its file
+stays readable; L2 LRU eviction that drops the idle-oldest, keeps the newer idle and the leased, and
+lands exactly on the cap with the evicted hash rejecting "not in the cache index"; all-leased under
+the cap → `BlobCapacityError` (`status 503`, `type 'over_limit_error'`) with the cap and the leases
+intact and nothing written; a missing file ("cannot be read") and a truncated one ("40 bytes on
+disk but indexed as 100") with accounting unchanged; the restart rule (`resetBlobStore()` → all-zero
+stats, the file still on disk, a later read throwing, a re-`putBlob` reporting `cached: false`); the
+idle TTL at 599 s vs 601 s with a leased blob surviving and the idle clock starting at the final
+release; an unlink failure reported rather than claimed (`removed === 0`, bytes still counted — root
+skipped); and the sweep's aged-vs-recent split, its six-entry skip set, a missing root reported
+without being created, and "startup operation only" (the sweep deletes the file while the index
+stays untouched, so the next read throws). `tests/unit/config-loader.test.ts` gains one test that
+drives the real `loadProxyConfig`: an aged blob is removed at startup, a recent one is kept, and the
+store's stats stay all-zero. Both new suites were mutation-checked rather than trusted: removing the
+`refs` guard fails the two TTL tests, disabling the length check fails the truncation test, relaxing
+the `refs === 0` filter fails the capacity test, and stubbing `blobSweep` out of `config-loader.ts`
+fails the startup test — 21/21 and 223/223 clean again after each revert.
+
+### feat(spool): stream passthrough request bodies as identity egress (plan §5.3)
+
+Fifth increment of `docs/architecture/plan-ssd-spool-image-request-bodies.md`: the first egress
+shape. `/passthrough` already forwarded the client body with zero transformation; what changed is
+*how* it leaves the proxy — the raw client bytes are now streamed upstream with an exact
+`Content-Length` instead of being re-held as one full-body string, and the parsed tree is released
+before the send. This also discharges Phase 0 item 3 (§9.4), which folds into the chosen Phase 2
+step.
+
+- **Identity egress in `src/handlers/passthrough.ts`.** `handlePassthroughRequest` no longer takes
+  a `bodyText` argument. It reads the body itself via `readIngressSpoolText()`, parses it, runs the
+  existing schema gate, and keeps only scalars — `model`, `stream_options.include_usage`, and a
+  300-char preview for error details — inside a block scope, so the source text and the parsed
+  object are both collectible before the upstream call. What it sends is the request's own raw
+  bytes: `request.body` (the stream `src/index.ts:1200` already builds from the raw spool) with
+  `Content-Length` from `IngressSpool.size` and `duplex: 'half'`, matching the repo's existing
+  streamed-body convention. Without a raw-body ref (handler called directly, or a body-less
+  request) it falls back to the decoded text's UTF-8 bytes, so the handler still stands alone.
+- **Byte identity, not a re-serialization.** Identity passthrough makes the *raw spool*
+  authoritative (§5.3); a `JSON.stringify` of the parsed body would silently drop the client's
+  whitespace and key order. The new tests assert sha256 equality between the client bytes and the
+  upstream body on an indented fixture, and a byte-vs-UTF-16 `Content-Length` on a non-ASCII one.
+- **Deliberate deviation from the plan's literal transport.** §5.3 says "stream the spool file
+  directly: `Content-Length` from `stat`, body from `createReadStream`". That would be a second
+  disk read of bytes `src/index.ts:1200` has *already* materialized into the request, and it would
+  drag §5.5's lease/lifetime handshake into the send: the spill could not be released until a
+  still-streaming upstream body finished, and `open()` + `unlink()` is explicitly ruled out for
+  the win32 SEA build. The stated outcome — zero transformation, no full-body string at send — is
+  reached without either. If a later step stops materializing the body in `src/index.ts`, the
+  natural continuation is to feed `createReadStream` here and take the lease at that point.
+- **`src/index.ts` no longer reads a body it does not need.** The deferred
+  `auth_with_model` / `auth_with_body` gate still parses the body, so `readIngressSpoolText()` runs
+  only inside that branch instead of on every passthrough request.
+- **Trace logging keeps full fidelity without retention.** The `upstream-request` trace used to log
+  the string the handler already held; it now re-reads the spool *at log time* and only when
+  `logger.traceEnabled` is set. Tracing therefore still shows the exact client body (asserted
+  verbatim on a >300-char spilled fixture) while nothing is retained when trace is off. The re-read
+  is guarded on the spool: `readIngressSpoolText()` falls back to `request.text()`, which the parse
+  has already consumed, so the unguarded version threw `Body is already read` on the no-spool path
+  (the new test caught it). That path logs the 300-char preview instead.
+- **The model scalar is type-checked.** `(body.model as string) || 'unknown'` became "a non-empty
+  string, else `'unknown'`", so a non-string `model` can no longer reach the rate-limit and usage
+  keys as a coerced value.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **1964/1964**
+(0 skipped, up from 1957). New file `tests/unit/passthrough-egress.test.ts` (seven tests): the
+client bytes reach the upstream byte-identically with a byte-exact `Content-Length` on both the
+no-ref and the spilled path; a spilled body is sent as a **stream**, not a string, still
+byte-identical; the upstream-request trace carries a spilled body verbatim and untruncated; invalid
+JSON and a schema-gate failure both 400 without ever calling the upstream; the parsed `model` lands
+in the rate-limit table under its own key (and not under `'unknown'`); and the
+`stream_options.include_usage` warning fires only when the flag is absent. The guards were
+mutation-checked rather than assumed: forcing the fallback branch fails the spilled-egress test.
+`tests/unit/passthrough-auth.test.ts` and `tests/unit/index-routing.test.ts` were updated for the
+new signature — the two routing tests now drain the streamed body and assert its exact text and
+byte `Content-Length` through the real `handler.fetch` dispatch path.
+
+### feat(spool): sweep spills left by a crashed run at startup (plan §5.5)
+
+Fourth increment of `docs/architecture/plan-ssd-spool-image-request-bodies.md`: the lifecycle piece.
+A restart discards all spool state — no recovery manifest, no replay metadata — so spill files from
+a previous process are garbage. They are now removed at startup, but only once they are old enough
+to be certain they are garbage.
+
+- **`sweepStaleSpills()` in `src/utils/spool.ts` — age-thresholded, non-recursive, regular files
+  only.** A file under `<spool_dir>/requests` whose mtime is at least `SPOOL_SWEEP_MIN_AGE_MS`
+  (1 hour) old is deleted; anything newer may belong to a worker starting up alongside this one
+  that is still filling it, so it is left alone and counted as `keptRecent`. The sweep does not
+  recurse, and a `Dirent.isFile()` check means a symlink is neither followed nor deleted — a link
+  planted in the spill directory cannot make cleanup reach a file outside it. The 1-hour default is
+  the bound on a plausible in-flight upload: what too large a threshold costs is disk space, and
+  what too small a one costs is a corrupt in-flight request.
+- **Portable by construction.** Deletion is `unlinkSync` on a closed name. Hiding an open fd behind
+  an unlinked name (`open()` + `unlink()`) is POSIX-only and the repo ships a win32 SEA build, so
+  the sweep is the answer there too (§5.5).
+- **Nothing is skipped silently (repo rule #8).** The result reports `removed`, `keptRecent`,
+  `dirMissing`, and a `skipped` list of `{ path, reason }` for every entry left in place —
+  directory, symlink/special file, stat failure, or a failed unlink. The startup caller logs the
+  removal summary at info and every skipped entry with its reason at warn. A missing `requests/`
+  directory is normal (`dirMissing`), not an error: the ingress path creates it on the first spill,
+  and the sweep deliberately does not create it as a startup side effect.
+- **`src/utils/spool-ingress.ts` now shares the layout** (`requestSpillDir()` /
+  `REQUEST_SPILL_SUBDIR`) instead of spelling `'requests'` a second time, so the writer and the
+  sweeper cannot drift apart. `src/utils/config-loader.ts` runs the sweep inside the existing
+  `if (startupSpool.enabled)` block, next to the `Spool active: dir=…` line that already satisfies
+  §5.5's "the resolved path is logged at startup". A disabled spool still touches nothing (§9.1):
+  no directory, no sweep, no log.
+- **Blast radius is exactly the spill files.** Only `<spool_dir>/requests/*` regular files are
+  candidates; the spool root itself is never scanned, so the write probe and anything else an
+  operator keeps in `[spool] dir` are out of reach. A future response/event spill directory has to
+  be added to the sweep explicitly.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **1957/1957**
+(0 skipped, up from 1952). New coverage in `tests/unit/spool.test.ts` (`sweepStaleSpills (§5.5)`,
+five tests): a 2-hour-old spill is removed while a 10-minute-old one survives byte-intact and an
+equally old file *outside* `requests/` is untouched; with an explicit 1-hour cutoff a file just
+under it is kept and one just over it is removed; a missing `requests/` directory yields
+`dirMissing` and is not created; a symlink to an old file outside the spool and a subdirectory are
+both left in place with their reasons reported while a genuine stale file is still removed; and a
+read-only spill directory turns the failed unlink into a `skipped` entry with `removed: 0` rather
+than a throw or a false success (that test skips only when the suite runs as root, where
+permission checks do not apply). The guards were mutation-checked rather than assumed: dropping the
+regular-file check fails the symlink test, ignoring the age threshold fails the two age tests, and
+sweeping the spool root instead of the spill subdirectory fails three.
+
+### feat(spool): wire the ingress spool into the live request path (plan §5.1, §5.2, Phase 1)
+
+Third increment of `docs/architecture/plan-ssd-spool-image-request-bodies.md`, and the one that
+makes Phase 1 real: the ingress primitive is now on the request path, and the adapter feeding it
+applies actual backpressure. Spooling is still **off by default** (`[spool] enabled = false`), so
+an unchanged config behaves exactly as before — but with `enabled = true` a large upload now
+streams to disk instead of being held in RAM while the client sends it.
+
+- **`src/index.ts` — the 10 MiB buffering block is gone, replaced by one backpressured,
+  byte-counted receive path (§5.1).** Every request with a body goes through
+  `receiveIngressBody()`: at or below `threshold_bytes` it stays in memory, above it it spills
+  from the first byte, and an unknown-length body crosses the threshold without losing the bytes
+  already received. `Content-Length` is only the early-rejection hint it always was; the byte
+  counter decides. The old block's `if (!body)` / over-cap / read-into-memory branches are
+  subsumed. Statuses now come from the error class rather than the explicit `413` the old block
+  passed: a declared or counted length past `max_request_bytes` is a `SpoolRequestTooLargeError`
+  (413, message wording essentially unchanged), an exhausted spill budget a new
+  `SpoolCapacityError` (503), and an unusable spill directory a `SpoolWriteError` (500) — all
+  `ClaudeProxyError`s, so `createErrorResponse(error, requestId)` needs no new plumbing and the
+  envelope on `/v1/responses` paths is unchanged.
+- **The request is re-wrapped, and the ref survives the reconstruction (§5.1, §5.2).** Downstream
+  handlers still call `request.json()` / `request.text()` on a dozen paths, so the raw bytes are
+  re-wrapped onto a fresh `Request` and `attachIngressSpool()` re-attaches the spool to it —
+  `new Request(other, init)` copies neither properties nor symbols, which is why attaching only
+  in the adapter is insufficient. The three top-level body reads now go through
+  `readIngressSpoolText(request)`: the raw spool when a ref is attached, the request body
+  otherwise. A read of an already-released spool throws rather than silently falling back to a
+  body the proxy has already answered.
+- **The raw spool is released in a `finally` around the handler**, so every terminal path returns
+  its `max_total_bytes` reservation — the success path, each error path, and every early return
+  inside the handler (repo rule #8). The raw body is fully read before the response is produced,
+  so one release point covers all of them.
+- **`src/server.ts` — `createNodeBodyStream()` is pull-driven, so the ingress backpressure is
+  real.** The previous shape attached a `data` listener and never paused: Node went into flowing
+  mode and a client could push its whole body into an unbounded in-memory queue however slowly
+  the handler read. Now the stream uses `{ highWaterMark: 0 }`, pauses the socket again right
+  after attaching, resumes it only when a read is pending (`pull`), and pauses after each chunk a
+  read consumed — one chunk released per read. `drain()` detaches the `'data'`/`'end'` listeners
+  and resumes the socket once the handler returns, so the paths that answer without reading the
+  body (auth rejection, dashboard, OPTIONS) discard the rest of the upload instead of leaving a
+  client to finish writing a body nobody will read. `cancel()` routes through the same drain. The
+  `'error'` listener deliberately stays attached: removing it would turn a late socket error into
+  an uncaught exception.
+- **What Phase 1 still does not fix (§6), unchanged:** slow *upstream* sends and SSE request-body
+  retention. Full parsed objects and serialized upstream bodies still exist; the lazy/streamed
+  readers that remove them are §5.3/§5.7 Phase 2 work, and the §5.5 startup sweep of stale spill
+  files was still to come at this increment (the entry above adds it).
+- **The memory win is the upload window, not the peak.** The request is re-wrapped by reading the
+  spool back with `readBytes()`, because a `Request` body is a single byte sequence and the
+  downstream read sites need one; so a spilled body is materialized once the upload ends, and
+  peak residency at the point of use is still O(body) — the same cost §5.2 accepts for the
+  effective body. What changed is *when* it is resident: no longer for the whole duration of a
+  slow client upload, which is the window §3.1/§6 scoped this phase to. Removing the read-back
+  is §5.2's streaming-through-effective-body work.
+
+This closes the four items the previous entry listed as required before enabling: the buffering
+block, the `SpoolRef` across reconstruction, the downstream body-read sites, and the pull-based
+adapter stream.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit` **1952/1952**
+(0 skipped). New coverage: `tests/unit/spool-ingress.test.ts` gains the raw-body ref block (the
+ref is dropped by `new Request` and re-attaches to the same spool; a spool read does not consume
+the request body, so `request.json()` still works afterwards; no ref falls back to the request
+body; a released spool fails loudly). `tests/unit/server.test.ts` gains four deterministic
+`createNodeBodyStream` tests against a fake `IncomingMessage` that counts `pause`/`resume` and
+listeners (paused after construction, one resume per pending read, pause after each consumed
+chunk, `drain()`/`cancel()` detach `'data'`/`'end'` and resume while keeping `'error'`, drain is
+idempotent, GET/HEAD get no stream), plus two integration tests over a real socket: a 16 MiB
+upload whose handler reads one chunk and stalls must stall the client well below the body size
+and then deliver all 16 MiB with a matching sha256, and a 4 MiB upload whose handler returns 401
+without reading a byte must still receive that response. The backpressure assertion was sized by
+measurement, not guesswork: against the old flowing shape `socket.bytesWritten` reaches the whole
+16,777,357 bytes within 150 ms, while the pull-driven stream plateaus at 917,645 bytes (~896 KiB
+of kernel buffer plus Node's small write queue) and stays there until the handler reads again —
+so the test's `stalled < totalBytes / 4` bound discriminates by a margin of ~18×, and the exact
+equality after a further 200 ms is what a merely-slower reader would fail.
+
+### feat(spool): the Phase 1 ingress receive path — bounded-memory request bodies (plan §5.1, §5.2, §5.5)
+
+Second increment of `docs/architecture/plan-ssd-spool-image-request-bodies.md`. This adds the
+ingress primitive that receives a request body with bounded memory; **nothing calls it yet**, so
+an `enabled = true` spool was still inert and behavior unchanged — the entry above is the one that
+puts it on the request path.
+
+- **`src/utils/spool-ingress.ts` (new) — `receiveIngressBody()` and the `IngressSpool` handle.**
+  A body at or below `threshold_bytes` stays in RAM; a body whose `Content-Length` already
+  exceeds it spills from the first byte; an unknown-length body (chunked / HTTP/2) buffers only
+  until the threshold is crossed and then writes the bytes already received *before* any further
+  read, so no byte is dropped in the memory→file transition. `Content-Length` is treated only as
+  an early-rejection hint (§5.1): a declared length past `max_request_bytes` returns 413 without
+  pulling a single byte, while a running byte counter enforces the same cap for every encoding.
+  The receive loop is a pull-based `pipeline`-style loop — each chunk is written to disk before
+  the next `read()` — so the socket and the file both provide backpressure instead of the
+  unbounded push the old buffering block relied on.
+- **Spilled bytes are charged to `max_total_bytes` as they are written, and released on every
+  terminal path** (success, breach, abort, disk error). A breach raises an explicit
+  `SpoolCapacityError` (503) rather than truncating the body, and a failed or cancelled upload
+  removes its spill file and returns its reservation, so the live total returns to baseline. A
+  ledger underflow is thrown, never clamped — a silent clamp would hide exactly the accounting
+  bug the counter exists to catch. Only spilled bytes are charged: an in-memory body is bounded
+  by `threshold_bytes` × in-flight requests, and the whole-process budget knob is the admission
+  limiter of §5.9, which stays disabled by default.
+- **A spool is a reader-owned handle, not a stream.** §5.1 rejects
+  `new Request(url, { body: fileStream })` followed by `.json()`, because undici buffers the
+  whole body anyway; `IngressSpool.readBytes()` / `readText()` read the file at the point of use,
+  and `release()` (idempotent, expected in a `finally`) deletes it and returns the reservation.
+  Reading a released spool throws instead of returning a short body. With `enabled = false`
+  nothing is written and `SpoolWriteError` never fires, but the body still travels the unified
+  byte-counted path.
+- The three failure modes are loud and mapped to the existing error convention: a body over
+  `max_request_bytes` → `SpoolRequestTooLargeError` (413), the aggregate budget exceeded →
+  `SpoolCapacityError` (503), and an unusable spill directory or a failed write/close →
+  `SpoolWriteError` (500), each carried by `ClaudeProxyError` so `createErrorResponse` needs no
+  new plumbing. Spill files are `<spool_dir>/requests/req-<uuid>.body` at mode `0600`, in a
+  lazily created `0700` directory; leftover files from a crash are left for the §5.5 startup
+  sweep, which is not part of this change.
+
+Still required before any of this could be enabled, and what the entry above went on to do:
+replacing the 10 MiB buffering block in `src/index.ts:1176-1211`, preserving the `SpoolRef`
+across the early `Request` reconstruction, routing the downstream `request.text()` / `.json()`
+sites through the spool, and making `src/server.ts`'s request body stream pull-based (`pull` +
+`pause`/`resume`) so the ingress backpressure is real rather than queued in memory.
+
+Verified at this increment: `npm run typecheck` clean; `npm run test:unit` **1942/1942** (0 skipped,
+before the ten wiring tests the entry above adds), including
+the new `tests/unit/spool-ingress.test.ts` (16 tests: the in-memory path writes no directory and
+re-reads one buffer; a declared over-cap length pulls **zero** bytes; an unknown-length over-cap
+body is cancelled and leaves no file; `enabled = false` never spills; spill-from-start is
+`0600` and sha256-identical to the body; an unknown-length threshold crossing keeps the prefix
+byte-identical; the reader stays within two chunks of the file at every pull, which a
+buffer-then-write loop would fail; the ledger is unchanged by a refused upload and back to zero
+after release, including a mid-stream breach; `release()` twice does not underflow and reading
+after release throws; an unwritable spill directory fails with `SpoolWriteError`).
+
+### feat(spool): `[spool]` config surface and the trace-level body-logging gate (plan Phase 0 item 1 + §5.6, foundation for Phase 1)
+
+First increment of `docs/architecture/plan-ssd-spool-image-request-bodies.md`. This change
+adds the configuration layer and one free win; **no request path is spooled yet**, so an
+`enabled = true` spool is currently inert. Nothing changes for an existing config that has
+no `[spool]` section.
+
+- **`src/utils/logger.ts` — gate the body stringification on trace (plan Phase 0 item 1).**
+  `logPipelineStage` stringified the whole request/response body (up to a 2 MB preview of
+  it) at four pipeline stages before handing the text to `logger.trace`, which then
+  discarded it unless `LOG_LEVEL=trace`. It now returns immediately when the new
+  `Logger.traceEnabled` flag (derived from `createLogger`'s closed-over `minLevel`) is
+  false, so the copy never happens. `Logger` gained the flag in both declarations —
+  `src/utils/logger.ts` (the implementation) and the narrower `src/types/shared.ts` view,
+  which must stay in sync. Per plan §9.4 this stays unreleased until Phases 1–2 land.
+- **`src/utils/spool.ts` (new) — `[spool]` resolution.** `resolveSpoolConfig()` fills every
+  §5.6 default (`enabled = false`, `dir = ~/.cache/model-proxy/spool`, `threshold_bytes =
+  1048576`, `max_request_bytes = 10485760`, `max_response_bytes = 67108864`, `max_total_bytes
+  = 2147483648`, `max_materialized_body_bytes = 0`, `materialization_factor = 2.0`,
+  `max_admission_queue = 64`, `admission_timeout_ms = 30000`, `max_blob_cache_bytes =
+  67108864`, `max_blob_disk_bytes = 268435456`, `ttl_seconds = 600`), validates each key,
+  and expands a leading `~`. An unusable directory is a **fatal** startup error (a new
+  `SpoolConfigError` carrying `fatal = true`, the `KeyStoreError` convention): a spool that
+  silently falls back to memory would hide the risk it exists to remove. A disabled spool
+  touches nothing on disk — reading config never creates a directory. When enabled, the
+  directory is created, forced to mode `0700`, and proven writable with a write+unlink
+  probe (`mkdir` succeeding says nothing about a read-only mount, a full disk, or another
+  owner's directory), and a tmpfs/ramfs target is reported as a RAM-backed warning.
+- **`src/utils/config-loader.ts` — the `[spool]` TOML section.** Parsed (quoted `dir`,
+  unquoted numeric limits and `enabled`), serialized back for the dashboard/TUI save path,
+  and resolved once in `loadProxyConfig` next to the image-encode resolution, logging the
+  resolved dir at startup (§5.5). An unrecognised `[spool]` key is reported as a validation
+  error rather than dropped — a limit an operator believes is in force but that was never
+  parsed is worse than a rejected key.
+
+Deferred deliberately (both noted in `src/utils/spool.ts`): `SPOOL_*` env overrides, because
+`isEnvFlagEnabled` lives in `dashboard-stats.ts`, which imports from `config-loader.ts` —
+taking that dependency would close a `config-loader → spool → dashboard-stats →
+config-loader` cycle; and the blob store/leases themselves, which are Phase 1.
+
+Verified: `npm run typecheck` clean; `npm run test:unit` **1926/1926** (0 skipped), including
+the new `tests/unit/spool.test.ts` (per-key validation and its error text, `~` expansion,
+mode `0700`, the write probe failing loud, tmpfs/ramfs magic numbers, inertness while
+disabled), `tests/unit/logger.test.ts` (the body is serialized **zero** times when trace is
+off and exactly once when it is on), `[spool]` parse → serialize → parse coverage plus four
+`loadProxyConfig` startup cases (section absent, enabled, unusable dir, invalid limit) in
+`tests/unit/config-loader.test.ts`. Also checked outside the test harness: a real
+`loadProxyConfig` run with `[spool] enabled = true` logs
+`[config] Spool active: dir=… thresholdBytes=… maxTotalBytes=…` and creates the directory as
+`drwx------`; the same run without a `[spool]` section creates nothing (the §5.6 default
+`~/.cache/model-proxy/spool` is not touched).
+
 ### fix(dashboard): a `TUI=1` / `DASHBOARD=1` start recorded no heatmap events and skipped token-limit enforcement — one shared mode-flag predicate, plus a 31-day monthly heatmap window and restore window
 
 `areModeFlagsEnabled()` (`src/utils/dashboard-stats.ts`) accepted only `'true'`, while

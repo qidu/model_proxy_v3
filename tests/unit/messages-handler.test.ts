@@ -2,6 +2,7 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { handleMessagesRequest } from '../../src/handlers/messages.js';
+import { countClaudeRequestTokens } from '../../src/utils/token-counting.js';
 import { ClaudeProxyError } from '../../src/utils/errors.js';
 
 const TARGET_URL = 'https://upstream.example/v1/chat/completions';
@@ -263,11 +264,12 @@ describe('handleMessagesRequest', () => {
     }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
 
     try {
-      const response = await postMessages({
+      const requestBody = {
         model: 'gpt-test',
         stream: true,
         messages: [{ role: 'user', content: 'Weather?' }],
-      }, 'openai-responses');
+      };
+      const response = await postMessages(requestBody, 'openai-responses');
       assert.equal(response.status, 200);
       assert.equal(response.headers.get('content-type'), 'text/event-stream');
       const text = await response.text();
@@ -277,6 +279,13 @@ describe('handleMessagesRequest', () => {
       });
 
       assert.equal(parsed[0].type, 'message_start');
+      // §5.3: the pre-stream estimate over the request body is reported up front,
+      // before the response stream exists — not the upstream usage (8) that only
+      // arrives later on response.completed.
+      assert.equal(
+        parsed[0].message.usage.input_tokens,
+        countClaudeRequestTokens(requestBody as any, { useLocalCounting: true, tokenizer: null }),
+      );
       assert.deepEqual(parsed[1], {
         type: 'content_block_start',
         index: 0,
@@ -291,6 +300,59 @@ describe('handleMessagesRequest', () => {
         usage: { input_tokens: 8, output_tokens: 4 },
       });
       assert.deepEqual(parsed[6], { type: 'message_stop' });
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('aborts a Responses SSE stream that ends before response.completed', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(
+      'data: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )) as typeof fetch;
+
+    try {
+      const response = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'hello' }],
+      }, 'openai-responses');
+      await assert.rejects(response.text(), /Responses stream ended before response\.completed/);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('aborts on malformed Responses SSE JSON instead of skipping it and reporting success', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(
+      'data: {bad json}\n\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )) as typeof fetch;
+
+    try {
+      const response = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'hello' }],
+      }, 'openai-responses');
+      await assert.rejects(response.text(), /Invalid JSON in Responses SSE data/);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('propagates a Responses upstream read failure instead of closing cleanly', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
+        controller.error(new Error('upstream reset'));
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+    try {
+      const response = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'hello' }],
+      }, 'openai-responses');
+      await assert.rejects(response.text(), /upstream reset/);
     } finally {
       globalThis.fetch = previousFetch;
     }

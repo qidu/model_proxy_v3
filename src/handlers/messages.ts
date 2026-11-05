@@ -7,7 +7,7 @@
 import { Env } from '../types/shared.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { Logger, createLogger, logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
+import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStream } from '../utils/logger.js';
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
 import { convertClaudeToOpenAIRequest, ThinkingConversionOptions, budgetToReasoningEffort } from '../converters/claude-to-openai.js';
@@ -27,6 +27,11 @@ import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fe
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { OpenAIResponsesResponse } from '../converters/completions-to-responses.js';
+import { collectBlobRefs, rehydrateInlineBlobs } from '../utils/blob-refs.js';
+import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
+import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
+import { getSpoolConfig } from '../utils/spool.js';
+import { receiveJsonResponse } from '../utils/spool-response.js';
 
 /**
  * Get token counting configuration from environment
@@ -37,6 +42,26 @@ function getTokenCountingConfig(env?: Env): TokenCountingConfig {
     enabled: config.enabled,
     modelName: config.modelName,
   };
+}
+
+/**
+ * Estimate a request's input tokens from the body while it is still in hand.
+ *
+ * Every SSE path resolves this *before* it creates its response stream (§5.3):
+ * the stream's transformer/pump outlives the handler for the whole downstream
+ * send, so it must be handed a number instead of closing over the request body
+ * — which would pin the entire request, inline base64 payloads included, until
+ * the client stops reading. A counting failure degrades to 0, as the previous
+ * in-stream counter did.
+ */
+function estimateInputTokens(requestBody: Record<string, unknown> | undefined): number {
+  if (!requestBody) return 0;
+  try {
+    const options: TokenCountingOptions = { useLocalCounting: true, tokenizer: null };
+    return countClaudeRequestTokens(requestBody as any, options);
+  } catch {
+    return 0;
+  }
 }
 
 function normalizeOpenAICompletionsBody(requestBody: Record<string, unknown>): Record<string, unknown> {
@@ -197,6 +222,21 @@ export async function handleMessagesRequest(
   // Clone request before parsing body to preserve body for SDK handler
   // Parse request body from cloned request
   const requestBody = isSdkUrl(targetUrl) ? await request.clone().json() as Record<string, unknown> : await request.json() as Record<string, unknown>;
+  // §5.3 egress shape. The send boundary forwards refs, not payloads, so each
+  // branch below decides at its own send whether to put the payloads back (shape 2)
+  // or to hand the refs to a serializer that streams each payload at the offset its
+  // ref occupies (shape 3). `streamRefs` is the Claude-format path's decision,
+  // taken here because that path converts before it sends and a body expanded here
+  // would have no refs left to stream; the already-OpenAI branch below decides for
+  // itself at each of its sends.
+  // `enabled` gates the walk, so a deployment with spooling off (§9.1) pays
+  // nothing: with no extraction pass there can be no ref. The `sdk://` branch
+  // below is handed the parsed body itself, so it stays on shape 2.
+  const streamRefs = !isSdkUrl(targetUrl) && getSpoolConfig().enabled &&
+    collectBlobRefs(requestBody).length > 0;
+  if (isSdkUrl(targetUrl)) {
+    await rehydrateInlineBlobs(requestBody);
+  }
   logPipelineStage(activeLogger, requestId, 'inbound', '/v1/messages', requestBody);
   logPipelineHeaders(activeLogger, requestId, 'inbound', '/v1/messages', request.headers);
 
@@ -251,7 +291,14 @@ export async function handleMessagesRequest(
   }
 
   if (isOpenAIFormat && !hasClaudeFormatTools) {
-    // Request is already in OpenAI format, pass through directly
+    // Request is already in OpenAI format, pass through directly.
+    // §5.3: this branch forwards a body the client already spelled as OpenAI, so
+    // there is no conversion of its own to carry a ref into — but the refs stay
+    // in the body all the same. The token counter counts them where they sit
+    // (an untyped block's refs are counted by their recorded size, §5.3's own
+    // approximation), and both sends below decide their egress shape from the
+    // body they are handed, so nothing here has to read a payload before the
+    // send. The one expansion left in this handler is the `sdk://` branch above.
     const openaiRequestBody = normalizeOpenAICompletionsBody(requestBody);
     const isStreaming = openaiRequestBody.stream === true;
 
@@ -330,10 +377,8 @@ export async function handleMessagesRequest(
       logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, responsesBody);
       const responsesFetchHeaders1 = { 'Content-Type': 'application/json', ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request) };
       logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, responsesFetchHeaders1);
-      let responsesResponse = await fetch(targetUrl, {
-        method: 'POST',
+      let responsesResponse = await postJsonWithSpool(targetUrl, responsesBody, {
         headers: responsesFetchHeaders1,
-        body: JSON.stringify(responsesBody),
         signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
       });
 
@@ -360,9 +405,9 @@ export async function handleMessagesRequest(
       if (isStreaming) {
         return handleResponsesStreamAsClaude(responsesResponse, model, requestId, activeLogger, requestBody);
       }
-      const responsesJsonText = await responsesResponse.text();
-      logPipelineStage(activeLogger, requestId, 'upstream-response', targetUrl, responsesJsonText);
-      const responsesJson = JSON.parse(responsesJsonText) as OpenAIResponsesResponse;
+      const responsesJson = await receiveJsonResponse<OpenAIResponsesResponse>(
+        responsesResponse, requestId, activeLogger, targetUrl, request.signal,
+      );
       const outputItem = responsesJson.output?.find(o => o.type === 'message');
       const textPart = outputItem?.content?.find(c => c.type === 'output_text');
       const toolCallItems = responsesJson.output?.filter(o => o.type === 'function_call') ?? [];
@@ -421,10 +466,8 @@ export async function handleMessagesRequest(
     logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, upstreamBodyOpenai);
     const openaiFetchHeaders = { 'Content-Type': 'application/json', ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request) };
     logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, openaiFetchHeaders);
-    let response = await fetch(targetUrl, {
-      method: 'POST',
+    let response = await postJsonWithSpool(targetUrl, upstreamBodyOpenai, {
       headers: openaiFetchHeaders,
-      body: JSON.stringify(upstreamBodyOpenai),
       signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
@@ -480,7 +523,7 @@ export async function handleMessagesRequest(
     if (isStreaming) {
       return handleStreamingResponse(response, model, requestId, activeLogger, openaiRequestBody, tokenCountingConfig);
     }
-    return handleNonStreamingResponse(response, model, requestId, activeLogger, openaiRequestBody, tokenCountingConfig);
+    return handleNonStreamingResponse(response, model, requestId, activeLogger, openaiRequestBody, tokenCountingConfig, request.signal);
   }
 
   // Claude format - convert to OpenAI
@@ -607,12 +650,25 @@ export async function handleMessagesRequest(
     if (openaiRequest.tool_choice !== undefined) responsesBody.tool_choice = completionsToolChoiceToResponsesToolChoice(openaiRequest.tool_choice);
 
     logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, responsesBody);
-    const responsesFetchHeaders2 = { 'Content-Type': 'application/json', ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request) };
+    // §5.3 shape 3 (claude.ts:154 precedent): a body that still carries refs is
+    // sent as a stream — skeleton plus one blob chunk at a time — with the exact
+    // length the serializer measured and `duplex: 'half'`. A ref-free body sends
+    // the expanded string exactly as before.
+    const responsesStreamed = streamRefs ? createRefAwareJsonBody(responsesBody) : undefined;
+    const responsesEgress = responsesStreamed
+      ? { body: responsesStreamed.body, contentLength: responsesStreamed.contentLength, spilled: true }
+      : await createJsonEgressBody(responsesBody, 'att-');
+    const responsesFetchHeaders2 = {
+      'Content-Type': 'application/json',
+      ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),
+      ...(responsesEgress.contentLength !== undefined ? { 'Content-Length': String(responsesEgress.contentLength) } : {}),
+    };
     logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, responsesFetchHeaders2);
     let responsesResponse = await fetch(targetUrl, {
       method: 'POST',
       headers: responsesFetchHeaders2,
-      body: JSON.stringify(responsesBody),
+      body: responsesEgress.body,
+      ...(responsesEgress.spilled ? { duplex: 'half' } : {}),
       signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
@@ -644,9 +700,9 @@ export async function handleMessagesRequest(
     }
 
     // Non-streaming: parse Responses response and convert to Claude format.
-    const responsesJsonText2 = await responsesResponse.text();
-    logPipelineStage(activeLogger, requestId, 'upstream-response', targetUrl, responsesJsonText2);
-    const responsesJson = JSON.parse(responsesJsonText2) as OpenAIResponsesResponse;
+    const responsesJson = await receiveJsonResponse<OpenAIResponsesResponse>(
+      responsesResponse, requestId, activeLogger, targetUrl, request.signal,
+    );
 
     // Synthesise an OpenAI Completions-style response so we can reuse the existing converter.
     const outputItem = responsesJson.output?.find(o => o.type === 'message');
@@ -718,12 +774,25 @@ export async function handleMessagesRequest(
     };
     ({ body: upstreamBodyClaude, headers: authHeaders } = runHook('before_upstream', { body: upstreamBodyClaude, headers: authHeaders }, hookCtxClaude));
   }
-  const claudeFetchHeaders = { 'Content-Type': 'application/json', ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request) };
+  const claudeFetchHeadersBase = { 'Content-Type': 'application/json', ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request) };
+  // §5.3 shape 3: see the OpenAI-Responses send above — the converted body
+  // streams its blobs at their ref positions instead of being expanded into one
+  // string first. `upstreamRequest` above is only a log preview, so a ref left in
+  // it costs a few metadata bytes there and nothing upstream.
+  const claudeStreamed = streamRefs ? createRefAwareJsonBody(upstreamBodyClaude) : undefined;
+  const claudeEgress = claudeStreamed
+    ? { body: claudeStreamed.body, contentLength: claudeStreamed.contentLength, spilled: true }
+    : await createJsonEgressBody(upstreamBodyClaude, 'att-');
+  const claudeFetchHeaders = {
+    ...claudeFetchHeadersBase,
+    ...(claudeEgress.contentLength !== undefined ? { 'Content-Length': String(claudeEgress.contentLength) } : {}),
+  };
   logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, claudeFetchHeaders);
   let response = await fetch(targetUrl, {
     method: 'POST',
     headers: claudeFetchHeaders,
-    body: JSON.stringify(upstreamBodyClaude),
+    body: claudeEgress.body,
+    ...(claudeEgress.spilled ? { duplex: 'half' } : {}),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -780,7 +849,7 @@ export async function handleMessagesRequest(
   }
 
   // Handle non-streaming response
-  return handleNonStreamingResponse(response, targetModelId, requestId, activeLogger, requestBody, tokenCountingConfig);
+  return handleNonStreamingResponse(response, targetModelId, requestId, activeLogger, requestBody, tokenCountingConfig, request.signal);
 }
 
 /**
@@ -792,15 +861,16 @@ async function handleNonStreamingResponse(
   requestId: string,
   logger: Logger,
   requestBody?: Record<string, unknown>,
-  tokenCountingConfig?: TokenCountingConfig
+  tokenCountingConfig?: TokenCountingConfig,
+  signal?: AbortSignal
 ): Promise<Response> {
+  // §5.7: bounded receive outside the `try` below, so a cap breach keeps its own
+  // status instead of being re-wrapped as a conversion failure.
+  const openaiResponse = await receiveJsonResponse<OpenAIResponse>(
+    response, requestId, logger, response.url || '(upstream)', signal,
+  );
+
   try {
-    // Parse target API response
-    const responseText = await response.text();
-    logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream)', responseText);
-
-    const openaiResponse: OpenAIResponse = JSON.parse(responseText);
-
     // Convert to Claude format
     const claudeResponse: ClaudeMessagesResponse = await convertOpenAIToClaudeResponse(
       openaiResponse,
@@ -840,79 +910,22 @@ async function handleStreamingResponse(
     throw new Error('Response body is not readable');
   }
 
-  const decoder = new TextDecoder();
-
   try {
 
+    // §5.3: resolve input usage before the response stream exists, so the
+    // transformer carries a scalar rather than retaining the request body.
+    const inputTokens = tokenCountingConfig?.enabled ? estimateInputTokens(requestBody) : 0;
+
     // Create streaming transformer
-    const transformer = createStreamTransformer(model, requestId, requestBody, tokenCountingConfig);
+    const transformer = createStreamTransformer(model, requestId, inputTokens, tokenCountingConfig);
 
-    // Create a tee to read the raw response while also transforming it
-    const [stream1, stream2] = response.body.tee();
-
-    // Read and log raw chunks from stream2
-    const reader = stream2.getReader();
-    const logRawChunks = async () => {
-      try {
-        let rawData = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          rawData += decoder.decode(value, { stream: true });
-          // Log when we have complete lines
-          const lines = rawData.split('\n');
-          if (lines.length > 1) {
-            for (const line of lines.slice(0, -1)) {
-              if (line.startsWith('data: ')) {
-                const data = line.substring(6);
-                if (data.trim() !== '[DONE]') {
-                  logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', data);
-                }
-              }
-            }
-            rawData = lines[lines.length - 1] || '';
-          }
-        }
-      } catch (e) {
-        logger.error(requestId, `Error logging raw chunks: ${(e as Error).message}`);
-      }
-    };
-
-    // Start logging in background
-    logRawChunks();
-
-    // Create transformed stream from stream1; tee again so the outbound
-    // (Claude SSE) events sent to the client are also logged at trace level.
-    const [outStream1, outStream2] = stream1
+    // §5.7: both the raw upstream SSE and the outbound (Claude SSE) events are
+    // logged by observing the one path the client already reads, rather than by
+    // teeing each a second reader that would pull the stream through on its own.
+    const transformedStream = response.body
+      .pipeThrough(observeStream(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', 'sse-lines'))
       .pipeThrough(new TransformStream(transformer))
-      .tee();
-    (async () => {
-      try {
-        const outReader = outStream2.getReader();
-        const outDecoder = new TextDecoder();
-        let outBuffer = '';
-        while (true) {
-          const { done, value } = await outReader.read();
-          if (done) break;
-          outBuffer += outDecoder.decode(value, { stream: true });
-          const lines = outBuffer.split('\n');
-          if (lines.length > 1) {
-            for (const line of lines.slice(0, -1)) {
-              if (line.startsWith('data: ')) {
-                const data = line.substring(6);
-                if (data.trim() !== '[DONE]') {
-                  logPipelineStage(logger, requestId, 'outbound', '/v1/messages (SSE)', data);
-                }
-              }
-            }
-            outBuffer = lines[lines.length - 1] || '';
-          }
-        }
-      } catch {
-        // best-effort debug logging only
-      }
-    })();
-    const transformedStream = outStream1;
+      .pipeThrough(observeStream(logger, requestId, 'outbound', '/v1/messages (SSE)', 'sse-lines'));
 
     // Return streaming response with proper headers
     const streamOutHeaders = {
@@ -955,26 +968,27 @@ function handleResponsesStreamAsClaude(
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
+  // §5.3: resolve input usage before the response stream exists, so the pump
+  // below does not retain the request body for the stream's lifetime. This
+  // path counts whenever a body was handed in (it never consulted the
+  // token-counting config), and that behaviour is preserved here.
+  const estimatedInputTokens = estimateInputTokens(requestBody);
+
   function claudeEvent(event: string, data: unknown): Uint8Array {
     return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
+  let failed = false;
 
   async function pump() {
     try {
       const messageId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
 
-      let inputTokens = 0;
-      if (requestBody) {
-        try {
-          const options: TokenCountingOptions = { useLocalCounting: true, tokenizer: null };
-          inputTokens = countClaudeRequestTokens(requestBody as any, options);
-        } catch {
-          inputTokens = 0;
-        }
-      }
+      // Starts at the pre-stream estimate; upstream-reported usage replaces it
+      // when the response.completed event carries one.
+      let inputTokens = estimatedInputTokens;
 
       await writer.write(claudeEvent('message_start', {
         type: 'message_start',
@@ -996,6 +1010,7 @@ function handleResponsesStreamAsClaude(
       let nextBlockIndex = 0;
       let buffer = '';
       let outputTokens = 0;
+      let completed = false;
 
       const reader = upstreamResponse.body!.getReader();
 
@@ -1013,7 +1028,11 @@ function handleResponsesStreamAsClaude(
           if (!raw || raw === '[DONE]') continue;
 
           let evt: Record<string, unknown>;
-          try { evt = JSON.parse(raw); } catch { continue; }
+          try {
+            evt = JSON.parse(raw);
+          } catch {
+            throw new Error(`Invalid JSON in Responses SSE data (request ${requestId})`);
+          }
 
           const type = evt.type as string | undefined;
 
@@ -1077,6 +1096,8 @@ function handleResponsesStreamAsClaude(
                 }));
               }
             }
+          } else if (type === 'response.failed') {
+            throw new Error(`Responses stream failed before response.completed (request ${requestId})`);
           } else if (type === 'response.completed') {
             const resp = evt.response as Record<string, unknown> | undefined;
             const usage = resp?.usage as Record<string, unknown> | undefined;
@@ -1094,15 +1115,22 @@ function handleResponsesStreamAsClaude(
               usage: { input_tokens: inputTokens, output_tokens: outputTokens },
             }));
             await writer.write(claudeEvent('message_stop', { type: 'message_stop' }));
+            completed = true;
           }
         }
+        if (completed) break;
       }
 
+      if (!completed) {
+        throw new Error(`Responses stream ended before response.completed (request ${requestId})`);
+      }
       logger.debug(requestId, `Responses stream done: input=${inputTokens} output=${outputTokens}`);
     } catch (e) {
+      failed = true;
       logger.error(requestId, `Error in Responses->Claude stream: ${(e as Error).message}`);
+      await writer.abort(e);
     } finally {
-      await writer.close();
+      if (!failed) await writer.close();
     }
   }
 

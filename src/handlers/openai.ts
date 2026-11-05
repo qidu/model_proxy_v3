@@ -14,8 +14,10 @@ import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount }
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { handleTargetApiError } from '../utils/errors.js';
 import { OpenAIContent, OpenAIMessage } from '../types/openai.js';
-import { decodeDataUri } from '../converters/claude-to-gemini.js';
+import { decodeDataUriOrRef } from '../converters/claude-to-gemini.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
+import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
+import { postJsonWithSpool } from '../utils/spool-json.js';
 
 /**
  * Check if request is in Gemini Interactions format
@@ -43,27 +45,32 @@ function isGeminiInteractionsRequest(body: Record<string, unknown>): boolean {
  */
 function geminiPartsToOpenAIContent(
   parts: any[] | undefined,
-): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> {
+): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> {
   if (!Array.isArray(parts)) return '';
   const textParts: string[] = [];
-  const imageParts: Array<{ type: 'image_url'; image_url: { url: string } }> = [];
+  const imageParts: Array<{ type: 'image_url'; image_url: { url: string | BlobRef } }> = [];
   for (const p of parts as any[]) {
     if (p && typeof p.text === 'string' && !p.thought) {
       textParts.push(p.text);
     }
     const inline = p?.inline_data ?? p?.inlineData;
-    if (inline && typeof inline.data === 'string' && inline.data !== '') {
+    const data: unknown = inline?.data;
+    if ((typeof data === 'string' && data !== '') || isBlobRef(data)) {
       const mime = inline.mime_type ?? inline.mimeType;
       imageParts.push({
         type: 'image_url',
-        image_url: { url: `data:${mime || 'image/jpeg'};base64,${inline.data}` },
+        image_url: {
+          url: isBlobRef(data)
+            ? rebindBlobRef(data, 'chat-image-url', `data:${mime || 'image/jpeg'};base64,`)
+            : `data:${mime || 'image/jpeg'};base64,${data}`,
+        },
       });
     }
   }
   if (imageParts.length === 0) {
     return textParts.join('');
   }
-  const out: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = [];
+  const out: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> = [];
   const text = textParts.join('');
   if (text !== '') out.push({ type: 'text', text });
   out.push(...imageParts);
@@ -236,20 +243,25 @@ export function convertGeminiGenerateContentToOpenAI(geminiRequest: Record<strin
             const inline = p.inline_data ?? p.inlineData;
             if (!inline) return null;
             const mime = inline.mime_type ?? inline.mimeType;
-            const data = inline.data;
-            if (typeof data !== 'string' || data === '') return null;
+            const data: unknown = inline.data;
+            if (typeof data !== 'string' && !isBlobRef(data)) return null;
+            if (typeof data === 'string' && data === '') return null;
             return {
               type: 'image_url' as const,
-              image_url: { url: `data:${mime || 'image/jpeg'};base64,${data}` },
+              image_url: {
+                url: isBlobRef(data)
+                  ? rebindBlobRef(data, 'chat-image-url', `data:${mime || 'image/jpeg'};base64,`)
+                  : `data:${mime || 'image/jpeg'};base64,${data}`,
+              },
             };
           })
-          .filter((p: any): p is { type: 'image_url'; image_url: { url: string } } => p !== null);
+          .filter((p: any): p is { type: 'image_url'; image_url: { url: string | BlobRef } } => p !== null);
 
         let msg: Record<string, unknown>;
         if (imageParts.length === 0) {
           msg = { role, content: textContent };
         } else {
-          const contentArr: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = [];
+          const contentArr: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> = [];
           if (textContent) contentArr.push({ type: 'text', text: textContent });
           for (const ip of imageParts) contentArr.push(ip);
           msg = { role, content: contentArr };
@@ -605,14 +617,19 @@ async function openAIContentToClaudeStringOrBlocks(
       const text = part.text as string | undefined;
       if (typeof text === 'string' && text !== '') blocks.push({ type: 'text', text });
     } else if (pType === 'image_url') {
-      const url = (part.image_url as Record<string, unknown> | undefined)?.url as string;
-      if (typeof url !== 'string' || url === '') continue;
-      const img = url.startsWith('data:')
-        ? decodeDataUri(url)
+      const url: unknown = (part.image_url as Record<string, unknown> | undefined)?.url;
+      if (typeof url !== 'string' && !isBlobRef(url)) continue;
+      if (typeof url === 'string' && url === '') continue;
+      const img = isBlobRef(url) || url.startsWith('data:')
+        ? decodeDataUriOrRef(url)
         : await fetchImageAsInlineData(url);
       blocks.push({
         type: 'image',
-        source: { type: 'base64', media_type: img.mime_type, data: img.data },
+        source: {
+          type: 'base64',
+          media_type: img.mime_type,
+          data: isBlobRef(img.data) ? rebindBlobRef(img.data, 'claude-source-data', '') : img.data,
+        },
       });
     }
     // Unknown part types (e.g. thinking) are skipped here — handled by caller.
@@ -847,10 +864,8 @@ async function forwardCompletionsAsAnthropicMessages(
     ...addForwardedHeaders(anthropicHeaders, originalRequest),
   };
   logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, anthropicFetchHeaders);
-  const response = await fetch(targetUrl, {
-    method: 'POST',
+  const response = await postJsonWithSpool(targetUrl, claudeBody, {
     headers: anthropicFetchHeaders,
-    body: JSON.stringify(claudeBody),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -994,10 +1009,8 @@ async function forwardCompletionsAsOpenAIResponses(
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), originalRequest),
   };
   logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, responsesFetchHeaders);
-  let response = await fetch(targetUrl, {
-    method: 'POST',
+  let response = await postJsonWithSpool(targetUrl, responsesBody, {
     headers: responsesFetchHeaders,
-    body: JSON.stringify(responsesBody),
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
@@ -1291,10 +1304,8 @@ export async function handleOpenAIRequest(
         logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, upstreamBody);
         const openaiFetchHeaders = addForwardedHeaders(headers, request);
         logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, openaiFetchHeaders);
-        let response = await fetch(targetUrl, {
-            method: 'POST',
+        let response = await postJsonWithSpool(targetUrl, upstreamBody, {
             headers: openaiFetchHeaders,
-            body: JSON.stringify(upstreamBody),
             signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
         });
 

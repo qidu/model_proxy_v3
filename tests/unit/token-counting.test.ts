@@ -13,6 +13,9 @@
 
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   estimateTokenCount,
@@ -25,6 +28,9 @@ import {
   getTiktokenTokenizer,
 } from '../../src/utils/token-counting.js';
 import type { Tiktoken } from 'js-tiktoken/lite';
+import { BLOB_REF_MARKER, extractInlineBlobs, isBlobRef, type BlobRef, type BlobRefKind } from '../../src/utils/blob-refs.js';
+import { BlobStoreError, resetBlobStore } from '../../src/utils/blob-store.js';
+import { resolveSpoolConfig, setSpoolConfig } from '../../src/utils/spool.js';
 
 // ---------------------------------------------------------------------------
 // estimateTokenCount
@@ -165,6 +171,147 @@ describe('content-block token counting', () => {
     const block = { type: 'mystery', foo: 'bar' };
     const n = count(block);
     assert.equal(n, estimateTokenCount(JSON.stringify(block)));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ref-aware counting (plan §5.3, §9.3)
+// ---------------------------------------------------------------------------
+
+describe('counting a payload the spool extracted (plan §5.3)', () => {
+  /**
+   * One block's contribution, by subtracting an empty-content message counted
+   * with the same options. Unlike the delta above this stays exact when a
+   * tokenizer is supplied, because the role text is then counted both times.
+   */
+  const count = (block: any, options?: any) =>
+    countMessageTokens({ role: 'user', content: [block] }, options) -
+    countMessageTokens({ role: 'user', content: [] }, options);
+
+  /** A ref for `size` base64 chars. The hash deliberately names no stored blob. */
+  const refFor = (kind: BlobRefKind, size: number, prefix = 'data:image/png;base64,'): BlobRef => ({
+    [BLOB_REF_MARKER]: true,
+    kind,
+    hash: 'f'.repeat(64),
+    size,
+    prefix,
+  });
+
+  it('counts an extracted image as ceil(base64 length / 4), with no surcharge', () => {
+    const n = count({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: refFor('claude-source-data', 4000) } });
+    assert.equal(n, 1000, 'exactly 4000/4, so neither the +20 surcharge nor the field labels survive');
+  });
+
+  it('counts an extracted document identically, so the +20/+10 split is gone', () => {
+    const image = count({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: refFor('claude-source-data', 4000) } });
+    const document = count({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: refFor('claude-source-data', 4000, 'data:application/pdf;base64,') } });
+    assert.equal(document, 1000);
+    assert.equal(document, image, 'same payload length, same count, whatever the block type');
+  });
+
+  it('honours charactersPerToken and adds no fixed overhead', () => {
+    const block = { type: 'image', source: { data: refFor('claude-source-data', 1000) } };
+    assert.equal(count(block, { charactersPerToken: 4 }), 250);
+    assert.equal(count(block, { charactersPerToken: 10 }), 100);
+    // The text path keeps its 5-token overhead, so the two differ by more than the divisor.
+    assert.equal(count({ type: 'text', text: 'x'.repeat(1000) }, { charactersPerToken: 10 }), 105);
+  });
+
+  it('never reads the blob: a ref whose hash names no stored blob still counts', () => {
+    resetBlobStore(); // an empty store, so any read would throw
+    assert.equal(count({ type: 'image', source: { data: refFor('claude-source-data', 4004) } }), 1001);
+  });
+
+  it('bypasses the tiktoken tokenizer for the payload', () => {
+    // One token per character: 4000 chars read as text would count 4000 tokens.
+    const tokenizer = { encode: (text: string) => Array.from(text) };
+    const options = { tokenizer } as any;
+    assert.equal(count({ type: 'text', text: 'x'.repeat(4000) }, options), 4000);
+    assert.equal(count({ type: 'image', source: { data: refFor('claude-source-data', 4000) } }, options), 1000);
+  });
+
+  it('refuses a malformed ref instead of counting NaN', () => {
+    const fractional = { ...refFor('claude-source-data', 4000), size: 1.5 };
+    assert.throws(
+      () => count({ type: 'image', source: { data: fractional } }),
+      (error: any) => error instanceof BlobStoreError && /malformed ref/.test(error.message),
+    );
+    const noPrefix = { ...refFor('claude-source-data', 4000), prefix: undefined };
+    assert.throws(() => count({ type: 'image', source: { data: noPrefix } }), BlobStoreError);
+  });
+
+  it('counts a ref in a block with no Claude block type as the payload, wherever it sits', () => {
+    // A §5.4 allowlisted Chat position, a Gemini one, and a Responses one nested
+    // two levels deep: none is a Claude block, so all three are counted by their
+    // JSON text plus the payload each ref stands for.
+    const positions: Record<string, any> = {
+      chat: { type: 'image_url', image_url: { url: refFor('chat-image-url', 4000) } },
+      gemini: { inline_data: { mime_type: 'image/png', data: refFor('gemini-inline-data', 4000, '') } },
+      responses: { type: 'inline', source: { type: 'base64', data: refFor('responses-input-image', 4000) } },
+    };
+    for (const [name, block] of Object.entries(positions)) {
+      assert.equal(
+        count(block),
+        1000 + estimateTokenCount(JSON.stringify(block)),
+        `${name}: ceil(4000 / 4) for the payload, on top of the block's own text and nothing else`,
+      );
+    }
+  });
+
+  it('grows with the payload it stands for, not with the ref object', () => {
+    // 4000 -> 4004 keeps the JSON text the same length, so the whole delta is the
+    // payload: ceil(4004/4) - ceil(4000/4) = 1.
+    const wide = { type: 'image_url', image_url: { url: refFor('chat-image-url', 4004) } };
+    const narrow = { type: 'image_url', image_url: { url: refFor('chat-image-url', 4000) } };
+    assert.equal(JSON.stringify(wide).length, JSON.stringify(narrow).length);
+    assert.equal(count(wide) - count(narrow), 1);
+  });
+
+  it('still refuses a malformed ref in a block with no Claude block type', () => {
+    const fractional = { type: 'image_url', image_url: { url: { ...refFor('chat-image-url', 4000), size: 1.5 } } };
+    assert.throws(
+      () => count(fractional),
+      (error: any) => error instanceof BlobStoreError && /malformed ref/.test(error.message),
+    );
+  });
+
+  it('counts a ref nested in tool_result content as binary', () => {
+    const nested = { type: 'image', source: { data: refFor('claude-source-data', 4000) } };
+    const withRef = count({ type: 'tool_result', tool_use_id: 'c', content: [nested] });
+    const without = count({ type: 'tool_result', tool_use_id: 'c', content: [] });
+    assert.equal(withRef - without, 1000);
+  });
+
+  it('contributes the same amount to a whole Claude request', () => {
+    const withRef = countClaudeRequestTokens({
+      messages: [{ role: 'user', content: [{ type: 'image', source: { data: refFor('claude-source-data', 8000) } }] }],
+    });
+    const without = countClaudeRequestTokens({ messages: [{ role: 'user', content: [] }] });
+    assert.equal(withRef - without, 2000);
+  });
+
+  it('counts a payload that extraction actually recorded by the same rule', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'token-counting-spool-'));
+    try {
+      setSpoolConfig(resolveSpoolConfig({ enabled: true, dir }));
+      resetBlobStore();
+
+      const data = Buffer.alloc(48, 0x41).toString('base64');
+      assert.equal(data.length, 64);
+      const body: any = {
+        messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }] }],
+      };
+      assert.equal((await extractInlineBlobs(body)).refs, 1);
+
+      const block = body.messages[0].content[0];
+      const ref = block.source.data;
+      assert.ok(isBlobRef(ref));
+      assert.equal(ref.size, data.length, 'size is the base64 character count');
+      assert.equal(count(block), 16, 'ceil(64 / 4)');
+    } finally {
+      resetBlobStore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

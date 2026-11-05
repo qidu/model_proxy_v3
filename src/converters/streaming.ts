@@ -2,14 +2,21 @@
  * Streaming response converter from OpenAI SSE to Claude SSE
  */
 
-import { countClaudeRequestTokens, countTokensWithTiktoken, getTiktokenTokenizer, TokenCountingOptions } from '../utils/token-counting.js';
+import { countTokensWithTiktoken, getTiktokenTokenizer } from '../utils/token-counting.js';
 import { TokenCountingConfig, SYNTHETIC_THINKING_SIGNATURE } from './openai-to-claude.js';
 import { stringify } from '../utils/stringify.js';
 
+/**
+ * `inputTokens` is the request's input-token estimate, resolved by the caller
+ * before the response stream exists (§5.3). This transformer lives as long as
+ * the downstream send, so it takes the resulting scalar rather than the request
+ * body: closing over the body would pin the whole request — inline base64
+ * payloads included — until the client stops reading.
+ */
 export function createStreamTransformer(
     model: string,
     requestId: string,
-    requestBody?: Record<string, unknown>,
+    inputTokens = 0,
     tokenCountingConfig?: TokenCountingConfig,
     includeThinking = false
 ) {
@@ -38,7 +45,6 @@ export function createStreamTransformer(
     let thinkingBlockIndex = -1;
 
     // Token counting state
-    let inputTokens = 0;
     let outputTokens = 0;
     let tokenizer: any = null;
     let tokenizerReady = false;
@@ -73,21 +79,13 @@ export function createStreamTransformer(
         }
     };
 
-    // Calculate input tokens and prepare tokenizer for output counting
+    // Prepare the tokenizer for output counting
     const initializeTokenCounting = async () => {
-        if (tokenCountingConfig?.enabled && requestBody) {
+        if (tokenCountingConfig?.enabled) {
             try {
-                const options: TokenCountingOptions = {
-                    useLocalCounting: true,
-                    tokenizer: null,
-                };
-                // Count input tokens
-                inputTokens = countClaudeRequestTokens(requestBody as any, options);
-                // Initialize tokenizer for output counting
                 tokenizer = await getTiktokenTokenizer(tokenCountingConfig.modelName);
                 tokenizerReady = true;
             } catch (e) {
-                inputTokens = 0;
                 tokenizerReady = false;
             }
         }
@@ -216,8 +214,9 @@ export function createStreamTransformer(
     return {
         async transform(chunk: Uint8Array, controller: TransformStreamDefaultController) {
             if (!initialized) {
-                // Initialize token counting (must complete before message_start so
-                // input_tokens is populated instead of always reporting 0)
+                // Initialize output token counting (must complete before the
+                // first delta so the tokenizer is ready for it). Input tokens
+                // were resolved by the caller and arrive on the parameter.
                 await initializeTokenCounting();
 
                 // Send message_start event with input tokens
@@ -482,63 +481,16 @@ export function createStreamTransformer(
                         }
                     }
                 } catch (e) {
-                    // Ignore JSON parse errors for non-data lines
+                    throw new Error(`Invalid JSON in upstream SSE data (request ${requestId || 'unknown'})`);
                 }
             }
         },
 
-        flush(controller: TransformStreamDefaultController) {
-            // Send final events if stream ends unexpectedly
-            if (initialized) {
-                // Send content_block_stop for all active blocks
-                sendEvent(controller, 'content_block_stop', {
-                    type: 'content_block_stop',
-                    index: 0
-                });
-
-                // Send signature_delta before content_block_stop for thinking block.
-                // Fall back to a synthetic signature when the upstream provided none,
-                // so signature-less thinking blocks still satisfy Anthropic's spec.
-                if (thinkingStarted && thinkingBlockIndex !== -1) {
-                    sendEvent(controller, 'content_block_delta', {
-                        type: 'content_block_delta',
-                        index: thinkingBlockIndex,
-                        delta: {
-                            type: 'signature_delta',
-                            signature: accumulatedSignature || SYNTHETIC_THINKING_SIGNATURE,
-                            index: thinkingBlockIndex
-                        }
-                    });
-                }
-
-                // Send content_block_stop for thinking block if active
-                if (thinkingStarted && thinkingBlockIndex !== -1) {
-                    sendEvent(controller, 'content_block_stop', {
-                        type: 'content_block_stop',
-                        index: thinkingBlockIndex
-                    });
-                }
-
-                // Send content_block_stop for tool calls
-                Object.values(toolCalls).forEach(tc => {
-                    if (tc.started) {
-                        sendEvent(controller, 'content_block_stop', {
-                            type: 'content_block_stop',
-                            index: tc.claudeIndex
-                        });
-                    }
-                });
-
-                sendEvent(controller, 'message_delta', {
-                    type: 'message_delta',
-                    delta: { stop_reason: hasToolCalls ? "tool_use" : "end_turn", stop_sequence: null },
-                    usage: buildFinalUsage()
-                });
-
-                sendEvent(controller, 'message_stop', {
-                    type: 'message_stop'
-                });
-            }
+        flush() {
+            // A normal OpenAI stream terminates through the [DONE] branch above,
+            // which calls controller.terminate(). Reaching flush without it is an
+            // unexpected EOF, not a successful response to finalize.
+            throw new Error(`Upstream SSE stream ended before [DONE] (request ${requestId || 'unknown'})`);
         }
     };
 }

@@ -6,19 +6,22 @@
  */
 
 import { Env } from '../types/shared.js';
-import { Logger, createLogger, logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
+import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStream } from '../utils/logger.js';
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { GeminiInteractionRequest, GeminiInteractionResponse } from '../types/gemini.js';
 import { convertClaudeToGeminiRequest } from '../converters/claude-to-gemini.js';
 import { convertGeminiGenerateContentToClaude } from '../converters/gemini-to-claude.js';
 import { createGeminiStreamTransformer, createNativeGeminiStreamTransformer } from '../converters/gemini-streaming.js';
-import { handleTargetApiError } from '../utils/errors.js';
+import { ClaudeProxyError, handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
+import { postJsonWithSpool } from '../utils/spool-json.js';
+import { createConvertedResponseBody, receiveJsonResponse, receiveResponseBody, type ConvertedResponseBody } from '../utils/spool-response.js';
+import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
 
 /**
  * Check if request is in native Gemini format
@@ -129,10 +132,15 @@ async function handleGeminiCountTokensRequest(
         handleTargetApiError(response, 'Gemini API', { url: targetUrl, upstreamBody: errorText });
     }
 
-    const responseText = await response.text();
+    // §5.7: received with bounded memory — `max_response_bytes` enforced, the
+    // upstream body cancelled on breach — and forwarded from that spool unparsed.
+    // The body is a `{ totalTokens }` object, so nothing on §5.7's response
+    // allowlist can be in it and there is nothing to extract; the client reads the
+    // same bytes the upstream sent, from the spool rather than from a second copy.
+    const received = await receiveResponseBody(response.body);
     const countTokensOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
     logPipelineHeaders(activeLogger, requestId, 'outbound', ':countTokens', countTokensOutHeaders);
-    return new Response(responseText, { status: 200, headers: countTokensOutHeaders });
+    return new Response(received.readStream(), { status: 200, headers: countTokensOutHeaders });
 }
 
 /**
@@ -250,10 +258,8 @@ async function handleGeminiInteractionsRequest(
 
     logPipelineStage(activeLogger, requestId, 'upstream-request', fullTargetUrl, upstreamBodyGemini);
     logPipelineHeaders(activeLogger, requestId, 'upstream-request', fullTargetUrl, geminiHeaders);
-    let response = await fetch(fullTargetUrl, {
-        method: 'POST',
+    let response = await postJsonWithSpool(fullTargetUrl, upstreamBodyGemini, {
         headers: geminiHeaders,
-        body: JSON.stringify(upstreamBodyGemini),
         signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
     });
 
@@ -282,45 +288,79 @@ async function handleGeminiInteractionsRequest(
         return handleGeminiStreamingResponse(response, requestBody.model as string || modelId || 'gemini-no-id-at-proxy', requestId, activeLogger, 'interactions');
     }
     
-    // Convert generateContent response to Interactions format
-    const geminiResponseText = await response.text();
-    logPipelineStage(activeLogger, requestId, 'upstream-response', fullTargetUrl, geminiResponseText);
-    const geminiResponse = JSON.parse(geminiResponseText) as any;
-    
-    const interactionResponse = {
-        id: `v1_${Date.now()}_${requestId}`,
-        model: requestBody.model || modelId || 'gemini-no-id-at-proxy',
-        status: 'completed',
-        object: 'interaction',
-        created: new Date().toISOString(),
-        updated: new Date().toISOString(),
-        role: 'model',
-        outputs: [] as any[],
-        usage: {
-            total_input_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
-            total_output_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0,
-            total_tokens: geminiResponse.usageMetadata?.totalTokenCount || 0,
-            ...(geminiResponse.usageMetadata?.cachedContentTokenCount ? { total_cached_tokens: geminiResponse.usageMetadata.cachedContentTokenCount } : {}),
-        }
-    };
-    
-    // Convert candidates to outputs
-    if (geminiResponse.candidates && geminiResponse.candidates.length > 0) {
-        const candidate = geminiResponse.candidates[0];
-        if (candidate.content && candidate.content.parts) {
-            interactionResponse.outputs = candidate.content.parts.map((part: any) => {
-                if (part.text) {
-                    return { type: 'text', text: part.text };
-                }
-                return part;
-            });
-        }
+    // Convert generateContent response to Interactions format.
+    // §5.7: the body is received with bounded memory instead of
+    // `response.text()` — above `threshold_bytes` it lives on disk — and
+    // `max_response_bytes` now caps it: a breach cancels the upstream body and
+    // fails explicitly rather than truncating the response.
+    const received = await receiveResponseBody(response.body);
+    let lease: AdmissionLease;
+    try {
+        // §5.9 byte admission, opt-in via `max_materialized_body_bytes`: parsing
+        // this body is the materialization the budget is for, and waiting for
+        // capacity here waits before any of it has been materialized. The charge
+        // is the received byte count, never a guess from `Content-Length`. A
+        // refusal must leave neither bytes on disk nor a reservation (rule #8).
+        lease = await admitMaterialization(received.size, request.signal);
+    } catch (error) {
+        await received.release();
+        throw error;
     }
 
-    logPipelineStage(activeLogger, requestId, 'outbound', '/v1/interactions', interactionResponse);
-    const interactionsOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+    let converted: ConvertedResponseBody;
+    try {
+        const geminiResponseText = await received.readText();
+        logPipelineStage(activeLogger, requestId, 'upstream-response', fullTargetUrl, geminiResponseText);
+        const geminiResponse = JSON.parse(geminiResponseText) as any;
+
+        const interactionResponse = {
+            id: `v1_${Date.now()}_${requestId}`,
+            model: requestBody.model || modelId || 'gemini-no-id-at-proxy',
+            status: 'completed',
+            object: 'interaction',
+            created: new Date().toISOString(),
+            updated: new Date().toISOString(),
+            role: 'model',
+            outputs: [] as any[],
+            usage: {
+                total_input_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
+                total_output_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0,
+                total_tokens: geminiResponse.usageMetadata?.totalTokenCount || 0,
+                ...(geminiResponse.usageMetadata?.cachedContentTokenCount ? { total_cached_tokens: geminiResponse.usageMetadata.cachedContentTokenCount } : {}),
+            }
+        };
+
+        // Convert candidates to outputs
+        if (geminiResponse.candidates && geminiResponse.candidates.length > 0) {
+            const candidate = geminiResponse.candidates[0];
+            if (candidate.content && candidate.content.parts) {
+                interactionResponse.outputs = candidate.content.parts.map((part: any) => {
+                    if (part.text) {
+                        return { type: 'text', text: part.text };
+                    }
+                    return part;
+                });
+            }
+        }
+
+        logPipelineStage(activeLogger, requestId, 'outbound', '/v1/interactions', interactionResponse);
+        // §5.7 converted-response egress: the generated image in a non-text part
+        // goes to this response's own scratch store and comes back as the client
+        // takes the skeleton, so relaying it costs one chunk rather than a second
+        // full copy. The parsed body's spill is released below, before the send.
+        converted = await createConvertedResponseBody(interactionResponse);
+    } finally {
+        lease.release();
+        await received.release();
+    }
+
+    const interactionsOutHeaders: Record<string, string> = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+    // A streamed skeleton is not a text body the runtime can measure.
+    if (converted.contentLength !== undefined) {
+        interactionsOutHeaders['Content-Length'] = String(converted.contentLength);
+    }
     logPipelineHeaders(activeLogger, requestId, 'outbound', '/v1/interactions', interactionsOutHeaders);
-    return new Response(JSON.stringify(interactionResponse), { status: 200, headers: interactionsOutHeaders });
+    return new Response(converted.body, { status: 200, headers: interactionsOutHeaders });
 }
 
 
@@ -431,10 +471,8 @@ async function handleGeminiGenerateContentRequest(
     try {
         logPipelineStage(activeLogger, requestId, 'upstream-request', fullTargetUrl, upstreamBodyGeminiGen);
         logPipelineHeaders(activeLogger, requestId, 'upstream-request', fullTargetUrl, geminiHeaders);
-        let response = await fetch(fullTargetUrl, {
-            method: 'POST',
+        let response = await postJsonWithSpool(fullTargetUrl, upstreamBodyGeminiGen, {
             headers: geminiHeaders,
-            body: JSON.stringify(upstreamBodyGeminiGen),
             signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
         });
 
@@ -465,7 +503,7 @@ async function handleGeminiGenerateContentRequest(
 
         // Handle non-streaming response
         const endpointType = outputFormat === 'claude-format' ? 'interactions' : 'native-gemini';
-        return handleGeminiNonStreamingResponse(response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger, endpointType);
+        return handleGeminiNonStreamingResponse(response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger, endpointType, request.signal);
 
     } catch (error) {
         activeLogger.error(requestId, `Gemini API error: ${(error as Error).message}`);
@@ -519,36 +557,112 @@ async function handleGeminiNonStreamingResponse(
     model: string,
     requestId: string,
     logger: Logger,
-    endpointType: 'interactions' | 'native-gemini' = 'interactions'
+    endpointType: 'interactions' | 'native-gemini' = 'interactions',
+    signal?: AbortSignal
 ): Promise<Response> {
+    if (endpointType === 'native-gemini') {
+        return await relayNativeGeminiResponse(response, requestId, logger, signal);
+    }
+
     try {
         // Upstream-response headers are logged by callers; only body is logged here.
-        const responseText = await response.text();
         logger.debug(requestId, 'Gemini response received');
-        logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream)', responseText);
 
-        if (endpointType === 'native-gemini') {
-            // Native Gemini format - return as-is
-            logPipelineStage(logger, requestId, 'outbound', ':generateContent (native)', responseText);
-            const nativeOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
-            logPipelineHeaders(logger, requestId, 'outbound', ':generateContent (native)', nativeOutHeaders);
-            return new Response(responseText, { status: response.status, headers: nativeOutHeaders });
-        } else {
-            // Parse native Gemini generateContent response
-            const geminiResponse = JSON.parse(responseText);
+        // §5.7: the body is received with bounded memory — `max_response_bytes`
+        // enforced, the upstream cancelled on breach — and parsed once, because the
+        // conversion needs the value; the spill is released before this returns.
+        // No payload extraction: `convertGeminiGenerateContentToClaude` collects
+        // text parts only, so an `inlineData` part is dropped before any converted
+        // value exists to extract from (see the known limitation in the converter).
+        const geminiResponse = await receiveJsonResponse<Record<string, unknown>>(
+            response, requestId, logger, response.url || '(upstream)', signal
+        );
 
-            // Convert to Claude format
-            const claudeResponse = convertGeminiGenerateContentToClaude(geminiResponse, model, requestId);
-            logPipelineStage(logger, requestId, 'outbound', '/v1/messages (via generateContent)', claudeResponse);
+        // Convert to Claude format
+        const claudeResponse = convertGeminiGenerateContentToClaude(geminiResponse, model, requestId);
+        logPipelineStage(logger, requestId, 'outbound', '/v1/messages (via generateContent)', claudeResponse);
 
-            const genContentOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
-            logPipelineHeaders(logger, requestId, 'outbound', '/v1/messages (via generateContent)', genContentOutHeaders);
-            return new Response(JSON.stringify(claudeResponse), { status: 200, headers: genContentOutHeaders });
-        }
+        const genContentOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+        logPipelineHeaders(logger, requestId, 'outbound', '/v1/messages (via generateContent)', genContentOutHeaders);
+        return new Response(JSON.stringify(claudeResponse), { status: 200, headers: genContentOutHeaders });
     } catch (error) {
+        // A proxy error already carries the status and type the client switches on
+        // (a spool cap breach is 500 `processing_error`, an admission refusal 503
+        // `over_limit_error`); relabelling it as a conversion failure would hide
+        // that (rule #8).
+        if (error instanceof ClaudeProxyError) throw error;
         logger.error(requestId, `Error converting Gemini response: ${(error as Error).message}`);
         throw new Error(`Failed to convert Gemini response: ${(error as Error).message}`);
     }
+}
+
+/**
+ * Relay a native Gemini non-streaming response as identity (§5.7).
+ *
+ * This branch never parses the body, so the upstream bytes are the client's
+ * bytes — `inlineData` image/audio parts included, which is the payload §5.7's
+ * response allowlist names for native Gemini passthrough. It used to be
+ * `await response.text()` handed to `new Response`: the whole body as a string,
+ * a second copy inside the response, and no `max_response_bytes` at all. The
+ * body is now received bounded — spilled past `threshold_bytes` when spilling
+ * is on — and the client is given a stream over that same spool, so its own
+ * pace bounds what the proxy holds.
+ *
+ * The receive is **not** gated on `[spool] enabled`, matching the Interactions
+ * branch above and the other identity egresses (`passthrough.ts`,
+ * `responses.ts`): there the spool receive replaced the whole-body read
+ * outright, so `max_response_bytes` bounds the read whether or not an operator
+ * opted into spilling, and a response past the cap fails 500 `processing_error`
+ * instead of being forwarded. `enabled` decides where the bytes live (RAM or
+ * disk), not how many of them the proxy will hold. The two paths that *are*
+ * gated — §5.7's SSE framing and the router's stats read — kept their pre-spool
+ * behaviour as the `enabled = false` fallback, which is the difference.
+ *
+ * The trace line is the only read on this branch, so the §5.9 lease is taken
+ * only when tracing materializes it — a body nobody reads is never charged and
+ * never refused — and it is released before the client's copy is handed out.
+ * `readText()` leaves a live spool readable, so the trace re-read does not
+ * consume the bytes the client is about to receive.
+ */
+async function relayNativeGeminiResponse(
+    response: Response,
+    requestId: string,
+    logger: Logger,
+    signal?: AbortSignal
+): Promise<Response> {
+    const nativeOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+    logger.debug(requestId, 'Gemini response received');
+
+    const received = await receiveResponseBody(response.body);
+
+    if (logger.traceEnabled) {
+        // §5.9 byte admission, opt-in via `max_materialized_body_bytes`. The
+        // body is received but not yet read, so a body that has to wait for
+        // capacity waits before any of it is materialized, and the client has
+        // no headers yet, so a refusal can still be answered. A refusal must
+        // leave neither bytes on disk nor a reservation (rule #8).
+        let lease: AdmissionLease;
+        try {
+            lease = await admitMaterialization(received.size, signal);
+        } catch (error) {
+            await received.release();
+            throw error;
+        }
+        try {
+            const traced = await received.readText();
+            logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream)', traced);
+            logPipelineStage(logger, requestId, 'outbound', ':generateContent (native)', traced);
+        } finally {
+            // The trace text is unreachable here and the client's body has not
+            // been handed out yet, so §5.9's "release before network streaming"
+            // holds: the write to the client is bounded by its own pace, not by
+            // this budget.
+            lease.release();
+        }
+    }
+
+    logPipelineHeaders(logger, requestId, 'outbound', ':generateContent (native)', nativeOutHeaders);
+    return new Response(received.readStream(), { status: response.status, headers: nativeOutHeaders });
 }
 
 /**
@@ -565,8 +679,6 @@ async function handleGeminiStreamingResponse(
         throw new Error('Response body is not readable');
     }
 
-    const decoder = new TextDecoder();
-
     try {
         logger.debug(requestId, 'Gemini streaming response started');
 
@@ -575,72 +687,14 @@ async function handleGeminiStreamingResponse(
             ? createNativeGeminiStreamTransformer(model, requestId)
             : createGeminiStreamTransformer(model, requestId);
 
-        // Create a tee to read the raw response while also transforming it
-        const [stream1, stream2] = response.body.tee();
-
-        // Read and log raw chunks from stream2
-        const reader = stream2.getReader();
-        const logRawChunks = async () => {
-            try {
-                let rawData = '';
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    rawData += decoder.decode(value, { stream: true });
-                    const lines = rawData.split('\n');
-                    if (lines.length > 1) {
-                        for (const line of lines.slice(0, -1)) {
-                            if (line.startsWith('data: ')) {
-                                const data = line.substring(6);
-                                if (data.trim() !== '[DONE]') {
-                                    logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', data);
-                                }
-                            }
-                        }
-                        rawData = lines[lines.length - 1] || '';
-                    }
-                }
-            } catch (e) {
-                logger.error(requestId, `Error logging raw chunks: ${(e as Error).message}`);
-            }
-        };
-
-        // Start logging in background
-        logRawChunks();
-
-        // Create transformed stream from stream1; tee again so the outbound
-        // events sent to the client are also logged at trace level.
+        // §5.7: both the raw upstream SSE and the outbound events are logged by
+        // observing the one path the client already reads, rather than by teeing
+        // each a second reader that would pull the stream through on its own.
         const transformerObj = transformer as any;
-        const [outStream1, outStream2] = stream1
+        const transformedStream = response.body
+            .pipeThrough(observeStream(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', 'sse-lines'))
             .pipeThrough(new TransformStream(transformerObj))
-            .tee();
-        (async () => {
-            try {
-                const outReader = outStream2.getReader();
-                const outDecoder = new TextDecoder();
-                let outBuffer = '';
-                while (true) {
-                    const { done, value } = await outReader.read();
-                    if (done) break;
-                    outBuffer += outDecoder.decode(value, { stream: true });
-                    const lines = outBuffer.split('\n');
-                    if (lines.length > 1) {
-                        for (const line of lines.slice(0, -1)) {
-                            if (line.startsWith('data: ')) {
-                                const data = line.substring(6);
-                                if (data.trim() !== '[DONE]') {
-                                    logPipelineStage(logger, requestId, 'outbound', 'stream', data);
-                                }
-                            }
-                        }
-                        outBuffer = lines[lines.length - 1] || '';
-                    }
-                }
-            } catch {
-                // best-effort debug logging only
-            }
-        })();
-        const transformedStream = outStream1;
+            .pipeThrough(observeStream(logger, requestId, 'outbound', 'stream', 'sse-lines'));
 
         const streamOutHeaders = {
             'Content-Type': 'text/event-stream',

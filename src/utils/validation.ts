@@ -4,9 +4,35 @@
 
 import { ClaudeMessagesRequest, ClaudeTokenCountingRequest, ClaudeContent, ThinkingConfigParam } from '../types/claude.js';
 import { ValidationError } from './errors.js';
+import { assertRefShape, isBlobRef } from './blob-refs.js';
 
 // Default max image block data size: 10MB
 const DEFAULT_IMAGE_DATA_MAX_SIZE = 10 * 1024 * 1024;
+
+/**
+ * The size of an inline `source.data` field: the character count of the base64 the
+ * client sent, or the byte count a §5.3 shape-3 ref records for the payload it
+ * stands in for.
+ *
+ * A ref is not a smaller spelling of the payload and cannot be measured as one —
+ * `JSON.stringify(ref).length` would be its metadata's size — so the recorded
+ * `size` is the only honest answer, and `assertRefShape` runs first because a
+ * fraction or a missing `size` would silently make every bound below pass (§9.3).
+ *
+ * `undefined` means the field holds no inline payload at all, which is the case
+ * each caller reports in its own words (an empty string is not a payload either,
+ * matching what this check did before refs existed).
+ */
+function sourceDataSize(data: unknown): number | undefined {
+  if (isBlobRef(data)) {
+    assertRefShape(data);
+    return data.size;
+  }
+  if (typeof data !== 'string' || data === '') {
+    return undefined;
+  }
+  return data.length;
+}
 
 /**
  * Validate Claude messages request
@@ -216,10 +242,13 @@ export function validateClaudeContentBlock(
         if (!block.source.media_type || typeof block.source.media_type !== 'string') {
           throw new ValidationError(`${context}.source.media_type is required for base64 images`);
         }
-        if (!block.source.data || typeof block.source.data !== 'string') {
+        // §5.3 shape 3: the payload may be a ref, in which case `sourceDataSize`
+        // reads the size the extraction recorded instead of the field's own.
+        const dataSize = sourceDataSize(block.source.data);
+        if (dataSize === undefined) {
           throw new ValidationError(`${context}.source.data is required for base64 images`);
         }
-        if (block.source.data.length > maxImageDataSize) {
+        if (dataSize > maxImageDataSize) {
           throw new ValidationError(`${context}.source.data exceeds maximum size of ${maxImageDataSize} bytes`);
         }
       } else if (block.source.type === 'url') {
@@ -245,7 +274,8 @@ export function validateClaudeContentBlock(
       if (!block.source.media_type || typeof block.source.media_type !== 'string') {
         throw new ValidationError(`${context}.source.media_type is required`);
       }
-      if (!block.source.data || typeof block.source.data !== 'string') {
+      // §5.3 shape 3: see the image branch — a ref stands in for the payload here too.
+      if (sourceDataSize(block.source.data) === undefined) {
         throw new ValidationError(`${context}.source.data is required`);
       }
       break;

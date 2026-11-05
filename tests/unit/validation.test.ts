@@ -294,6 +294,44 @@ describe('validateClaudeContentBlock', () => {
     );
   });
 
+  it('accepts a §5.4 ref at source.data and bounds it by the size the ref records', () => {
+    // §5.3 shape 3: the payload is on disk, so `source.data` holds metadata until
+    // the send streams it. The size bound has to read the ref's own `size` — the
+    // ref's JSON is a couple of hundred characters whatever the payload weighs, so
+    // a bound that measured the field as text would pass every payload through.
+    const ref = (size: number) => ({
+      $spoolBlob: true, kind: 'claude-source-data', hash: 'a'.repeat(64), size, prefix: '',
+    });
+
+    assert.doesNotThrow(() => validateClaudeContentBlock({
+      type: 'image', source: { type: 'base64', media_type: 'image/png', data: ref(48) },
+    }));
+    expectValidationError(
+      () => validateClaudeContentBlock({
+        type: 'image', source: { type: 'base64', media_type: 'image/png', data: ref(10 * 1024 * 1024 + 1) },
+      }, 'exceeds maximum size'),
+    );
+    // A ref that does not record a size cannot be measured at all: it is refused
+    // rather than read as a payload of no weight (repo rule #8).
+    assert.throws(
+      () => validateClaudeContentBlock({
+        type: 'image',
+        source: { type: 'base64', media_type: 'image/png', data: { $spoolBlob: true, kind: 'claude-source-data', hash: 'a'.repeat(64), prefix: '' } },
+      } as any),
+    );
+  });
+
+  it('accepts a §5.4 ref at a document source.data', () => {
+    assert.doesNotThrow(() => validateClaudeContentBlock({
+      type: 'document',
+      source: {
+        type: 'base64',
+        media_type: 'application/pdf',
+        data: { $spoolBlob: true, kind: 'claude-source-data', hash: 'b'.repeat(64), size: 12, prefix: '' },
+      },
+    } as any));
+  });
+
   // document
   it('document requires source with base64 or text type + media_type + data', () => {
     expectValidationError(

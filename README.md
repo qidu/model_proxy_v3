@@ -379,7 +379,7 @@ without `--export-pi-models` / without a model id / naming an unknown one).
 | `GET /favicon.ico` | Returns `204 No Content` (browser plumbing). |
 | `POST /decision` | The Clef API — typed decision questions (noul/choice/score) on arbitrary state. Proxies to a configured upstream (local Laya sidecar, Cloudflare Clef, or Ollama's System One API). See [Decision endpoint](#decision-endpoint-post-decision). |
 | `/{protocol}/{host}/...` dynamic route | Per-request upstream override. See [Dynamic routing](./docs/api/api-endpoints.md#dynamic-routing). |
-| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[models.passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. |
+| `POST /passthrough/v1/...` | Passthrough mode: the path after `/passthrough` is forwarded verbatim to a `[models.passthrough]` target whose `mode` matches it (see [Passthrough mode](./docs/architecture/design_passthrough_mode.md)). Client auth, `auth_server`, logging, usage recording, and timeouts still apply; model routing, composite/schedule, transforms, privacy filtering, and kompress do not. The request body is forwarded byte-for-byte as a stream with its exact `Content-Length` (nothing is re-serialized). |
 
 A Gemini `/v1/models/{model}:...` variant exists for each `/v1beta/models/{model}:...`
 endpoint. `:countTokens` is supported too: native Gemini routes forward to Gemini
@@ -821,6 +821,113 @@ The full field-by-field reference lives in
 - **TOML sections** — `[general]`, `[models.default]`, `[remote]`,
   `[transforms.*]` / `[transforms.default]`, `[privacy_filter]`, `[models.decision]`,
   `[dashboard]`, `[models.passthrough]`.
+- **`[spool]` (opt-in)** — the SSD spool for large request/response bodies and individual SSE
+  events is being built in
+  [`docs/architecture/plan-ssd-spool-image-request-bodies.md`](./docs/architecture/plan-ssd-spool-image-request-bodies.md).
+  Phase 1 is live: with `enabled = true`, a request body past `threshold_bytes` (default 1 MiB) is
+  streamed to `dir` instead of being held in RAM while a slow client uploads it, and the socket is
+  backpressured until the spool has taken the bytes. An unknown-length (chunked) body spills once
+  it crosses the same threshold. Bounds: `max_request_bytes` (10 MiB, the same cap as before, now
+  enforced by a byte counter for every encoding) and `max_total_bytes` (2 GiB of live spill files;
+  exceeding it is a 503, never a truncated body). Egress is moving the same way: `/passthrough`
+  now streams the client's raw bytes upstream with an exact `Content-Length` instead of re-sending
+  a materialized string, keeping only `model` and `stream_options.include_usage` from the parsed
+  body. That holds whether or not the section is enabled — it reuses the request body the proxy
+  already holds, so it costs no extra disk read. §5.4's **RAM + SSD two-level blob cache** is in
+  place too (`src/utils/blob-store.ts`): it content-addresses a shared base64 payload by the sha256
+  of its base64 text, keeps a byte-capped
+  LRU in RAM (`max_blob_cache_bytes`, 64 MiB) over a `blobs/<aa>/<bb>/<sha256>` file tree
+  (`max_blob_disk_bytes`, 256 MiB, written temp-then-rename), and never rebuilds its index from
+  disk — so a file left by an earlier run can never become a cache hit. A disk budget that cannot
+  be met without dropping a blob that is still in use is a 503, never a deleted live blob or an
+  over-budget write. The §5.4/§9.3 **ref layer** (`src/utils/blob-refs.ts`) is the counterpart that
+  moves an allowlisted inline payload — Claude base64 image/document sources, Chat
+  image/audio/file parts, Gemini `inline_data`, Responses image/file/inline-skill parts — into one
+  of those blobs and restores the field's original bytes on the way out; an attempt body is copied
+  from an extracted one with `structuredClone` plus one `retain()` per ref, so the copy shares each
+  blob's lease and releases it exactly once. The `/v1/messages`-family request path uses that
+  extraction: the payloads leave the parsed body before privacy, kompress and the tool judge run,
+  the refs then cross the send boundary and routing as plain JSON (shape 2, §5.3), and the handler
+  that dispatches the request expands them back to the client's exact bytes as its first act after
+  parsing — before conversion, validation and the `before_upstream` hook — with their leases given
+  back when the request ends. Four egress paths have graduated past that (shape 3): the native
+  `/v1/messages` send, the native `/v1/chat/completions` send, the `/v1/responses` passthrough (this
+  handler's default branch, for the native Responses mode and its alias), and the two converted sends
+  in the
+  `/v1/messages` handler when it targets an OpenAI upstream (an OpenAI Completions one and an OpenAI
+  Responses one — the converter carries each ref through re-prefixed, as the data URL the converted
+  position expects). They keep the refs
+  and stream the body out of the blob store, one chunk at a time, with a `Content-Length` measured
+  from the skeleton plus each ref's size and `duplex: 'half'`, so the expanded body never exists on
+  those paths. Every other send still expands — including the `/v1/messages` handler's
+  already-OpenAI branch, whose refs sit in positions the token counter refuses to guess at, the
+  `/v1/chat/completions` handler's three converting modes, whose converters read the payload as a
+  string, and the `/v1/responses` handler's four converting modes, which read it the same way. A route's
+  `request_ingress` transforms run before dispatch, so they
+  see a small `$spoolBlob` object where an allowlisted payload was. The auth server is the one
+  pre-dispatch consumer that needs the bytes: with no uploader configured it is handed an expanded
+  copy of the body, and with one it gets §5.8's link projection. Neither converted SSE path keeps the request body
+  alive for the client's read either: the input-token estimate is resolved from the effective body
+  before the response stream is created, so the stream's transformer and pump carry a number rather
+  than the body. Non-SSE response bodies are spooled the same way on the `/passthrough` path, on
+  the `/v1/responses` passthrough, on the `/v1/messages` handler's three non-streaming response
+  readers — the two OpenAI-Format/Responses-format conversions and the upstream `openai-completions`
+  path, which now receive before they parse instead of calling `response.text()` — on
+  the native `anthropic-messages` egress beside them, where the upstream bytes are the client's
+  bytes, so the body is relayed from its spill and read again only when tracing is on — on
+  the `/v1/chat/completions` handler's two converted non-streaming readers (the `anthropic-messages`
+  and `gemini-generatecontent` upstreams) and its `openai-responses` passthrough, which forwards the
+  spool unparsed — on the native Gemini `:generateContent` egress — the one whose
+  response carries the model's `inlineData` image/audio parts, relayed unparsed — on the
+  `:generateContent` branch that answers a `/v1/messages` client (converted after one parse)
+  and the `:countTokens` branch beside it (relayed unparsed) — and in the attempt
+  loop's JSON usage/tool stats read: that read is
+  one pass over the spooled body instead of a `response.clone()` that keeps every remaining byte
+  alive for as long as it parses, and the client is sent a stream over the same spill. Above
+  `threshold_bytes` the upstream body lands in `responses/` and the client is sent a stream over that
+  spill, re-read a chunk at a time, freed once the client has taken every byte, aborted, or the read
+  failed; `max_response_bytes` (64 MiB) caps one response body and exceeding it is a 500, never a
+  truncated body. **SSE events are framed one at a time** on both streaming egresses — the attempt
+  loop and the `/passthrough` SSE branch — when `enabled = true`: each event is relayed as it
+  arrives, boundaries and order preserved and the whole stream never accumulated, and only an event
+  past `threshold_bytes` spills (to `events/`), its spill deleted once the client has taken its last
+  byte or disconnected. An event past `max_response_bytes` fails the stream and reports the error to
+  the client mid-stream, never a silently truncated response or a terminal `[DONE]`, and the client's
+  own reads are what drive the upstream reads, so a slow client pauses the stream instead of growing
+  a RAM queue. With `enabled = false` there is no framing at all and the relay is the upstream bytes
+  untouched. §5.9's opt-in RAM budget is
+  `max_materialized_body_bytes` (default `0`, off): a request body or a non-SSE response body whose
+  `ceil(bytes × materialization_factor)` (factor `2.0`) nominal charge does not fit the process-wide
+  budget is refused with 503 `over_limit_error`, after queueing behind at most `max_admission_queue`
+  (64) bodies for at most `admission_timeout_ms` (30000). It is independent of `enabled`, since a body
+  the spool never touches is materialized in RAM too. Spill files left by a crashed run are
+  deleted at startup once they are over an hour old (newer ones may belong to a worker starting
+  alongside this one), as are stale blob files found under the same rule, and anything the sweep
+  declines to remove — a subdirectory, a symlink, an unlink failure — is reported with its reason
+  in the startup log. **§5.8's external upload is live for `auth_with_body`.**
+  `external_upload_url` names the HTTPS endpoint that receives each spooled blob
+  — one `PUT` per distinct blob, the stored base64 text as the body with an exact `Content-Length`,
+  `X-Blob-Sha256` and `X-Blob-Size` — and answers with a short-lived signed download URL plus the
+  stored `sha256`, `size` and `expires_in`, all of which the uploader checks before the URL is used
+  (HTTPS, no embedded credentials, matching hash and length, a lifetime at or above the floor). An
+  optional bearer `external_upload_token` authenticates it, `external_upload_timeout_ms` (30000)
+  bounds one blob, and `external_url_min_lifetime_s` (900) is the lifetime floor — a floor of 60
+  seconds, in place of an auth timeout the proxy has none of. The endpoint must be HTTPS and must not
+  embed credentials, and configuring a token, timeout or lifetime without a URL — or any of the keys
+  with `enabled = false`, since a disabled spool produces no blobs to project — is a startup error.
+  Signed URLs, the token and the endpoint are redacted from every error and log line. With
+  `auth_with_body` set, the auth server receives the request with each extracted inline payload
+  replaced by an `external_blob` object (`url`, `sha256`, `size`, `media_type`,
+  `encoding: "base64"`) at that field's own path — text and tools as the upstream will see them —
+  while the upstream request still streams the original inline bytes from the local blobs. The
+  proxy **never deletes** an uploaded object: it uploads and forgets, and the store's own bucket
+  lifecycle rule is what expires them (a decision taken with the user, and a divergence from the
+  plan's best-effort delete). A blob that cannot be read, a failed upload or a receipt that disagrees
+  with what was sent **fails the request explicitly** — 500 `processing_error`, no auth call, no
+  upstream call — rather than sending an empty binary field or a broken link. With no uploader
+  configured the auth server gets the whole body inline, exactly as before.
+  Leaving the section out, or `enabled = false`, writes nothing and creates no
+  directory.
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
   config `api_key` into the OS keychain — macOS Keychain, Windows Credential Vault, Linux
   Secret Service (`gnome-keyring`/KWallet + `libsecret`) — and rewrites each key in

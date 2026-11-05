@@ -11,6 +11,10 @@
  *   Supported models: cl100k_base, p50k_base, p50k_edit, r50k_base, gpt2, o200k_base
  * - TIKTOKEN_BPE_URL: URL to fetch tiktoken BPE data from (default: OpenAI's CDN)
  *   Note: bpeUrl parameter is currently not used with js-tiktoken
+ *
+ * An inline binary payload the spool extracted into a BlobRef (§5.2) is counted
+ * by the §5.3 rule instead of as text: `Math.ceil(size / charactersPerToken)`,
+ * the blob never read. See `countRefTokens` below.
  */
 
 import { Tiktoken } from 'js-tiktoken/lite';
@@ -21,6 +25,7 @@ import p50k_edit from 'js-tiktoken/ranks/p50k_edit';
 import r50k_base from 'js-tiktoken/ranks/r50k_base';
 import gpt2 from 'js-tiktoken/ranks/gpt2';
 import { ThinkingConfigParam } from '../types/claude.js';
+import { assertRefShape, collectBlobRefs, isBlobRef, type BlobRef } from './blob-refs.js';
 
 export interface TokenCountingOptions {
   /** Whether to use local token counting (default: false, use API) */
@@ -268,10 +273,14 @@ function countContentBlockTokens(block: CountableContentBlock, options: TokenCou
     case 'tool_use':
       return countStringTokens(`tool_use: ${block.id ?? ''}\nname: ${block.name ?? ''}\ninput: ${JSON.stringify(block.input ?? {})}`, options);
     case 'image': {
+      const ref = inlinePayloadRef(block);
+      if (ref) return countRefTokens(ref, options);
       const source = block.source ?? {};
       return countStringTokens(`image: ${source.type ?? ''}\nmedia_type: ${source.media_type ?? ''}\nurl: ${source.url ?? ''}\ndata: ${source.data ?? ''}`, options) + 20;
     }
     case 'document': {
+      const ref = inlinePayloadRef(block);
+      if (ref) return countRefTokens(ref, options);
       const source = block.source ?? {};
       return countStringTokens(`document: ${block.title ?? ''}\nmedia_type: ${source.media_type ?? ''}\ntype: ${source.type ?? ''}\ndata: ${source.data ?? ''}`, options) + 10;
     }
@@ -279,9 +288,68 @@ function countContentBlockTokens(block: CountableContentBlock, options: TokenCou
       return countStringTokens(`thinking: ${block.thinking ?? ''}\nsignature: ${block.signature ?? ''}`, options);
     case 'web_search_result':
       return countStringTokens(`web_search_result: ${JSON.stringify(block)}`, options);
-    default:
-      return countStringTokens(JSON.stringify(block), options);
+    default: {
+      // A block with no Claude `type` discriminator — a Chat `image_url`, a Gemini
+      // `inline_data`, a Responses `input_image`/`input_file`/`inline` — is counted
+      // by its JSON text, which measures the ref's *metadata object* instead of the
+      // payload it stands for. So every ref it holds contributes the payload's own
+      // §5.3 approximation as well: without that, the payload would count as
+      // nothing (the invisible undercount §9.3 rejects, and one `estimateInputTokens`
+      // would have turned into a zero for the whole request).
+      //
+      // The block's own few tokens of JSON stay in — the one place this differs from
+      // the `image`/`document` branches, which drop every fixed cost. A malformed ref
+      // still fails the count rather than inflating it: `countRefTokens` asserts the
+      // shape first (repo rule #8).
+      let tokens = countStringTokens(JSON.stringify(block), options);
+      for (const ref of collectBlobRefs(block)) {
+        tokens += countRefTokens(ref, options);
+      }
+      return tokens;
+    }
   }
+}
+
+/**
+ * The §5.3 contribution of one extracted binary payload: exactly
+ * `Math.ceil(base64CharLength / charactersPerToken)` and nothing else.
+ *
+ * The base64 character count is the ref's recorded `size` — base64 is ASCII, so
+ * the blob's byte length *is* its character count — and the blob is deliberately
+ * never read: reading it to tokenize would defeat the extraction that produced
+ * the ref. The tokenizer is skipped for the same reason, and every fixed block
+ * cost is dropped: field labels, media/source type, the `data:` prefix, and the
+ * former image/document `+20`/`+10` overhead. So this is an approximation that
+ * need not match what the same body counted inline (§5.3 accepts that, and
+ * upstream-reported usage wins when it is available).
+ *
+ * `assertRefShape` runs before the arithmetic: a ref whose `size` is missing or
+ * fractional would turn the whole request's count into `NaN` in silence, which is
+ * the miscount §9.3 rejects (repo rule #8).
+ */
+function countRefTokens(ref: BlobRef, options: TokenCountingOptions): number {
+  assertRefShape(ref);
+  const { charactersPerToken = 4 } = { ...DEFAULT_OPTIONS, ...options };
+  return Math.ceil(ref.size / charactersPerToken);
+}
+
+/**
+ * The ref standing in for a Claude block's inline payload, when the spool
+ * extracted it (§5.4): `source.data` on an `image` or `document` block.
+ *
+ * Without this the ref would be interpolated into the label text — `data:
+ * [object Object]` — and the payload would be counted as nothing: a small,
+ * invisible undercount of exactly the kind §9.3 rules out. These two are the
+ * positions this estimator can name by hand, because they are the only §5.4
+ * allowlisted ones that are Claude content blocks; every other allowlisted
+ * position belongs to a Chat, Gemini or Responses shape, whose blocks reach the
+ * `default` branch above and are counted there by a walk of their own refs.
+ */
+function inlinePayloadRef(block: CountableContentBlock): BlobRef | undefined {
+  const source = block.source;
+  if (!source || typeof source !== 'object') return undefined;
+  const data = (source as Record<string, unknown>).data;
+  return isBlobRef(data) ? data : undefined;
 }
 
 /**

@@ -10,6 +10,8 @@ import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { getPrivacyFilterConfig } from './privacy-filter.js';
 import { resolveImageEncodeConfig, setImageEncodeConfig } from './image-fetch.js';
+import { blobRootDir, sweepStaleBlobs } from './blob-store.js';
+import { resolveSpoolConfig, setSpoolConfig, sweepStaleSpills } from './spool.js';
 import { buildConsulKvUrl, parseConsulConfig } from './consul-loader.js';
 import type { ConsulKvEntry } from './consul-loader.js';
 import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
@@ -106,6 +108,35 @@ export interface ProxyConfig {
   fetch?: {
     image_encode?: string;
     timeout_ms?: number;
+  };
+  /**
+   * SSD spool for large request/response bodies and individual SSE events
+   * (docs/architecture/plan-ssd-spool-image-request-bodies.md §5.6). Opt-in:
+   * with no `[spool]` section nothing is spooled and behavior is unchanged.
+   * See `utils/spool.ts` for the resolved shape and the defaults.
+   *
+   * The `external_*` keys are the §5.8 opt-in that sends spooled binaries to an
+   * external uploader instead of the auth service receiving them inline. They
+   * are validated at startup and not yet acted on — the uploader lands next.
+   */
+  spool?: {
+    enabled?: boolean;
+    dir?: string;
+    threshold_bytes?: number;
+    max_request_bytes?: number;
+    max_response_bytes?: number;
+    max_total_bytes?: number;
+    max_materialized_body_bytes?: number;
+    materialization_factor?: number;
+    max_admission_queue?: number;
+    admission_timeout_ms?: number;
+    max_blob_cache_bytes?: number;
+    max_blob_disk_bytes?: number;
+    ttl_seconds?: number;
+    external_upload_url?: string;
+    external_upload_token?: string;
+    external_upload_timeout_ms?: number;
+    external_url_min_lifetime_s?: number;
   };
   /**
    * Passthrough targets for verbatim upstream forwarding.
@@ -2917,6 +2948,28 @@ export function serializeProxyConfigToml(config: ProxyConfig): string {
     lines.push('');
   }
 
+  if (config.spool) {
+    const sp = config.spool;
+    lines.push('[spool]');
+    if (sp.enabled !== undefined) lines.push(`enabled = ${sp.enabled}`);
+    if (sp.dir !== undefined) lines.push(`dir = ${JSON.stringify(sp.dir)}`);
+    // §5.8 external upload. The token is written verbatim like `api_key`: this
+    // writes the config file, which already holds secrets in plaintext — the
+    // redaction §5.8 requires applies to logs, not to the operator's own file.
+    if (sp.external_upload_url !== undefined) lines.push(`external_upload_url = ${JSON.stringify(sp.external_upload_url)}`);
+    if (sp.external_upload_token !== undefined) lines.push(`external_upload_token = ${JSON.stringify(sp.external_upload_token)}`);
+    for (const key of [
+      'threshold_bytes', 'max_request_bytes', 'max_response_bytes', 'max_total_bytes',
+      'max_materialized_body_bytes', 'materialization_factor', 'max_admission_queue',
+      'admission_timeout_ms', 'max_blob_cache_bytes', 'max_blob_disk_bytes', 'ttl_seconds',
+      'external_upload_timeout_ms', 'external_url_min_lifetime_s',
+    ] as const) {
+      const value = sp[key];
+      if (value !== undefined) lines.push(`${key} = ${value}`);
+    }
+    lines.push('');
+  }
+
   if (config.passthrough) {
     lines.push('[models.passthrough]');
     lines.push(...Object.entries(config.passthrough).map(([name, target]) => `${tomlKey(name)} = ${serializePassthroughTarget(target)}`));
@@ -3207,6 +3260,55 @@ export async function loadProxyConfig(env: Env): Promise<ProxyConfig> {
       }
     }
 
+    // Spool resolution (once, at startup). Throws a fatal error when the
+    // configured directory is unusable: silently falling back to the in-memory
+    // path would hide the exact memory risk the spool exists to remove (§5.6).
+    {
+      const startupSpool = resolveSpoolConfig(cleanedConfig.spool);
+      setSpoolConfig(startupSpool);
+      if (startupSpool.enabled) {
+        startupLogger.info('config', `Spool active: dir=${startupSpool.dir} thresholdBytes=${startupSpool.thresholdBytes} maxTotalBytes=${startupSpool.maxTotalBytes} maxBlobDiskBytes=${startupSpool.maxBlobDiskBytes}`);
+
+        // §5.5: a restart discards all spool state (no manifest, no replay), so
+        // spills left by a crashed run are garbage — but only the old ones. The
+        // age threshold keeps a worker starting alongside this one from having
+        // its in-progress upload deleted. Every spill directory is swept (the
+        // counts are aggregated across them); everything the sweep declines to
+        // remove is reported rather than passed over (repo rule #8).
+        const sweep = sweepStaleSpills(startupSpool);
+        if (sweep.removed > 0) {
+          startupLogger.info(
+            'config',
+            `Spool startup sweep: removed ${sweep.removed} stale spill file(s) from the spool directories under ${startupSpool.dir}; kept ${sweep.keptRecent} too recent to judge`,
+          );
+        }
+        if (sweep.skipped.length > 0) {
+          startupLogger.warn(
+            'config',
+            `Spool startup sweep left ${sweep.skipped.length} entr${sweep.skipped.length === 1 ? 'y' : 'ies'} in place: ${sweep.skipped.map((entry) => `${entry.path} (${entry.reason})`).join('; ')}`,
+          );
+        }
+
+        // §5.4: the blob index lives only in process memory and is never
+        // reconstructed from disk, so at startup every blob file belongs to a
+        // process that is gone — the age threshold is what keeps a worker
+        // starting alongside this one from losing the blob it is writing now.
+        const blobSweep = sweepStaleBlobs(startupSpool);
+        if (blobSweep.removed > 0) {
+          startupLogger.info(
+            'config',
+            `Spool startup sweep: removed ${blobSweep.removed} stale blob file(s) from ${blobRootDir(startupSpool)}; kept ${blobSweep.keptRecent} too recent to judge`,
+          );
+        }
+        if (blobSweep.skipped.length > 0) {
+          startupLogger.warn(
+            'config',
+            `Spool startup sweep left ${blobSweep.skipped.length} blob entr${blobSweep.skipped.length === 1 ? 'y' : 'ies'} in place: ${blobSweep.skipped.map((entry) => `${entry.path} (${entry.reason})`).join('; ')}`,
+          );
+        }
+      }
+    }
+
     return cachedConfig;
   } catch (error) {
     // Fatal errors (e.g. system-keychain failures) must not degrade to an
@@ -3218,6 +3320,36 @@ export async function loadProxyConfig(env: Env): Promise<ProxyConfig> {
     return {};
   }
 }
+
+/**
+ * Numeric `[spool]` limits accepted by the parser. Kept here (not imported
+ * from spool.ts) so a typo'd key is reported at parse time; spool.ts owns the
+ * range validation.
+ */
+const SPOOL_NUMERIC_KEYS = new Set([
+  'threshold_bytes',
+  'max_request_bytes',
+  'max_response_bytes',
+  'max_total_bytes',
+  'max_materialized_body_bytes',
+  'materialization_factor',
+  'max_admission_queue',
+  'admission_timeout_ms',
+  'max_blob_cache_bytes',
+  'max_blob_disk_bytes',
+  'ttl_seconds',
+  'external_upload_timeout_ms',
+  'external_url_min_lifetime_s',
+]);
+
+/**
+ * String `[spool]` values accepted by the parser, beyond the quoted `dir`.
+ *
+ * `external_upload_url` and `external_upload_token` are written as quoted values
+ * — a URL and a bearer token, not a number or a boolean — so they take the
+ * quoted-value path instead of {@link SPOOL_NUMERIC_KEYS}.
+ */
+const SPOOL_STRING_KEYS = new Set(['dir', 'external_upload_url', 'external_upload_token']);
 
 /**
  * Simple TOML parser for category-based structure
@@ -3340,6 +3472,10 @@ export function parseSimpleToml(content: string): ProxyConfig {
         currentSection = 'fetch';
         currentCategory = null;
         config.fetch = {};
+      } else if (parts[0] === 'spool') {
+        currentSection = 'spool';
+        currentCategory = null;
+        config.spool = {};
       } else if (parts[0] === 'transforms' && parts[1] === 'default') {
         // Canonical home of transform defaults. Intercept before the generic
         // [transforms.<name>] branch so "default" is not created as a transform
@@ -3471,6 +3607,18 @@ export function parseSimpleToml(content: string): ProxyConfig {
       } else if (currentSection === 'fetch' && config.fetch) {
         if (cleanKey === 'image_encode') {
           config.fetch.image_encode = value;
+        }
+      } else if (currentSection === 'spool' && config.spool) {
+        // The quoted [spool] keys are the strings (the dir and the §5.8
+        // external-upload URL/token); the rest are numbers/booleans and are
+        // handled in the unquoted branch below.
+        if (SPOOL_STRING_KEYS.has(cleanKey)) {
+          (config.spool as Record<string, unknown>)[cleanKey] = value;
+        } else {
+          sectionFieldErrors.push({
+            path: `spool.${cleanKey}`,
+            message: `[spool] keys are written unquoted as numbers or booleans — a quoted value here is ignored`,
+          });
         }
       } else if (currentSection === 'transforms' && currentCategory && config.transforms) {
         const set = config.transforms[currentCategory];
@@ -3817,6 +3965,21 @@ export function parseSimpleToml(content: string): ProxyConfig {
           config.fetch.timeout_ms = cleanValueAny;
         } else if (cleanKey === 'image_encode' && typeof cleanValueAny === 'string') {
           config.fetch.image_encode = cleanValueAny;
+        }
+      } else if (currentSection === 'spool' && config.spool) {
+        if (cleanKey === 'enabled' && typeof cleanValueAny === 'boolean') {
+          config.spool.enabled = cleanValueAny;
+        } else if (SPOOL_STRING_KEYS.has(cleanKey) && typeof cleanValueAny === 'string') {
+          (config.spool as Record<string, unknown>)[cleanKey] = cleanValueAny;
+        } else if (SPOOL_NUMERIC_KEYS.has(cleanKey) && typeof cleanValueAny === 'number') {
+          (config.spool as Record<string, unknown>)[cleanKey] = cleanValueAny;
+        } else {
+          // A silently dropped limit is a limit the operator believes is in
+          // force (repo rule #8). Report the key instead of skipping it.
+          sectionFieldErrors.push({
+            path: `spool.${cleanKey}`,
+            message: `unknown [spool] key or non-numeric value for a numeric limit`,
+          });
         }
       } else if (currentSection === 'remote' && config.remote) {
         if ((cleanKey === 'auth_server' || cleanKey === 'auth_passthrough_with'

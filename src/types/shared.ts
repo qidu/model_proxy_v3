@@ -4,8 +4,14 @@
 
 /**
  * Logger interface
+ *
+ * NOTE: this is the narrow, argument-less view of the logger used by type
+ * declarations in this file tree. The runtime implementation and the full
+ * interface live in `utils/logger.ts`. Keep `traceEnabled` in sync with it —
+ * `logPipelineStage` reads the flag to skip full-body `JSON.stringify` work.
  */
 export interface Logger {
+    traceEnabled: boolean;
     trace(requestId: string, message: string): void;
     debug(requestId: string, message: string): void;
     info(requestId: string, message: string): void;
