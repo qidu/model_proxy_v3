@@ -4,7 +4,7 @@ Plan: `docs/architecture/plan-ssd-spool-image-request-bodies.md`
 
 Status values: `[ ]` pending, `[~]` in progress, `[x]` complete with verification.
 
-Current P1 verification: typecheck clean, build clean, 2,358/2,358 unit tests pass, plus 83 focused response/scratch/event tests.
+Current P2 verification: typecheck clean, build clean, 2,489/2,489 unit tests pass. All P0–P2 items are complete; P3 (measurement and end-to-end evidence) remains.
 
 ## P0 — Correctness and lifecycle defects
 
@@ -67,6 +67,18 @@ Current P1 verification: typecheck clean, build clean, 2,358/2,358 unit tests pa
     in `src/` constructs a Responses `image_generation_call`, so the identity passthrough
     is where that allowlisted payload arrives today; these egresses are the next §5.7
     items.
+  - Update (later increments): the readers this scope named are now wired — the four
+    converted `responses.ts` readers and its two identity forwards, the `/v1/messages`
+    non-SSE and converted readers, `/v1/chat/completions`' two converted egresses and its
+    `openai-responses` passthrough, the three small passthrough handlers, and the
+    `after_upstream` transform path (`applyAfterUpstream` now receives through
+    `withResponseText`, `tests/unit/transform-response-spool.test.ts`), and all three
+    `models.ts` model-listing readers (`tests/unit/models-response-spool.test.ts`, which also
+    pins the one degradation left in place: `getModelCount` answers a count of 0 for a cap
+    breach — logged at error level, but its caller still answers its usual 404, so the client
+    cannot tell it from an empty upstream). Still unwired, and each a separate increment: the
+    `!response.ok` error-body reads repo-wide, and the fusion `readResponseJson` clone in
+    `src/index.ts`.
 - [x] **Stream the identity non-SSE response from its spool**
   - Do not buffer a second copy for a log line.
   - Enforce `max_response_bytes` on the forwarded body.
@@ -82,6 +94,8 @@ Current P1 verification: typecheck clean, build clean, 2,358/2,358 unit tests pa
   - Scope: `/v1/responses/compact` already streams the upstream body unread, so it has no
     copy to remove and no materialization to admit — left alone. The whole-body readers
     listed in the item above are still unwired.
+  - Update (later increments): the readers this scope named are wired; the same "Update"
+    note on the item above lists what remains.
 - [x] **Add response/event scratch-blob storage**
   - Keep response blobs separate from the cross-request cache.
   - Delete scratch blobs after final delivery or abort.
@@ -107,21 +121,29 @@ Current P1 verification: typecheck clean, build clean, 2,358/2,358 unit tests pa
 
 ## P2 — Contract reconciliation
 
-- [ ] **Finish §5.9 admission lifetimes**
-  - Release binary reservations after extraction where rehydration is no longer needed.
+- [x] **Finish §5.9 admission lifetimes**
+  - Release the materialization (RAM) reservation after allowlisted binary payloads become refs, when no later consumer rehydrates them.
+    Done earlier: `src/index.ts` releases at the send boundary when `refs > 0 && skipped === 0`; `tests/unit/index-admission.test.ts` proves the release and the combined request+response budget.
+  - Keep spill/blob disk ownership separate: release disk state only when its owning body or blob lease ends.
   - Reacquire admission per rung.
+    Resolved as a recorded deviation: rungs share one parse, so a non-ref body holds its reservation across all rungs (conservative); per-rung acquisition exists where a rung actually parses (the attempt loop's response-stats read). Plan §5.9 records this.
   - Pause upstream response/event reads while queued.
+    New test in `tests/unit/spool-events.test.ts`: a queued event's admission wait pulls nothing further from upstream, and delivery resumes byte-exactly once the budget frees.
   - Cover converted responses and combined request+response budgets.
-- [ ] **Resolve the lease-contract deviation**
-  - Either implement the planned `leaseId` and renewal protocol or revise the plan to explicitly accept active-ref pinning.
-  - Add long-lived, renewal-failure, missing-file, and final-release tests.
-- [ ] **Resolve request-transform behavior**
-  - Make transforms explicitly ref-aware or rehydrate before transforms that require original bytes.
-  - Test every built-in and custom-transform contract involving binary fields.
-- [ ] **Close remaining auth-link requirements**
+    Every handler's `*-response-spool.test.ts` suite covers admission refusal/admission on its converted response path; `index-admission.test.ts` covers the combined budget.
+- [x] **Resolve the lease-contract deviation**
+  - Resolved by revising the plan: §5.5 now records active-ref pinning as the accepted mechanism — the blob hash is the lease identity, the L2 index's `refs` counts shared owners, and renewal is structural (TTL/LRU only look at `refs = 0` entries, so a live exchange's blob can never expire). The leaseId/renewal-ticker protocol is not implemented.
+  - Test evidence, all in `tests/unit/blob-store.test.ts`: long-lived — a lease held a simulated hour past `ttl_seconds = 600` is never expired and the idle clock starts only at the final release (`:421`); missing-file — a missing/truncated leased file throws instead of serving a partial payload (`:341`, `:621`); final-release — the last release makes the blob idle-eligible and it then expires normally (`:404`, `:421`); the renewal-failure requirement maps to the mechanism's own loud failures (release with no active lease throws, `:388`).
+- [x] **Resolve request-transform behavior**
+  - Transforms are ref-safe by position, and that is now proven end to end: extraction runs before any hook, the ref is plain JSON the engine cannot address (payload paths are refused at load — `tests/unit/request-ingress-transform-refs.test.ts`), and every named builtin plus every Tier-1 op kind runs against a ref-bearing body in `tests/unit/transform-ref-matrix.test.ts` with byte-identity against the spool-off baseline.
+  - New matrix row closes the last recorded gap: a *converting* Rule-B send (`chat-completions.ts:110`, Chat→Claude) whose `before_upstream` op drops the ref's container degrades to the plain string egress (`streamed: false`, no `Content-Length`/`duplex`), byte-identical to spool-off — previously measured only for the already-OpenAI Messages send.
+- [x] **Close remaining auth-link requirements**
   - Prove the auth service fetches and hash-verifies external objects.
+    New `tests/unit/index-auth-projection.test.ts` block: a verifying auth-service double walks the projection's `external_blob` links, fetches each from a fake object store, and hash/size-verifies the bytes — the projected link survives exactly that check; a 404ing store makes auth refuse, the client gets 401, and the upstream is never called.
   - Record the final decision on proxy deletion versus store-lifecycle-only cleanup.
+    §5.8 now records the 2026-11-04 decision: the proxy issues no `DELETE` to the object store on any path; the store's lifecycle TTL alone bounds every external object. The success-path test asserts the only object-store call is the auth service's GET.
   - Add auth-fetch failure and cleanup integration tests.
+    Both new tests run the real handler end to end and assert the lease is held across upload/auth/auth-fetch/send and released at request end on success and failure (no lingering lease, no proxy-side delete).
 
 ## P3 — Acceptance evidence and documentation
 

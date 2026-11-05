@@ -8,9 +8,10 @@ import { Logger } from '../utils/logger.js';
 import type { OpenAIModelsResponse } from '../types/openai.js';
 import { mergeOpenAIModelsResponse } from '../converters/openai-to-claude.js';
 import { validateModelsRequestParams } from '../utils/validation.js';
-import { handleTargetApiError } from '../utils/errors.js';
+import { createErrorResponse, handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
+import { receiveJsonResponse } from '../utils/spool-response.js';
 
 // In-memory cache for model list
 interface CacheEntry {
@@ -106,13 +107,17 @@ export async function getModelCount(
   logger.debug(requestId, `Fetching model list from upstream for count: ${targetUrl}`);
 
   try {
+    // One signal for the GET and for the receive below: this path takes no
+    // `Request`, so there is no client signal to hand the §5.9 wait.
+    const signal = createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env));
+
     const response = await fetch(targetUrl, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders,
       },
-      signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
+      signal,
     });
 
     if (!response.ok) {
@@ -120,8 +125,16 @@ export async function getModelCount(
       return { count: 0, cached: false };
     }
 
-    const responseText = await response.text();
-    const openaiResponse: OpenAIModelsResponse = JSON.parse(responseText);
+    // §5.7: one bounded receive — above `threshold_bytes` the body lives on this
+    // response's spill while it is received, and `max_response_bytes` caps it.
+    // The catch below reports a cap or a spill failure at error level and returns
+    // a count of 0, which this function's only caller answers as its usual 404 —
+    // logged rather than silent, but not distinguishable to the client from an
+    // upstream that answered with an empty list. Left as it is: this function's
+    // contract is a count, and its caller treats 0 and a throw alike.
+    const openaiResponse = await receiveJsonResponse<OpenAIModelsResponse>(
+      response, requestId, logger, targetUrl, signal,
+    );
     const mergedResponse = mergeOpenAIModelsResponse(openaiResponse, []);
 
     // Cache the response
@@ -205,8 +218,28 @@ export async function handleModelsRequest(
       handleTargetApiError(response, 'Models API', { url: targetApiUrl.toString(), upstreamBody: upstreamErrorBody });
     }
 
-    // Parse target API response
-    const openaiResponse: OpenAIModelsResponse = JSON.parse(await response.text());
+    // Parse target API response. §5.7: one bounded receive — above
+    // `threshold_bytes` the body lives on this response's spill while it is
+    // received, and `max_response_bytes` caps it.
+    //
+    // The inner catch is deliberately this narrow. A body that is not JSON keeps
+    // this endpoint's existing degradation (the outer catch below answers with the
+    // config-only list), but a §5.7 cap, a spill write failure or a §5.9 refusal
+    // is the proxy's own limit and must surface as itself — the outer catch would
+    // turn it into a silently smaller model list (rule #8).
+    let openaiResponse: OpenAIModelsResponse;
+    try {
+      openaiResponse = await receiveJsonResponse<OpenAIModelsResponse>(
+        response,
+        requestId,
+        logger,
+        targetApiUrl.toString(),
+        request.signal,
+      );
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) return createErrorResponse(error as Error, requestId);
+      throw error;
+    }
     upstreamModels = mergeOpenAIModelsResponse(openaiResponse, []);
 
     // Cache the response (only for non-paginated requests)
@@ -359,7 +392,25 @@ export async function handleAnthropicModelsDiscovery(
       });
     }
 
-    const upstreamResponse: any = await response.json();
+    // §5.7: one bounded receive — above `threshold_bytes` the body lives on this
+    // response's spill while it is received, and `max_response_bytes` caps it.
+    // Same split as `handleModelsRequest`: a malformed body keeps this handler's
+    // existing 500 `internal_error` (via the catch below), while a cap, a write
+    // failure or a §5.9 refusal surfaces as itself rather than as a 500 that
+    // claims the upstream broke (rule #8).
+    let upstreamResponse: any;
+    try {
+      upstreamResponse = await receiveJsonResponse<any>(
+        response,
+        requestId,
+        logger,
+        targetApiUrl.toString(),
+        request.signal,
+      );
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) return createErrorResponse(error as Error, requestId);
+      throw error;
+    }
 
     // Transform to Anthropic shape and filter
     let rawModels: any[] = [];

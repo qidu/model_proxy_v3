@@ -1,10 +1,11 @@
 /**
- * Unit tests for the §5.7 non-SSE response path in `src/handlers/responses.ts`'s
- * passthrough branch (`handleAsPassthrough`).
+ * Unit tests for the §5.7 non-SSE identity forwards in `src/handlers/responses.ts`:
+ * `handleAsPassthrough`'s non-SSE tail, and the passthrough halves of
+ * `POST /v1/responses/input_tokens` and `POST /v1/responses/compact`.
  *
  * Plan: docs/architecture/plan-ssd-spool-image-request-bodies.md §5.7, §5.9.
  *
- * This branch never converts, so the upstream bytes are the client's bytes: the
+ * None of these branches converts, so the upstream bytes are the client's bytes: the
  * tests pin that identity (one fixture is not even JSON, so a parse-and-re-serialize
  * would fail them), the spill's life — charged while the response is in flight,
  * gone once the body has been read, the client aborts, or the read fails — and the
@@ -14,8 +15,12 @@
  * branch does: with tracing off there is nothing to admit and a budget one byte
  * short of the charge must still serve the response.
  *
+ * The two `/input_tokens` and `/compact` sites came later and are the same shape, so
+ * their properties are written once against a site table at the bottom of this file.
+ *
  * Request-side egress (client -> upstream) is covered by
- * responses-ref-streaming.test.ts; the SSE response path by responses-stream-events.ts.
+ * responses-ref-streaming.test.ts; the SSE response path by responses-stream-events.ts;
+ * the converting readers by responses-response-spool.test.ts.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
@@ -25,7 +30,11 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, truncateSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { handleResponsesRequest } from '../../src/handlers/responses.js';
+import {
+  handleResponsesRequest,
+  handleResponsesInputTokensRequest,
+  handleResponsesCompactRequest,
+} from '../../src/handlers/responses.js';
 import { SpoolResponseTooLargeError } from '../../src/utils/spool-response.js';
 import { SpoolWriteError, getLiveSpillBytes } from '../../src/utils/spool-body.js';
 import { SPOOL_DEFAULTS, responseSpillDir, setSpoolConfig, type SpoolConfig } from '../../src/utils/spool.js';
@@ -59,7 +68,10 @@ after(() => {
 
 const ENV = { LOG_LEVEL: 'error' } as any;
 const CLIENT_URL = 'http://proxy';
+const REQUEST_ID = 'req-responses-response';
 const UPSTREAM_URL = 'https://upstream.example/v1/responses';
+const INPUT_TOKENS_URL = 'https://upstream.example/v1/responses/input_tokens';
+const COMPACT_URL = 'https://upstream.example/v1/responses/compact';
 
 /** Spool enabled with a small threshold, so a few hundred bytes spill. */
 function configureSpool(overrides: Partial<SpoolConfig> = {}): SpoolConfig {
@@ -171,7 +183,7 @@ async function callHandler(opts: {
     }),
     UPSTREAM_URL,
     { Authorization: 'Bearer upstream-key' },
-    'req-responses-response',
+    REQUEST_ID,
     'gpt-test',
     ENV,
     opts.logger ?? recordingLogger(false),
@@ -425,3 +437,195 @@ describe('responses.ts passthrough non-SSE response, byte admission (§5.9)', ()
     assert.equal(getLiveSpillBytes(), 0);
   });
 });
+
+/**
+ * The other two identity forwards: the passthrough halves of
+ * `POST /v1/responses/input_tokens` and `POST /v1/responses/compact`. They are the
+ * same shape as the one above — the upstream body is the client's body, one
+ * bounded receive, nothing parsed — so the properties are written once against a
+ * site table. Before this they handed `new Response(<upstream>.body, …)` straight
+ * to the client: no receive, no `max_response_bytes`, no spool.
+ */
+interface IdentitySite {
+  name: string;
+  /** Send the client request, with the native upstream mode, and return the answer. */
+  invoke: (logger: Logger) => Promise<Response>;
+  /** The upstream URL the body comes from, as it appears in the trace line. */
+  upstreamUrl: string;
+}
+
+const IDENTITY_SITES: IdentitySite[] = [
+  {
+    name: 'POST /v1/responses/input_tokens',
+    invoke: (logger) => handleResponsesInputTokensRequest(
+      new Request(`${CLIENT_URL}/v1/responses/input_tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-test', input: 'hi' }),
+      }),
+      INPUT_TOKENS_URL,
+      { Authorization: 'Bearer upstream-key' },
+      REQUEST_ID,
+      'gpt-test',
+      ENV,
+      logger,
+    ),
+    upstreamUrl: INPUT_TOKENS_URL,
+  },
+  {
+    name: 'POST /v1/responses/compact',
+    invoke: (logger) => handleResponsesCompactRequest(
+      new Request(`${CLIENT_URL}/v1/responses/compact`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-test', input: 'hi' }),
+      }),
+      COMPACT_URL,
+      { Authorization: 'Bearer upstream-key' },
+      REQUEST_ID,
+      'gpt-test',
+      ENV,
+      logger,
+    ),
+    upstreamUrl: COMPACT_URL,
+  },
+];
+
+for (const site of IDENTITY_SITES) {
+  describe(`responses.ts ${site.name} passthrough response (§5.7)`, () => {
+    it('forwards a body it cannot parse verbatim, with no spill', async () => {
+      const config = configureSpool({ thresholdBytes: 4096 });
+      // Not JSON on purpose: a branch that parsed and re-serialized would fail here.
+      const payload = '{"object":"response.input_tokens","input_tokens":12';
+      stubUpstream(() => new Response(payload, { headers: { 'Content-Type': 'application/json' } }));
+
+      const response = await site.invoke(recordingLogger(false));
+
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('x-request-id'), REQUEST_ID);
+      assert.equal(await response.text(), payload, 'the upstream bytes are the client bytes');
+      assert.deepEqual(spillFiles(config), [], 'a body under the threshold leaves no spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('spills above threshold_bytes and sends the body from the spill, which ends with the response', async () => {
+      const config = configureSpool();
+      const payload = responsePayload('x'.repeat(400));
+      const upstreamBytes = new TextEncoder().encode(payload);
+      assert.ok(upstreamBytes.byteLength > config.thresholdBytes, 'the fixture must cross the threshold');
+      stubUpstream(() => new Response(payload, { headers: { 'Content-Type': 'application/json' } }));
+
+      const response = await site.invoke(recordingLogger(false));
+
+      // Unlike a converting branch, this one hands the body out still on the spool:
+      // the spill is the live body until the client has read it.
+      assert.equal(response.status, 200);
+      assert.equal(spillFiles(config).length, 1);
+      assert.equal(getLiveSpillBytes(), upstreamBytes.byteLength);
+
+      const forwarded = new Uint8Array(await response.arrayBuffer());
+
+      assert.equal(sha256(forwarded), sha256(upstreamBytes), 'the client must receive the upstream bytes');
+      assert.deepEqual(spillFiles(config), [], 'the client reading the body must free the spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('fails loudly past max_response_bytes instead of truncating, and cancels the upstream body', async () => {
+      const config = configureSpool({ maxResponseBytes: 200 });
+      const src = source([new TextEncoder().encode(responsePayload('z'.repeat(1000)))]);
+      const { calls } = stubUpstream(() => new Response(src.stream, { headers: { 'Content-Type': 'application/json' } }));
+
+      let caught: unknown;
+      try {
+        await site.invoke(recordingLogger(false));
+      } catch (error) {
+        caught = error;
+      }
+
+      assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+      assert.equal(caught.status, 500);
+      assert.equal(caught.type, 'processing_error');
+      assert.equal(calls(), 1);
+      assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+      assert.deepEqual(spillFiles(config), [], 'a rejected response leaves no partial spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('enforces max_response_bytes with the spool disabled, as the other egresses do', async () => {
+      const config = configureSpool({ enabled: false, maxResponseBytes: 200 });
+      const payload = responsePayload('d'.repeat(400));
+      assert.ok(new TextEncoder().encode(payload).byteLength > config.maxResponseBytes);
+      stubUpstream(() => new Response(payload, { headers: { 'Content-Type': 'application/json' } }));
+
+      let caught: unknown;
+      try {
+        await site.invoke(recordingLogger(false));
+      } catch (error) {
+        caught = error;
+      }
+
+      // Deliberate: the receive replaced a whole-body forward, so the cap bounds
+      // that receive and is not part of the spilling feature.
+      assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+      assert.equal(caught.status, 500);
+      assert.equal(caught.type, 'processing_error');
+      assert.deepEqual(spillFiles(config), [], 'nothing may reach disk when spilling is off');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('traces the upstream bytes from the spool when tracing is on', async () => {
+      const config = configureSpool();
+      const payload = responsePayload('t'.repeat(400));
+      const upstreamBytes = new TextEncoder().encode(payload);
+      const logger = recordingLogger(true);
+      stubUpstream(() => new Response(payload, { headers: { 'Content-Type': 'application/json' } }));
+
+      const response = await site.invoke(logger);
+
+      // The read that used to happen on every request now happens only for trace,
+      // and it must still carry the raw upstream body.
+      const stage = logger.traces.filter((line) => line.startsWith('[UPSTREAM-RESP] '));
+      assert.equal(stage.length, 1, `expected one upstream-response body line, got ${JSON.stringify(logger.traces)}`);
+      assert.match(stage[0], new RegExp(`^\\[UPSTREAM-RESP\\] ${site.upstreamUrl}: `));
+      assert.equal(stage[0].slice(stage[0].indexOf(': ') + 2), payload, 'the traced body must be the upstream bytes');
+
+      const forwarded = new Uint8Array(await response.arrayBuffer());
+      assert.equal(sha256(forwarded), sha256(upstreamBytes), 'reading the spill for the trace must not alter the body');
+      assert.deepEqual(spillFiles(config), [], 'the spill ends when the response is read out');
+    });
+
+    it('never charges the budget when nothing is read, and refuses a trace read one byte past it', async () => {
+      const payload = responsePayload('b'.repeat(400));
+      const upstreamBytes = new TextEncoder().encode(payload);
+      const charge = Math.ceil(upstreamBytes.byteLength * 2);
+      const config = configureSpool({ maxMaterializedBodyBytes: charge - 1 });
+      assert.ok(upstreamBytes.byteLength > config.thresholdBytes, 'the fixture must spill, so a leak would be visible on disk');
+      stubUpstream(() => new Response(payload, { headers: { 'Content-Type': 'application/json' } }));
+
+      // Tracing off: no read, so a budget this body could not afford is never
+      // consulted. A version that admitted every received body would 503 here.
+      const served = await site.invoke(recordingLogger(false));
+      assert.equal(served.status, 200);
+      assert.equal(sha256(new Uint8Array(await served.arrayBuffer())), sha256(upstreamBytes));
+      assert.equal(getAdmittedBytes(), 0);
+      assert.deepEqual(spillFiles(config), []);
+
+      // Tracing on: the same body needs the budget, and one byte short is a refusal
+      // that leaves neither the spilled bytes nor a reservation behind.
+      let caught: unknown;
+      try {
+        await site.invoke(recordingLogger(true));
+      } catch (error) {
+        caught = error;
+      }
+
+      assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+      assert.equal(caught.status, 503);
+      assert.equal(caught.type, 'over_limit_error');
+      assert.match(caught.message, /exceed max_materialized_body_bytes/);
+      assert.deepEqual(spillFiles(config), [], 'a refused response must not leave its bytes on disk');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(getAdmittedBytes(), 0, 'a refused response holds nothing on the ledger either');
+    });
+  });
+}

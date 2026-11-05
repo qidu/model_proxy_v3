@@ -81,13 +81,13 @@
  *
  * One cell of that 2×2 — **Rule B with a transform that itself drops every ref**,
  * where the re-detection finds nothing and the send degrades to `streamed: false`
- * — is measured for exactly one call site: the already-OpenAI Messages send
+ * — is measured for two call sites: the already-OpenAI Messages send
  * (`messages.ts:468`) under a `request_ingress` op that replaces the ref's
- * container, in `request-ingress-transform-refs.test.ts` block 3. The converting
- * Rule-B sends (`chat-completions.ts:108`/`:254`/`:335`, `responses.ts:951`) are
- * still unmeasured in that cell: each needs its own response fixture, and rows
- * 16–18 all carry their refs, so they cannot distinguish the two rules. Recorded
- * as a gap rather than implied to be covered.
+ * container, in `request-ingress-transform-refs.test.ts` block 3, and the
+ * converting Chat→Claude send (`chat-completions.ts:110`) in the
+ * `setchatcontent` row below. The remaining converting Rule-B sends
+ * (`chat-completions.ts:254`/`:335`, `responses.ts:951`) share the same
+ * `postJsonWithSpool` re-detection the measured two exercise.
  *
  * Coverage: all ten `BUILTIN_NAMES` and all five op kinds, across the three
  * hooks that can run on a ref-bearing body (`before_upstream` on the Anthropic,
@@ -140,11 +140,12 @@ const MAXTOK_IMAGE = P('G');
 const SETCONTENT_IMAGE = P('H');
 const RESP_PROGRAM_IMAGE = P('I');
 const OPENAI_URL_IMAGE = P('J');
+const CHAT_SET_IMAGE = P('K');
 const ALL_PAYLOADS = [
   LC_IMAGE, TOOLRES_IMAGE, THINK_IMAGE, TRAIL_IMAGE, SYSTEM_IMAGE, BETA_IMAGE, ALIAS_IMAGE,
   RENAME_IMAGE, SET_IMAGE, REMOVE_IMAGE, DEFAULT_IMAGE, MAPVAL_IMAGE, CHAT_TOOL_IMAGE,
   SSE_IMAGE, CHAT_RENAME_IMAGE, MAXTOK_IMAGE, SETCONTENT_IMAGE, RESP_PROGRAM_IMAGE,
-  OPENAI_URL_IMAGE,
+  OPENAI_URL_IMAGE, CHAT_SET_IMAGE,
 ];
 assert.equal(
   new Set(ALL_PAYLOADS).size,
@@ -371,6 +372,23 @@ const CHAT_RENAME_BODY = () => ({
     content: [
       { type: 'text', text: 'describe' },
       { type: 'image_url', image_url: { url: `data:image/png;base64,${CHAT_RENAME_IMAGE}` } },
+    ],
+  }],
+});
+
+/**
+ * The Chat fixture for the ref-dropping row: identical shape to
+ * `CHAT_RENAME_BODY`, its own payload. The op below replaces the content array
+ * wholesale, so the payload's container — and with it the only ref — is gone
+ * before the converter runs.
+ */
+const CHAT_SET_BODY = () => ({
+  model: 'gpt-test',
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'describe' },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${CHAT_SET_IMAGE}` } },
     ],
   }],
 });
@@ -642,6 +660,29 @@ const ROWS: Row[] = [
       assert.ok('parts' in msg && !('content' in msg), 'the rename must move the key, not copy it');
     },
     call: (r, route) => handleChatCompletionsPassthrough(r, TARGET, AUTH, 't15', LOGGER, ENV, 'gpt-test', 'openai-completions', route),
+  },
+  {
+    // The header's last unmeasured cell: a *converting* Rule-B send whose hook
+    // drops every ref. The op replaces the payload's container, the converter
+    // then builds a Claude body with no ref in it, and `postJsonWithSpool`'s
+    // re-detection finds nothing — so the send degrades to the plain string
+    // path. This is the cell the Messages-door ingress test measures for
+    // `messages.ts:468`; here it is measured for the Chat→Claude send
+    // (`chat-completions.ts:110`).
+    name: 'before_upstream: op set messages[].content (converting Rule-B send degrades to a string once the ref is gone)',
+    clientPath: '/v1/chat/completions', upstreamMode: 'anthropic-messages',
+    body: CHAT_SET_BODY, refs: 1, carried: [], dropped: [CHAT_SET_IMAGE],
+    streamedAfterTransform: false, acts: true,
+    set: setOf('setchatcontent', 'openai-completions', 'before_upstream',
+      { ops: [{ op: 'set', path: 'messages[].content', value: 'rewritten' }] }),
+    effect: (call) => {
+      const msg = json(call).messages[0];
+      assert.ok(
+        JSON.stringify(msg.content).includes('rewritten'),
+        'the converter must see the value the op wrote, not the ref it replaced',
+      );
+    },
+    call: (r, route) => handleChatCompletionsPassthrough(r, TARGET, AUTH, 't20', LOGGER, ENV, 'gpt-test', 'anthropic-messages', route),
   },
 
   // -- Messages door: `before_conversion` (converted egress) ---------------

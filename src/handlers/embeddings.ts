@@ -13,6 +13,7 @@ import type { Env, Logger } from '../types/shared.js';
 import { createErrorResponse } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
+import { receiveJsonResponse } from '../utils/spool-response.js';
 
 /**
  * Reshape an OpenAI `/v1/embeddings` body into Ollama's `POST /api/embed` body.
@@ -131,11 +132,22 @@ export async function handleEmbeddingsRequest(
     });
   }
 
-  const responseText = await upstreamResponse.text();
+  // §5.7: one bounded receive — above `threshold_bytes` the body lives on this
+  // response's spill while it is received, and `max_response_bytes` caps it.
   let responseData: Record<string, unknown>;
   try {
-    responseData = JSON.parse(responseText);
-  } catch {
+    responseData = await receiveJsonResponse<Record<string, unknown>>(
+      upstreamResponse,
+      requestId,
+      logger,
+      targetUrl,
+      request.signal,
+    );
+  } catch (error) {
+    // Only a body that is not JSON is "Invalid upstream response" (502). A cap
+    // breach, a write failure or a §5.9 refusal is one of the proxy's own limits
+    // and must surface as itself, not as a claim about the upstream (rule #8).
+    if (!(error instanceof SyntaxError)) throw error;
     return createErrorResponse(new Error('Invalid upstream response'), requestId, 502);
   }
 

@@ -24,7 +24,7 @@ import { completionsToClaudeBody } from './openai.js';
 import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
 import { collectBlobRefs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
-import { receiveResponseBody } from '../utils/spool-response.js';
+import { receiveResponseBody, receiveJsonResponse } from '../utils/spool-response.js';
 import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
 import { getSpoolConfig } from '../utils/spool.js';
 
@@ -713,10 +713,17 @@ async function handleAsAnthropicMessages(
     return streamClaudeAsResponses(response, model, requestId, logger, allowedTools);
   }
 
-  const claudeJsonText = await response.text();
-  logger.debug(requestId, `Upstream claude response: ${claudeJsonText.substring(0, 500)}`);
-  logPipelineStage(logger, requestId, 'upstream-response', targetUrl, claudeJsonText);
-  const claudeJson = JSON.parse(claudeJsonText) as Record<string, unknown>;
+  // §5.7: one bounded receive instead of `response.text()` — above
+  // `threshold_bytes` the body lives on this response's spill while it is
+  // received and is read back from disk for the single parse, `max_response_bytes`
+  // caps it, and both the spill and the §5.9 lease are released before the client
+  // is answered. The receive emits the `upstream-response` stage line itself, so
+  // the explicit `logPipelineStage` call and the 500-character debug preview that
+  // stood beside it are gone; the stage line carries the whole body at trace
+  // level, which the preview only truncated.
+  const claudeJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, request.signal,
+  );
   const responsesResponse = claudeResponseToResponses(claudeJson, model, allowedTools, logger, requestId);
   logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
 
@@ -989,11 +996,14 @@ async function handleAsCompletions(
     return streamCompletionsAsResponses(response, model, requestId, logger, onComplete, conversationId, namespaceMap, allowedTools);
   }
 
-  // Convert Chat Completions response back to Responses API format
-  const responseText = await response.text();
-  logger.debug(requestId, `Upstream completions response: ${responseText.substring(0, 1000)}`);
-  logPipelineStage(logger, requestId, 'upstream-response', targetUrl, responseText);
-  const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
+  // Convert Chat Completions response back to Responses API format.
+  // §5.7: the same bounded receive as the anthropic-messages branch above — one
+  // parse, `max_response_bytes` enforced, nothing of the spool outliving the call.
+  // The explicit `upstream-response` stage line and its 1000-character debug
+  // preview are gone; the receive logs that stage itself.
+  const completionsResponse = await receiveJsonResponse<OpenAIResponse>(
+    response, requestId, logger, targetUrl, request.signal,
+  );
   const responsesResponse = convertCompletionsToResponses(completionsResponse, model, namespaceMap, { allowedTools, logger, requestId });
   if (conversationId) {
     (responsesResponse as unknown as Record<string, unknown>).conversation = conversationId;
@@ -1677,8 +1687,10 @@ export async function handleResponsesInputTokensRequest(
       handleResponsesApiError(response, 'Responses input_tokens (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
     }
 
-    const responseText = await response.text();
-    const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
+    // §5.7: bounded receive, as in the other converted readers.
+    const completionsResponse = await receiveJsonResponse<OpenAIResponse>(
+      response, requestId, activeLogger, targetUrl, request.signal,
+    );
     const inputTokens = completionsResponse.usage?.prompt_tokens ?? 0;
 
     const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
@@ -1726,7 +1738,39 @@ export async function handleResponsesInputTokensRequest(
 
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
   logPipelineHeaders(activeLogger, requestId, 'outbound', '/v1/responses/input_tokens', outHeaders);
-  return new Response(passthroughInputTokensResponse.body, { status: 200, headers: outHeaders });
+
+  // §5.7: receive the body bounded and forward it from the spool — above
+  // `threshold_bytes` it lives in a `responses/` spill and is re-read from disk a
+  // chunk at a time, so the client's write pace bounds what the proxy holds rather
+  // than a whole-body buffer. This path never converts, so nothing here parses the
+  // body: the only read is the trace line, which re-reads the spool and only when
+  // tracing is on — the convention `handleAsPassthrough` and the request side
+  // follow. A null upstream body receives as an empty spool stream, which is the
+  // body `new Response(<upstream>.body)` sent before.
+  const received = await receiveResponseBody(passthroughInputTokensResponse.body);
+
+  if (activeLogger.traceEnabled) {
+    // §5.9 byte admission, opt-in via `max_materialized_body_bytes`, taken only
+    // where something is materialized — here the trace read. The body is received
+    // but not yet read and the client has no headers yet, so a refusal still
+    // leaves neither spill bytes nor a reservation behind (#8).
+    let lease: AdmissionLease;
+    try {
+      lease = await admitMaterialization(received.size, request.signal);
+    } catch (error) {
+      await received.release();
+      throw error;
+    }
+    try {
+      logPipelineStage(activeLogger, requestId, 'upstream-response', passthroughInputTokensResponse.url || targetUrl, await received.readText());
+    } finally {
+      // Released before the body is handed to the client: the write is bounded by
+      // the client's own pace, not by this budget.
+      lease.release();
+    }
+  }
+
+  return new Response(received.readStream(), { status: 200, headers: outHeaders });
 }
 
 /**
@@ -1798,8 +1842,10 @@ export async function handleResponsesCompactRequest(
       handleResponsesApiError(compactCompletionsResponse, 'Responses compact (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
     }
 
-    const responseText = await compactCompletionsResponse.text();
-    const completionsResponse = JSON.parse(responseText) as OpenAIResponse;
+    // §5.7: bounded receive, as in the other converted readers.
+    const completionsResponse = await receiveJsonResponse<OpenAIResponse>(
+      compactCompletionsResponse, requestId, activeLogger, targetUrl, request.signal,
+    );
     const compactedResponse = convertCompletionsToCompactedResponse(completionsResponse, model, namespaceMap);
 
     const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
@@ -1847,7 +1893,28 @@ export async function handleResponsesCompactRequest(
 
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
   logPipelineHeaders(activeLogger, requestId, 'outbound', '/v1/responses/compact', outHeaders);
-  return new Response(compactPassthroughResponse.body, { status: 200, headers: outHeaders });
+
+  // §5.7: bounded receive and forward from the spool, exactly as the
+  // `/input_tokens` passthrough above — nothing is parsed, the trace line is the
+  // only read, and a null upstream body receives as an empty spool stream.
+  const received = await receiveResponseBody(compactPassthroughResponse.body);
+
+  if (activeLogger.traceEnabled) {
+    let lease: AdmissionLease;
+    try {
+      lease = await admitMaterialization(received.size, request.signal);
+    } catch (error) {
+      await received.release();
+      throw error;
+    }
+    try {
+      logPipelineStage(activeLogger, requestId, 'upstream-response', compactPassthroughResponse.url || targetUrl, await received.readText());
+    } finally {
+      lease.release();
+    }
+  }
+
+  return new Response(received.readStream(), { status: 200, headers: outHeaders });
 }
 
 /**

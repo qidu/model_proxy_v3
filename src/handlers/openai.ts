@@ -18,6 +18,7 @@ import { decodeDataUriOrRef } from '../converters/claude-to-gemini.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
+import { receiveJsonResponse } from '../utils/spool-response.js';
 
 /**
  * Check if request is in Gemini Interactions format
@@ -889,9 +890,12 @@ async function forwardCompletionsAsAnthropicMessages(
     return handleCrossModeStreamingResponse(response, model, requestId, logger, isInteractionsRequest, isGenerateContentRequest, 'anthropic-messages');
   }
 
-  const claudeJsonText = await response.text();
-  logPipelineStage(logger, requestId, 'upstream-response', targetUrl, claudeJsonText);
-  const claudeJson = JSON.parse(claudeJsonText) as Record<string, unknown>;
+  // §5.7: one bounded receive instead of `response.text()` — above
+  // `threshold_bytes` the body lives on this response's spill while it is
+  // received, and `max_response_bytes` caps it.
+  const claudeJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, originalRequest.signal,
+  );
   // Convert Claude Messages response → OpenAI Completions response shape, then
   // let the existing Gemini response converters produce the right endpoint shape.
   const syntheticCompletions = claudeJsonToSyntheticCompletions(claudeJson, model);
@@ -1018,6 +1022,7 @@ async function forwardCompletionsAsOpenAIResponses(
     response = await applyAfterUpstream(response, {
       hook: 'after_upstream', route, upstreamMode: 'openai-responses',
       clientModel: model, requestId, streaming: isStreaming ?? false, logger,
+      signal: originalRequest.signal,
     });
   }
 
@@ -1036,9 +1041,10 @@ async function forwardCompletionsAsOpenAIResponses(
     return handleCrossModeStreamingResponse(response, model, requestId, logger, isInteractionsRequest === true, isGenerateContentRequest === true, 'openai-responses');
   }
 
-  const responsesJsonText = await response.text();
-  logPipelineStage(logger, requestId, 'upstream-response', targetUrl, responsesJsonText);
-  const responsesJson = JSON.parse(responsesJsonText) as Record<string, unknown>;
+  // §5.7: the same bounded receive as the anthropic-messages egress above.
+  const responsesJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, originalRequest.signal,
+  );
   // Build a synthetic Completions response from the Responses output items so
   // we can reuse the existing Gemini response converters.
   const outputItems = (responsesJson.output as Array<Record<string, unknown>>) ?? [];
@@ -1336,7 +1342,7 @@ export async function handleOpenAIRequest(
         }
 
         // Handle non-streaming response
-        return handleOpenAINonStreamingResponse(response, openaiRequest.model as string, requestId, activeLogger, isInteractionsRequest, isGenerateContentRequest);
+        return handleOpenAINonStreamingResponse(response, openaiRequest.model as string, requestId, activeLogger, isInteractionsRequest, isGenerateContentRequest, request.signal);
 
     } catch (error) {
         activeLogger.debug(requestId, `OpenAI API error: ${(error as Error).message}`);
@@ -1433,11 +1439,14 @@ async function handleOpenAINonStreamingResponse(
     requestId: string,
     logger: Logger,
     isInteractionsRequest: boolean = false,
-    isGenerateContentRequest: boolean = false
+    isGenerateContentRequest: boolean = false,
+    signal?: AbortSignal
 ): Promise<Response> {
-    const responseText = await response.text();
-    logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream)', responseText);
-    const openaiResponse = JSON.parse(responseText) as Record<string, unknown>;
+    // §5.7: one bounded receive instead of `response.text()`, parsed once and
+    // released before the converted body is built.
+    const openaiResponse = await receiveJsonResponse<Record<string, unknown>>(
+        response, requestId, logger, response.url || '(upstream)', signal,
+    );
 
     if (isGenerateContentRequest) {
         // Convert to Gemini generateContent format

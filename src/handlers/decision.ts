@@ -23,6 +23,7 @@ import type { Logger } from '../types/shared.js';
 import type { ProxyConfig } from '../utils/config-loader.js';
 import { createErrorResponse } from '../utils/errors.js';
 import { createUpstreamAbortSignal } from '../utils/fetch-timeout.js';
+import { withResponseText } from '../utils/spool-response.js';
 
 /**
  * Convert one Clef `images` entry into the bare base64 string that Ollama's
@@ -134,11 +135,16 @@ export async function handleDecisionRequest(
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
 
+  // One signal for the POST and for the receive below: this handler takes no
+  // `Request` (the caller consumed the body), so the upstream body timeout is
+  // what a §5.9 wait outlives its patience on.
+  const signal = createUpstreamAbortSignal(timeoutMs);
+
   const upstreamResponse = await fetch(url, {
     method: 'POST',
     headers,
     body: upstreamBody,
-    signal: createUpstreamAbortSignal(timeoutMs),
+    signal,
   });
 
   if (!upstreamResponse.ok) {
@@ -154,13 +160,29 @@ export async function handleDecisionRequest(
     });
   }
 
-  const responseText = await upstreamResponse.text();
-  let responseData: Record<string, unknown>;
+  // §5.7: one bounded receive — above `threshold_bytes` the body lives on this
+  // response's spill while it is received, and `max_response_bytes` caps it.
+  // The egress below is the upstream body verbatim, so the text is kept and the
+  // envelope is validated from the parse of it rather than from a re-serialized
+  // value.
+  let received: { text: string; data: Record<string, unknown> };
   try {
-    responseData = JSON.parse(responseText);
-  } catch {
+    received = await withResponseText(
+      upstreamResponse,
+      requestId,
+      logger,
+      url,
+      (text) => ({ text, data: JSON.parse(text) as Record<string, unknown> }),
+      signal,
+    );
+  } catch (error) {
+    // Only a body that is not JSON is "Invalid upstream response" (502). A cap
+    // breach, a write failure or a §5.9 refusal is one of the proxy's own limits
+    // and must surface as itself, not as a claim about the upstream (rule #8).
+    if (!(error instanceof SyntaxError)) throw error;
     return createErrorResponse(new Error('Invalid upstream response'), requestId, 502);
   }
+  const { text: responseText, data: responseData } = received;
 
   // Envelope-only validation: top-level required fields of the Clef output schema.
   if (

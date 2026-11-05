@@ -64,6 +64,18 @@ let upstreamText = '';
 let evictionsDuringRequest: number[] = [];
 /** The answer the upload endpoint gives, once per PUT. */
 let uploadResponse: (headers: Record<string, string>) => Response;
+/**
+ * The object store the signed URLs point at, when a test turns it on: the PUT's
+ * stored bytes by hash. The auth-service doubles below fetch from it.
+ */
+let objectStore: Map<string, string> | null = null;
+/** Every call the object store received, in order — the proxy must make none. */
+let objectStoreCalls: { url: string; method: string }[] = [];
+/**
+ * When set, the auth endpoint is this service double rather than the default
+ * `{version: '1'}` answer. It is handed the parsed auth body.
+ */
+let authService: ((body: unknown) => Promise<Response>) | null = null;
 
 /** A past-TTL clock, so an unleased blob is expired by the next sweep. */
 function afterTtl(): number {
@@ -177,6 +189,9 @@ beforeEach(() => {
   upstreamCalls = 0;
   upstreamText = '';
   evictionsDuringRequest = [];
+  objectStore = null;
+  objectStoreCalls = [];
+  authService = null;
   uploadResponse = (headers) => new Response(JSON.stringify({
     url: SIGNED_URL,
     sha256: headers['x-blob-sha256'],
@@ -188,23 +203,43 @@ beforeEach(() => {
     const url = urlOf(input);
     if (url === new URL(UPLOAD_URL).toString()) {
       const headers = headersOf(init);
+      const body = await bodyTextOf(init?.body);
       uploadCalls.push({
         url,
         method: init?.method ?? 'GET',
         headers,
-        body: await bodyTextOf(init?.body),
+        body,
         streamed: init?.body instanceof ReadableStream,
       });
+      // A test that turns the object store on gets the PUT's bytes filed under
+      // the hash the proxy declared — what a real ingest endpoint would store.
+      objectStore?.set(headers['x-blob-sha256'], body);
       evictionsDuringRequest.push(await evictIdleBlobs(afterTtl()));
       return uploadResponse(headers);
     }
+    if (url.startsWith('https://objects.example.test/')) {
+      objectStoreCalls.push({ url, method: init?.method ?? 'GET' });
+      // The auth service's fetch is external I/O inside the request too: the
+      // blob must still be leased while it runs (§5.8).
+      evictionsDuringRequest.push(await evictIdleBlobs(afterTtl()));
+      const hash = /\/blobs\/([0-9a-f]{64})\.b64/.exec(url)?.[1];
+      const stored = hash && objectStore ? objectStore.get(hash) : undefined;
+      if (stored === undefined) {
+        return new Response('no such object', { status: 404 });
+      }
+      return new Response(stored, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } });
+    }
     if (url === AUTH_URL) {
+      const body = init?.body === undefined || init?.body === null ? undefined : await bodyTextOf(init.body);
       authCalls.push({
         method: init?.method ?? 'GET',
         headers: headersOf(init),
-        body: init?.body === undefined || init?.body === null ? undefined : await bodyTextOf(init.body),
+        body,
       });
       evictionsDuringRequest.push(await evictIdleBlobs(afterTtl()));
+      if (authService) {
+        return authService(body === undefined ? undefined : JSON.parse(body));
+      }
       return new Response(JSON.stringify({ version: '1' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     upstreamCalls += 1;
@@ -427,5 +462,114 @@ describe('§5.8 external-link projection in the request path', () => {
     assert.equal(authCalls.length, 0);
     assert.equal(upstreamCalls, 0, 'a body with a forged ref never reaches an upstream');
     assert.equal(await evictIdleBlobs(afterTtl()), 1, 'the leased blob was released even though the request failed');
+  });
+});
+
+describe('§5.8 the auth service fetches and hash-verifies the linked object', () => {
+  /**
+   * The auth side of §5.8's contract, as a service double: walk the projection
+   * for `external_blob` links, fetch each from the object store, and refuse the
+   * request when an object is missing or its bytes do not hash to what the link
+   * states. This is what the plan asks the auth service to do with a link; the
+   * proxy's half is producing a link that survives exactly this check.
+   */
+  function verifyingAuthService(): (body: unknown) => Promise<Response> {
+    return async (body) => {
+      const links: Record<string, unknown>[] = [];
+      const walk = (node: unknown): void => {
+        if (Array.isArray(node)) {
+          for (const item of node) walk(item);
+        } else if (node && typeof node === 'object') {
+          if ((node as Record<string, unknown>).type === 'external_blob') {
+            links.push(node as Record<string, unknown>);
+            return; // a link holds no nested links
+          }
+          for (const value of Object.values(node)) walk(value);
+        }
+      };
+      walk(body);
+      for (const link of links) {
+        const fetched = await fetch(link.url as string);
+        if (!fetched.ok) {
+          return new Response(JSON.stringify({ error: `object not fetchable: HTTP ${fetched.status}` }), { status: 403 });
+        }
+        const bytes = await fetched.text();
+        const digest = createHash('sha256').update(bytes).digest('hex');
+        if (digest !== link.sha256 || Buffer.byteLength(bytes) !== link.size) {
+          return new Response(JSON.stringify({ error: 'object fails hash/size verification' }), { status: 403 });
+        }
+      }
+      return new Response(JSON.stringify({ version: '1' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+  }
+
+  /** Signed URLs that name their object, so the store can serve them. */
+  function perHashUploadResponse(headers: Record<string, string>): Response {
+    return new Response(JSON.stringify({
+      url: `https://objects.example.test/blobs/${headers['x-blob-sha256']}.b64?sig=deadbeef`,
+      sha256: headers['x-blob-sha256'],
+      size: Number(headers['x-blob-size']),
+      expires_in: LINK_LIFETIME_S,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  it('serves a link the auth service can fetch and hash-verify, and the proxy never touches the store', async () => {
+    const image = Buffer.alloc(600, 0x66).toString('base64');
+    const hash = createHash('sha256').update(image).digest('hex');
+    writeConfig();
+    objectStore = new Map();
+    uploadResponse = perHashUploadResponse;
+    authService = verifyingAuthService();
+
+    const response = await handler.fetch(clientRequest(messagesBody([image])), env() as any);
+
+    assert.equal(response.status, 200, 'auth accepted the projection after fetching and verifying the object');
+    assert.equal(upstreamCalls, 1);
+
+    // The object store saw exactly one call: the auth service's GET of the
+    // signed URL. The proxy itself never calls the store — in particular it
+    // issues no DELETE: external-object lifetime is the store's lifecycle TTL,
+    // by the 2026-11-04 decision recorded in §5.8.
+    assert.deepStrictEqual(
+      objectStoreCalls,
+      [{ url: `https://objects.example.test/blobs/${hash}.b64?sig=deadbeef`, method: 'GET' }],
+      'one fetch, by the auth service, of the link the proxy projected',
+    );
+    // The fetch got the bytes the PUT stored, or the hash check above could not
+    // have passed: sha256(base64 text) is the link's stated hash.
+    assert.equal(hash, uploadCalls[0].headers['x-blob-sha256']);
+
+    // The lease covered the auth fetch too: upload, auth POST, the store GET,
+    // and the upstream send all ran with the blob unexpireable.
+    assert.deepStrictEqual(evictionsDuringRequest, [0, 0, 0, 0], 'the blob stays leased through upload, auth, the auth fetch, and the send');
+    assert.equal(await evictIdleBlobs(afterTtl()), 1, 'released at request end, so the sweep may now expire it');
+    assert.equal(getBlobStoreStats().diskEntries, 0);
+  });
+
+  it('fails the request before the upstream when the auth service cannot fetch the object', async () => {
+    const image = Buffer.alloc(600, 0x77).toString('base64');
+    writeConfig();
+    // The store answers, but holds nothing: every fetch 404s, as an expired or
+    // never-ingested object would.
+    objectStore = new Map();
+    const store = objectStore;
+    uploadResponse = (headers) => {
+      // Do not file the PUT's bytes: the object is gone by the time auth asks.
+      store.delete(headers['x-blob-sha256']);
+      return perHashUploadResponse(headers);
+    };
+    authService = verifyingAuthService();
+
+    const response = await handler.fetch(clientRequest(messagesBody([image])), env() as any);
+
+    assert.equal(response.status, 401, 'an auth refusal is the client-visible answer');
+    const payload = await response.json() as { type: string; error: { type: string } };
+    assert.equal(payload.type, 'error');
+    assert.equal(objectStoreCalls.length, 1, 'the auth service did try the link');
+    assert.equal(upstreamCalls, 0, '§5.8: an auth-fetch failure prevents the upstream call');
+    // No proxy-side delete and no lingering lease on the failure path either.
+    assert.ok(objectStoreCalls.every((call) => call.method === 'GET'));
+    assert.equal(await evictIdleBlobs(afterTtl()), 1, 'the leased blob was released even though auth failed');
+    assert.equal(getBlobStoreStats().diskEntries, 0);
   });
 });

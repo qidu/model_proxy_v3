@@ -877,10 +877,29 @@ The full field-by-field reference lives in
   bytes, so the body is relayed from its spill and read again only when tracing is on — on
   the `/v1/chat/completions` handler's two converted non-streaming readers (the `anthropic-messages`
   and `gemini-generatecontent` upstreams) and its `openai-responses` passthrough, which forwards the
-  spool unparsed — on the native Gemini `:generateContent` egress — the one whose
+  spool unparsed — on the three cross-mode readers `openai.ts` answers a Gemini-shaped client with
+  (`/v1/interactions` and `:generateContent`, from an `anthropic-messages`, `openai-responses` or
+  `openai-completions` upstream), converted after one bounded receive — on the `/v1/responses`
+  handler's four converted readers (both `openai-completions` and the `anthropic-messages` upstream
+  on `POST /v1/responses`, and the converting branches of `POST /v1/responses/input_tokens` and
+  `POST /v1/responses/compact`), converted after one bounded receive — and the passthrough halves of
+  those same two routes, which never parse the body and so relay it unparsed from its spill, read
+  again only when tracing is on — on the native Gemini
+  `:generateContent` egress — the one whose
   response carries the model's `inlineData` image/audio parts, relayed unparsed — on the
   `:generateContent` branch that answers a `/v1/messages` client (converted after one parse)
-  and the `:countTokens` branch beside it (relayed unparsed) — and in the attempt
+  and the `:countTokens` branch beside it (relayed unparsed) — on the `/v1/embeddings`, `/decision`
+  and `/v1/messages/count_tokens` success reads, which parse a bounded receive instead of
+  `response.text()` (`/decision` keeps the text, because its answer is the upstream body verbatim) —
+  and on a route's `after_upstream` transforms, which receive the body they transform rather than
+  reading it whole with `response.text()`, so the ops run on a bounded body and the handler's own
+  receive no longer re-bounds an already-materialized copy — and on the three model-listing
+  readers in `models.ts` (the model count behind `GET /v1/models`' 404 check, the listing itself,
+  and the Anthropic model-discovery reader), each a bounded receive where `response.text()`/`response.json()`
+  stood, with a §5.7 cap, a spill failure or a §5.9 refusal surfacing as itself while a malformed
+  body keeps that reader's own pre-existing answer (the count reader still answers a count of 0 and
+  its caller its usual 404 — logged at error level, but indistinguishable to the client from an
+  empty upstream) — and in the attempt
   loop's JSON usage/tool stats read: that read is
   one pass over the spooled body instead of a `response.clone()` that keeps every remaining byte
   alive for as long as it parses, and the client is sent a stream over the same spill. Above

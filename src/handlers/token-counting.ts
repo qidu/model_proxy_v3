@@ -27,6 +27,7 @@ import { addForwardedHeaders } from '../utils/routing.js';
 import { validateBetaFeatures, hasBetaFeature } from '../utils/beta-features.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
+import { receiveJsonResponse } from '../utils/spool-response.js';
 
 /**
  * Handle token counting API request
@@ -240,10 +241,17 @@ async function handleApiBasedTokenCounting(
     return buildCharFallbackTokenCountResponse(requestId, charEstimate);
   }
 
-  // Parse target API response
-  const responseText = await response.text();
-
-  const openaiResponse: OpenAIResponse = JSON.parse(responseText);
+  // Parse target API response. §5.7: one bounded receive — above
+  // `threshold_bytes` the body lives on this response's spill while it is
+  // received, and `max_response_bytes` caps it. A malformed body threw before and
+  // still throws, so this changes the memory the read costs and nothing else.
+  const openaiResponse = await receiveJsonResponse<OpenAIResponse>(
+    response,
+    requestId,
+    logger,
+    targetUrl,
+    request.signal,
+  );
 
   // Extract input tokens from usage
   const inputTokens = openaiResponse.usage?.prompt_tokens ?? 0;

@@ -5,6 +5,364 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(spool): §5.7 — the three model-listing readers' response reads are bounded
+
+`src/handlers/models.ts` held the repo's last three whole-body upstream reads: `getModelCount` (the
+`/health` path's count), `handleModelsRequest` (`GET /v1/models`) and `handleAnthropicModelsDiscovery`
+(the Anthropic-shaped `?limit=1000` discovery). Each read with `response.text()`/`response.json()` and
+then parsed, so nothing bounded what an upstream could send on. All three now go through
+`receiveJsonResponse`, the same bounded receive the converting egresses use.
+
+- Each of the three sits inside a catch-all that already had a job, so the receive is threaded
+  through it rather than replacing it, and the increment's real content is where a failure lands:
+  - `handleModelsRequest` and `handleAnthropicModelsDiscovery` keep their existing malformed-body
+    answers (the config-only 200 list; the 500 `internal_error`) — `SyntaxError` is re-thrown into
+    those catches deliberately. But a `max_response_bytes` breach, a spill write failure or a §5.9
+    refusal is the proxy's own limit, not a parse failure, so those leave through
+    `createErrorResponse` as themselves (500 `processing_error`, 503 `over_limit_error`). Letting a
+    catch-all take them would turn a proxy limit into a quietly smaller model list (rule #8).
+  - `getModelCount`'s catch-all is left intact and **one behaviour is disclosed rather than
+    blessed**: it answers `{ count: 0, cached: false }` for every failure, and its only caller
+    (`src/index.ts:997`) answers a count of 0 with its usual 404 (`src/index.ts:1013`) — so a cap
+    breach is reported at error level but still reaches the client as a 404 it cannot tell from an
+    upstream that listed nothing. The cap does take effect (the body is never materialized); the
+    status a client sees is unchanged. Fixing that would mean changing a function whose contract is
+    a count, so it is left as it is and pinned by a test that says so.
+- `getModelCount` takes no `Request`, so it hoists one `createUpstreamAbortSignal(...)` and passes it
+  to both the GET and the receive; the two handlers that do take a `Request` pass `request.signal`,
+  matching the existing `receiveJsonResponse(…, request.signal)` convention.
+- Deliberately out of scope, left as they are: the `!response.ok` upstream *error* reads beside two
+  of these sites (`models.ts:217`, `:358`), which belong to the repo-wide error-body item in
+  `docs/architecture/todos-of-spool-design.md`.
+
+Verified: `tests/unit/models-response-spool.test.ts` 14/14 — per site: the answer byte-identical to
+the same request with spooling off (with the large model id asserted to have survived, so two
+equally-degraded answers cannot pass), the spill observed mid-receive on disk and charged, released
+before the reader answers, a `max_response_bytes` breach cancelling the upstream body and leaving no
+partial spill, and zero `clone()`; plus, per site, the malformed-body answer each handler already
+gave and a §5.9 refusal reported as 503 `over_limit_error` rather than as that handler's own
+fallback; plus `getModelCount`'s disclosed degradation answering 0 with the real error logged exactly
+once. Full suite 2489/2489, typecheck and build clean.
+
+### feat(spool): §5.7 — the `after_upstream` transform path's response read is bounded
+
+`applyAfterUpstream` in `src/utils/request-transform.ts` read its upstream body with
+`response.text()` and parsed the result, so on a route that declares `after_upstream` ops the spool
+was defeated twice: the transform materialized the whole body in RAM first, and the handler's own
+bounded receive then ran its bound over the already-materialized text. It now receives the body
+through `withResponseText`, the primitive the converting egresses already use: a body over
+`threshold_bytes` lives on that response's spill while it is transformed, `max_response_bytes` caps
+it, and the parse is charged to the §5.9 budget.
+
+- One bounded receive wraps both existing branches, unchanged: the `assemble_sse_chunks` assembly
+  (5-arg `applyTransformSet`, `content-type` re-labelled `application/json`) and the JSON-ops
+  branch (4-arg `applyTransformSet`, with its non-JSON passthrough). That pre-existing 5-arg vs
+  4-arg asymmetry is preserved rather than blended. `assembleSseChunks(response)` became
+  `assembleSseText(text)`: it now consumes the text the receive already read instead of reading the
+  response a second time.
+- New optional `HookContext.signal`, fed the **client request's** signal by all five call sites
+  (`messages.ts` ×4 → `request.signal`, `openai.ts` ×1 → `originalRequest.signal`) — matching the
+  existing `receiveJsonResponse(…, request.signal)` convention. It is the client abort §5.9 names,
+  not the upstream `createUpstreamAbortSignal` timeout, which is a different thing. An aborted
+  client now drops its queued §5.9 waiter instead of holding its place until `admission_timeout_ms`.
+- **One behaviour change, worth stating plainly:** `max_response_bytes` (default 64 MiB) now bounds
+  this read *whether or not* `[spool] enabled` is set, as it does on the other receives
+  (`enabled` decides whether disk is used; the cap bounds the body). So a route that declares
+  `after_upstream` ops and receives a body over the cap now fails with 500 `processing_error`
+  instead of being transformed — previously the whole body was read regardless. Transforming it
+  instead would mean holding it twice in RAM, which is the cost the cap exists to refuse.
+- Fast paths are untouched: a route with no `after_upstream` ops still returns the very same
+  `Response` without reading a byte.
+
+Verified: `tests/unit/transform-response-spool.test.ts` 14/14 — both fast paths returning the
+identical `Response` with zero pulls; unchanged answer below and above the threshold against a
+spool-disabled baseline; the spill observed mid-receive, released before return, and the body read
+exactly once (`[0,1,2]` pulls) with zero `clone()`; a `max_response_bytes` breach failing loudly and
+cancelling the upstream body (and with `enabled = false`); status/statusText/upstream headers kept
+and `content-length`/`content-encoding` dropped on the rebuilt answer; the SSE assembly and the
+non-JSON passthrough both still correct through the receive; a §5.9 refusal reported as itself; and
+— the signal this increment threaded — an aborted client dropping its queued waiter at once and a
+pre-aborted one refused with nothing left on disk. Full suite 2475/2475, typecheck and build clean.
+
+### feat(spool): §5.7 — the small passthrough handlers' response reads are bounded
+
+Three handlers still read their upstream body whole with `response.text()` and then parsed it:
+`POST /v1/embeddings`, `POST /decision` and `POST /v1/messages/count_tokens`. Each now reads
+through §5.7's bounded receive, so a body over `threshold_bytes` lives on that response's spill
+while it is received and `max_response_bytes` caps it.
+
+- New primitive in `src/utils/spool-response.ts`: `withResponseText(response, requestId, logger,
+  stageUrl, consume, signal?)` receives the body, takes the §5.9 lease, and runs `consume` on the
+  text while the lease and the spill are still held. `receiveJsonResponse` is now its `JSON.parse`
+  consumer, so the parse stays charged at every existing call site instead of moving outside the
+  budget the budget exists for.
+- `embeddings.ts` and `token-counting.ts` go through `receiveJsonResponse`. `decision.ts` goes
+  through `withResponseText` and keeps the text: its answer is the upstream body verbatim
+  (`new Response(responseText, …)`), and its Clef envelope is validated from the parse of that
+  text. Its one signal now covers both the POST and the receive.
+- Only `SyntaxError` still maps to each handler's pinned 502 `Invalid upstream response`. A cap
+  breach, a spill write failure or a §5.9 refusal is the proxy's own limit and surfaces as itself
+  (500 `processing_error`, 503 `over_limit_error`) rather than as a claim about the upstream
+  (rule #8). `models.ts`'s two readers are left alone for exactly this reason: they sit inside
+  catch-all fallbacks that would turn a spool limit into a quietly smaller answer.
+
+Verified: `tests/unit/aux-handler-response-spool.test.ts` 23/23 — per site: unchanged answer
+below and above the threshold, the spill observed mid-receive and released before the answer, a
+`max_response_bytes` breach failing loudly and cancelling the upstream body (and with
+`enabled = false`), each handler's own malformed-body outcome, a §5.9 refusal reported as 503,
+zero `clone()`, and the charge equal to the received byte count; plus `withResponseText` driven
+directly to pin that `consume` runs with the spill written and the lease held, and that a
+throwing `consume` releases both. Full suite 2461/2461, typecheck and build clean.
+
+### refactor(spool): §5.7 — the last logging-only response clones are gone
+
+`src/handlers/messages.ts` held the repo's final response `tee()` branches used only for
+logging: two `response.clone().text()` captures for the `LOG_LEVEL=debug` `/tmp/test_model.log`
+dump (body contains `test_tool`). Both now observe the single read the client already performs,
+via a module-local `captureTestModelLog` helper — no second reader, no second full body copy.
+
+- The line lands on a terminal state of the body rather than when upstream finished: the end of
+  the body, or the cancel the SSE converter performs when it stops upstream at `[DONE]`. A
+  client that disconnects before that writes no line where the clone wrote one regardless of
+  the client. The capture is therefore not a "response arrived" record; it is a "response body
+  ended" record.
+- A manual `ReadableStream` with `pull`/`cancel` and a drain-once `finish()` (the shape
+  `createRefAwareJsonBody` uses) rather than a `TransformStream` tap: `createStreamTransformer`
+  calls `controller.terminate()` on `[DONE]`, so a `flush()`-based tap would never write on any
+  converted stream. The write is synchronous (`appendFileSync`) so it cannot be skipped by a
+  later rejection, and an observation failure becomes one `logger.debug` line, matching
+  `observeStream`'s rule for code that sits on the client's only path.
+- The capture still keeps the first 2000 decoded characters; the decoder is flushed at the
+  terminal state, so a multibyte sequence split across the last two chunks is not truncated.
+- The wrapper is a constructed `Response`, which copies status/headers but not `url`, so the
+  two trace labels fall back to `'(upstream)'` / `'(upstream SSE)'` on these debug+`test_tool`
+  requests only.
+
+Verified: `tests/unit/messages-response-spool.test.ts` 13/13, including four new cases — the
+passthrough body (byte-identical client body, exactly one capture, zero clones, body spilled),
+the converted site plus its two gates (no capture without `test_tool`, none outside debug), a
+streaming run whose upstream never ends so the converter's cancel is the only terminal path
+(one capture of the first 2000 characters, zero clones), and the `!response.ok` 429 path
+(capture written with the error status, `upstreamBody` unchanged). Removing `finish()` from the
+`cancel` hook fails exactly the streaming case. Full suite 2438/2438, typecheck and build clean.
+
+### feat(spool): §5.9 admission lifetimes closed out
+
+The §5.9 contract item had one unproven behavior and one undocumented deviation left.
+
+- New test in `tests/unit/spool-events.test.ts`: with the whole materialization budget held by
+  another body, a spilled SSE event's admission queues *before* the event is parsed, the wait
+  pulls nothing further from upstream (the plan's "pause upstream response/event reads while
+  their admission is waiting"), and once the budget frees the event is admitted and delivered
+  byte-exactly with no spill, scratch blob, or reservation left behind.
+- Plan §5.9 now records the per-rung deviation: the request path parses once per request, not
+  once per rung — composite and auth-ladder rungs share the parsed object and re-serialize it
+  into per-rung attempt spools — so a non-ref body holds its reservation across every rung
+  (strictly conservative against the plan's per-rung release/re-acquire), and per-rung
+  acquisition exists where a rung actually parses, namely the attempt loop's per-response
+  stats read.
+- The rest of the item was already proven: binary early release at the send boundary and the
+  combined request+response budget (`tests/unit/index-admission.test.ts`), refusal and exact-fit
+  admission on every handler's converted response path (`*-response-spool.test.ts` suites).
+
+Verified: 37/37 focused admission/event tests (`spool-admission`, `index-admission`,
+`spool-events`); the §12 §5.9 checklist line is now checked.
+
+### docs(spool): §5.5 accepts active-ref pinning as the lease contract
+
+The plan sketched a `leaseId` plus a renewal ticker (`ttl_seconds / 3`); the code implements
+active-ref pinning, and the plan now says so explicitly rather than leaving the deviation
+implicit. The invariants are unchanged — a leased blob is never deleted by TTL, LRU, or the
+sweep; the idle clock starts at the final release; failures are loud — but the mechanism is:
+the blob hash is the lease identity, the L2 index's `refs` counts the owners sharing the
+lease, and renewal is structural because eviction only ever looks at `refs = 0` entries. That
+makes "renewal while merely holding an idle blob" unexpressible and removes the renewal
+ticker's failure mode; the plan's renewal-failure requirement maps onto the mechanism's own
+loud failures (missing/truncated leased file throws, release with no active lease throws).
+§5.8's "renew the lease throughout upload/auth fetch" and the §12 lease/failure test items
+were reworded to match.
+
+Verified: the evidence the TODO names already exists in `tests/unit/blob-store.test.ts` —
+long-lived hold past TTL (`:421`), missing/truncated file refusal (`:341`, `:621`),
+final-release idle expiry (`:404`, `:421`), and lease-underflow refusal (`:388`).
+
+### test(spool): transform contracts on ref-bearing bodies — last Rule-B cell measured
+
+`tests/unit/transform-ref-matrix.test.ts` already ran every named builtin and every Tier-1 op
+kind against ref-bearing bodies through the real handlers; its header recorded one unmeasured
+cell: a *converting* Rule-B send (`postJsonWithSpool` re-detects refs on the outgoing body)
+whose transform drops every ref. A new row closes it: Chat→Claude (`chat-completions.ts:110`)
+with a `before_upstream` op that replaces `messages[].content` — the converted body holds no
+ref, the send degrades to the plain string path (`streamed: false`, no `Content-Length`,
+no `duplex`), byte-identical to the same run with spooling off, and the dropped payload is
+proven to be the transform's doing (present in the untransformed baseline). The header note
+now lists both measured call sites.
+
+Verified: 29/29 in `transform-ref-matrix` + `request-ingress-transform-refs`.
+
+### test(spool): §5.8 auth link — fetch/hash-verification round trip and the no-delete decision
+
+Two integration tests in `tests/unit/index-auth-projection.test.ts` close the auth-link item.
+A verifying auth-service double walks the projection's `external_blob` links, fetches each from
+a fake object store, and hash/size-verifies the bytes it downloaded:
+
+- success: the proxy's projected link survives exactly that check, the upstream still gets the
+  original inline bytes, and the only call the object store ever sees is the auth service's
+  `GET` — the proxy issues no `DELETE`, pinning the 2026-11-04 decision that external-object
+  lifetime is the store's lifecycle TTL alone (now recorded in §5.8);
+- failure: a store that 404s makes the auth service refuse, the client gets 401, the upstream
+  is never called, and the leased blob is still released at request end.
+
+The lease-hold evidence was extended to cover the auth fetch itself: the idle sweep runs at
+every external call (upload, auth POST, store GET, upstream send) and must expire nothing.
+
+Verified: 9/9 in `index-auth-projection`.
+
+### feat(spool): §5.7 bounds the two identity forwards in `responses.ts`
+
+The passthrough halves of `POST /v1/responses/input_tokens` (`handleResponsesInputTokensRequest`)
+and `POST /v1/responses/compact` (`handleResponsesCompactRequest`) hand the upstream `openai-responses`
+body straight to the client — they never convert it. Before this change that was literally
+`new Response(<upstream>.body, …)`: no receive, no `max_response_bytes`, no spool, and no trace of
+the body either, unlike `handleAsPassthrough`'s non-SSE tail next to them.
+
+- Both now use the same identity shape as that tail (and as `chat-completions.ts`'s
+  `openai-responses` branch): `receiveResponseBody` once, the client streamed `received.readStream()`.
+  Above `threshold_bytes` the body lives in a `responses/` spill while it is received and the client
+  is served from disk a chunk at a time, so the client's read pace — not a buffer — bounds what the
+  proxy holds; `max_response_bytes` caps the receive, and a breach cancels the upstream body and
+  surfaces as a 500 `processing_error` rather than a truncated body. The cap applies with
+  `enabled = false`, as on every other receive; the gated-vs-ungated conflict recorded in the Gemini
+  and `:countTokens` entries is unchanged.
+- The only read either path does is the trace line, so it is now trace-gated and reads the spool
+  instead of a second copy: `if (logger.traceEnabled)`, one §5.9 lease around
+  `logPipelineStage(... 'upstream-response' ...)`, released before the body is handed to the client.
+  With tracing off — the default log level — neither path reads the body at all, and §5.9 is never
+  consulted for it.
+- Preserved as they were: the hard-coded `status: 200`, the two-header `outHeaders`
+  (`Content-Type`, `x-request-id` — upstream headers are still not copied), and the `!response.ok`
+  error reads above them, which are unchanged and still unbounded.
+- No §5.7 response-binary extraction: these paths never parse the body, so there is no position to
+  extract a payload from — the upstream bytes are the client bytes.
+- 12 tests in `tests/unit/responses-response-egress.test.ts`, six properties against both sites in
+  one table: a body that is not JSON is forwarded verbatim (a parse-and-reserialize would fail it);
+  a body above the threshold spills and is served from the spill, which stays live until the client
+  has read it; a cap breach is a 500 `processing_error` with the upstream cancelled and nothing on
+  disk; the cap is enforced with `enabled = false`; with tracing on, exactly one `[UPSTREAM-RESP]`
+  body line carries the upstream bytes and the forwarded body is unchanged by that read; and with
+  tracing off a budget one byte short of the charge still serves the response while the same body
+  with tracing on is refused 503 `over_limit_error` with no spill and no reservation.
+
+Reported, not fixed: the `!response.ok` error-body reads in this file (`:707`, `:980`, `:1685`,
+`:1734`, `:1889`, `:1989`) and `handleAsGemini`'s in-process `claudeResponse.json()`
+(`:786`).
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit`
+**2431/2431** (0 skipped, 0 todo, 0 cancelled) — 12 of those are this increment's, and the suite was
+2419 before them.
+
+### feat(spool): §5.7 bounds the four converted non-SSE reads in `responses.ts`
+
+`src/handlers/responses.ts` answers a Responses client from an `openai-completions` or
+`anthropic-messages` upstream by converting the upstream JSON, and none of those four answers is
+streamed: `handleAsAnthropicMessages` and `handleAsCompletions` on `POST /v1/responses`, plus the
+converting branches of `handleResponsesInputTokensRequest` (`POST /v1/responses/input_tokens`) and
+`handleResponsesCompactRequest` (`POST /v1/responses/compact`). All four read the body whole
+(`response.text()` or `compactCompletionsResponse.text()`) and then parsed it, so nothing bounded
+what the upstream could send.
+
+- All four now use `receiveJsonResponse`, the same receive as `/v1/messages`,
+  `/v1/chat/completions` and `openai.ts`'s cross-mode egresses: one bounded receive, one parse, and
+  the spill released before the client is answered. Above `threshold_bytes` the body lives in a
+  `responses/` spill while it is received and is read back from disk for that parse, so neither the
+  body nor a clone of it is held in RAM; `max_response_bytes` caps it, and a breach cancels the
+  upstream body and surfaces as a 500 `processing_error` rather than a truncated body handed to
+  `JSON.parse`.
+- The cap applies with `enabled = false` — the rule the other receives follow. The
+  gated-vs-ungated conflict recorded in the Gemini and `:countTokens` entries is unchanged.
+- Behaviour change stated rather than hidden: the `handleAsCompletions` read carried a
+  `logger.debug(...substring(0, 1000))` preview and an explicit `logPipelineStage`
+  `upstream-response` line. `receiveJsonResponse` emits that stage line itself (whole body, at trace
+  level), so the explicit call was redundant and is gone; the 1000-character *debug* preview has no
+  replacement. `handleAsAnthropicMessages` lost the same pair of lines (its preview was 500
+  characters) in the same change.
+- No §5.7 response-binary extraction here, deliberately: the allowlist is Gemini
+  `inline_data`/`inlineData` parts and Responses `image_generation_call` results, and all four
+  readers convert *away* from those shapes before the client body is built — the two Responses
+  converters emit `output_text`/`response.compaction` envelopes, and the input_tokens answer is
+  `{object, input_tokens}`. There is no converted position holding a payload to extract.
+- Reported, not fixed, as the next increment: the passthrough halves of `/input_tokens` (`:1741`)
+  and `/compact` (`:1864`) still hand the upstream body straight to the client with
+  `new Response(<upstream>.body, …)` — no receive, no cap, no spill — unlike
+  `handleAsPassthrough`'s non-SSE tail. Also reported, not fixed: the four `!response.ok` branches
+  above these sites still read the upstream error body with `await response.text()` (`:707`,
+  `:980`, `:1685`, `:1808`), and `handleAsGemini`'s `claudeResponse.json()` (`:786`) is an
+  in-process parse of an already bounded body.
+- 28 tests in `tests/unit/responses-response-spool.test.ts`, seven properties against all four
+  readers: the converted body (structure and values, clock-minted fields masked) is unchanged under
+  the threshold and above it; the spill is observed live mid-receive, released before the response
+  is returned, with `Response.prototype.clone` never called; a cap breach is a 500
+  `processing_error` with the upstream cancelled and nothing on disk; the cap is enforced with
+  `enabled = false`; a malformed upstream body surfaces as a `SyntaxError` with its spill released;
+  a §5.9 refusal is a 503 `over_limit_error` that leaves no spill and no reservation; and an
+  admitted body is answered converted with the ledger returned to zero. Three of the four expected
+  answers keep every echoed field asserted (`id`, `created_at`, `output_text`, `usage`) and mask
+  only the synthesized message id; the `created_at`/`id` pair the Claude upstream's own envelope
+  mints is masked on the anthropic-messages reader.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit`
+**2418/2418** (0 skipped, 0 todo, 0 cancelled) — 2390 of those before this increment's 28. One
+earlier run of the same suite reported 2417/2418 with a single failure whose output was not
+captured; the next twenty full-suite runs, including the exact interleaving that preceded it, are
+2418/2418, and it was not seen again, so that test could not be named.
+
+### feat(spool): §5.7 bounds the three cross-mode non-SSE reads in `openai.ts`
+
+`handleOpenAIRequest` answers a Gemini-shaped client (`/v1/interactions`,
+`/v1beta/models/{model}:generateContent`) from three upstream families, and none of those responses
+is streamed to the client — the handler parses the upstream JSON, converts it into the Gemini shape,
+and sends that. All three read the body whole before this change: an `anthropic-messages` upstream
+in `forwardCompletionsAsAnthropicMessages`, an `openai-responses` upstream in
+`forwardCompletionsAsOpenAIResponses`, and an `openai-completions` upstream in
+`handleOpenAINonStreamingResponse` each called `response.text()` and `JSON.parse`. Nothing bounded
+what the upstream sent on any of them.
+
+- All three now use `receiveJsonResponse`, the same receive as `/v1/messages` and
+  `/v1/chat/completions`: one bounded receive, one parse, and the spill released before the client
+  is answered. Above `threshold_bytes` the body lives in a `responses/` spill while it is received
+  and is read back from disk for the parse, i.e. neither the body nor a clone of it is held in RAM;
+  `max_response_bytes` caps it, a breach cancels the upstream body and surfaces as a 500
+  `processing_error` rather than a truncated body handed to `JSON.parse`.
+- `handleOpenAINonStreamingResponse` gained a `signal` parameter, and its call site passes
+  `request.signal`, so the §5.9 `admitMaterialization` lease it now takes is released if the client
+  aborts while the body is received — the other two sites already reached `originalRequest.signal`.
+- The cap applies with `enabled = false` — the eighth follower of the stated rule. The
+  gated-vs-ungated conflict recorded in the Gemini and `:countTokens` entries is unchanged.
+- No §5.7 response-binary extraction here, deliberately: the allowlist is Gemini
+  `inline_data`/`inlineData` parts and Responses `image_generation_call` results, and all three
+  egresses convert *away* from those shapes before the client body is built —
+  `convertOpenAIToGeminiGenerateContent` emits only `{thought,text}` / `{text}` / `{functionCall}`
+  parts, and the two Interaction paths likewise build their content from the converted Completions
+  text. There is no converted position holding a payload, so `createConvertedResponseBody`'s tree
+  walk would cost a pass over every response for nothing.
+- Reported, not fixed: the `!response.ok` branches above these three still read the upstream error
+  body with `await response.text()` (`openai.ts:879`, `:1034`, `:1333`), an unbounded copy on the
+  error path; and the "fall back to the OpenAI conversion as-is" branches in the two Interaction
+  forwarders are unreachable from dispatch (`src/index.ts` routes only the `interactions` and
+  `generateContent` client families here, so `isInteractionsRequest || isGenerateContentRequest` is
+  always true), so they were left untouched rather than converted.
+- 21 tests in `tests/unit/openai-response-spool.test.ts`, seven properties against all three sites:
+  the converted body (structure and values, clock fields masked) is unchanged under the threshold
+  and above it; the spill is observed live mid-receive, released before the response is returned,
+  with `Response.prototype.clone` never called; a cap breach is a 500 `processing_error` with the
+  upstream cancelled and nothing on disk; the cap is enforced with `enabled = false`; a malformed
+  upstream body surfaces as a `SyntaxError` with its spill released; a §5.9 refusal is a 503
+  `over_limit_error` that leaves no spill and no reservation; and an admitted body is answered
+  converted with the ledger returned to zero.
+
+Verified: `npm run typecheck` clean; `npm run build` clean; `npm run test:unit`
+**2390/2390** (0 skipped, 0 todo, 0 cancelled) — 2369 of those before this increment's 21.
+
 ### feat(spool): §5.7 streams the native `/v1/messages` non-SSE response from its spill
 
 The native `anthropic-messages` egress in `src/handlers/claude.ts` was the last non-streaming

@@ -5,6 +5,7 @@
  */
 
 import { Env } from '../types/shared.js';
+import { appendFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStream } from '../utils/logger.js';
@@ -387,6 +388,7 @@ export async function handleMessagesRequest(
           hook: 'after_upstream', route, upstreamMode: 'openai-responses',
           clientModel: (requestBody.model as string) || modelId || 'unknown',
           requestId, streaming: isStreaming, logger: activeLogger,
+          signal: request.signal,
         });
       }
 
@@ -476,6 +478,7 @@ export async function handleMessagesRequest(
         hook: 'after_upstream', route, upstreamMode: upstreamMode || 'openai-completions',
         clientModel: (requestBody.model as string) || modelId || 'unknown',
         requestId, streaming: isStreaming, logger: activeLogger,
+        signal: request.signal,
       });
     }
 
@@ -484,16 +487,7 @@ export async function handleMessagesRequest(
       try {
         const bodyText = typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody);
         if (bodyText.includes('test_tool')) {
-          const respClone = response.clone();
-          const respBody = await respClone.text();
-          const { appendFileSync } = await import('fs');
-          appendFileSync(join(tmpdir(), 'test_model.log'),
-            `[${new Date().toISOString()}] upstream response (openai-passthrough)\n` +
-            `upstream url: ${targetUrl}\n` +
-            `upstream status: ${response.status}\n` +
-            `upstream response body:\n${respBody.slice(0, 2000)}\n` +
-            `---\n`,
-          );
+          response = captureTestModelLog(response, 'openai-passthrough', targetUrl, requestId, activeLogger);
         }
       } catch (_e) { /* ignore */ }
     }
@@ -677,6 +671,7 @@ export async function handleMessagesRequest(
         hook: 'after_upstream', route, upstreamMode: 'openai-responses',
         clientModel: (requestBody.model as string) || modelId || 'unknown',
         requestId, streaming: isStreaming, logger: activeLogger,
+        signal: request.signal,
       });
     }
 
@@ -801,6 +796,7 @@ export async function handleMessagesRequest(
       hook: 'after_upstream', route, upstreamMode: upstreamMode || 'openai-completions',
       clientModel: (requestBody.model as string) || modelId || 'unknown',
       requestId, streaming: requestBody.stream === true, logger: activeLogger,
+      signal: request.signal,
     });
   }
 
@@ -808,16 +804,7 @@ export async function handleMessagesRequest(
   if (env?.LOG_LEVEL === 'debug') {
     try {
       if (upstreamRequest.includes('test_tool')) {
-        const respClone = response.clone();
-        const respBody = await respClone.text();
-        const { appendFileSync } = await import('fs');
-        appendFileSync(join(tmpdir(), 'test_model.log'),
-          `[${new Date().toISOString()}] upstream response (claude->openai)\n` +
-          `upstream url: ${targetUrl}\n` +
-          `upstream status: ${response.status}\n` +
-          `upstream response body:\n${respBody.slice(0, 2000)}\n` +
-          `---\n`,
-        );
+        response = captureTestModelLog(response, 'claude->openai', targetUrl, requestId, activeLogger);
       }
     } catch (_e) { /* ignore */ }
   }
@@ -850,6 +837,107 @@ export async function handleMessagesRequest(
 
   // Handle non-streaming response
   return handleNonStreamingResponse(response, targetModelId, requestId, activeLogger, requestBody, tokenCountingConfig, request.signal);
+}
+
+/** Characters of an upstream body the `/tmp/test_model.log` capture keeps. */
+const TEST_MODEL_LOG_CHARS = 2000;
+
+/**
+ * §5.7: copy the start of an upstream response body to `/tmp/test_model.log` by
+ * observing the one path the client already reads.
+ *
+ * Both call sites used to capture it with `response.clone().text()`: the tee
+ * gave the logging branch a reader of its own, which ran ahead of the client and
+ * held the whole body — a spooled response included — in its unread queue for a
+ * debug line. Here every chunk is passed on unchanged, the first
+ * {@link TEST_MODEL_LOG_CHARS} decoded characters are kept, and the line is
+ * appended once the body reaches a terminal state. The line therefore lands when
+ * the body is consumed rather than when the upstream finished, and a client that
+ * disconnects before the end leaves none where the clone wrote one whatever the
+ * client did.
+ *
+ * A manual stream rather than a `TransformStream` because the two terminal paths
+ * are not the same one: a body read to its end (`receiveJsonResponse`, the error
+ * path's `text()`) closes the stream, while the SSE egress stops at `[DONE]` by
+ * terminating the converter downstream, which cancels this reader instead of
+ * flushing it. {@link createRefAwareJsonBody} writes its one terminal action the
+ * same way, and for the same reason; a `flush` alone would silently drop the
+ * capture on every converted stream.
+ *
+ * `observeStream`'s rule applies to the capture itself: this sits on the client's
+ * only path, where a throw would abort a response the tee'd branch could not have
+ * touched, so a failed append becomes one debug line. The response returned is a
+ * constructed one and so carries no `url`; the trace labels downstream already
+ * fall back to `'(upstream)'` there — what they read after `applyAfterUpstream`
+ * rebuilds a response too.
+ */
+function captureTestModelLog(
+  response: Response,
+  label: string,
+  targetUrl: string,
+  requestId: string,
+  logger: Logger,
+): Response {
+  const decoder = new TextDecoder();
+  let captured = '';
+  let finished = false;
+
+  /** One path per terminal state, and only one of them runs: the line is a `---`. */
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    // Flushing the decoder releases a sequence split across the last two chunks,
+    // so the text is the one `text()` would have produced.
+    if (captured.length < TEST_MODEL_LOG_CHARS) captured += decoder.decode();
+    try {
+      appendFileSync(join(tmpdir(), 'test_model.log'),
+        `[${new Date().toISOString()}] upstream response (${label})\n` +
+        `upstream url: ${targetUrl}\n` +
+        `upstream status: ${response.status}\n` +
+        `upstream response body:\n${captured.slice(0, TEST_MODEL_LOG_CHARS)}\n` +
+        `---\n`,
+      );
+    } catch (error) {
+      logger.debug(requestId, `Test model log capture failed: ${(error as Error).message}`);
+    }
+  };
+
+  const source = response.body;
+  if (!source) {
+    // Nothing to observe and nothing left to read: the capture is complete.
+    finish();
+    return response;
+  }
+
+  const reader = source.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let next: ReadableStreamReadResult<Uint8Array>;
+      try {
+        next = await reader.read();
+      } catch (error) {
+        finish();
+        controller.error(error);
+        return;
+      }
+      if (next.done) {
+        finish();
+        controller.close();
+        return;
+      }
+      controller.enqueue(next.value);
+      if (captured.length < TEST_MODEL_LOG_CHARS) captured += decoder.decode(next.value, { stream: true });
+    },
+    async cancel(reason) {
+      // The converter stopped the stream early (or the client went away): what was
+      // read is all there will be, and the upstream body is released here because
+      // this reader, not a `pipeThrough`, is now the one holding it.
+      finish();
+      await reader.cancel(reason);
+    },
+  });
+
+  return new Response(body, response);
 }
 
 /**

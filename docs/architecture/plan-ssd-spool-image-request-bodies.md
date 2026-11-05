@@ -608,6 +608,28 @@ shared across requests. Neither tier is loaded or reused after a restart.
   silently fall back to an empty payload. Restart still discards all leases
   and files; no lease is persisted or recovered.
 
+**Accepted mechanism (2026-11): active-ref pinning instead of a leaseId/renewal
+protocol.** The invariants above stand; the mechanism that enforces them is
+simpler than the one first sketched, and is the contract the code implements:
+
+- A ref's blob hash *is* the lease identity. The L2 index holds one entry per
+  blob with a `refs` count of the owners sharing the lease; `putBlob` on an
+  indexed blob and `retainBlob` increment it atomically with the lookup, and
+  each owner's `releaseBlob` decrements it exactly once. A separate `leaseId`
+  would be a second counter over the same lifetime.
+- Renewal is structural, not a timer: TTL and LRU only look at entries with
+  `refs = 0`, so a blob held by a live exchange is never idle, never expired,
+  and never evicted, however long the exchange runs. `lastUsed` is refreshed
+  by retain/release/read and starts the idle clock only at the final release.
+  This makes "renewal while merely holding an idle cached blob" unexpressible
+  rather than forbidden, and removes the renewal ticker's failure mode.
+- The failure requirements map onto the mechanism's own failure modes, all of
+  which fail loudly: reading a leased blob whose file is missing or truncated
+  throws and aborts the exchange (no partial or empty payload), releasing a
+  blob with no active lease throws instead of clamping the count, and a cache
+  write that would exceed the disk cap while every entry is leased fails the
+  new write explicitly rather than deleting an active blob.
+
 **Spill and request lifetime:**
 
 - A per-request spool has explicit owners/readers. Delete it only after parse,
@@ -724,7 +746,7 @@ request-side `source.data` predicate indiscriminately on responses.
 
 **Failure after response streaming begins:** before response headers, return an
 explicit non-2xx error. Once headers or any body bytes/events have reached the
-client, a renewal, disk, or parse failure must **abort the client connection**
+client, a missing-file, disk, or parse failure must **abort the client connection**
 and emit an error log containing the request ID and failed stage. Do not emit a
 terminal success/`[DONE]` event or silently accept a truncated body. Cancel the
 upstream response and active file readers; release each shared-lease ref exactly
@@ -832,8 +854,8 @@ change. They do not authorize sending the custom auth object upstream.
 
 - Upload each L2 blob by streaming it to the configured object store. Upload
   and auth network I/O retain only the small ref skeleton, not the full parsed
-  request. Renew the blob's existing lease throughout upload, auth fetch, and
-  the subsequent upstream
+  request. Keep the blob's existing lease held throughout upload, auth fetch,
+  and the subsequent upstream
   send; slow external I/O must not trigger TTL deletion.
 - Serialize and send only the small auth projection to `auth_with_body`. Do not
   rehydrate a full auth JSON string. The upstream request is unchanged in
@@ -853,6 +875,10 @@ change. They do not authorize sending the custom auth object upstream.
   request recovery state, are never reused as a persistent proxy cache, and
   are never resumed after restart. This temporary auth-link store does not
   change the no-cross-process-sharing rule for the local blob cache.
+  **Decision (2026-11-04): the proxy does not delete.** The delete half of this
+  bullet is dropped: the operator configures the store's lifecycle TTL, and
+  that TTL alone bounds every object's lifetime, not just failure/crash
+  leftovers. The proxy issues no `DELETE` to the object store on any path.
 - If no external uploader is configured, preserve the existing full-body auth
   behavior. The implementation must not silently emit refs or strip binary
   without the auth service's explicit contract support.
@@ -884,6 +910,17 @@ slow sidecars and serialization. A non-ref rung that starts from an effective
 spool acquires a fresh reservation before parsing/conversion and releases it
 after its attempt spool is complete. Large non-ref responses and SSE events use
 the same rule.
+
+Implementation note (2026-11): the request path parses once per request, not
+once per rung — composite and auth-ladder rungs share the one parsed object and
+re-serialize it into per-rung attempt spools. A non-ref body therefore holds
+its single reservation across every rung instead of releasing and re-acquiring
+per rung; this charges the same bytes for a strictly longer window, so the
+budget outcome is conservative relative to the per-rung rule above. Binary
+bodies still release right after extraction, since what rungs retain from then
+on is refs. Per-rung acquisition does exist where a rung actually parses: the
+attempt loop's response-stats read reserves per completed JSON response, and a
+retry's response is a fresh body with a fresh reservation.
 
 Admission behavior:
 
@@ -1196,15 +1233,16 @@ specifically exercises rejection.
 - **BlobRef lease outlives idle TTL:** with a fake clock and `ttl_seconds = 600`,
   keep an upstream POST and a downstream response/event write alive for 1200
   seconds, including a no-byte-progress interval above 600 seconds. Assert the
-  lease renews, L2 eviction does not delete the blob, no `ENOENT` occurs, and
+  lease is held (pinning: `refs > 0` keeps the blob unexpireable — there is no
+  renewal tick), L2 eviction does not delete the blob, no `ENOENT` occurs, and
   forwarded bytes hash-equal the baseline. After the final release, assert an
   idle cache blob expires normally and a response/event scratch blob is deleted.
 - **Lease release and failure:** abort upstream and downstream writes; assert
-  renewal stops, every lease is released, and cleanup occurs after handles
-  close. Inject renewal failure or remove a leased file; assert the exchange
-  fails explicitly and no partial/empty payload is substituted.
+  every lease is released exactly once and cleanup occurs after handles
+  close. Remove a leased file or release one lease too many; assert the
+  exchange fails explicitly and no partial/empty payload is substituted.
 - **Failure after response streaming begins:** after a partial non-SSE body or
-  an initial SSE event reaches the client, inject renewal, disk, and parse
+  an initial SSE event reaches the client, inject missing-file, disk, and parse
   failures. Assert the client observes a connection abort, an error log contains
   request ID and stage, no success/`[DONE]` terminator is emitted, upstream reads
   and file readers are cancelled, every shared-lease ref is released exactly
@@ -1234,10 +1272,10 @@ specifically exercises rejection.
   assert the upstream still receives the original inline binary bytes. Without
   an uploader, assert legacy full-body auth remains unchanged.
 - **Auth-link lease and failure:** keep upload/auth fetch alive beyond the idle
-  TTL and assert renewal prevents deletion while retaining only the small ref
-  skeleton. Inject upload, URL, auth-fetch, and hash-verification failures; assert
-  no upstream call and explicit errors. Assert signed URLs are redacted from
-  logs, external deletion/lifecycle cleanup is scheduled, and restart never
+  TTL and assert the held lease prevents deletion while retaining only the small
+  ref skeleton. Inject upload, URL, auth-fetch, and hash-verification failures;
+  assert no upstream call and explicit errors. Assert signed URLs are redacted
+  from logs, external deletion/lifecycle cleanup is scheduled, and restart never
   reuses an external object as recovery/cache state.
 - **Converted SSE lifetime:** parameterize over the binary families and
   converted endpoints above. Let the upstream request finish, then keep the
@@ -1314,18 +1352,18 @@ Decisions are recorded (§9); what remains is evidence.
       the documented payload-length estimate with upstream usage preferred.
 - [ ] Paused-client tests prove bounded response queues and upstream read
       backpressure across logging, keep-alive, converters, and the Node adapter.
-- [ ] Mid-stream renewal/disk/parse failure tests prove client connection abort,
-      error logging, upstream cancellation, and complete lease/spill cleanup
-      without a false success terminator.
+- [ ] Mid-stream missing-file/disk/parse failure tests prove client connection
+      abort, error logging, upstream cancellation, and complete lease/spill
+      cleanup without a false success terminator.
 - [ ] Every §5.4 request predicate has round-trip and mid-stream retention
       evidence; every §5.7 response predicate has completed-JSON and applicable
       SSE-event round-trip/cleanup evidence. Non-ref tests separately report
       ungated O(N×B) processing and prove object release before network I/O.
-- [ ] Optional §5.9 tests prove pre-parse byte reservation, binary early release,
+- [x] Optional §5.9 tests prove pre-parse byte reservation, binary early release,
       non-ref retention through serialization, bounded queue/timeout, abort and
       failure cleanup, and no admission held during network/SSE streaming.
 - [ ] §5.8 auth-link tests prove post-sidecar auth content, binary-free auth
-      projections, unchanged upstream inline bytes, lease renewal, failure
-      handling, URL redaction, and external-object cleanup.
+      projections, unchanged upstream inline bytes, lease holding past the idle
+      TTL, failure handling, URL redaction, and external-object cleanup.
 - [ ] `CHANGELOG.md` + `README.md` updated in the same change as any
       implementation, per the repo's documentation rule.

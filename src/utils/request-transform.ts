@@ -12,6 +12,7 @@ import type { TransformSet, TransformOp, BuiltinName } from './config-loader.js'
 import type { ModelRouteConfig } from './config-loader.js';
 import type { Logger } from './logger.js';
 import { sanitizeUpstreamResponseHeaders } from './routing.js';
+import { withResponseText } from './spool-response.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,6 +35,12 @@ export interface HookContext {
   logger: Logger;
   /** Upstream HTTP status — set on after_upstream / response_egress only. */
   status?: number;
+  /**
+   * The client request's signal, when the caller has one. `applyAfterUpstream`
+   * hands it to the §5.9 admission wait, so a queued waiter is dropped when the
+   * client goes away instead of holding its place until `admission_timeout_ms`.
+   */
+  signal?: AbortSignal;
 }
 
 export interface HookBodyPayload {
@@ -716,9 +723,13 @@ export function runHook(
  * Fast-path: if no transforms declare ops at `after_upstream`, returns the
  * original Response object unchanged (no buffering, no overhead).
  *
- * Active path: buffers the response body as JSON, applies all declared ops,
- * and returns a new Response with the modified JSON body (same status/headers).
- * If the body is not valid JSON, it is passed through unchanged.
+ * Active path: receives the response body through §5.7's bounded receive —
+ * spilled past `threshold_bytes`, capped by `max_response_bytes`, charged to the
+ * §5.9 budget for the parse — then applies all declared ops and returns a new
+ * Response with the modified JSON body (same status/headers). If the body is not
+ * valid JSON, it is passed through unchanged. Either way the body is read exactly
+ * once, in the receive: `response.text()` and `response.clone()` would each hold a
+ * second copy of a body this path already holds in full.
  *
  * Call this immediately after `fetch()`, before any `if (!response.ok)` check:
  *   const response = await fetch(...);
@@ -741,60 +752,68 @@ export async function applyAfterUpstream(
     s['after_upstream']?.builtins?.includes('assemble_sse_chunks'),
   );
   const contentType = response.headers.get('content-type') ?? '';
-  if (needsAssembly && !contentType.includes('text/event-stream')) {
+  const assembling = needsAssembly && contentType.includes('text/event-stream');
+  if (needsAssembly && !assembling) {
     ctx.logger.warn(ctx.requestId, `assemble_sse_chunks: expected text/event-stream from upstream but got "${contentType || '(none)'}"; skipping assembly and passing response through unchanged`);
   }
-  if (needsAssembly && contentType.includes('text/event-stream')) {
-    const assembled = await assembleSseChunks(response);
-    // Re-enter the normal JSON-ops path with the assembled body.
-    const hookCtx: HookContext = { ...ctx, status: response.status };
-    let body = assembled;
-    let headers: Record<string, string> = {};
-    for (const set of activeSets) {
-      ({ body, headers } = applyTransformSet(set, 'after_upstream', body, headers, { logger: ctx.logger, requestId: ctx.requestId, clientModel: ctx.clientModel }));
-      void headers;
-    }
-    const responseHeaders = sanitizeUpstreamResponseHeaders(response);
-    responseHeaders.set('content-type', 'application/json');
-    return new Response(JSON.stringify(body), {
-      status: hookCtx.status,
-      statusText: response.statusText,
-      headers: responseHeaders,
-    });
-  }
 
-  // Buffer body and parse JSON.
-  const text = await response.text();
-  let body: Record<string, unknown>;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    // Not JSON — reconstruct original response and return unchanged.
-    return new Response(text, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: sanitizeUpstreamResponseHeaders(response),
-    });
-  }
+  return await withResponseText<Response>(
+    response,
+    ctx.requestId,
+    ctx.logger,
+    response.url || '(upstream)',
+    (text) => {
+      if (assembling) {
+        // Re-enter the normal JSON-ops path with the assembled body.
+        const hookCtx: HookContext = { ...ctx, status: response.status };
+        let body: Record<string, unknown> = assembleSseText(text);
+        let headers: Record<string, string> = {};
+        for (const set of activeSets) {
+          ({ body, headers } = applyTransformSet(set, 'after_upstream', body, headers, { logger: ctx.logger, requestId: ctx.requestId, clientModel: ctx.clientModel }));
+          void headers;
+        }
+        const responseHeaders = sanitizeUpstreamResponseHeaders(response);
+        responseHeaders.set('content-type', 'application/json');
+        return new Response(JSON.stringify(body), {
+          status: hookCtx.status,
+          statusText: response.statusText,
+          headers: responseHeaders,
+        });
+      }
 
-  // Apply ops (status available in ctx).
-  const hookCtx: HookContext = { ...ctx, status: response.status };
-  let headers: Record<string, string> = {};
-  for (const set of activeSets) {
-    ({ body, headers } = applyTransformSet(set, 'after_upstream', body, headers));
-    void headers; // header ops not supported on after_upstream (response headers come from fetch)
-  }
+      // Apply ops (status available in ctx).
+      const hookCtx: HookContext = { ...ctx, status: response.status };
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        // Not JSON — reconstruct original response and return unchanged.
+        return new Response(text, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: sanitizeUpstreamResponseHeaders(response),
+        });
+      }
 
-  return new Response(JSON.stringify(body), {
-    status: hookCtx.status,
-    statusText: response.statusText,
-    headers: sanitizeUpstreamResponseHeaders(response),
-  });
+      let headers: Record<string, string> = {};
+      for (const set of activeSets) {
+        ({ body, headers } = applyTransformSet(set, 'after_upstream', body, headers));
+        void headers; // header ops not supported on after_upstream (response headers come from fetch)
+      }
+
+      return new Response(JSON.stringify(body), {
+        status: hookCtx.status,
+        statusText: response.statusText,
+        headers: sanitizeUpstreamResponseHeaders(response),
+      });
+    },
+    ctx.signal,
+  );
 }
 
 /**
- * Read an OpenAI SSE stream to completion and assemble all chat.completion.chunk
- * events into a single chat.completion JSON object.
+ * Assemble all `chat.completion.chunk` events of an OpenAI SSE body into a
+ * single chat.completion JSON object.
  *
  * Chunks may arrive with choices in any order and with any index values. The
  * assembled choices array is sorted by index. Content deltas are concatenated
@@ -803,8 +822,7 @@ export async function applyAfterUpstream(
  * from the last chunk that carries them per choice are used. Usage is taken from
  * the final chunk that includes a non-null usage object (stream_options.include_usage).
  */
-async function assembleSseChunks(response: Response): Promise<Record<string, unknown>> {
-  const text = await response.text();
+function assembleSseText(text: string): Record<string, unknown> {
 
   // Per-choice accumulation state.
   interface ChoiceState {

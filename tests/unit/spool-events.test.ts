@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { streamResponseEvents } from '../../src/utils/spool-events.js';
-import { AdmissionOverBudgetError, getAdmittedBytes, resetAdmission } from '../../src/utils/spool-admission.js';
+import { AdmissionOverBudgetError, admitMaterialization, getAdmittedBytes, resetAdmission } from '../../src/utils/spool-admission.js';
 import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
 import { SpoolResponseTooLargeError } from '../../src/utils/spool-response.js';
 import {
@@ -576,5 +576,45 @@ describe('streamResponseEvents — binary payload extraction (§5.7)', () => {
     assert.deepEqual(eventSpillFiles(config), [], 'the refused event leaves no spill and no scratch blob behind');
     assert.equal(getLiveSpillBytes(), 0);
   });
+
+  it('pauses upstream reads while an event waits for admission, and resumes once the budget frees', async () => {
+    const factor = 2;
+    const event = geminiImageEvent(imageBase64(2048, 5));
+    const eventBytes = encoder.encode(event).byteLength;
+    const config = configure({
+      thresholdBytes: 1024,
+      maxResponseBytes: 200_000,
+      maxMaterializedBodyBytes: Math.ceil(eventBytes * factor),
+      materializationFactor: factor,
+      admissionTimeoutMs: 5_000,
+    });
+    const src = source([event, 'data: [DONE]\n\n']);
+
+    // Someone else holds the whole budget, so this event's parse has to queue.
+    const held = await admitMaterialization(eventBytes);
+    assert.equal(getAdmittedBytes(), Math.ceil(eventBytes * factor));
+
+    const reader = streamResponseEvents(src.stream).getReader();
+    let resolved = false;
+    const first = reader.read().then((result) => {
+      resolved = true;
+      return result;
+    });
+
+    await delay(50);
+    assert.equal(resolved, false, 'no capacity — the event waits before it is parsed, it is not parsed first');
+    assert.equal(src.pulls(), 1, 'the wait pauses upstream reads: nothing past the queued event is pulled');
+
+    held.release();
+    const firstResult = await first;
+    assert.equal(decoder.decode(firstResult.value), 'data: ', 'the queued event is admitted once the budget frees');
+
+    const rest = await drainRest(reader);
+    const chunks = [firstResult.value!, rest];
+    const reassembled = concat(chunks, chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
+    assert.equal(sha256(reassembled), sha256(encoder.encode(event + 'data: [DONE]\n\n')), 'a queued event is still delivered byte-exactly');
+    assert.deepEqual(eventSpillFiles(config), []);
+    assert.equal(getLiveSpillBytes(), 0);
+  }, { timeout: 15000 });
 });
 

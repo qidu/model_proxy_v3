@@ -35,8 +35,12 @@
  * parse, and the client's copy streamed from that same spool — never a
  * `response.clone()`. {@link receiveJsonResponse} is the converted egress's
  * receive: the handlers that must parse the body to convert it (`/v1/messages`,
- * `/v1/chat/completions`) get one bounded receive, one parse, and the spill back
- * before the client is answered.
+ * `/v1/chat/completions`, and `openai.ts`'s cross-mode egresses for a Gemini
+ * client, `responses.ts`'s four converting readers) get one bounded receive, one
+ * parse, and the spill back before the client is answered. Its primitive is
+ * {@link withResponseText}, which the small endpoints' own readers use
+ * (`embeddings.ts`, `token-counting.ts`, and `decision.ts`, whose egress is the
+ * upstream body verbatim).
  */
 
 import { ClaudeProxyError } from './errors.js';
@@ -99,18 +103,48 @@ export async function receiveResponseBody(
  * `JSON.parse` to trip over. The cap is not gated on `[spool] enabled` — that
  * switch decides whether disk is used, not whether the body is bounded.
  *
- * The caller wants the parsed value, so the body is read once here and the spill
- * is released before this returns: what the client reads is the converted body,
+ * The caller wants the parsed value, so the body is read once and the spill is
+ * released before this returns: what the client reads is the converted body,
  * never these bytes. §5.9 admission is taken around the parse — the
  * materialization that budget exists for — and is a no-op when
  * `max_materialized_body_bytes` is 0. A refusal releases the spill first, so a
  * denied body leaves neither bytes on disk nor a reservation (rule #8).
+ *
+ * The receive, the lease and both releases are {@link withResponseText}; this is
+ * its `JSON.parse` consumer.
  */
 export async function receiveJsonResponse<T>(
   response: Response,
   requestId: string,
   logger: Logger,
   stageUrl: string,
+  signal?: AbortSignal
+): Promise<T> {
+  return await withResponseText(response, requestId, logger, stageUrl, (text) => JSON.parse(text) as T, signal);
+}
+
+/**
+ * Receive an upstream response body into text with bounded memory, and hand that
+ * text to `consume` while the §5.9 budget and the spill are still held (§5.7).
+ *
+ * The primitive behind {@link receiveJsonResponse} and the egresses that cannot
+ * use it. A caller that wants the parsed value passes `JSON.parse` and so pays,
+ * inside the same lease, for the materialization the §5.9 budget exists for. A
+ * caller that must answer *from the text* keeps the text instead: `/decision`
+ * returns the upstream body verbatim, and a handler whose own error mapping a
+ * helper-thrown `JSON.parse` failure would replace reads it through here.
+ *
+ * A `consume` that throws — a malformed body, under a caller that maps that to
+ * its own status — still releases the lease and the spill first, and a §5.9
+ * refusal releases the spill before it propagates, so a failed receive leaves
+ * neither bytes on disk nor a reservation (rule #8).
+ */
+export async function withResponseText<T>(
+  response: Response,
+  requestId: string,
+  logger: Logger,
+  stageUrl: string,
+  consume: (text: string) => T,
   signal?: AbortSignal
 ): Promise<T> {
   const received = await receiveResponseBody(response.body);
@@ -124,7 +158,7 @@ export async function receiveJsonResponse<T>(
   try {
     const text = await received.readText();
     logPipelineStage(logger, requestId, 'upstream-response', stageUrl, text);
-    return JSON.parse(text) as T;
+    return consume(text);
   } finally {
     lease.release();
     await received.release();

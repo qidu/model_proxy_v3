@@ -28,16 +28,21 @@
  *  - `Response.prototype.clone()` is never called: the whole point of the
  *    bounded receive is that no second copy of the body exists;
  *  - §5.9 admission is charged the received byte count, and a refusal releases
- *    the spill and holds no reservation.
+ *    the spill and holds no reservation;
+ *  - the `/tmp/test_model.log` debug capture observes that same single read
+ *    instead of teeing a second reader, and reaches its line on either terminal
+ *    path — the end of a body, and the cancel the SSE converter performs when it
+ *    stops the upstream at `[DONE]`.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { handleMessagesRequest } from '../../src/handlers/messages.js';
+import { ClaudeProxyError } from '../../src/utils/errors.js';
 import { SpoolResponseTooLargeError } from '../../src/utils/spool-response.js';
 import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
 import { SPOOL_DEFAULTS, responseSpillDir, setSpoolConfig, type SpoolConfig } from '../../src/utils/spool.js';
@@ -47,6 +52,8 @@ const realFetch = globalThis.fetch;
 const COMPLETIONS_URL = 'https://upstream.example/v1/chat/completions';
 const RESPONSES_URL = 'https://upstream.example/v1/responses';
 const ENV = { LOG_LEVEL: 'error' } as any;
+/** The level both capture sites are gated on. */
+const DEBUG_ENV = { LOG_LEVEL: 'debug' } as any;
 
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -149,6 +156,53 @@ function openaiClientRequest(): Request {
   });
 }
 
+/**
+ * The same already-OpenAI body, naming `test_tool`: the gate the passthrough
+ * capture site reads off the client's own body. An OpenAI-format tool keeps
+ * `hasClaudeFormatTools` false, so the request still takes the passthrough branch.
+ */
+function openaiToolRequest(stream = false): Request {
+  return new Request('http://proxy/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-test',
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [{ type: 'function', function: { name: 'test_tool', description: 'test', parameters: { type: 'object' } } }],
+      ...(stream ? { stream: true } : {}),
+    }),
+  });
+}
+
+/**
+ * A Claude-format body naming `test_tool`: the converted capture site reads its
+ * gate off the converted upstream body, so the tool has to survive the conversion.
+ */
+function claudeToolRequest(): Request {
+  return new Request('http://proxy/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-test',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      tools: [{ name: 'test_tool', description: 'test', input_schema: { type: 'object', properties: {} } }],
+    }),
+  });
+}
+
+/** The frames a Completions upstream answers a streaming request with, ending at `[DONE]`. */
+function sseFrames(): string[] {
+  const frame = (delta: Record<string, unknown>): string => `data: ${JSON.stringify({
+    id: 'chatcmpl-test',
+    object: 'chat.completion.chunk',
+    created: 1700000000,
+    model: 'gpt-test',
+    choices: [{ index: 0, delta, finish_reason: null }],
+  })}\n\n`;
+  return [frame({ role: 'assistant', content: 's'.repeat(3000) }), frame({ content: '!' }), 'data: [DONE]\n\n'];
+}
+
 interface Sourced {
   stream: ReadableStream<Uint8Array>;
   cancelled: boolean;
@@ -230,6 +284,7 @@ function slices(payload: string, size: number): Uint8Array[] {
 async function post(
   request: Request,
   upstreamMode: 'openai-completions' | 'openai-responses',
+  env: Record<string, unknown> = ENV,
 ): Promise<Response> {
   return await handleMessagesRequest(
     request,
@@ -237,7 +292,7 @@ async function post(
     { Authorization: 'Bearer upstream-key' },
     'req-messages-response',
     'gpt-test',
-    ENV,
+    env as any,
     undefined,
     undefined,
     upstreamMode,
@@ -476,5 +531,176 @@ describe('messages.ts non-SSE response, byte admission (§5.9)', () => {
     const converted = await response.json() as { content: Array<{ text: string }> };
     assert.equal(converted.content[0].text, 'f'.repeat(400), 'the body was admitted and converted, not dropped');
     assert.equal(getAdmittedBytes(), 0, 'the lease is given back once the parse is done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.7: the /tmp/test_model.log capture is single-pass too
+// ---------------------------------------------------------------------------
+
+/**
+ * Run `body` with `os.tmpdir()` pointed at a fresh scratch directory, and hand it
+ * the `/tmp/test_model.log` path inside it.
+ *
+ * `tmpdir()` reads `$TMPDIR` per call, so the redirect needs no seam in the
+ * proxy — and it keeps the operator's own `/tmp/test_model.log` untouched. The
+ * file does not exist until the proxy writes it, which is what makes "before the
+ * body is consumed there is nothing" an assertion rather than a guess.
+ */
+async function withLogDir<T>(body: (logPath: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), 'messages-test-model-log-'));
+  scratchDirs.push(dir);
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  try {
+    return await body(join(dir, 'test_model.log'));
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
+}
+
+interface Capture {
+  label: string;
+  url: string;
+  status: string;
+  body: string;
+}
+
+/**
+ * The captures a `/tmp/test_model.log` holds, as structure rather than as text:
+ * one record per `---`, so the count itself is pinned.
+ */
+function captures(log: string): Capture[] {
+  return log
+    .split('\n---\n')
+    .filter((record) => record.trim() !== '')
+    .map((record) => {
+      const lines = record.split('\n');
+      return {
+        label: /^\[[^\]]+\] upstream response \((.+)\)$/.exec(lines[0])?.[1] ?? '',
+        url: (lines[1] ?? '').replace('upstream url: ', ''),
+        status: (lines[2] ?? '').replace('upstream status: ', ''),
+        body: lines.slice(4).join('\n'),
+      };
+    });
+}
+
+/** Let the cancellation chain settle: the capture writes on its last hop. */
+const settle = (): Promise<void> => new Promise((resolve) => { setImmediate(resolve); });
+
+describe('messages.ts /tmp/test_model.log capture (§5.7)', () => {
+  it('captures the passthrough body once, in one pass, keeping 2000 characters and no clone', async () => {
+    const config = configureSpool();
+    const payload = JSON.stringify(completionsBody('p'.repeat(4000)));
+    assert.ok(payload.length > 2000, 'the fixture must be longer than the capture, or the bound proves nothing');
+    assert.ok(new TextEncoder().encode(payload).byteLength > config.thresholdBytes, 'the capture must survive the spill path');
+    const { calls } = stubUpstream(() => new Response(payload, { headers: { 'Content-Type': 'application/json' } }));
+    const baseline = await (await post(openaiToolRequest(), 'openai-completions')).text();
+
+    await withLogDir(async (logPath) => {
+      const { result: response, clones } = await countClones(() => post(openaiToolRequest(), 'openai-completions', DEBUG_ENV));
+
+      // This egress reads the upstream body to convert it before it answers, so the
+      // capture is already written here — what must not have happened is the second
+      // copy the old `clone()` held, and any change to the body the client reads.
+      assert.equal(await response.text(), baseline, 'the capture must not change the body the client reads');
+
+      const found = captures(readFileSync(logPath, 'utf8'));
+      assert.equal(found.length, 1, 'one response, one capture');
+      assert.deepEqual(found[0], {
+        label: 'openai-passthrough',
+        url: COMPLETIONS_URL,
+        status: '200',
+        body: payload.slice(0, 2000),
+      });
+      assert.equal(clones, 0, 'the capture must not have held a second copy of the body');
+    });
+    assert.equal(calls(), 2);
+  });
+
+  it('captures the converted body under its own label, and only when the request names test_tool', async () => {
+    configureSpool();
+    const payload = JSON.stringify(completionsBody('c'.repeat(3000)));
+    stubUpstream(() => new Response(payload, { headers: { 'Content-Type': 'application/json' } }));
+
+    await withLogDir(async (logPath) => {
+      const { result: response, clones } = await countClones(() => post(claudeToolRequest(), 'openai-completions', DEBUG_ENV));
+      const converted = await response.json() as { content: Array<{ text: string }> };
+      assert.equal(converted.content[0].text, 'c'.repeat(3000));
+
+      const found = captures(readFileSync(logPath, 'utf8'));
+      assert.equal(found.length, 1);
+      assert.deepEqual(found[0], {
+        label: 'claude->openai',
+        url: COMPLETIONS_URL,
+        status: '200',
+        body: payload.slice(0, 2000),
+      });
+      assert.equal(clones, 0);
+
+      // The same site, twice: the gate is the request body, and the level is the
+      // capture's. Neither run may add a line to the one already there.
+      await (await post(claudeClientRequest(), 'openai-completions', DEBUG_ENV)).text();
+      assert.equal(captures(readFileSync(logPath, 'utf8')).length, 1, 'a body not naming test_tool must not be captured');
+      await (await post(claudeToolRequest(), 'openai-completions')).text();
+      assert.equal(captures(readFileSync(logPath, 'utf8')).length, 1, 'a request outside LOG_LEVEL=debug must not be captured');
+    });
+  });
+
+  it('captures a streamed body on the cancel the converter stops the upstream with at [DONE]', async () => {
+    configureSpool();
+    const frames = sseFrames();
+    const wire = frames.join('');
+    assert.ok(frames[0].length > 2000, 'the first frame on its own must exceed the capture');
+    stubUpstream(() => new Response(wire, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }));
+    const baseline = await (await post(openaiToolRequest(true), 'openai-completions')).text();
+
+    // Frames past `[DONE]` that the converter never reads: the upstream body
+    // cannot reach its end, so the capture has no closing path to land on — only
+    // the cancel the converter performs, which is how every OpenAI stream ends.
+    const encoder = new TextEncoder();
+    const src = source([...frames, ...Array.from({ length: 6 }, () => 'data: {"ignored":true}\n\n')].map((f) => encoder.encode(f)));
+    stubUpstream(() => new Response(src.stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }));
+
+    await withLogDir(async (logPath) => {
+      const { result: response, clones } = await countClones(() => post(openaiToolRequest(true), 'openai-completions', DEBUG_ENV));
+      assert.equal(await response.text(), baseline, 'the capture must not change the SSE bytes');
+      await settle();
+
+      assert.equal(src.cancelled, true, 'the converter must have stopped the upstream, or this test proves nothing');
+      const found = captures(readFileSync(logPath, 'utf8'));
+      assert.equal(found.length, 1);
+      assert.deepEqual(found[0], {
+        label: 'openai-passthrough',
+        url: COMPLETIONS_URL,
+        status: '200',
+        body: frames[0].slice(0, 2000),
+      });
+      assert.equal(clones, 0);
+    });
+  });
+
+  it('captures an upstream error body before the error is raised', async () => {
+    configureSpool();
+    const body = JSON.stringify({ error: { type: 'rate_limit_error', message: 'slow down' } });
+    stubUpstream(() => new Response(body, { status: 429, headers: { 'Content-Type': 'application/json' } }));
+
+    await withLogDir(async (logPath) => {
+      let caught: unknown;
+      try {
+        await post(openaiToolRequest(), 'openai-completions', DEBUG_ENV);
+      } catch (error) {
+        caught = error;
+      }
+
+      assert.ok(caught instanceof ClaudeProxyError, `expected the upstream error, got ${String(caught)}`);
+      assert.equal(caught.status, 429);
+      assert.equal((caught as unknown as { upstreamBody?: string }).upstreamBody, body, 'the whole body was still read');
+      const found = captures(readFileSync(logPath, 'utf8'));
+      assert.equal(found.length, 1);
+      assert.equal(found[0].status, '429');
+      assert.equal(found[0].body, body);
+    });
   });
 });
