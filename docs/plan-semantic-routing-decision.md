@@ -1287,6 +1287,100 @@ one-cell regression changes routing under partial information, silently) and
 **unresolved ≠ false** (a dead judge that degrades to `false` reroutes traffic
 with no error anywhere).
 
+### 12.1 Benchmarking routing effectiveness and cost
+
+The tests above prove the rules execute correctly; they say nothing about
+whether routing picks a *better* model. That is an outcome question and needs
+an outcome benchmark, run per the methodology in
+[Evaluating Semantic Routing Signals and Decisions](./evaluation-of-semantic-routing.md).
+This section fixes the benchmark design for the four routing strategies this
+plan spans, so the comparison is made on task quality and cost rather than on
+match rates.
+
+**The four arms.** All route over the *same* candidate pool — that is what
+makes them comparable.
+
+| arm | mechanism | per-request routing cost |
+|---|---|---|
+| **A — judge ladder** | Variant A (§6.2, §7): `decision`/`keyword`/`structure`/`context` signals, priority ladder | one **batched** Clef call (§7), bounded by `budget_ms` |
+| **B — embedding** | Variant B (§6.4, §8): contrastive `embedding` signal | one embed call per request (shared by all embedding signals, §8.3) + sub-ms cosine; prototypes embedded once at startup |
+| **C — composite decision** | the existing `[composite.*.decision]` mode (§6.1) | one Clef `choice` call, only when the alias is hit |
+| **D — random/share** | `share` mode / `algorithm = "weighted"` (§5.6) | ~zero — the **null hypothesis** every other arm must beat |
+
+**Cost model.** An arm's cost has three components, and the arms differ on all
+three: (1) *routing overhead* — judge RTT (A, C) vs. embed RTT (B) vs. zero
+(D), measured with the plan's mitigations on (batching, lazy evaluation,
+short-circuiting, §7), because the benchmark must measure the arm as it would
+ship; (2) *downstream model cost* — the point of routing is sending easy
+prompts to cheap models; (3) *failure cost* — unresolved signals taking the
+`on_unknown` path, `budget_ms` breaches (§11's counter), and retries from
+misroutes. Total arm cost = routing overhead + Σ(routed model cost) + quality
+loss.
+
+**Procedure.**
+
+1. **Capability matrix — the one expensive run.** Fix the candidate pool
+   (3–5 models spanning price/quality tiers) and a labeled prompt suite of
+   ~300–500 prompts across categories (code, reasoning, chat/summary,
+   tool-use) plus boundary cases (32k-token context, brief requests), with
+   difficulty labels. Run **every model on every prompt** and record
+   `{score, tokens, latency, cost}` per pair. This yields the **oracle** (best
+   score per prompt, ties broken by lowest cost) and makes all later arm
+   evaluation a lookup rather than a re-run.
+2. **Offline replay per arm.** Each arm's selector picks a model per prompt;
+   score and cost come from the matrix. Run judge arms (A, C) **3×** to expose
+   judge drift (§8.1); B should be deterministic — that is a selling point,
+   verify it; D runs with a fixed seed plus a seed distribution. Adding a
+   **labeled-ideal router** (route by the prompt's true category to that
+   category's best model) gives the ceiling any category-based policy can
+   reach.
+3. **Metrics, in priority order:**
+   - **Regret vs. oracle** — mean `oracle_score − arm_score`, split by
+     category and difficulty. The single decisive number.
+   - **Quality-per-dollar Pareto position** — plot each arm plus the two
+     trivial endpoints ("always cheapest model", "always best model") and D.
+     **An arm only justifies existing if it sits above the line connecting
+     the two endpoints** — otherwise a static mixture beats it with no judge
+     at all. Beating random is necessary, not sufficient.
+   - **Routing overhead as % of request cost**, with `budget_ms` breaches
+     counted separately — per §7, a breach degrades to priority order, so the
+     `decidedBy` distribution must confirm that is what happened.
+   - **Unresolved and breach rates** — a high-accuracy arm with 10% timeouts
+     is operationally worse than its regret suggests.
+4. **Shadow validation** before trusting the offline numbers (evaluation doc
+   §4): prompts in the wild differ from the benchmark suite. Report
+   confidence intervals (bootstrap on regret); judge self-preference is a
+   hazard if the scoring judge shares a family with a candidate model.
+
+**Instrumentation the plan already provides.** The §9 summary log line
+(resolved/unresolved counts, `decidedBy`, elapsed vs. budget) is the
+per-request telemetry during replay; §11's `decidedBy` distribution is the
+sanity check — if `only_candidate`/`catch_all` dominates, the ladder is
+decoration and A ≈ C by construction; the budget breach counter is the
+intended trigger for migrating a hot signal from A to B.
+
+**Reading the results.**
+
+| result | conclusion |
+|---|---|
+| C ≤ D | ability-based judge selection does not beat weighted random — do not build the ladder |
+| A ≈ C in regret | the general ladder buys nothing over the existing mode; §1.1's table overstates the case |
+| B regret ≈ A, overhead ≪ A | embeddings win on cost; keep the judge only for judgement signals (§8.1) — a hybrid ladder |
+| A ≪ B on fuzzy intent categories | the judge's semantic reading is worth its RTT; B stays a pre-filter |
+| nothing beats the cheap↔best line | the pool's price/quality spread is the problem, not the router |
+
+**Sequencing** (matches §15.3): run **D vs. C first** — zero new code
+(`resolveCompositeWithDecision` and `share` both exist) and it answers the
+most important question, whether judge-based selection beats random at all.
+Add **A** once phase 0's evaluator exists, replayed offline against the same
+matrix. Build **B** only if A's *measured* overhead shows the per-request
+judge call dominating, or a taxonomy outgrows one `choice` question (§7.1).
+
+**Honesty constraint (§8.4).** Judge latency for the cost model must be
+measured on real hardware with the laya sidecar running — MLX is
+Apple-Silicon-only and no test run in this repo has ever reached a live
+judge, so any overhead figure derived from stubs is worthless here.
+
 ---
 
 ## 13. Documentation
