@@ -5,6 +5,21 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### docs(spool): the README's 216-line `[spool]` bullet moves to `docs/getting-started/spool-guide.md`
+
+The `[spool]` bullet under README's *Configuration Reference* had absorbed every increment of the
+plan since Phase 1 — 216 lines of one bullet, most of it a single "…and on X, and on Y, and on Z"
+sentence enumerating ~25 spooled readers and their ~10 upstream *error* bodies — while the other
+bullets around it stay one to three lines. The README now carries a six-line pointer and the detail
+lives in **`docs/getting-started/spool-guide.md`**, reorganized into Configuration / Request bodies /
+Response bodies / SSE events / Admission budget / External upload / Disk lifecycle. Per-path facts are
+preserved verbatim and only regrouped; the enumerated readers become lists instead of one sentence.
+
+The move also adds a field table with the real defaults from `SPOOL_DEFAULTS`, which is the first
+place `ttl_seconds` (600) is documented — an accepted `[spool]` key the README never mentioned: how
+long an unreferenced blob may sit idle before it is treated as expired, leased blobs never expiring.
+No `src/` change; `docs/getting-started/index.md` gains the guide in its list.
+
 ### test(spool): §5.3/§12 — a ref-bearing request's input usage at the two SSE egresses that report it
 
 Plan §12's accounting clause — "non-binary accounting is unchanged and binary usage uses the documented

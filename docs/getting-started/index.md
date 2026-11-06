@@ -10,6 +10,7 @@ Welcome to Model Proxy v3! This section covers the basics to get you up and runn
 ## Guides
 
 - [Configuration Guide](./configuration-guide.md) — Minimal `proxy_config.toml` walkthrough with model categories, `upstream_mode`, per-model overrides, wildcards, and extended thinking/reasoning notes
+- [SSD Spool (opt-in)](./spool-guide.md) — `[spool]` field table, per-path request/response and SSE behavior, §5.9 admission budget, §5.8 external upload, disk lifecycle
 - [Example Configuration](./proxy_config.example.toml) — Fully commented config covering every section and option
 - [README Details](./README_DETAILS.md) — Additional details from the main README
 
