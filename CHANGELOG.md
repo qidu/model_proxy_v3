@@ -5,6 +5,44 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### test(spool): §5.3/§12 — a ref-bearing request's input usage at the two SSE egresses that report it
+
+Plan §12's accounting clause — "non-binary accounting is unchanged and binary usage uses the documented
+payload-length estimate with upstream usage preferred" — had no test at the seam where that number is
+actually produced. Its other halves are covered: the mid-stream release by `index-admission.test.ts`
+(`getAdmittedBytes() === 0` with the headers in hand), and the counting primitive by
+`token-counting.test.ts`'s ref-aware block (`ceil(size/4)` exactly, no `+20`, malformed refs refused)
+plus `streaming.test.ts`'s caller-supplied scalar. What was untested is the two *handlers* that resolve
+the number before their stream exists and hand it over as a scalar (§5.3) — `handleStreamingResponse`
+at `messages.ts:1013`, gated on the token-counting config, and `handleResponsesStreamAsClaude` at
+`messages.ts:1071`, which never consulted that config — over a request whose binary §5.4 extracted.
+
+**`tests/unit/ref-input-usage.test.ts`** (6 cases) drives both end to end through the real
+`handleMessagesRequest` with a spooled body and reads the usage back out of the Claude SSE the client
+receives. The load-bearing assertion is a *differential*, not a shape check: a ref of 4000 base64
+characters must add **exactly 1000** tokens over a payload-free body of the same text, and one of 8000
+characters **exactly 2000** — which holds only if the count is `ceil(size/4)` and nothing else, since
+the ref's own JSON (`hash`, `kind`, `prefix`, and a `size` that is four digits either way) is the same
+length at both sizes. A leaked per-block cost, the payload additionally counted inline, or the ref's
+JSON text entering the count would each move it. Both sizes are measured against the same no-payload
+baseline, so the absolute value is pinned too, and the six figure is the inline branch's `+20` surcharge
+being absent. Also pinned: with no upstream usage the estimate survives to `message_delta`, and with
+upstream usage it is replaced *exactly* — `{input_tokens: 4242, output_tokens: 7}`, not blended.
+
+| Mutation | Cases that failed |
+|---|---|
+| `countRefTokens` gains a `+ 20` | both differential cases (2/6) |
+| `messages.ts:1013`'s config gate forced on | the disabled-config case (1/6) |
+| `messages.ts:1071`'s estimate fed `undefined` | the Responses differential alone (1/6) |
+
+That last row is the point of covering the two sites separately: the suites are independently
+load-bearing, so neither can pass on the other's code. All three mutations were reverted; `src/` is
+unchanged. Deliberately not covered: the already-OpenAI callers of these same two sites (`:526`,
+`:416`) reach the same estimator and their block branch is pinned at the primitive level; the
+non-streaming converted seam (`openai-to-claude.ts`'s `calculateLocalTokens`) is outside this clause's
+mid-stream scope; and a "non-binary accounting is unchanged" case would compare one computation against
+itself.
+
 ### perf(spool): §12's before/after numbers for the four named windows — and the instrument that has to be used to get them
 
 Plan §12's line ("Combined Phases 0–2 change landed, with before/after memory and latency numbers for
