@@ -25,6 +25,15 @@
  * converted (`claude-format`) half never carries an `inlineData` part, because
  * `convertGeminiGenerateContentToClaude` drops those parts — see the report on
  * increment 43.
+ *
+ * The same file reads an upstream *error* body whole on three further paths —
+ * the `!response.ok` branch of `:countTokens`, of the Interactions handler and of
+ * the native `:generateContent` handler. Those now share `withResponseText` with
+ * the success bodies above, so the last block here pins the same three
+ * properties on each of them: the body spills while it is received, the upstream
+ * error still reaches the client verbatim, and a cap breach or a §5.9 refusal
+ * surfaces as itself instead. The only local catch is the
+ * `handleGeminiGenerateContentRequest` one, which logs and re-throws.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
@@ -36,6 +45,8 @@ import { join } from 'node:path';
 
 import { handleGeminiRequest } from '../../src/handlers/gemini.js';
 import { SpoolResponseTooLargeError } from '../../src/utils/spool-response.js';
+import { UpstreamApiError } from '../../src/utils/errors.js';
+import { RESPONSE_BLOB_SCOPE } from '../../src/utils/response-blobs.js';
 import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
 import { SPOOL_DEFAULTS, responseSpillDir, setSpoolConfig, type SpoolConfig } from '../../src/utils/spool.js';
 import { AdmissionOverBudgetError, getAdmittedBytes } from '../../src/utils/spool-admission.js';
@@ -144,12 +155,13 @@ interface Sourced {
 }
 
 /** An upstream body we can watch being cancelled when the proxy gives up on it. */
-function source(chunks: Uint8Array[]): Sourced {
+function source(chunks: Uint8Array[], onPull?: (index: number) => void): Sourced {
   let index = 0;
   const state: Sourced = { cancelled: false, stream: null as unknown as ReadableStream<Uint8Array> };
   state.stream = new ReadableStream<Uint8Array>(
     {
       pull(controller) {
+        onPull?.(index);
         if (index >= chunks.length) {
           controller.close();
           return;
@@ -434,3 +446,265 @@ describe('gemini.ts native :generateContent non-SSE response, byte admission (§
     assert.equal(getAdmittedBytes(), 0);
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// §5.7: the Interactions converted egress — the one handler that extracts
+// ---------------------------------------------------------------------------
+
+describe('gemini.ts /v1/interactions non-SSE converted response (§5.7)', () => {
+  /** Names of the scratch blobs the converted body wrote. */
+  function scratchFiles(config: SpoolConfig): string[] {
+    const dir = join(config.dir, RESPONSE_BLOB_SCOPE.subdir);
+    return existsSync(dir) ? readdirSync(dir) : [];
+  }
+
+  /** A `/v1/interactions` request, as the router hands it to this handler. */
+  async function callInteractions(logger: Logger = recordingLogger(false)): Promise<Response> {
+    return await handleGeminiRequest(
+      new Request(`${CLIENT_URL}/v1/interactions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gemini-test', input: 'hi' }),
+      }),
+      UPSTREAM_URL,
+      { 'x-goog-api-key': 'upstream-key' },
+      'req-interactions-response',
+      'gemini-test',
+      ENV,
+      logger,
+    );
+  }
+
+  it('converts, extracts the generated image, and streams it back with an exact Content-Length', async () => {
+    const config = configureSpool();
+    const upstreamBody = geminiPayload();
+    const { calls } = stubUpstream(() => new Response(upstreamBody, { headers: { 'Content-Type': 'application/json' } }));
+
+    const response = await callInteractions();
+
+    assert.equal(response.status, 200);
+    assert.equal(calls(), 1);
+    // The receive spill is released with the conversion, before the answer is
+    // handed over; only the payload's scratch blob is still on disk.
+    assert.deepEqual(
+      spillFiles(config).filter((name) => !name.startsWith(RESPONSE_BLOB_SCOPE.filePrefix)),
+      [],
+      'the parsed body is done before the client is answered',
+    );
+    assert.equal(scratchFiles(config).length, 1, 'the generated image lives in this response’s scratch store');
+
+    const declared = Number(response.headers.get('content-length'));
+    const forwarded = Buffer.from(await response.arrayBuffer());
+    assert.equal(Number.isFinite(declared), true, 'a streamed skeleton must declare its exact length');
+    assert.equal(declared, forwarded.byteLength, 'the declared length is the exact byte count');
+
+    const text = forwarded.toString('utf8');
+    const parsed = JSON.parse(text);
+    assert.equal(parsed.object, 'interaction');
+    assert.deepEqual(parsed.outputs[0], { type: 'text', text: '日本語 — ✓ ok' }, 'the text part is converted');
+    assert.deepEqual(
+      parsed.outputs[1],
+      { inlineData: { mimeType: 'image/png', data: IMAGE_B64 } },
+      'the generated image round-trips at its own position',
+    );
+    assert.ok(text.includes(IMAGE_B64), 'the payload is on the wire, not just a marker');
+    assert.equal(text.includes('$spoolBlob'), false, 'the ref itself must never reach a client');
+
+    assert.deepEqual(scratchFiles(config), [], 'the last byte deletes the scratch blob');
+    assert.equal(getLiveSpillBytes(), 0);
+    assert.equal(getAdmittedBytes(), 0);
+  });
+
+  it('deletes the scratch blob when the client disconnects mid-body', async () => {
+    const config = configureSpool();
+    stubUpstream(() => new Response(geminiPayload(), { headers: { 'Content-Type': 'application/json' } }));
+
+    const response = await callInteractions();
+    assert.equal(response.status, 200);
+    assert.equal(scratchFiles(config).length, 1, 'the payload is still needed: the body has not been read');
+
+    await response.body?.cancel('client gone');
+
+    assert.deepEqual(scratchFiles(config), [], 'an abandoned response deletes its scratch blob');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.7: the upstream *error* body
+// ---------------------------------------------------------------------------
+
+/**
+ * The three `!response.ok` reads in `src/handlers/gemini.ts`: `:130` in
+ * `handleGeminiCountTokensRequest`, `:280` in `handleGeminiInteractionsRequest`
+ * and `:493` in `handleGeminiGenerateContentRequest`. The last sits under that
+ * function's `catch`, which logs and re-throws; the first two are under no catch
+ * at all. All three end in `handleTargetApiError` (typed `never`), so a cap
+ * breach or a §5.9 refusal reaches the client as itself while the upstream's own
+ * error reaches it unchanged.
+ */
+
+/** An upstream error body: 429, with a message the client-facing error quotes. */
+function errorPayload(marker: string): string {
+  return JSON.stringify({ error: { code: 429, message: `upstream said ${marker}`, status: 'RESOURCE_EXHAUSTED' } }, null, 2);
+}
+
+function errorResponse(body: ReadableStream<Uint8Array> | string): Response {
+  return new Response(body, { status: 429, headers: { 'Content-Type': 'application/json' } });
+}
+
+/** Send `path` to the Gemini router with a body of the shape it expects. */
+function callGeminiPath(path: string, body: unknown, logger: Logger = recordingLogger(false)): Promise<Response> {
+  return handleGeminiRequest(
+    new Request(`${CLIENT_URL}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+    UPSTREAM_URL,
+    { 'x-goog-api-key': 'upstream-key' },
+    'req-gemini-error',
+    'gemini-test',
+    ENV,
+    logger,
+  );
+}
+
+interface ErrorSite {
+  name: string;
+  post: () => Promise<Response>;
+}
+
+const ERROR_SITES: ErrorSite[] = [
+  {
+    name: ':countTokens',
+    post: () => callGeminiPath('/v1beta/models/gemini-test:countTokens', { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+  },
+  {
+    name: ':generateContent',
+    post: () => callGeminiPath('/v1beta/models/gemini-test:generateContent', { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+  },
+  {
+    name: '/v1/interactions',
+    post: () => callGeminiPath('/v1/interactions', { model: 'gemini-test', input: 'hi' }),
+  },
+];
+
+/** Run `run`, require that it failed, and hand back the error. */
+async function thrownBy(run: () => Promise<unknown>): Promise<Error> {
+  let caught: unknown;
+  try {
+    await run();
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof Error, `expected an Error, got ${String(caught)}`);
+  return caught;
+}
+
+/** Two chunks at the midpoint of an encoded body. */
+function twoChunks(payload: string): Uint8Array[] {
+  const bytes = new TextEncoder().encode(payload);
+  const half = Math.floor(bytes.byteLength / 2);
+  return [bytes.subarray(0, half), bytes.subarray(half)];
+}
+
+/** Fixed-size slices of an encoded body, for the cap case below. */
+function slices(payload: string, size: number): Uint8Array[] {
+  const bytes = new TextEncoder().encode(payload);
+  const out: Uint8Array[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += size) {
+    out.push(bytes.subarray(offset, offset + size));
+  }
+  return out;
+}
+
+for (const site of ERROR_SITES) {
+  describe(`gemini.ts ${site.name} upstream error body (§5.7)`, () => {
+    it('receives the error body through the spill and carries it verbatim', async () => {
+      const payload = errorPayload('x'.repeat(400));
+      const chunks = twoChunks(payload);
+
+      // The baseline runs with the spool off, so the two runs differ in nothing
+      // but the way the body was received.
+      setSpoolConfig(SPOOL_DEFAULTS);
+      const { calls: baselineCalls } = stubUpstream(() => errorResponse(payload));
+      const baseline = await thrownBy(() => site.post());
+      assert.ok(baseline instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(baseline)}`);
+      assert.equal(baseline.status, 429);
+      assert.equal(baseline.type, 'rate_limit_error');
+      assert.equal(baseline.upstreamBody, payload);
+
+      const config = configureSpool();
+      assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the first chunk must cross the threshold');
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+        if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+      });
+      const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+      const { result: spooled, clones } = await countClones(() => thrownBy(() => site.post()));
+
+      // The spill is the live body while it is received — and this path releases
+      // it before it throws, so the end state alone could not tell it apart.
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the received prefix must be on disk, charged');
+      assert.ok(spooled instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(spooled)}`);
+      assert.equal(spooled.status, baseline.status);
+      assert.equal(spooled.type, baseline.type);
+      assert.equal(spooled.message, baseline.message, 'the client-facing message must be the upstream one, unchanged');
+      assert.equal(spooled.upstreamBody, payload, 'the raw body must reach the error whole');
+      assert.equal(calls(), 1);
+      assert.equal(baselineCalls(), 1);
+      assert.deepEqual(spillFiles(config), [], 'the error path must release the spill before it throws');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(clones, 0, 'the bounded receive holds no second copy of the body');
+    });
+
+    it('fails loudly past max_response_bytes, and cancels the upstream body', async () => {
+      const config = configureSpool({ maxResponseBytes: 256 });
+      const payload = errorPayload('z'.repeat(400));
+      // 160-byte slices: the first crosses `threshold_bytes` (64) but not the cap,
+      // so a spill file really exists when the second slice breaches it.
+      const chunks = slices(payload, 160);
+      assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+      assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      });
+      const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+      const caught = await thrownBy(() => site.post());
+
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'a spill must have been live when the cap was breached');
+      assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+      assert.equal(caught.status, 500, 'the client sent a legal request: not a 4xx');
+      assert.equal(caught.type, 'processing_error');
+      assert.match(caught.message, /too large/);
+      assert.equal(calls(), 1);
+      assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+      assert.deepEqual(spillFiles(config), [], 'a rejected error body removes its partial spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('surfaces a §5.9 refusal ahead of the upstream error, releasing the spill', async () => {
+      const payload = errorPayload('b'.repeat(400));
+      const bodyBytes = new TextEncoder().encode(payload).byteLength;
+      const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
+      assert.ok(bodyBytes > config.thresholdBytes, 'the fixture must spill, so a leak here would be visible on disk');
+      const { calls } = stubUpstream(() => errorResponse(payload));
+
+      const caught = await thrownBy(() => site.post());
+
+      assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+      assert.equal(caught.status, 503);
+      assert.equal(caught.type, 'over_limit_error', 'the type the client switches on');
+      assert.equal(calls(), 1, 'the charge is the received byte count, so the body was received first');
+      assert.deepEqual(spillFiles(config), [], 'a refused error body must not leave its bytes on disk');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(getAdmittedBytes(), 0);
+    });
+  });
+}

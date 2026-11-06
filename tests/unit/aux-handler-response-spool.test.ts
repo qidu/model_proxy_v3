@@ -50,11 +50,13 @@
  * invisible from the handler level: `consume` — the parse the budget exists for
  * — runs while the lease and the spill are still held.
  *
- * Deliberately out of scope, and left as they are: the upstream *error* reads
- * beside these sites (`!response.ok` → `response.text()`, in all three) and the
- * two readers in `src/handlers/models.ts`, which sit inside catch-all fallbacks
- * that would turn a spool limit into a silently smaller answer (rule #8). Each is
- * a separate increment.
+ * The upstream *error* reads beside these sites are bounded too: `!response.ok`
+ * in `/v1/embeddings` and `/decision` used to call `response.text()`, so an
+ * upstream error body was the one part of these handlers nothing bounded. Both
+ * now receive it through the same `withResponseText`, and a cap breach, a write
+ * failure or a §5.9 refusal propagates as itself instead of being forwarded as
+ * the upstream's own error. `/v1/messages/count_tokens` reads nothing on that
+ * branch, so it is unchanged and out of scope here.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
@@ -512,6 +514,94 @@ for (const site of SITES) {
       assert.equal(response.status, 200);
       assert.deepEqual(await response.json(), site.expected('ok'));
       assert.equal(getAdmittedBytes(), 0, 'the lease is given back before the body is sent');
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// §5.7: the upstream error body is bounded the same way
+// ---------------------------------------------------------------------------
+
+/**
+ * The two handlers whose `!response.ok` branch reads a body at all. Both forward
+ * the upstream error body verbatim, so one table covers them; token counting
+ * reads nothing on that branch (it warns and falls back to the character count).
+ */
+const ERROR_SITES = SITES.filter((site) => site.name !== 'token-counting');
+
+for (const site of ERROR_SITES) {
+  describe(`${site.name} upstream error body (§5.7)`, () => {
+    it('forwards an upstream error body verbatim, having spilled it on the way', async () => {
+      const config = configureSpool();
+      const status = 429;
+      const errorBody = JSON.stringify({
+        error: { type: 'rate_limit_error', message: `upstream says ${'x'.repeat(300)}` },
+      });
+      const chunks = twoChunks(errorBody);
+      assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the fixture must spill');
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+        if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+      });
+      stubUpstream(() => new Response(src.stream, { status, headers: { 'Content-Type': 'application/json' } }));
+
+      const { result: response, clones } = await countClones(() => site.invoke());
+
+      // The error body really went through the spill: reverting to `response.text()`
+      // would leave nothing on disk and no charge part-way through the receive.
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the error body must have been on disk mid-receive');
+      assert.equal(response.status, status, 'the upstream status must reach the client unedited');
+      assert.equal(response.headers.get('x-request-id'), REQUEST_ID);
+      assert.equal(await response.text(), errorBody, 'the error body must be forwarded byte for byte');
+      assert.deepEqual(spillFiles(config), [], 'the spill must be released before the response is returned');
+      assert.equal(clones, 0, 'the proxy must not hold a second copy of the body');
+    });
+
+    it('fails loudly when the error body is past max_response_bytes, forwarding nothing', async () => {
+      const config = configureSpool({ maxResponseBytes: 256 });
+      const errorBody = JSON.stringify({ error: { type: 'rate_limit_error', message: 'z'.repeat(400) } });
+      const chunks = slices(errorBody, 160);
+      assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+      assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      });
+      const { calls } = stubUpstream(() => new Response(src.stream, { status: 429, headers: { 'Content-Type': 'application/json' } }));
+
+      const caught = await caughtFrom(() => site.invoke());
+
+      // The upstream status is never handed on here: the client is told about the
+      // proxy's cap, not about an error body it is not going to receive (rule #8).
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'a spill must have been live when the cap was breached');
+      assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+      assert.equal(caught.status, 500, 'the proxy limit is a 500, not the upstream\'s status');
+      assert.equal(caught.type, 'processing_error');
+      assert.match(caught.message, /too large/);
+      assert.equal(calls(), 1);
+      assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+      assert.deepEqual(spillFiles(config), [], 'a rejected error body removes its partial spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('reports a §5.9 refusal on an error body as itself, leaving no spill and no reservation', async () => {
+      const errorBody = JSON.stringify({ error: { type: 'rate_limit_error', message: 'b'.repeat(400) } });
+      const bodyBytes = new TextEncoder().encode(errorBody).byteLength;
+      const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
+      assert.ok(bodyBytes > config.thresholdBytes, 'the fixture must spill, so a leak here would be visible on disk');
+      const { calls } = stubUpstream(() => new Response(errorBody, { status: 429, headers: { 'Content-Type': 'application/json' } }));
+
+      const caught = await caughtFrom(() => site.invoke());
+
+      assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+      assert.equal(caught.status, 503);
+      assert.equal(caught.type, 'over_limit_error', 'not the upstream\'s own error type');
+      assert.match(caught.message, /exceed max_materialized_body_bytes/);
+      assert.equal(calls(), 1, 'the charge is the received byte count, so the body was received first');
+      assert.deepEqual(spillFiles(config), [], 'a refused body must not leave its bytes on disk');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(getAdmittedBytes(), 0, 'a refusal must not keep its queue slot');
     });
   });
 }

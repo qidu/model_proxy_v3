@@ -1,6 +1,6 @@
 /**
- * Unit tests for the §5.7 bounded response receive on the `after_upstream`
- * transform path (`src/utils/request-transform.ts`).
+ * Unit tests for the §5.7 bounded response receive on the two transform-hook
+ * response paths (`src/utils/request-transform.ts`).
  *
  * Plan: docs/architecture/plan-ssd-spool-image-request-bodies.md §5.7, §5.9.
  *
@@ -13,6 +13,17 @@
  * egresses use — so a body past `threshold_bytes` lives on disk while it is
  * transformed, is bounded by `max_response_bytes`, and charges the §5.9 budget for
  * the parse.
+ *
+ * The second block does the same for its mirror, `applyWriteoutBody` — the
+ * `response_egress` hook that rewrites the body on its way *to the client*. Its
+ * read is the same unbounded one, on the same shape of body, and it is the last
+ * one left in this module. Two differences are pinned rather than blended: this
+ * hook's own gate is a `hasHookOps('response_egress', …)` plus a
+ * content-type check that `applyAfterUpstream` does not have (a non-JSON body is
+ * returned untouched without being read at all), and its read is usually a
+ * *second* receive of a body the caller already spooled — so above the threshold
+ * it costs a second spill rather than saving RAM. What it buys is the bound, the
+ * charge and a trace stage on this read too, which is what the tests assert.
  *
  * What these tests pin, and why each assertion is worth its space:
  *  - the answer is unchanged both under `threshold_bytes` and above it. The
@@ -43,7 +54,11 @@
  *    `src/handlers/messages.ts` and `src/handlers/openai.ts` pass
  *    `request.signal` / `originalRequest.signal`, matching the existing
  *    `receiveJsonResponse(..., request.signal)` convention, rather than the
- *    upstream *timeout* signal, which is a different thing.
+ *    upstream *timeout* signal, which is a different thing. These tests hand
+ *    `ctx.signal` in directly and so pin the hook's side of that contract; the
+ *    central wrap in `src/index.ts` that fills `writeoutCtx` is a call site, read
+ *    rather than driven from here, exactly as `applyAfterUpstream`'s handler call
+ *    sites are.
  *
  * Deliberately out of scope, and left as they are: the `!response.ok` error-body
  * reads beside the five call sites, which are a separate repo-wide increment, and
@@ -57,7 +72,7 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { applyAfterUpstream, type HookContext } from '../../src/utils/request-transform.js';
+import { applyAfterUpstream, applyWriteoutBody, type HookContext } from '../../src/utils/request-transform.js';
 import type { Logger } from '../../src/utils/logger.js';
 import { createLogger } from '../../src/utils/logger.js';
 import type { TransformSet, ModelRouteConfig } from '../../src/utils/config-loader.js';
@@ -126,6 +141,13 @@ const STRIP_MODEL: TransformSet = {
   after_upstream: { ops: [{ op: 'remove', path: 'model' }] },
 };
 
+/** The same op, declared at the client-egress hook `applyWriteoutBody` runs. */
+const STRIP_MODEL_EGRESS: TransformSet = {
+  name: 'strip_model_egress',
+  schema: 'openai-completions',
+  response_egress: { ops: [{ op: 'remove', path: 'model' }] },
+};
+
 const ASSEMBLE_SSE: TransformSet = {
   name: 'sse_to_completions',
   schema: 'openai-completions',
@@ -146,9 +168,13 @@ function makeRoute(transforms: TransformSet[]): ModelRouteConfig {
   };
 }
 
-function makeCtx(transforms: TransformSet[], signal?: AbortSignal): HookContext {
+function makeCtx(
+  transforms: TransformSet[],
+  signal?: AbortSignal,
+  hook: HookContext['hook'] = 'after_upstream',
+): HookContext {
   return {
-    hook: 'after_upstream',
+    hook,
     route: makeRoute(transforms),
     upstreamMode: 'openai-completions',
     clientModel: 'test-model',
@@ -628,5 +654,239 @@ describe('applyAfterUpstream §5.9 admission (§5.9)', () => {
     assert.deepEqual(spillFiles(config), [], 'an aborted receive must give its spill back');
     assert.equal(getLiveSpillBytes(), 0);
     assert.equal(getAdmittedBytes(), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.7: the client-egress hook (`applyWriteoutBody`) goes through the same receive
+// ---------------------------------------------------------------------------
+
+/** Every call below declares ops at the hook this function serves. */
+function egressCtx(transforms: TransformSet[], signal?: AbortSignal): HookContext {
+  return makeCtx(transforms, signal, 'response_egress');
+}
+
+describe('applyWriteoutBody fast paths (§5.7)', () => {
+  it('returns the same Response when no route declares response_egress ops, without reading it', async () => {
+    const config = configureSpool();
+    // Spool-disabled as well: the gate is the transform list, and this hook must
+    // not consult the spool config on a route that declares nothing for it.
+    configureSpool({ enabled: false });
+    const src = source(twoChunks(JSON.stringify(answer('x'.repeat(400)))));
+    const original = streamedResponse(src, 'application/json');
+
+    const result = await applyWriteoutBody(original, egressCtx([UNRELATED]));
+
+    assert.equal(result, original, 'the exact same Response reference, op-free');
+    assert.deepEqual(src.pulls, [], 'the fast path must not read a byte');
+    assert.equal(src.cancelled, false);
+    assert.deepEqual(await result.json(), answer('x'.repeat(400)), 'and the body is still there for the client');
+    assert.deepEqual(spillFiles(config), []);
+  });
+
+  it('returns the same Response untouched when the body is not JSON, ops declared or not', async () => {
+    const config = configureSpool();
+    const text = sseText('s');
+    const src = source(twoChunks(text));
+    const original = streamedResponse(src, 'text/event-stream');
+
+    const result = await applyWriteoutBody(original, egressCtx([STRIP_MODEL_EGRESS]));
+
+    // The content-type gate is this hook's own and sits before the receive: an
+    // SSE body is the per-event path's business (`pipeEventTransformer`), so this
+    // function must not buffer one — not even to hand it straight back.
+    assert.equal(result, original);
+    assert.deepEqual(src.pulls, [], 'a non-JSON body must not be read at all');
+    assert.deepEqual(spillFiles(config), []);
+  });
+});
+
+describe('applyWriteoutBody bounded receive (§5.7)', () => {
+  it('answers a body under threshold_bytes without touching the spool or cloning it', async () => {
+    const config = configureSpool({ thresholdBytes: 4096 });
+    const payload = answer('ok');
+    assert.ok(new TextEncoder().encode(JSON.stringify(payload)).byteLength < config.thresholdBytes);
+    const src = source(twoChunks(JSON.stringify(payload)));
+
+    const { result: response, clones } = await countClones(() =>
+      applyWriteoutBody(streamedResponse(src, 'application/json'), egressCtx([STRIP_MODEL_EGRESS])),
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), expected('ok'));
+    assert.deepEqual(spillFiles(config), [], 'a body under the threshold leaves no spill');
+    assert.equal(clones, 0, 'the proxy must not hold a second copy of the body');
+    assert.equal(getAdmittedBytes(), 0, 'the lease is given back before the body is returned');
+  });
+
+  it('spills a body above threshold_bytes, applies the ops, and frees the spill before returning', async () => {
+    const marker = 'w'.repeat(400);
+    const payload = answer(marker);
+    const chunks = twoChunks(JSON.stringify(payload));
+
+    // The reference is the same call with spooling off: the two runs differ in
+    // nothing but the spool, so equal answers mean the spool changed nothing.
+    configureSpool({ enabled: false });
+    const baselineText = await (await applyWriteoutBody(
+      streamedResponse(source(twoChunks(JSON.stringify(payload))), 'application/json'),
+      egressCtx([STRIP_MODEL_EGRESS]),
+    )).text();
+    assert.deepEqual(JSON.parse(baselineText), expected(marker));
+
+    // Captured after the baseline run, because every `configureSpool` call makes a
+    // fresh directory: this is the config whose `responses/` the spill lands in.
+    const config = configureSpool();
+    assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the first chunk must cross the threshold');
+
+    const seen: Array<{ files: number; bytes: number }> = [];
+    const src = source(chunks, (index) => {
+      seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+    });
+
+    const { result: response, clones } = await countClones(() =>
+      applyWriteoutBody(streamedResponse(src, 'application/json'), egressCtx([STRIP_MODEL_EGRESS])),
+    );
+
+    assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the received prefix must be on disk, charged');
+    assert.deepEqual(spillFiles(config), [], 'the spill must be released before the response is returned');
+    assert.equal(getLiveSpillBytes(), 0);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'application/json');
+    assert.deepEqual(JSON.parse(await response.text()), JSON.parse(baselineText), 'the spool must not change the answer');
+    assert.equal(clones, 0);
+    assert.equal(getAdmittedBytes(), 0);
+    // Read exactly once: one pull per chunk, plus the pull that closes the source.
+    assert.deepEqual(src.pulls, [0, 1, 2], 'the body must be read exactly once, start to close');
+  });
+
+  it('fails loudly past max_response_bytes and cancels the body it was reading', async () => {
+    const config = configureSpool({ maxResponseBytes: 256 });
+    const payload = answer('z'.repeat(400));
+    // 160-byte slices: the first crosses `threshold_bytes` (64) but not the cap,
+    // so a spill file really exists when the second slice breaches it — the state
+    // the failure path has to clean up.
+    const chunks = slices(JSON.stringify(payload), 160);
+    assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+    assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+    const seen: Array<{ files: number; bytes: number }> = [];
+    const src = source(chunks, (index) => {
+      seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+    });
+
+    const caught = await caughtFrom(() =>
+      applyWriteoutBody(streamedResponse(src, 'application/json'), egressCtx([STRIP_MODEL_EGRESS])),
+    );
+
+    assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'a spill must have been live when the cap was breached');
+    assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+    assert.equal(caught.status, 500, 'the client sent a legal request: not a 4xx');
+    assert.equal(caught.type, 'processing_error');
+    assert.match(caught.message, /too large/);
+    assert.equal(src.cancelled, true, 'the body this hook was rewriting must be cancelled, not left flowing');
+    assert.deepEqual(spillFiles(config), [], 'a rejected response removes its partial spill');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('enforces max_response_bytes with the spool disabled, as the sibling hook does', async () => {
+    const config = configureSpool({ enabled: false, maxResponseBytes: 256 });
+    const payload = answer('c'.repeat(400));
+    assert.ok(new TextEncoder().encode(JSON.stringify(payload)).byteLength > config.maxResponseBytes);
+
+    const caught = await caughtFrom(() =>
+      applyWriteoutBody(jsonResponse(payload), egressCtx([STRIP_MODEL_EGRESS])),
+    );
+
+    // Same rule as `applyAfterUpstream` and the rest of the egresses: the cap
+    // bounds the read, `enabled` only decides whether disk is used. Asserted so a
+    // future change of that rule fails loudly here too.
+    assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+    assert.equal(caught.status, 500);
+    assert.equal(caught.type, 'processing_error');
+    assert.deepEqual(spillFiles(config), [], 'nothing may reach disk when spilling is off');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('passes a malformed JSON body through byte-for-byte, now that the receive reads it', async () => {
+    const config = configureSpool();
+    const text = `not json at all, ${'m'.repeat(300)}`;
+    const chunks = twoChunks(text);
+    assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the fixture must spill');
+
+    const seen: Array<{ files: number; bytes: number }> = [];
+    const src = source(chunks, (index) => {
+      seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+    });
+    const response = new Response(src.stream, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'content-length': String(new TextEncoder().encode(text).byteLength) },
+    });
+
+    const { result, clones } = await countClones(() => applyWriteoutBody(response, egressCtx([STRIP_MODEL_EGRESS])));
+
+    assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the parse branch is behind the receive');
+    assert.equal(await result.text(), text, 'a body that is not JSON is handed back unchanged');
+    assert.equal(result.status, 200);
+    assert.equal(result.headers.get('content-length'), null, 'nor the upstream length, which the spill invalidates');
+    assert.equal(clones, 0);
+    assert.deepEqual(spillFiles(config), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.9: the budget and the client abort the client-egress receive charges
+// ---------------------------------------------------------------------------
+
+describe('applyWriteoutBody §5.9 admission (§5.9)', () => {
+  it('refuses a body one nominal byte past the budget, leaving no spill and no reservation', async () => {
+    const upstream = answer('b'.repeat(400));
+    const bodyBytes = new TextEncoder().encode(JSON.stringify(upstream)).byteLength;
+    const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
+    assert.ok(bodyBytes > config.thresholdBytes, 'the fixture must spill, so a leak here would be visible on disk');
+    const src = source(twoChunks(JSON.stringify(upstream)));
+
+    const caught = await caughtFrom(() =>
+      applyWriteoutBody(streamedResponse(src, 'application/json'), egressCtx([STRIP_MODEL_EGRESS])),
+    );
+
+    // A refused body is a spool limit, never a transform failure: the body may be
+    // perfectly good JSON. Nothing here catches it, and `src/index.ts`'s writeout
+    // wrap does not either, so it reaches the handler's terminal catch as itself
+    // (503 `over_limit_error`) rather than as a transform error.
+    assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+    assert.equal(caught.status, 503);
+    assert.equal(caught.type, 'over_limit_error', 'the type the client switches on');
+    assert.match(caught.message, /exceed max_materialized_body_bytes/);
+    assert.deepEqual(src.pulls, [0, 1, 2], 'the charge is the received byte count, so the body was received first');
+    assert.deepEqual(spillFiles(config), [], 'a refused body must not leave its bytes on disk');
+    assert.equal(getLiveSpillBytes(), 0);
+    assert.equal(getAdmittedBytes(), 0, 'a refusal must not keep its queue slot');
+  });
+
+  it('drops a queued client-egress waiter when the client aborts, keeping nothing on disk', async () => {
+    const upstream = answer('q'.repeat(300));
+    const bodyBytes = new TextEncoder().encode(JSON.stringify(upstream)).byteLength;
+    // Room for exactly one body at factor 2, so the second has to queue.
+    const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2), admissionTimeoutMs: 60_000 });
+    const held = await admitMaterialization(bodyBytes);
+
+    const controller = new AbortController();
+    const src = source(twoChunks(JSON.stringify(upstream)));
+    const pending = applyWriteoutBody(streamedResponse(src, 'application/json'), egressCtx([STRIP_MODEL_EGRESS], controller.signal));
+    // The receive reads the body before it charges for it, so the raw bytes are on
+    // disk while the body waits — nothing is materialized until it is admitted.
+    await waitFor(() => getAdmissionQueueDepth() === 1);
+
+    const caught = await new Promise<unknown>((resolve) => {
+      pending.then(() => resolve(undefined), resolve);
+      controller.abort();
+    });
+
+    assert.equal(caught?.name, 'AbortError', `expected the abort to surface, got ${String(caught)}`);
+    assert.equal(getAdmissionQueueDepth(), 0, 'an aborted waiter must leave the queue at once');
+    assert.deepEqual(spillFiles(config), [], 'an abandoned receive must give its spill back');
+    assert.equal(getLiveSpillBytes(), 0, 'the raw bytes were on disk while it waited, and are gone now');
+    assert.ok(getAdmittedBytes() > 0, 'the holder still owns its bytes');
+    held.release();
   });
 });

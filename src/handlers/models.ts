@@ -11,7 +11,7 @@ import { validateModelsRequestParams } from '../utils/validation.js';
 import { createErrorResponse, handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
-import { receiveJsonResponse } from '../utils/spool-response.js';
+import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 
 // In-memory cache for model list
 interface CacheEntry {
@@ -212,9 +212,26 @@ export async function handleModelsRequest(
       signal: createUpstreamAbortSignal(getUpstreamBodyTimeoutMs(env)),
     });
 
-    // Handle target API errors
+    // Handle target API errors. §5.7: the error body is bounded exactly as the
+    // success body below is — one receive, `max_response_bytes` applied. A cap
+    // breach, a spill write failure or a §5.9 refusal is the proxy's own limit,
+    // and the outer catch below would turn it into the config-only model list:
+    // a smaller success standing in for a failure (rule #8), so it is answered
+    // here as itself instead.
     if (!response.ok) {
-      const upstreamErrorBody = await response.text();
+      let upstreamErrorBody: string;
+      try {
+        upstreamErrorBody = await withResponseText(
+          response,
+          requestId,
+          logger,
+          targetApiUrl.toString(),
+          (text) => text,
+          request.signal,
+        );
+      } catch (error) {
+        return createErrorResponse(error as Error, requestId);
+      }
       handleTargetApiError(response, 'Models API', { url: targetApiUrl.toString(), upstreamBody: upstreamErrorBody });
     }
 
@@ -375,7 +392,24 @@ export async function handleAnthropicModelsDiscovery(
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      const errorText = await response.text();
+      // §5.7: the error body is received through the same bounded path as the
+      // success body below, so `max_response_bytes` bounds it too. This
+      // function's own catch-all would report a spool limit as a generic
+      // `internal_error`, i.e. as "model discovery failed" — so the limit is
+      // answered here as itself (rule #8).
+      let errorText: string;
+      try {
+        errorText = await withResponseText(
+          response,
+          requestId,
+          logger,
+          targetApiUrl.toString(),
+          (text) => text,
+          request.signal,
+        );
+      } catch (error) {
+        return createErrorResponse(error as Error, requestId);
+      }
       logger.error(requestId, `Upstream model discovery failed: ${response.status} ${errorText}`);
       // Return error to client rather than silently degraded list
       return new Response(JSON.stringify({

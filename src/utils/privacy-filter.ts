@@ -27,7 +27,9 @@
  */
 
 import type { Env } from '../types/shared.js';
+import { ClaudeProxyError } from './errors.js';
 import { isInternalHost } from './routing.js';
+import { consumeResponseText } from './spool-response.js';
 import {
   buildWhitelist,
   findHashSpans,
@@ -308,7 +310,9 @@ export async function redactBody(
  * Sidecar path: POST the texts to `${url}/redact` and apply the returned
  * `redacted[]` array back onto the text refs. Throws on any transport /
  * shape error — fail-closed by design (the privacy filter never forwards
- * unredacted text upstream).
+ * unredacted text upstream). The answer body is read under §5.7's cap, so a
+ * body over `max_response_bytes` throws that error as itself rather than as a
+ * sidecar failure.
  */
 async function redactSidecar(
   config: PrivacyFilterConfig,
@@ -317,18 +321,33 @@ async function redactSidecar(
   texts: string[],
 ): Promise<RedactResult> {
   let payload: { redacted?: unknown; mapping?: unknown };
+  let resp: Response;
   try {
-    const resp = await fetch(`${config.url}/redact`, {
+    resp = await fetch(`${config.url}/redact`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ texts }),
       signal: AbortSignal.timeout(config.timeoutMs),
     });
-    if (!resp.ok) {
-      throw new Error(`sidecar returned ${resp.status}`);
-    }
-    payload = (await resp.json()) as { redacted?: unknown; mapping?: unknown };
   } catch (error) {
+    throw new Error(`privacy filter unavailable: ${(error as Error).message}`);
+  }
+  if (!resp.ok) {
+    throw new Error(`privacy filter unavailable: sidecar returned ${resp.status}`);
+  }
+  // §5.7: the sidecar answers with the redacted prompt text — as large as the
+  // request the filter accepted (`maxChars`), so the read is bounded like every
+  // other remote body: `max_response_bytes` caps it, the parse charges §5.9, and
+  // above `threshold_bytes` the bytes live on a spill meanwhile. The body is
+  // never logged (it is the user's own text), so this is the receive *without*
+  // the trace stage.
+  try {
+    payload = await consumeResponseText(resp.body, (text) => JSON.parse(text) as { redacted?: unknown; mapping?: unknown });
+  } catch (error) {
+    // A proxy limit — the response cap, a spill failure, a §5.9 refusal — is not
+    // the sidecar being unavailable: rethrow it as itself so the request fails
+    // with the real reason (rule #8). The filter stays fail-closed either way.
+    if (error instanceof ClaudeProxyError) throw error;
     throw new Error(`privacy filter unavailable: ${(error as Error).message}`);
   }
 

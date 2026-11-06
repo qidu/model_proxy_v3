@@ -11,10 +11,17 @@
  * `KOMPRESS_URL` is set, and it fails OPEN by default (a sidecar outage forwards
  * the original text rather than failing the request) because compression is an
  * optimization, not a correctness boundary.
+ *
+ * Failing open is not the same as failing silently: every fragment the sidecar
+ * did not compress is tallied by reason in {@link CompressResult.uncompressed}
+ * and the caller logs it (repo rule #8). The reasons stay short and never carry
+ * any of the fragment text, which is user content.
  */
 
 import type { Env } from '../types/shared.js';
+import { ClaudeProxyError } from './errors.js';
 import { isInternalHost } from './routing.js';
+import { consumeResponseText } from './spool-response.js';
 
 /**
  * Above this fraction of non-ASCII codepoints a fragment is treated as
@@ -227,38 +234,103 @@ export interface CompressResult {
   savedChars: number;
   /** Percentage of attempted characters removed. */
   savedPct: number;
+  /**
+   * Fragments forwarded uncompressed for a reason the operator needs to see, one
+   * entry per distinct reason with how many fragments it hit: a sidecar call that
+   * failed or an answer that could not be read, and the `maxChars` limit that
+   * suppresses a whole batch. Reasons are short, are safe to log, and never
+   * include any fragment text.
+   *
+   * A fragment skipped by design — shorter than `minChars`, or non-English
+   * (CJK-heavy) — is *not* tallied here: that is the intended steady state for
+   * most requests, and a line per request would bury the entries above. An answer
+   * that simply did not shorten the text is not a failure either and is not
+   * tallied.
+   */
+  uncompressed: { reason: string; count: number }[];
 }
 
-/** Compress a single fragment via the sidecar; returns null on any failure. */
-async function compressFragment(config: KompressConfig, text: string): Promise<string | null> {
+/** The failure half of a fragment call: no shortened text, and why. */
+interface FragmentOutcome {
+  compressed: string | null;
+  reason: string | null;
+}
+
+/** `message` for anything thrown, without assuming it is an `Error`. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Compress a single fragment via the sidecar. Returns the shortened text, or
+ * null together with a short reason so the failure is reported rather than
+ * swallowed (rule #8). The reason never carries fragment text — the parsed
+ * answer is deliberately not echoed, because `JSON.parse` failure messages quote
+ * the input they rejected.
+ */
+async function compressFragment(config: KompressConfig, text: string): Promise<FragmentOutcome> {
+  let resp: Response;
   try {
-    const resp = await fetch(`${config.url}/compress`, {
+    resp = await fetch(`${config.url}/compress`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, keep_ratio: config.keepRatio, max_length: config.maxLength }),
       signal: AbortSignal.timeout(config.timeoutMs),
     });
-    if (!resp.ok) return null;
-    const payload = (await resp.json()) as { compressed?: unknown };
-    return typeof payload.compressed === 'string' ? payload.compressed : null;
-  } catch {
-    return null;
+  } catch (error) {
+    return { compressed: null, reason: `sidecar unreachable: ${messageOf(error)}` };
   }
+  if (!resp.ok) {
+    // The error body is not read at all — nothing here wants it, and the same is
+    // true at every other `!response.ok` site in this repo.
+    return { compressed: null, reason: `sidecar returned ${resp.status}` };
+  }
+
+  // §5.7: the answer is the compressed fragment — derived from request text — so
+  // it is read bounded (`max_response_bytes`, a spill above `threshold_bytes`, the
+  // parse charged to §5.9) and *without* the trace stage, the same receive the
+  // privacy filter's sidecar uses: this body must never be echoed to a log.
+  let answer: string;
+  try {
+    answer = await consumeResponseText(resp.body, (bodyText) => bodyText);
+  } catch (error) {
+    // A proxy limit — the response cap, a spill failure, a §5.9 refusal — is not
+    // the sidecar being broken, and is named as such so the two can be told apart.
+    return {
+      compressed: null,
+      reason: error instanceof ClaudeProxyError
+        ? `proxy limit on the answer read: ${error.message}`
+        : `answer read failed: ${messageOf(error)}`,
+    };
+  }
+
+  let payload: { compressed?: unknown };
+  try {
+    payload = JSON.parse(answer) as { compressed?: unknown };
+  } catch {
+    return { compressed: null, reason: 'answer was not JSON' };
+  }
+  if (typeof payload.compressed !== 'string') {
+    return { compressed: null, reason: 'answer carried no "compressed" string' };
+  }
+  return { compressed: payload.compressed, reason: null };
 }
 
 /**
  * Compress compressible text in a request body by calling the sidecar once per
  * fragment (in parallel). Fragments that are too short, non-English, or fail to
- * compress are left untouched. Fails open by default: a sidecar outage forwards
- * the original text. When `config.failOpen` is false, any fragment failure
- * throws so the request fails fast.
+ * compress are left untouched, and every failure is tallied in
+ * {@link CompressResult.uncompressed} for the caller to log. Fails open by
+ * default: a sidecar outage forwards the original text. When `config.failOpen`
+ * is false, any fragment failure throws so the request fails fast — carrying the
+ * sidecar's own reason, so a proxy limit is not reported as a broken sidecar.
  */
 export async function compressBody(
   config: KompressConfig,
   body: Record<string, unknown>,
 ): Promise<CompressResult> {
   const refs = collectCompressibleRefs(body);
-  if (refs.length === 0) return { body, fragments: 0, savedChars: 0, savedPct: 0 };
+  if (refs.length === 0) return { body, fragments: 0, savedChars: 0, savedPct: 0, uncompressed: [] };
 
   // Build the worklist: skip tiny and non-English fragments.
   const work: { ref: TextRef; text: string }[] = [];
@@ -268,23 +340,36 @@ export async function compressBody(
     if (isCjkHeavy(text)) continue;
     work.push({ ref, text });
   }
-  if (work.length === 0) return { body, fragments: 0, savedChars: 0, savedPct: 0 };
+  if (work.length === 0) return { body, fragments: 0, savedChars: 0, savedPct: 0, uncompressed: [] };
 
   const totalChars = work.reduce((sum, w) => sum + w.text.length, 0);
   if (totalChars === 0 || totalChars > config.maxChars) {
-    return { body, fragments: 0, savedChars: 0, savedPct: 0 };
+    // Over the cap the whole batch is left alone, which used to be a silent
+    // no-op hitting exactly the requests where compression matters most.
+    return {
+      body,
+      fragments: 0,
+      savedChars: 0,
+      savedPct: 0,
+      uncompressed: totalChars > config.maxChars
+        ? [{ reason: `combined text ${totalChars} chars over maxChars ${config.maxChars}`, count: work.length }]
+        : [],
+    };
   }
 
-  const results = await Promise.all(work.map((w) => compressFragment(config, w.text)));
+  const outcomes = await Promise.all(work.map((w) => compressFragment(config, w.text)));
 
+  const failures = new Map<string, number>();
   let fragments = 0;
   let savedChars = 0;
   for (let i = 0; i < work.length; i++) {
-    const compressed = results[i];
+    const { compressed, reason } = outcomes[i];
     if (compressed === null) {
+      const why = reason ?? 'unknown failure';
       if (!config.failOpen) {
-        throw new Error('kompress sidecar unavailable');
+        throw new Error(`kompress sidecar unavailable: ${why}`);
       }
+      failures.set(why, (failures.get(why) ?? 0) + 1);
       continue; // fail open: leave original
     }
     const original = work[i].text;
@@ -296,5 +381,11 @@ export async function compressBody(
   }
 
   const savedPct = totalChars > 0 ? (savedChars / totalChars) * 100 : 0;
-  return { body, fragments, savedChars, savedPct };
+  return {
+    body,
+    fragments,
+    savedChars,
+    savedPct,
+    uncompressed: [...failures].map(([reason, count]) => ({ reason, count })),
+  };
 }

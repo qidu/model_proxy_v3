@@ -18,7 +18,7 @@ import { decodeDataUriOrRef } from '../converters/claude-to-gemini.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
-import { receiveJsonResponse } from '../utils/spool-response.js';
+import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 
 /**
  * Check if request is in Gemini Interactions format
@@ -876,7 +876,7 @@ async function forwardCompletionsAsAnthropicMessages(
   recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
-    const upstreamBody = await response.text();
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, (text) => text, originalRequest.signal);
     logger.error(requestId, `Interactions/generateContent->anthropic-messages error: ${response.status}, URL: ${targetUrl}`);
     handleTargetApiError(response, 'Interactions/generateContent (via anthropic-messages)', { url: targetUrl, upstreamBody });
   }
@@ -1032,7 +1032,7 @@ async function forwardCompletionsAsOpenAIResponses(
   recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
-    const upstreamBody = await response.text();
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, (text) => text, originalRequest.signal);
     logger.error(requestId, `Interactions/generateContent->openai-responses error: ${response.status}, URL: ${targetUrl}`);
     handleTargetApiError(response, 'Interactions/generateContent (via openai-responses)', { url: targetUrl, upstreamBody });
   }
@@ -1331,7 +1331,7 @@ export async function handleOpenAIRequest(
 
         // Handle target API errors
         if (!response.ok) {
-            const errorText = await response.text();
+            const errorText = await withResponseText(response, requestId, activeLogger, targetUrl, (text) => text, request.signal);
             activeLogger.debug(requestId, `OpenAI API error: ${response.status} ${errorText}`);
             handleTargetApiError(response, 'OpenAI API', { url: targetUrl, upstreamBody: errorText });
         }

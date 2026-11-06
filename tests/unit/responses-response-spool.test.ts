@@ -1,6 +1,7 @@
 /**
- * Unit tests for the four §5.7 converted non-SSE response reads in
- * `src/handlers/responses.ts`.
+ * Unit tests for the §5.7 whole-body response reads in
+ * `src/handlers/responses.ts`: the four converted non-SSE reads, and the seven
+ * reachable upstream *error* reads.
  *
  * Plan: docs/architecture/plan-ssd-spool-image-request-bodies.md §5.7, §5.9.
  *
@@ -45,12 +46,17 @@
  *  - §5.9 admission is charged the received byte count; a refusal releases the
  *    spill, holds no reservation, and never answers with a partial body.
  *
- * Deliberately out of scope, and left as they are: the four upstream *error*
- * reads beside these sites (`!response.ok` → `response.text()`) and the
- * in-process `claudeResponse.json()` in `handleAsGemini` (an already bounded
- * body). Each is a separate increment. The two identity forwards on the
- * passthrough halves of `/input_tokens` and `/compact` used to be listed here;
- * they are bounded now and pinned in `responses-response-egress.test.ts`.
+ * Deliberately out of scope, and left as they are: the in-process
+ * `claudeResponse.json()` in `handleAsGemini` (an already bounded body). The two
+ * identity forwards on the passthrough halves of `/input_tokens` and `/compact`
+ * used to be listed here; they are bounded now and pinned in
+ * `responses-response-egress.test.ts`.
+ *
+ * The eight `!response.ok` reads beside these sites (`response.text()` on the
+ * upstream's error body) were listed here too. Seven of them are bounded now and
+ * pinned at the bottom of this file, across both the converted and the
+ * passthrough branches; the eighth, `handleAsGemini`'s, is unreachable — see the
+ * note there.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
@@ -65,6 +71,7 @@ import {
   handleResponsesCompactRequest,
 } from '../../src/handlers/responses.js';
 import { SpoolResponseTooLargeError } from '../../src/utils/spool-response.js';
+import { UpstreamApiError } from '../../src/utils/errors.js';
 import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
 import { SPOOL_DEFAULTS, responseSpillDir, setSpoolConfig, type SpoolConfig } from '../../src/utils/spool.js';
 import { AdmissionOverBudgetError, getAdmittedBytes } from '../../src/utils/spool-admission.js';
@@ -244,6 +251,8 @@ interface Site {
 
 const RESPONSES_TARGET = 'https://upstream.example/v1/responses';
 const COMPLETIONS_TARGET = 'https://upstream.example/v1/chat/completions';
+const INPUT_TOKENS_TARGET = 'https://upstream.example/v1/responses/input_tokens';
+const COMPACT_TARGET = 'https://upstream.example/v1/responses/compact';
 
 const SITES: Site[] = [
   {
@@ -583,6 +592,179 @@ for (const site of SITES) {
       assert.equal(response.status, 200);
       assert.deepEqual(site.stable(await response.text()), site.expected('ok'));
       assert.equal(getAdmittedBytes(), 0, 'the lease is given back before the body is sent');
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// §5.7: the upstream *error* body (`!response.ok`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every `!response.ok` branch in `responses.ts` read the upstream's error body
+ * with `response.text()`, so nothing bounded an error answer: a 429 with a huge
+ * body, or a `max_response_bytes` that every success path honours, was ignored on
+ * exactly the branch that is already going wrong. They now go through the same
+ * `withResponseText` as the success bodies, and the raw text still reaches
+ * `handleResponsesApiError` verbatim — the wording Claude Code matches on for
+ * capability-rejection recovery.
+ *
+ * Seven branches are reachable and covered here: the converted ones
+ * (`anthropic-messages`, `openai-completions` ×3) and the three passthrough
+ * forwards. The eighth, `handleAsGemini`'s, is unreachable: `claudeResponse` comes
+ * from `handleGeminiGenerateContentRequest`, which turns any non-ok upstream into
+ * `handleTargetApiError`'s throw inside its own `try` and returns only 200s, so
+ * its error body can never be produced. It was made bounded anyway, because it is
+ * a one-line substitution of an existing statement, not new code.
+ */
+interface ErrorSite {
+  name: string;
+  /** Send the client request; the stub answers 429, so this throws. */
+  post: () => Promise<Response>;
+}
+
+const ERROR_SITES: ErrorSite[] = [
+  {
+    name: 'responses <- anthropic-messages',
+    post: () => handleResponsesRequest(
+      responsesClient(), RESPONSES_TARGET, AUTH, REQUEST_ID, 'gpt-test', undefined, LOGGER, 'anthropic-messages',
+    ),
+  },
+  {
+    name: 'responses <- openai-completions',
+    post: () => handleResponsesRequest(
+      responsesClient(), COMPLETIONS_TARGET, AUTH, REQUEST_ID, 'gpt-test', undefined, LOGGER, 'openai-completions',
+    ),
+  },
+  {
+    name: 'responses <- passthrough',
+    post: () => handleResponsesRequest(
+      responsesClient(), RESPONSES_TARGET, AUTH, REQUEST_ID, 'gpt-test', undefined, LOGGER, 'openai-responses',
+    ),
+  },
+  {
+    name: 'responses/input_tokens <- openai-completions',
+    post: () => handleResponsesInputTokensRequest(
+      inputTokensClient(), COMPLETIONS_TARGET, AUTH, REQUEST_ID, 'gpt-test', undefined, LOGGER, 'openai-completions',
+    ),
+  },
+  {
+    name: 'responses/input_tokens <- passthrough',
+    post: () => handleResponsesInputTokensRequest(
+      inputTokensClient(), INPUT_TOKENS_TARGET, AUTH, REQUEST_ID, 'gpt-test', undefined, LOGGER,
+    ),
+  },
+  {
+    name: 'responses/compact <- openai-completions',
+    post: () => handleResponsesCompactRequest(
+      compactClient(), COMPLETIONS_TARGET, AUTH, REQUEST_ID, 'gpt-test', undefined, LOGGER, 'openai-completions',
+    ),
+  },
+  {
+    name: 'responses/compact <- passthrough',
+    post: () => handleResponsesCompactRequest(
+      compactClient(), COMPACT_TARGET, AUTH, REQUEST_ID, 'gpt-test', undefined, LOGGER,
+    ),
+  },
+];
+
+/** A 429 answer whose body is large enough to spill, indented so bytes matter. */
+function errorPayload(marker: string): string {
+  return JSON.stringify(
+    { type: 'error', error: { type: 'rate_limit_error', message: `upstream said ${marker}` } },
+    null,
+    2,
+  );
+}
+
+/** The upstream's answer on every error site: a 429 carrying `payload`. */
+function errorResponse(body: BodyInit | ReadableStream<Uint8Array>): Response {
+  return new Response(body, { status: 429, headers: { 'Content-Type': 'application/json' } });
+}
+
+for (const site of ERROR_SITES) {
+  describe(`responses.ts ${site.name} upstream error body (§5.7)`, () => {
+    it('receives the error body through the spill and carries it verbatim', async () => {
+      const payload = errorPayload('x'.repeat(200));
+      const chunks = twoChunks(payload);
+
+      // The reference is the same 429 with spooling off: the error the client
+      // sees must not depend on whether the body went to disk.
+      configureSpool({ enabled: false });
+      stubUpstream(() => errorResponse(payload));
+      const baseline = await caughtFrom(site.post);
+      assert.equal(baseline.status, 429);
+      assert.equal(baseline.upstreamBody, payload);
+
+      const config = configureSpool();
+      assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the fixture must spill');
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+        if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+      });
+      stubUpstream(() => errorResponse(src.stream));
+
+      const { result: caught, clones } = await countClones(() => caughtFrom(site.post));
+
+      // The error body really went through the spill: a whole-body read leaves
+      // nothing on disk part-way through.
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the error body must have been on disk mid-receive');
+      assert.ok(caught instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(caught)}`);
+      assert.equal(caught.status, baseline.status, 'the upstream status still reaches the client');
+      assert.equal(caught.type, baseline.type);
+      assert.equal(caught.message, baseline.message, 'the wording the client matches on survives the spool');
+      // The raw body is what the client receives on this path, so equality is the
+      // property that matters: indentation, key order and the marker all survived.
+      assert.equal(caught.upstreamBody, payload, 'the error body must reach the client byte for byte');
+      assert.deepEqual(spillFiles(config), [], 'the spill is released before the error is thrown');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(clones, 0, 'the proxy must not hold a second copy of the error body');
+    });
+
+    it('fails loudly past max_response_bytes instead of carrying a truncated error body', async () => {
+      const config = configureSpool({ maxResponseBytes: 256 });
+      const payload = errorPayload('z'.repeat(400));
+      const chunks = slices(payload, 160);
+      assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+      assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      });
+      stubUpstream(() => errorResponse(src.stream));
+
+      const caught = await caughtFrom(site.post);
+
+      // The proxy's cap, not the upstream's 429: the client is told what actually
+      // stopped the body (rule #8), and no half error body is forwarded.
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'a spill must have been live when the cap was breached');
+      assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+      assert.equal(caught.status, 500);
+      assert.equal(caught.type, 'processing_error');
+      assert.match(caught.message, /too large/);
+      assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+      assert.deepEqual(spillFiles(config), [], 'a rejected error body removes its partial spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('surfaces a §5.9 refusal ahead of the upstream error, releasing the spill', async () => {
+      const payload = errorPayload('b'.repeat(400));
+      const bodyBytes = new TextEncoder().encode(payload).byteLength;
+      // One nominal byte short of the charge `ceil(bytes × factor)`.
+      const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
+      assert.ok(bodyBytes > config.thresholdBytes, 'the fixture must spill, so a leak here would be visible on disk');
+      const { calls } = stubUpstream(() => errorResponse(payload));
+
+      const caught = await caughtFrom(site.post);
+
+      assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+      assert.equal(caught.status, 503);
+      assert.equal(caught.type, 'over_limit_error');
+      assert.equal(calls(), 1, 'the error body was received before it was charged');
+      assert.deepEqual(spillFiles(config), [], 'a refused body must not leave its bytes on disk');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(getAdmittedBytes(), 0, 'a refusal must not keep its queue slot');
     });
   });
 }

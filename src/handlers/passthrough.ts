@@ -19,8 +19,8 @@ import { selectWeightedCompositeCandidate } from '../index.js';
 import { handleTargetApiError } from '../utils/errors.js';
 import { wrapSseStreamWithKeepAlive } from '../utils/sse-keepalive.js';
 import { getIngressSpool, readIngressSpoolText } from '../utils/spool-ingress.js';
-import { receiveResponseBody } from '../utils/spool-response.js';
-import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { receiveResponseBody, withResponseText } from '../utils/spool-response.js';
+import { admitResponseMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
 import { streamResponseEvents } from '../utils/spool-events.js';
 import { getSpoolConfig } from '../utils/spool.js';
 
@@ -289,9 +289,15 @@ export async function handlePassthroughRequest(
   if (!response.ok) {
     let upstreamErrorBody = '';
     try {
-      upstreamErrorBody = await response.text();
+      // §5.7: the error body goes through the same bounded receive as a success
+      // body, so `max_response_bytes` bounds it too. Only an unreadable body — the
+      // one thing the placeholder below was ever for — keeps it; a cap breach, a
+      // spill write failure or a §5.9 refusal is the proxy's own limit and must
+      // surface as itself, not as "the upstream body could not be read" (rule #8).
+      upstreamErrorBody = await withResponseText(response, requestId, logger, upstreamUrl, (text) => text, request.signal);
       logger.error(requestId, `Passthrough: upstream error (${response.status}): ${upstreamErrorBody.slice(0, 2000)}`);
-    } catch {
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
       upstreamErrorBody = '(failed to read response body)';
     }
     return handleTargetApiError(response, 'Passthrough upstream', { url: upstreamUrl, body: bodyPreview, upstreamBody: upstreamErrorBody });
@@ -384,7 +390,7 @@ export async function handlePassthroughRequest(
     // on the ledger (rule #8).
     let lease: AdmissionLease;
     try {
-      lease = await admitMaterialization(received.size, request.signal);
+      lease = await admitResponseMaterialization(received.size, request.signal);
     } catch (error) {
       await received.release();
       throw error;

@@ -104,9 +104,9 @@ import { uploadBlobsForAuth } from './utils/external-upload.js';
 import { getSpoolConfig } from './utils/spool.js';
 import { streamResponseEvents } from './utils/spool-events.js';
 import { attachIngressSpool, receiveIngressBody, readIngressSpoolText, type IngressSpool } from './utils/spool-ingress.js';
-import { admitMaterialization, type AdmissionLease } from './utils/spool-admission.js';
+import { admitMaterialization, admitResponseMaterialization, type AdmissionLease } from './utils/spool-admission.js';
 import { createJsonEgressBody, createTextEgressBody } from './utils/spool-json.js';
-import { receiveResponseBody } from './utils/spool-response.js';
+import { consumeResponseText, receiveJsonResponse, receiveResponseBody, withResponseText } from './utils/spool-response.js';
 
 let hasLoggedUpstreamConfig = false;
 
@@ -212,12 +212,20 @@ function generateRequestId(): string {
  * Restore PII sentinels back to their original values in a client-facing
  * response. Handles JSON (buffered) and text/event-stream (transform) bodies.
  * Returns the response unchanged when the mapping is empty.
+ *
+ * The buffered branches read the body through {@link withResponseText}: §5.7
+ * forbids an unbounded whole-body read, so above `threshold_bytes` the bytes
+ * live on this response's spill while they are received, `max_response_bytes`
+ * caps the body, and §5.9's budget covers the text the restore materializes.
+ * A cap breach or a §5.9 refusal propagates to the caller's error mapping, so a
+ * body the proxy refused to read is never restored from a partial copy (rule #8).
  */
 async function restorePrivacyResponse(
   response: Response,
   mapping: PiiMapping,
   requestId: string,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<Response> {
   if (Object.keys(mapping).length === 0) return response;
   const contentType = response.headers.get('content-type') || '';
@@ -233,26 +241,20 @@ async function restorePrivacyResponse(
     });
   }
 
-  if (contentType.includes('application/json')) {
-    const text = await response.text();
-    const restored = restoreText(text, mapping);
-    logger.debug(requestId, `[PII-RESTORE] json restore: body ${text.length} -> ${restored.length} chars`);
+  // JSON, and every other content-type (text/plain, text/html, empty, …), is
+  // restored from the whole body text. §5.7: one bounded receive instead of
+  // `response.text()` — the restore runs inside that receive's lease, and the
+  // spill is released before the restored text is handed to `new Response`.
+  const isJson = contentType.includes('application/json');
+  if (isJson || response.body) {
+    const restored = await withResponseText(response, requestId, logger, '(privacy restore)', (text) => {
+      const value = restoreText(text, mapping);
+      logger.debug(requestId, `[PII-RESTORE] ${isJson ? 'json' : 'text'} restore: body ${text.length} -> ${value.length} chars`);
+      return value;
+    }, signal);
     // restored text length differs from the redacted body; and the upstream
-    // body has already been decompressed by .text(), so content-encoding no
+    // body has already been decompressed by the receive, so content-encoding no
     // longer matches. Strip both via sanitizeUpstreamResponseHeaders.
-    return new Response(restored, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: sanitizeUpstreamResponseHeaders(response),
-    });
-  }
-
-  // Fallback: treat any other content-type as text and restore sentinels.
-  // This catches text/plain, text/html, empty content-type, etc.
-  if (response.body) {
-    const text = await response.text();
-    const restored = restoreText(text, mapping);
-    logger.debug(requestId, `[PII-RESTORE] text restore: body ${text.length} -> ${restored.length} chars`);
     return new Response(restored, {
       status: response.status,
       statusText: response.statusText,
@@ -1081,32 +1083,52 @@ export default {
         const sendBody = authWithBody && typeof bodyTextForAuth === 'string';
         if (sendBody) authForwardHeaders['Content-Type'] = 'application/json';
 
-        let authStatus: number;
-        let authRespBodyText: string | undefined;
+        let authResp: Response;
         try {
-          const authResp = await fetch(authUrl, {
+          authResp = await fetch(authUrl, {
             method: sendBody ? 'POST' : 'GET',
             headers: authForwardHeaders,
             body: sendBody ? bodyTextForAuth : undefined,
             redirect: 'follow',
           });
-          authStatus = authResp.status;
-          modelUsageOneTimeAuthCode = authResp.headers.get('one_time_auth_code') || undefined;
-          // Read the auth service's response body so a rejection (4xx/5xx) can
-          // surface its reason to the client instead of a bare "Authentication
-          // failed." — mirrors handleTargetApiError's upstream-message passthrough.
-          try {
-            authRespBodyText = await authResp.text();
-          } catch {
-            // best-effort; body read failures fall back to the generic message below
-          }
         } catch (err) {
+          // Only a failed *fetch* is "unreachable". The body read below is a
+          // separate `try` on purpose: a proxy-side limit must not be reported
+          // as the auth server being down (rule #8), and `max_response_bytes`
+          // applies with `[spool] enabled = false` too — that switch decides
+          // whether disk is used, not whether the body is bounded.
           logger.warn(requestId, `Auth server (${authUrl}) unreachable: ${(err as Error).message}`);
           return createErrorResponse(
             new Error(`Authentication service unavailable: could not reach remote auth server (${authUrl}). ${(err as Error).message}`),
             requestId,
             503,
           );
+        }
+        const authStatus = authResp.status;
+        modelUsageOneTimeAuthCode = authResp.headers.get('one_time_auth_code') || undefined;
+
+        // Read the auth service's response body so a rejection (4xx/5xx) can
+        // surface its reason to the client instead of a bare "Authentication
+        // failed." — mirrors handleTargetApiError's upstream-message passthrough.
+        //
+        // §5.7: bounded, like every other remote body this file reads, through
+        // `consumeResponseText` rather than `withResponseText` for one reason —
+        // the body carries `targets[].key`/`otac` (upstream credentials, see
+        // target-retry.ts), and that primitive's trace stage echoes the text it
+        // receives. A credential-bearing body is never echoed, so this site
+        // receives it without a log stage. §5.9 is the response class (the
+        // helper's), because a deferred-auth request already holds its own ingress
+        // reservation and this read must not queue behind it — hold-and-wait, see
+        // spool-admission.ts.
+        let authRespBodyText: string | undefined;
+        try {
+          authRespBodyText = await consumeResponseText(authResp.body, (text) => text, request.signal);
+        } catch (err) {
+          // The proxy's own limit — a cap breach, a spill failure, a §5.9
+          // refusal — is this request's failure, not the upstream's: rethrow so
+          // it reaches the terminal catch and is reported as itself.
+          if (err instanceof ClaudeProxyError) throw err;
+          // A transport read failure stays best-effort: the generic message below.
         }
 
         if (authStatus !== 200) {
@@ -1464,7 +1486,18 @@ export default {
           // after redaction so it operates on already-redacted text. One-directional
           // — no response-side restore. Fails open by default.
           if (kompressActive) {
-            const { fragments, savedPct } = await compressBody(kompressConfig!, body);
+            const { fragments, savedPct, uncompressed } = await compressBody(kompressConfig!, body);
+            // Fail-open is not fail-silent: a fragment the sidecar did not compress,
+            // or a batch the char cap suppressed, is reported (rule #8) even though
+            // the request still forwards the original text.
+            const leftUncompressed = uncompressed.reduce((n, u) => n + u.count, 0);
+            if (leftUncompressed > 0) {
+              logger.warn(
+                requestId,
+                `Kompress left ${leftUncompressed} fragment(s) uncompressed from ${path}: ` +
+                  uncompressed.map((u) => `${u.reason} (${u.count})`).join('; '),
+              );
+            }
             if (fragments > 0) {
               bodyText = JSON.stringify(body);
               logger.info(requestId, `Kompress compressed ${fragments} fragment(s), saved ~${savedPct.toFixed(1)}% chars from ${path}`);
@@ -2129,13 +2162,25 @@ export default {
         return '';
       };
 
-      // Attempt to read the full JSON body from a (non-streaming) Response.
-      const readResponseJson = async (resp: Response): Promise<Record<string, unknown> | null> => {
+      // Read the full JSON body of a (non-streaming) Response the caller is done
+      // with (§5.7). A panel or judge response is never forwarded to the client,
+      // so this consumes the body through the same bounded receive as every
+      // other response: `resp.clone().json()` would hold a second copy of the
+      // whole body while it parses — an image panel response pays for its base64
+      // payload twice — and would leave the receive's spill unreleased.
+      const readResponseJson = async (resp: Response, stageUrl: string): Promise<Record<string, unknown> | null> => {
+        const ct = resp.headers.get('content-type') || '';
+        if (!ct.includes('application/json') || !resp.body) return null;
         try {
-          const ct = resp.headers.get('content-type') || '';
-          if (!ct.includes('application/json')) return null;
-          return await resp.clone().json() as Record<string, unknown>;
-        } catch { return null; }
+          return await receiveJsonResponse<Record<string, unknown>>(resp, requestId, logger, stageUrl, request.signal);
+        } catch (error) {
+          // A cap breach, a spill failure or a §5.9 refusal is the proxy's own
+          // limit and must not be reported to the client as this panel's answer
+          // (rule #8). A body advertised as JSON but not parseable stays the
+          // "non-JSON response" diagnostic it has always been.
+          if (error instanceof ClaudeProxyError) throw error;
+          return null;
+        }
       };
 
       // Extract text content from a Claude-format or OpenAI-format response payload.
@@ -2192,21 +2237,23 @@ export default {
 
           const timeoutMs = options.panel_timeout_ms;
           const settled = await Promise.allSettled(
-            batchAttempts.map(a =>
-              Promise.race([
-                runAttempt(a),
-                new Promise<never>((_, reject) =>
-                  setTimeout(() => reject(new Error(`panel timeout after ${timeoutMs}ms`)), timeoutMs)
-                ),
-              ])
-            )
+            batchAttempts.map(a => {
+              // Clear the timer whichever way the race settles: a panel call
+              // that answers on time must not leave a 60 s timer holding the
+              // process (and the dashboard's timer heap) open behind it.
+              let timer: ReturnType<typeof setTimeout>;
+              const timeout = new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`panel timeout after ${timeoutMs}ms`)), timeoutMs);
+              });
+              return Promise.race([runAttempt(a), timeout]).finally(() => clearTimeout(timer));
+            })
           );
 
           for (let i = 0; i < batch.length; i++) {
             const result = settled[i];
             const modelName = batch[i].modelName;
             if (result.status === 'fulfilled') {
-              const json = await readResponseJson(result.value);
+              const json = await readResponseJson(result.value, batchAttempts[i].targetUrl);
               if (json) {
                 const text = extractResponseText(json);
                 if (text) {
@@ -2271,7 +2318,7 @@ export default {
 
           try {
             const judgeResp = await runAttempt(judgeAttemptWithDepth);
-            const judgeJson = await readResponseJson(judgeResp);
+            const judgeJson = await readResponseJson(judgeResp, judgeAttemptWithDepth.targetUrl);
             if (judgeJson) {
               const judgeText = extractResponseText(judgeJson);
               // Strip optional markdown code fences
@@ -2280,6 +2327,10 @@ export default {
               logger.info(requestId, `Fusion judge complete for alias ${plan.alias}`);
             }
           } catch (e) {
+            // A cap breach, a spill failure or a §5.9 refusal is the proxy's own
+            // limit, not a judge failure, and must not be degraded into a
+            // successful-looking answer (rule #8).
+            if (e instanceof ClaudeProxyError) throw e;
             logger.warn(requestId, `Fusion judge failed: ${(e as Error).message}`);
             if (options.judge_required) {
               throw new Error(`judge_failed: ${(e as Error).message}`);
@@ -2328,33 +2379,83 @@ export default {
           } as RequestInit),
         };
 
-        const synthResp = await runAttempt(synthAttemptWithDepth);
+        let synthResp = await runAttempt(synthAttemptWithDepth);
 
         // Attach fusion_metadata to non-streaming responses when expose_metadata is true
         if (options.expose_metadata && !bodyObj.stream) {
-          const synthJson = await readResponseJson(synthResp);
-          if (synthJson) {
-            const metadata = {
-              router: 'fusion',
-              fusion_metadata: {
-                alias: plan.alias,
-                panel_models: plan.panel.map(p => p.modelName),
-                judge_model: plan.judge?.modelName ?? null,
-                synth_model: plan.synth.modelName,
-                panel_errors: panelErrors,
-                analysis_present: analysis !== null,
-              },
-            };
-            const enriched = { ...synthJson, ...metadata };
-            // Adding fusion_metadata changes the body size, so the upstream
-            // Content-Length is stale and would truncate the client read.
-            // Drop it and let the runtime recompute it for the new body.
-            const enrichedHeaders = new Headers(synthResp.headers);
-            enrichedHeaders.delete('content-length');
-            return new Response(JSON.stringify(enriched), {
-              status: synthResp.status,
-              headers: enrichedHeaders,
-            });
+          const synthContentType = synthResp.headers.get('content-type') || '';
+          if (synthContentType.includes('application/json') && synthResp.body) {
+            // §5.7: the metadata read must not cost a second copy of the
+            // synthesis body. `resp.clone().json()` holds every remaining byte
+            // while it parses, so an image answer pays for its whole base64
+            // payload twice. The body goes through the same bounded receive as
+            // every other response (spilled past `threshold_bytes`, capped by
+            // `max_response_bytes`) and the client's copy is streamed back out
+            // of that spool.
+            const received = await receiveResponseBody(synthResp.body);
+            // §5.9 byte admission, opt-in via `max_materialized_body_bytes`: the
+            // parse below is the materialization the budget is for. The charge is
+            // the received byte count, never a `Content-Length` guess. A refusal
+            // must leave neither bytes on disk nor a reservation (rule #8).
+            // Response class: this read can run while a non-ref request still
+            // holds its own reservation through the attempt loop, so it must not
+            // queue behind waiting request bodies (see spool-admission.ts).
+            let lease: AdmissionLease;
+            try {
+              lease = await admitResponseMaterialization(received.size, request.signal);
+            } catch (error) {
+              await received.release();
+              throw error;
+            }
+            let synthText: string;
+            try {
+              synthText = await received.readText();
+            } catch (error) {
+              // A spill read failure is the proxy's own fault, not the model's
+              // answer, and must free the spill before it propagates (rule #8).
+              await received.release();
+              throw error;
+            } finally {
+              // The materialized text is all this scope needs, so §5.9's
+              // "release before network streaming" holds, as on the request path.
+              lease.release();
+            }
+            let synthJson: Record<string, unknown> | null = null;
+            try {
+              synthJson = JSON.parse(synthText) as Record<string, unknown>;
+            } catch {
+              // Advertised as JSON but is not: the synthesis answer is forwarded
+              // unchanged and no metadata is attached to it.
+            }
+            if (synthJson) {
+              const metadata = {
+                router: 'fusion',
+                fusion_metadata: {
+                  alias: plan.alias,
+                  panel_models: plan.panel.map(p => p.modelName),
+                  judge_model: plan.judge?.modelName ?? null,
+                  synth_model: plan.synth.modelName,
+                  panel_errors: panelErrors,
+                  analysis_present: analysis !== null,
+                },
+              };
+              const enriched = { ...synthJson, ...metadata };
+              // Adding fusion_metadata changes the body size, so the upstream
+              // Content-Length is stale and would truncate the client read.
+              // Drop it and let the runtime recompute it for the new body.
+              const enrichedHeaders = new Headers(synthResp.headers);
+              enrichedHeaders.delete('content-length');
+              // The client is handed the rebuilt JSON rather than the spool, so
+              // the spill and its reservation are freed here instead of leaked.
+              await received.release();
+              return new Response(JSON.stringify(enriched), {
+                status: synthResp.status,
+                headers: enrichedHeaders,
+              });
+            }
+            // The body was consumed into the spool, so the client's copy is
+            // streamed back out of it.
+            synthResp = new Response(received.readStream(), synthResp);
           }
         }
 
@@ -2374,7 +2475,31 @@ export default {
 
         // request_ingress: apply transforms to the inbound body before any handler sees it.
         if (attemptRoute && attemptRoute.transforms.length > 0) {
-          const bodyText = await attemptRequest.clone().text();
+          // §5.1/§5.7: the attempt body is received through the request-side
+          // spool, not `attemptRequest.clone().text()`. A clone tees the body, so
+          // the branch nobody reads stays resident for as long as the read runs —
+          // a second full copy of a body that may carry an image, which is exactly
+          // what §5.7 rules out. The receive consumes the body in place: this block
+          // rebuilds the request from the transformed body below, so the original
+          // is never read again.
+          //
+          // No declared length is passed — the `Content-Length` on a request the
+          // proxy has already rebuilt describes an earlier body, and §5.1 makes a
+          // declared length a hint only. In practice `max_request_bytes` cannot
+          // fire here (the body was bounded at ingress, and re-serialization adds
+          // a model name), but the read is bounded either way. §5.9 is not charged
+          // again: the request's own ingress lease already covers this
+          // materialization of the same bytes, so a second charge inside that
+          // lifetime would double-count them.
+          const received = await receiveIngressBody(attemptRequest.body);
+          let bodyText: string;
+          try {
+            bodyText = await received.readText();
+          } finally {
+            // Every terminal path: a spill left behind holds `max_total_bytes`
+            // that nothing else can reclaim (rule #8).
+            await received.release();
+          }
           let parsedBody: Record<string, unknown>;
           try { parsedBody = JSON.parse(bodyText); } catch { parsedBody = {}; }
           const hookCtx: HookContext = {
@@ -2409,9 +2534,40 @@ export default {
 
         // Debug log routing info for test model requests (LOG_LEVEL=debug)
         if (path === '/v1/messages' && env.LOG_LEVEL === 'debug') {
+          // §5.1/§5.7: the dump reads the attempt body through the request-side
+          // spool, not through `attemptRequest.clone()`. A clone tees the body,
+          // so the branch the dump never reads stays resident in RAM for as long
+          // as the read runs — a second full copy of a body nothing else bounds
+          // but `max_request_bytes`, and with spooling off that body still holds
+          // the image inline. Consuming it needs the request handed back a stream
+          // over the spill, the same idiom as the ingress receive above, so the
+          // handler below sends exactly the bytes the dump logged.
+          //
+          // No declared length is passed — the request has been re-serialized at
+          // least once, so its `Content-Length` describes an earlier body — and
+          // §5.9 is not charged again: this materialization is of bytes the
+          // request's own ingress lease already covers.
+          let debugBodyText: string;
           try {
-            const clonedBody = attemptRequest.clone();
-            const bodyText = await clonedBody.text();
+            const received = await receiveIngressBody(attemptRequest.body);
+            try {
+              debugBodyText = await received.readText();
+              attemptRequest = new Request(attemptRequest, { body: received.readStream(), duplex: 'half' } as RequestInit);
+            } catch (error) {
+              // The body is gone either way, so nothing downstream can read it:
+              // return the spill rather than hold the budget for a request that
+              // is about to be refused.
+              await received.release();
+              throw error;
+            }
+          } catch (error) {
+            // The failed receive consumed the body, so the request can no longer
+            // be forwarded: the refusal is the client's answer, not a footnote
+            // in the dump (rule #8).
+            logger.warn(requestId, `Request body not available for the debug log: ${(error as Error).message}`);
+            return createErrorResponse(error as Error, requestId);
+          }
+          try {
             const { writeFileSync } = await import('fs');
             writeFileSync(join(tmpdir(), 'test_model.log'),
               `[${new Date().toISOString()}] proxy routing\n` +
@@ -2421,13 +2577,18 @@ export default {
               `modelId: ${attemptModelId}\n` +
               `handlerType: ${attemptHandlerType}\n` +
               `authHeaders: ${JSON.stringify(Object.keys(attemptAuthHeaders))}\n` +
-              `request body:\n${JSON.stringify(JSON.parse(bodyText), null, 2)}\n`,
+              `request body:\n${JSON.stringify(JSON.parse(debugBodyText), null, 2)}\n`,
             );
           } catch (_e) {
+            // The dump is best-effort: a body that will not parse writes the
+            // failure instead of the record, and a failure to write *that* is
+            // reported rather than dropped (rule #8).
             try {
               const { writeFileSync } = await import('fs');
               writeFileSync(join(tmpdir(), 'test_model.log'), `[${new Date().toISOString()}] proxy routing - failed to log request body: ${(_e as Error).message}\n`);
-            } catch {}
+            } catch (writeError) {
+              logger.debug(requestId, `Debug log unavailable: ${(writeError as Error).message}`);
+            }
           }
         }
 
@@ -2608,10 +2769,13 @@ export default {
               // the parse below is the materialization the budget is for. The
               // charge is the received byte count, never a `Content-Length`
               // guess. A refusal must leave neither bytes on disk nor a
-              // reservation (rule #8).
+              // reservation (rule #8). Response class: this read can run while
+              // a non-ref request still holds its own reservation through the
+              // attempt loop, so it must not queue behind waiting request
+              // bodies — that is hold-and-wait (see spool-admission.ts).
               let lease: AdmissionLease;
               try {
-                lease = await admitMaterialization(received.size, request.signal);
+                lease = await admitResponseMaterialization(received.size, request.signal);
               } catch (error) {
                 await received.release();
                 throw error;
@@ -2697,15 +2861,45 @@ export default {
           if (modelUsageRecordUrl) {
             let errorBody: unknown;
             if (modelUsageRecordBody) {
-              try {
-                const ct = response.headers.get('content-type') || '';
-                if (ct.includes('application/json')) {
-                  errorBody = await response.clone().json();
-                } else {
-                  errorBody = await response.clone().text();
+              const ct = response.headers.get('content-type') || '';
+              const isJson = ct.includes('application/json');
+              if (getSpoolConfig().enabled && response.body) {
+                // §5.7: same bounded receive as the success-side stats read
+                // above — an error body can be large too, and `clone()` would
+                // hold a second copy of it while it is parsed. The client still
+                // has to receive this error, so the spill goes back under the
+                // response instead of being released here; the error status and
+                // headers are carried over unchanged.
+                const received = await receiveResponseBody(response.body);
+                let lease: AdmissionLease;
+                try {
+                  lease = await admitResponseMaterialization(received.size, request.signal);
+                } catch (error) {
+                  await received.release();
+                  throw error;
                 }
-              } catch {
-                errorBody = undefined;
+                let text: string;
+                try {
+                  text = await received.readText();
+                } catch (error) {
+                  await received.release();
+                  throw error;
+                } finally {
+                  lease.release();
+                }
+                try {
+                  errorBody = isJson ? JSON.parse(text) : text;
+                } catch {
+                  // Advertised as JSON but is not: recorded without a body, as
+                  // the clone-and-parse did before. The client's copy is intact.
+                }
+                response = new Response(received.readStream(), response);
+              } else {
+                try {
+                  errorBody = isJson ? await response.clone().json() : await response.clone().text();
+                } catch {
+                  errorBody = undefined;
+                }
               }
             }
             const zeroUsage = {
@@ -2753,12 +2947,15 @@ export default {
             streaming: writeoutContentType.includes('text/event-stream'),
             logger,
             status: response.status,
+            signal: request.signal,
           };
 
           // Body ops: buffered JSON rewrite (mirrors applyAfterUpstream shape).
           // Note: stats extraction above already read the body. With the spool on
           // it re-wrapped that read as `response` (§5.7), so what this consumes is
-          // that body, not a second read of the upstream stream.
+          // that body, not a second read of the upstream stream — and that consume
+          // is bounded by the same receive, so `max_response_bytes` bounds this
+          // read too.
           // For streams: skip buffered JSON rewrite (would break streaming) and
           // let pipeEventTransformer handle per-event rewriting below.
           if (!writeoutCtx.streaming) {
@@ -2822,6 +3019,22 @@ export default {
         const baseOtac = modelUsageOneTimeAuthCode;
         let lastOutcome: AttemptOutcome | undefined;
 
+        /**
+         * Drop a response the ladder will not hand to the client. Its body may be
+         * a §5.7 spill, and an unread spill keeps its disk reservation (and file)
+         * until the startup sweep — a process-wide budget the rest of the run
+         * pays for. Cancelling the stream is what releases it, so the drop is
+         * explicit rather than an abandonment.
+         */
+        const discardOutcome = async (outcome: AttemptOutcome | undefined): Promise<void> => {
+          if (!outcome?.response?.body) return;
+          try {
+            await outcome.response.body.cancel();
+          } catch (error) {
+            logger.warn(requestId, `Target ladder: could not release a discarded response body: ${(error as Error).message}`);
+          }
+        };
+
         for (let i = 0; i < entries.length; i++) {
           const entry = entries[i];
           // A rung's own `retry` overrides the `[remote]` default for this rung only.
@@ -2852,6 +3065,7 @@ export default {
 
             if (n >= maxTargetRetries || !entry.retry_on?.includes(outcome.status)) break;
 
+            await discardOutcome(outcome); // re-hitting the same rung
             const retryAfterMs = parseRetryAfterMs(outcome.response);
             const backoffMs = Math.min(250 * 2 ** n, 2000);
             const waitMs = retryAfterMs !== undefined ? Math.min(retryAfterMs, 2000) : backoffMs;
@@ -2864,6 +3078,7 @@ export default {
           if (!outcome || !isRetryableOutcome(outcome)) break;
           if (i < entries.length - 1) {
             logger.warn(requestId, `Target ladder: ${entry.target}@${entry.base} returned ${outcome.status}; trying next target ${entries[i + 1].target}`);
+            await discardOutcome(outcome); // this rung is superseded, not surfaced
           }
         }
 
@@ -2880,7 +3095,7 @@ export default {
       if (useAuthLadder) {
         const ladderResponse = await runTargetLadder(authTargets, routeBody as Record<string, unknown>);
         recordRequestTiming(path, Date.now() - requestStartTime);
-        return applyCorsHeaders(await restorePrivacyResponse(ladderResponse, piiMapping, requestId, logger), request, env);
+        return applyCorsHeaders(await restorePrivacyResponse(ladderResponse, piiMapping, requestId, logger, request.signal), request, env);
       }
 
       // ---- Fusion dispatch ----
@@ -2889,7 +3104,7 @@ export default {
       if (_fusionPlan && _fusionBody) {
         const fusionResp = await runFusion(_fusionPlan, _fusionBody);
         recordRequestTiming(path, Date.now() - requestStartTime);
-        return applyCorsHeaders(await restorePrivacyResponse(fusionResp, piiMapping, requestId, logger), request, env);
+        return applyCorsHeaders(await restorePrivacyResponse(fusionResp, piiMapping, requestId, logger, request.signal), request, env);
       }
 
       if (compositeAttempts && compositeAttempts.length > 0) {
@@ -2917,7 +3132,7 @@ export default {
               }
             }
             recordRequestTiming(path, Date.now() - requestStartTime);
-            return applyCorsHeaders(await restorePrivacyResponse(response, piiMapping, requestId, logger), attempt.request, env);
+            return applyCorsHeaders(await restorePrivacyResponse(response, piiMapping, requestId, logger, attempt.request.signal), attempt.request, env);
           } catch (error) {
             lastError = error;
             // Transport errors (DNS / refused / TLS / abort) arrive as plain
@@ -2969,7 +3184,7 @@ export default {
 
       // Apply CORS headers
       recordRequestTiming(path, Date.now() - requestStartTime);
-      return applyCorsHeaders(await restorePrivacyResponse(response, piiMapping, requestId, logger), request, env);
+      return applyCorsHeaders(await restorePrivacyResponse(response, piiMapping, requestId, logger, request.signal), request, env);
 
     } catch (error) {
       // Handle errors without exposing sensitive info. The envelope shape

@@ -23,6 +23,13 @@
  * pins that the budget is taken around the **trace** read, which is the only read
  * this branch does: with tracing off there is nothing to admit, so a budget one
  * byte short of the charge must still serve the response.
+ *
+ * The same file reads an upstream *error* body whole on the `!response.ok` branch
+ * (`:184`), behind a bare `catch {}` that replaced any failure with
+ * `'(failed to read response body)'`. That read now goes through
+ * `withResponseText` and the catch keeps only a `TypeError`, so the placeholder is
+ * still there for the case it was written for while a cap breach or a refusal
+ * surfaces as itself rather than as the upstream's 429.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
@@ -34,6 +41,7 @@ import { join } from 'node:path';
 
 import { handleClaudeRequest } from '../../src/handlers/claude.js';
 import { SpoolResponseTooLargeError } from '../../src/utils/spool-response.js';
+import { UpstreamApiError } from '../../src/utils/errors.js';
 import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
 import { SPOOL_DEFAULTS, responseSpillDir, setSpoolConfig, type SpoolConfig } from '../../src/utils/spool.js';
 import { AdmissionOverBudgetError, getAdmittedBytes } from '../../src/utils/spool-admission.js';
@@ -143,17 +151,35 @@ interface Sourced {
 }
 
 /** An upstream body we can watch being cancelled when the proxy gives up on it. */
-function source(chunks: Uint8Array[]): Sourced {
+function source(chunks: Uint8Array[], onPull?: (index: number) => void): Sourced {
   let index = 0;
   const state: Sourced = { cancelled: false, stream: null as unknown as ReadableStream<Uint8Array> };
   state.stream = new ReadableStream<Uint8Array>(
     {
       pull(controller) {
+        onPull?.(index);
         if (index >= chunks.length) {
           controller.close();
           return;
         }
         controller.enqueue(chunks[index++]);
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return state;
+}
+
+/** A body that fails partway through, the one case the placeholder was ever for. */
+function failingSource(error: Error): Sourced {
+  const state: Sourced = { cancelled: false, stream: null as unknown as ReadableStream<Uint8Array> };
+  state.stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        controller.error(error);
       },
       cancel() {
         state.cancelled = true;
@@ -468,5 +494,171 @@ describe('claude.ts native /v1/messages non-SSE response, byte admission (§5.9)
     const forwarded = new Uint8Array(await response.arrayBuffer());
     assert.equal(sha256(forwarded), sha256(upstreamBytes));
     assert.deepEqual(spillFiles(config), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.7: the upstream *error* body
+// ---------------------------------------------------------------------------
+
+/**
+ * The `!response.ok` branch on this handler read the upstream's error body with
+ * `response.text()` behind a bare `catch {}` that replaced *any* failure with
+ * `'(failed to read response body)'`. That catch now keeps only a `TypeError` —
+ * the unreadable-body case the placeholder was written for — so a
+ * `max_response_bytes` breach, a spill write failure or a §5.9 refusal surfaces
+ * as itself instead of being reported to the client as the upstream's error
+ * (rule #8). The upstream's own status, type, message and raw body still reach
+ * the client unchanged, because `handleTargetApiError` is fed the same text.
+ */
+
+function errorPayload(marker: string): string {
+  return JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `upstream said ${marker}` } }, null, 2);
+}
+
+function errorResponse(body: ReadableStream<Uint8Array> | string): Response {
+  return new Response(body, { status: 429, headers: { 'Content-Type': 'application/json' } });
+}
+
+/** Run `run`, require that it failed, and hand back the error. */
+async function thrownBy(run: () => Promise<unknown>): Promise<Error> {
+  let caught: unknown;
+  try {
+    await run();
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof Error, `expected an Error, got ${String(caught)}`);
+  return caught;
+}
+
+function twoChunks(payload: string): Uint8Array[] {
+  const bytes = new TextEncoder().encode(payload);
+  const half = Math.floor(bytes.byteLength / 2);
+  return [bytes.subarray(0, half), bytes.subarray(half)];
+}
+
+/**
+ * Fixed-size slices of an encoded body. A body that first crosses
+ * `threshold_bytes` (so a spill really is created) and only then breaches
+ * `max_response_bytes` needs more than two chunks to arrange.
+ */
+function slices(payload: string, size: number): Uint8Array[] {
+  const bytes = new TextEncoder().encode(payload);
+  const out: Uint8Array[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += size) {
+    out.push(bytes.subarray(offset, offset + size));
+  }
+  return out;
+}
+
+describe('claude.ts native /v1/messages upstream error body (§5.7)', () => {
+  it('receives the error body through the spill and carries it verbatim', async () => {
+    const payload = errorPayload('x'.repeat(400));
+
+    // Baseline: spooling off, which is the `response.text()` behaviour this
+    // replaces — the same request must still fail the same way.
+    setSpoolConfig(SPOOL_DEFAULTS);
+    const baselineCalls = stubUpstream(() => errorResponse(payload));
+    const baseline = await thrownBy(() => callHandler());
+    assert.ok(baseline instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(baseline)}`);
+    assert.equal(baseline.status, 429);
+    assert.equal(baseline.type, 'rate_limit_error', 'the type the client switches on');
+    assert.equal(baseline.upstreamBody, payload);
+
+    const chunks = twoChunks(payload);
+
+    // Captured after the baseline run, because every `configureSpool` call makes
+    // a fresh directory: this is the config whose `responses/` the spill lands in.
+    const config = configureSpool();
+    assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the first chunk must cross the threshold');
+
+    const seen: Array<{ files: number; bytes: number }> = [];
+    const src = source(chunks, (index) => {
+      seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+    });
+    const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+    const { result: spooled, clones } = await countClones(() => thrownBy(() => callHandler()));
+
+    // The spill is the live body while it is received — and this path releases
+    // it before it throws, so the end state alone could not tell it apart.
+    assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the received prefix must be on disk, charged');
+    assert.ok(spooled instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(spooled)}`);
+    assert.equal(spooled.status, baseline.status);
+    assert.equal(spooled.type, baseline.type);
+    assert.equal(spooled.message, baseline.message, 'the client-facing message must be the upstream one, unchanged');
+    assert.equal(spooled.upstreamBody, payload, 'the raw body must reach the error whole');
+    assert.equal(calls(), 1);
+    assert.equal(baselineCalls.calls(), 1);
+    assert.deepEqual(spillFiles(config), [], 'the spill must be released even though this path ends in a throw');
+    assert.equal(getLiveSpillBytes(), 0);
+    assert.equal(clones, 0, 'no `response.clone()` for an error body either');
+  });
+
+  it('fails loudly past max_response_bytes instead of reporting the placeholder', async () => {
+    const config = configureSpool({ maxResponseBytes: 256 });
+    // 160-byte slices: the first crosses `threshold_bytes` (64) but not the cap,
+    // so a spill file really exists when the second slice breaches it — the
+    // state the failure path has to clean up.
+    const chunks = slices(errorPayload('y'.repeat(400)), 160);
+    assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+    assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+    const seen: Array<{ files: number; bytes: number }> = [];
+    const src = source(chunks, (index) => {
+      seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+    });
+    const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+    const caught = await thrownBy(() => callHandler());
+
+    assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'a spill must have been live when the cap was breached');
+    // The bare `catch {}` this replaces would have turned this into the upstream's
+    // 429 with the placeholder body; the proxy's own limit must surface as itself.
+    assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+    assert.equal(caught.status, 500, 'the client sent a legal request: not a 4xx');
+    assert.equal(caught.type, 'processing_error');
+    assert.match(caught.message, /too large/);
+    assert.equal(calls(), 1);
+    assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+    assert.deepEqual(spillFiles(config), [], 'a rejected response removes its partial spill');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('surfaces a §5.9 refusal instead of the upstream error, and holds no lease', async () => {
+    const payload = errorPayload('z'.repeat(400));
+    const bodyBytes = new TextEncoder().encode(payload).byteLength;
+    // 160-byte slices: the first crosses the threshold, so the refusal has a
+    // spill to clean up rather than refusing an in-memory body.
+    const chunks = slices(payload, 160);
+    const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
+    assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the body must be spilling when it is admitted');
+    stubUpstream(() => errorResponse(payload));
+
+    const caught = await thrownBy(() => callHandler());
+
+    assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+    assert.equal(caught.status, 503);
+    assert.equal(caught.type, 'over_limit_error', 'the type the client switches on');
+    assert.match(caught.message, /exceed max_materialized_body_bytes/);
+    assert.deepEqual(spillFiles(config), [], 'a refused error body must not leave its bytes on disk');
+    assert.equal(getLiveSpillBytes(), 0, 'nor hold them against max_total_bytes');
+    assert.equal(getAdmittedBytes(), 0);
+  });
+
+  it('still substitutes the placeholder when the body itself cannot be read', async () => {
+    const config = configureSpool({ thresholdBytes: 4096 });
+    // A `TypeError` is what an unreadable body throws; the narrowing exists so
+    // that only that case keeps the placeholder, and this pins that it still does.
+    stubUpstream(() => errorResponse(failingSource(new TypeError('terminated')).stream));
+
+    const caught = await thrownBy(() => callHandler());
+
+    assert.ok(caught instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(caught)}`);
+    assert.equal(caught.status, 429);
+    assert.equal(caught.upstreamBody, '(failed to read response body)');
+    assert.deepEqual(spillFiles(config), []);
+    assert.equal(getLiveSpillBytes(), 0);
   });
 });

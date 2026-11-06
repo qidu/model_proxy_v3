@@ -960,14 +960,22 @@ export function hasHookOps(hook: HookPoint, transforms: TransformSet[] | undefin
  *
  * - Fast-path: when no transforms declare `response_egress` ops, returns the
  *   original Response unchanged (no buffering).
- * - Buffered JSON: buffers the body, applies ops, returns a new Response with
- *   the rewritten JSON body (status/headers preserved).
+ * - Buffered JSON: receives the body through the §5.7 receive, applies ops, and
+ *   returns a new Response with the rewritten JSON body (status/headers
+ *   preserved).
  * - Non-JSON bodies (including SSE streams): passed through unchanged.
  *
  * Streaming transform support lives in `pipeEventTransformer` — call sites that
  * want per-event SSE rewriting for the writeout hook wrap their stream with it.
  *
- * Mirror of `applyAfterUpstream` but on the client-schema response.
+ * Mirror of `applyAfterUpstream` but on the client-schema response, including its
+ * receive: the buffered read is {@link withResponseText}, so a body past
+ * `threshold_bytes` lives on disk while it is transformed, `max_response_bytes`
+ * bounds it (not gated on `[spool] enabled`), and the parse charges the §5.9
+ * budget. As on the sibling hook, this is usually a *second* receive of a body the
+ * caller already spooled, so above the threshold it costs a second spill rather
+ * than saving RAM — what it buys is the bound, the charge and a trace stage on
+ * this read too.
  */
 export async function applyWriteoutBody(
   response: Response,
@@ -978,35 +986,44 @@ export async function applyWriteoutBody(
   const contentType = response.headers.get('content-type') || '';
   if (!contentType.includes('application/json')) return response;
 
-  // Buffer body and parse JSON.
-  const text = await response.text();
-  let body: Record<string, unknown>;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return new Response(text, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: sanitizeUpstreamResponseHeaders(response),
-    });
-  }
+  // Consume the received text. The body is still the pre-`restorePrivacyResponse`
+  // one (that runs after the attempt loop), so what a trace stage echoes here is
+  // sentinel-bearing text, never the caller's own PII.
+  return await withResponseText<Response>(
+    response,
+    ctx.requestId,
+    ctx.logger,
+    response.url || '(client egress)',
+    (text) => {
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        // Not JSON — hand the bytes back unchanged.
+        return new Response(text, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: sanitizeUpstreamResponseHeaders(response),
+        });
+      }
 
-  // Apply ops.
-  const hookCtx: HookContext = { ...ctx, status: response.status };
-  let headers: Record<string, string> = {};
-  for (const set of ctx.route.transforms!) {
-    const slot = set['response_egress'];
-    if (!slot) continue;
-    ({ body, headers } = applyTransformSet(set, 'response_egress', body, headers, { logger: ctx.logger, requestId: ctx.requestId, clientModel: ctx.clientModel }));
-    void headers; // header ops on response_egress run in index.ts central wrap
-  }
-  void hookCtx;
+      // Apply ops.
+      let headers: Record<string, string> = {};
+      for (const set of ctx.route.transforms!) {
+        const slot = set['response_egress'];
+        if (!slot) continue;
+        ({ body, headers } = applyTransformSet(set, 'response_egress', body, headers, { logger: ctx.logger, requestId: ctx.requestId, clientModel: ctx.clientModel }));
+        void headers; // header ops on response_egress run in index.ts central wrap
+      }
 
-  return new Response(JSON.stringify(body), {
-    status: response.status,
-    statusText: response.statusText,
-    headers: sanitizeUpstreamResponseHeaders(response),
-  });
+      return new Response(JSON.stringify(body), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: sanitizeUpstreamResponseHeaders(response),
+      });
+    },
+    ctx.signal,
+  );
 }
 
 /**

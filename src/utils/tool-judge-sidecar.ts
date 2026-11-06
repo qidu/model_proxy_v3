@@ -3,6 +3,10 @@
  * Calls a local sidecar to judge tool relevance against user prompt.
  * Fails OPEN — any error/timeout keeps all tools.
  *
+ * The answer is read through the §5.7 receive (`readJudgeAnswer`), so a large or
+ * hostile body cannot outgrow `max_response_bytes`, and a proxy limit on that read
+ * is reported as a proxy limit rather than as the sidecar failing.
+ *
  * Wire format is docs/architecture/design_tool_judge_sidecar_protocol.md:
  *   §2.2/§2.3 request  — { state, questions: { <question_id>: <question> } }
  *   §2.4/§2.5 response — { <question_id>: <answer> }  (a top-level map)
@@ -11,7 +15,9 @@
  */
 
 import type { ProxyConfig } from './config-loader.js';
+import { ClaudeProxyError } from './errors.js';
 import { createLogger } from './logger.js';
+import { consumeResponseText } from './spool-response.js';
 import { extractToolRecords, type ToolRecord } from './tool-shapes.js';
 
 const logger = createLogger({});
@@ -557,6 +563,43 @@ export function requestTimeoutMs(config: JudgeSidecarConfig, questionCount: numb
 }
 
 /**
+ * Read a judge answer through the §5.7 receive and return its text, or null when
+ * the read failed — `callJudgeSidecar` and `callDecisionApi` both fail open on
+ * null, exactly as they do for a broken sidecar.
+ *
+ * The receive is {@link consumeResponseText}, the no-trace variant: this answer is
+ * derived from the tools and the user's prompt, and both callers already log the
+ * body at their own level, so a second `upstream-response` echo would only widen
+ * the exposure. What the receive buys is the bound — `max_response_bytes` caps the
+ * answer and a spill holds it above `threshold_bytes` — and the §5.9 budget for
+ * the parse that follows.
+ *
+ * A cap breach, a spill failure or a §5.9 refusal is the proxy's own limit, not
+ * the sidecar misbehaving, and is logged as such: the old single `catch` reported
+ * it as `Tool judge … error: …` and sent a health check after a healthy sidecar
+ * (rule #8). The failure is reported, never swallowed — the caller still fails
+ * open, and `judgeTools` still accounts for those tools as unjudged.
+ */
+async function readJudgeAnswer(
+  response: Response,
+  requestId: string,
+  label: string,
+): Promise<string | null> {
+  try {
+    return await consumeResponseText(response.body, (text) => text);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn(
+      requestId,
+      error instanceof ClaudeProxyError
+        ? `${label} answer over a proxy limit: ${message}`
+        : `${label} answer read failed: ${message}`,
+    );
+    return null;
+  }
+}
+
+/**
  * Call the judge sidecar with the given request. Returns null on any failure
  * (timeout, non-2xx, malformed body) so the caller can fail open.
  */
@@ -599,7 +642,8 @@ export async function callJudgeSidecar(
       return null;
     }
 
-    const text = await resp.text();
+    const text = await readJudgeAnswer(resp, requestId, 'Tool judge sidecar');
+    if (text === null) return null;
     logger.debug(
       requestId,
       `Tool judge sidecar raw response (${resp.status}, ${questionCount} question(s)): ${truncate(text, 4000)}`,
@@ -688,7 +732,8 @@ export async function callDecisionApi(
       return null;
     }
 
-    const text = await resp.text();
+    const text = await readJudgeAnswer(resp, requestId, 'Tool judge decision API');
+    if (text === null) return null;
     logger.trace(requestId, `Tool judge decision API response (full): ${text}`);
     logger.debug(
       requestId,

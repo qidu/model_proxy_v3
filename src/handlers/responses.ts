@@ -24,8 +24,8 @@ import { completionsToClaudeBody } from './openai.js';
 import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
 import { collectBlobRefs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
-import { receiveResponseBody, receiveJsonResponse } from '../utils/spool-response.js';
-import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { receiveResponseBody, receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
+import { admitResponseMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
 import { getSpoolConfig } from '../utils/spool.js';
 
 /**
@@ -704,7 +704,7 @@ async function handleAsAnthropicMessages(
   recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
   if (!response.ok) {
-    const upstreamBody = await response.text();
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, (text) => text, request.signal);
     logger.error(requestId, `Responses->anthropic-messages error: ${response.status}, URL: ${targetUrl}`);
     handleResponsesApiError(response, 'Responses API (via anthropic-messages)', { url: targetUrl, upstreamBody });
   }
@@ -774,7 +774,7 @@ async function handleAsGemini(
   if (!claudeResponse.ok) {
     // The Gemini handler produced an Anthropic-shaped error; re-throw it in the
     // Responses envelope so /v1/responses clients get the spec's shape.
-    const upstreamErrorBody = await claudeResponse.text();
+    const upstreamErrorBody = await withResponseText(claudeResponse, requestId, logger, targetUrl, (text) => text, request.signal);
     handleResponsesApiError(claudeResponse, 'Responses API (via gemini)', { url: targetUrl, upstreamBody: upstreamErrorBody });
   }
 
@@ -977,7 +977,7 @@ async function handleAsCompletions(
 
   if (!response.ok) {
     const bodyPreview = JSON.stringify(completionsRequest);
-    const upstreamErrorBody = await response.text();
+    const upstreamErrorBody = await withResponseText(response, requestId, logger, targetUrl, (text) => text, request.signal);
     logger.debug(requestId, `Responses->Completions API error code: ${response.status}, URL: ${targetUrl}`);
     handleResponsesApiError(response, 'Responses API (via Completions)', { url: targetUrl, status: response.status, body: bodyPreview, upstreamBody: upstreamErrorBody });
   }
@@ -1682,7 +1682,7 @@ export async function handleResponsesInputTokensRequest(
     recordUpstreamRateLimit(model, (name) => response.headers.get(name), targetUrl);
 
     if (!response.ok) {
-      const upstreamErrorBody = await response.text();
+      const upstreamErrorBody = await withResponseText(response, requestId, activeLogger, targetUrl, (text) => text, request.signal);
       activeLogger.error(requestId, `Responses input_tokens error: ${response.status}, URL: ${targetUrl}`);
       handleResponsesApiError(response, 'Responses input_tokens (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
     }
@@ -1731,7 +1731,7 @@ export async function handleResponsesInputTokensRequest(
   recordUpstreamRateLimit(model, (name) => passthroughInputTokensResponse.headers.get(name), targetUrl);
 
   if (!passthroughInputTokensResponse.ok) {
-    const upstreamErrorBody = await passthroughInputTokensResponse.text();
+    const upstreamErrorBody = await withResponseText(passthroughInputTokensResponse, requestId, activeLogger, targetUrl, (text) => text, request.signal);
     activeLogger.error(requestId, `Responses input_tokens passthrough error: ${passthroughInputTokensResponse.status}, URL: ${targetUrl}`);
     handleResponsesApiError(passthroughInputTokensResponse, 'Responses input_tokens', { url: targetUrl, upstreamBody: upstreamErrorBody });
   }
@@ -1756,7 +1756,7 @@ export async function handleResponsesInputTokensRequest(
     // leaves neither spill bytes nor a reservation behind (#8).
     let lease: AdmissionLease;
     try {
-      lease = await admitMaterialization(received.size, request.signal);
+      lease = await admitResponseMaterialization(received.size, request.signal);
     } catch (error) {
       await received.release();
       throw error;
@@ -1837,7 +1837,7 @@ export async function handleResponsesCompactRequest(
     recordUpstreamRateLimit(model, (name) => compactCompletionsResponse.headers.get(name), targetUrl);
 
     if (!compactCompletionsResponse.ok) {
-      const upstreamErrorBody = await compactCompletionsResponse.text();
+      const upstreamErrorBody = await withResponseText(compactCompletionsResponse, requestId, activeLogger, targetUrl, (text) => text, request.signal);
       activeLogger.error(requestId, `Responses compact error: ${compactCompletionsResponse.status}, URL: ${targetUrl}`);
       handleResponsesApiError(compactCompletionsResponse, 'Responses compact (via Completions)', { url: targetUrl, upstreamBody: upstreamErrorBody });
     }
@@ -1886,7 +1886,7 @@ export async function handleResponsesCompactRequest(
   recordUpstreamRateLimit(model, (name) => compactPassthroughResponse.headers.get(name), targetUrl);
 
   if (!compactPassthroughResponse.ok) {
-    const upstreamErrorBody = await compactPassthroughResponse.text();
+    const upstreamErrorBody = await withResponseText(compactPassthroughResponse, requestId, activeLogger, targetUrl, (text) => text, request.signal);
     activeLogger.error(requestId, `Responses compact passthrough error: ${compactPassthroughResponse.status}, URL: ${targetUrl}`);
     handleResponsesApiError(compactPassthroughResponse, 'Responses compact', { url: targetUrl, upstreamBody: upstreamErrorBody });
   }
@@ -1902,7 +1902,7 @@ export async function handleResponsesCompactRequest(
   if (activeLogger.traceEnabled) {
     let lease: AdmissionLease;
     try {
-      lease = await admitMaterialization(received.size, request.signal);
+      lease = await admitResponseMaterialization(received.size, request.signal);
     } catch (error) {
       await received.release();
       throw error;
@@ -1986,7 +1986,7 @@ async function handleAsPassthrough(
 
   if (!response.ok) {
     const bodyPreview = JSON.stringify(requestBody);
-    const upstreamErrorBody = await response.text();
+    const upstreamErrorBody = await withResponseText(response, requestId, logger, targetUrl, (text) => text, request.signal);
     logger.debug(requestId, `Responses API error code: ${response.status} from URL: ${targetUrl}`);
     handleResponsesApiError(response, 'Responses API', { url: targetUrl, status: response.status, body: bodyPreview, upstreamBody: upstreamErrorBody });
   }
@@ -2038,7 +2038,7 @@ async function handleAsPassthrough(
     // neither the received bytes on disk nor a reservation on the ledger (#8).
     let lease: AdmissionLease;
     try {
-      lease = await admitMaterialization(received.size, request.signal);
+      lease = await admitResponseMaterialization(received.size, request.signal);
     } catch (error) {
       await received.release();
       throw error;

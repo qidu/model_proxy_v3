@@ -5,6 +5,906 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(spool): §5.7 — the tool judge sidecar's answer is read bounded (the last unbounded request-path read in `src/`)
+
+`callJudgeSidecar` (`/judge`) and `callDecisionApi` (`/decision`) in
+`src/utils/tool-judge-sidecar.ts` both read their answer with `await resp.text()`. That was the last
+unbounded request-path body read in `src/`, and it is not a small body: the answer is derived from the
+tool descriptions and the user's prompt, so it grows with what the client sent. Both now go through one
+helper, `readJudgeAnswer`, which receives with `consumeResponseText` — `max_response_bytes` caps the
+answer, a spill holds it above `threshold_bytes`, and the `JSON.parse` that follows is the
+materialization §5.9 charges. The no-trace variant is deliberate: both callers already log the body at
+their own level, so a second `upstream-response` echo would only widen the exposure.
+
+The failure split is the other half. The read sat inside the same `try` as the parse, so a cap breach,
+a spill failure or a §5.9 refusal came out as `Tool judge … error: …` — indistinguishable from a broken
+sidecar, sending a health check after a healthy one. A `ClaudeProxyError` from the receive is now logged
+as `<label> answer over a proxy limit: …` and everything else as `<label> answer read failed: …`. Both
+still fail open, as this module documents: the answer is discarded, `judgeTools` accounts every tool as
+unjudged, and no tool is erased from a read that could not finish.
+
+Verified: `tests/unit/tool-judge-response-spool.test.ts`, seven tests. A healthy answer still judges
+identically from a body that lived on disk mid-receive and was pulled exactly `chunks + 1` times; the
+decision API reads the same way; a cap breach and a §5.9 refusal both fail open with the answer body
+cancelled on a breach, nothing left on disk, both ledgers back at 0, `judgedNames` empty and
+`unjudgedNames` complete; the cap applies with `enabled = false`; and an answer body that errors
+mid-stream is still "no answer" rather than a partial one. Mutation check: reverting the helper to
+`resp.text()` fails five of the seven.
+
+**Stated weakness:** the log line that separates a proxy limit from a sidecar fault is not pinned by an
+assertion. This module builds its logger at import time (`createLogger` snapshots `LOG_LEVEL` then) and
+`tests/setup/silent-logs.ts` silences it before any import, so the message cannot be observed from a
+unit test; what the suite pins is the observable contract — a failed read never yields a partial or an
+erased answer. Removing the `instanceof ClaudeProxyError` branch fails no test.
+
+Full suite 2634/2634 (535 suites), typecheck and build clean. `terminal-notifier` is not on `PATH` in
+this environment, so rule #9's notification cannot be sent for this increment.
+
+### test(spool): §12 — a paused client bounds the upstream read, measured at the Node adapter
+
+Plan §12 asks for "paused-client tests [that] prove bounded response queues and upstream read
+backpressure across logging, keep-alive, converters, and the Node adapter". The implementation was
+already in place (§5.7's `pipeline()` in `src/server.ts`, the pull-driven `wrapSseStreamWithKeepAlive`,
+the one-event-per-pull ref serializer, the bounded response receive); nothing measured it. Four tests in
+`tests/unit/server.test.ts` now do, and each pins a count rather than a mechanism:
+
+- **A destination that accepts nothing** — a `Writable` whose `_write` never calls back, driven straight
+  through `createNodeRequestHandler`: of 1024 offered 64 KiB chunks (64 MiB) the upstream is asked for
+  **3** on macOS. The old shape, which wrote into a PassThrough and ignored the `false` it returned,
+  reads all 1024.
+- **A real stalled socket** — `http.request`, then `res.pause()`, against a 64 MiB body: **15** chunks
+  read, 192 KiB of 960 KiB at the client, `cancelled === false` (a pause, not a teardown). After
+  `resume()` every byte arrives byte-identical, from exactly 1025 reads — one per chunk plus the read
+  that ends the stream.
+- **The SSE path** — the same body behind `wrapSseStreamWithKeepAlive` at a 60 s ping interval: **22**
+  chunks while stalled, then the same byte-exact delivery and 1025 total. Mutating the SSE branch back to
+  `await response.arrayBuffer()` reads **1025 of 1024** at the stall point: the whole body buffered
+  before the client saw a byte.
+- **A spooled response** — the parse/logging shape (`receiveResponseBody` then a `Response` around the
+  spill's `readStream()`): the bounded receive reads the body once (257 reads for 256 chunks) and then
+  the stalled client's unread copy sits **on disk** — 16 MiB accounted as a live spill, one file in
+  `responses/` at the full size — until the client reads it, after which both the reservation and the
+  file are gone.
+
+Two measurements worth keeping: the adapter reads only ~1 MiB ahead of a stalled client (the
+`Readable.fromWeb` buffers plus a 192 KiB loopback socket window), and a body must exceed the socket
+buffers for a stall to exist at all — a 512 KiB response was fully absorbed before the first assertion,
+which is why the spool test uses 16 MiB rather than "bigger than the threshold".
+
+Verified: full suite 2638/2638 (536 suites), typecheck and build clean. Mutation checks: buffering the
+non-SSE branch fails three of the four (the sink, the socket, and the spooled response — the last because
+the whole spill is read into RAM before the client is answered); buffering the SSE branch fails the SSE
+test only, and hangs the pre-existing client-disconnect test, since an un-cancelled upstream body means
+the handler never settles; forcing `threshold_bytes` to infinity fails the spooled test with `0 !==
+16777216`. **Stated limit:** these bound the queues the proxy builds, not resident bytes — a chunk count
+is not a heap high-water mark. That half of §12 (the heap/allocation profile) stays open.
+`terminal-notifier` is not on `PATH` in this environment, so rule #9's notification cannot be sent.
+
+### fix(fusion): clear the panel-timeout timer when the panel answers in time
+
+Every fusion panel attempt raced `runAttempt` against a `setTimeout(panel_timeout_ms)` that was
+never cleared when the attempt won, so each panel call left a ref'd 60-second timer behind. In a
+running proxy that is one stale timer per panel call per fusion request, piling up for a minute
+each; in tests it held each fusion test process open for 60 s after the suite's real work
+(~0.2 s) was done. The timer is now cleared in `finally` whichever way the race settles.
+
+Verified: `fusion-response-spool.test.ts` process exits in 0.23 s (was 60 s); full suite
+2,627/2,627, typecheck clean.
+
+### feat(spool): §5.7 — the kompress sidecar's answer is read bounded, and its silent fail-open now says why
+
+`compressFragment` (`src/utils/kompress.ts`) read the sidecar's `/compress` answer with `resp.json()` —
+the last unbounded request-path read outside `tool-judge-sidecar.ts`. The answer is the compressed
+fragment, derived from the request's prompt text and bounded by the sidecar's own `max_length`, so it
+now goes through `consumeResponseText`: `max_response_bytes` caps it, a spill above `threshold_bytes`
+holds the bytes, and the `JSON.parse` is the materialization §5.9 charges. The no-trace-stage variant is
+deliberate — this text is user content and must not be echoed into an `upstream-response` line.
+
+The larger hole was that the read *and* the failure were both silent. `catch { return null }` forwarded
+the fragment uncompressed with nothing said, and `totalChars > maxChars` skipped a whole batch the same
+way — a no-op hitting exactly the largest requests, where compression matters most. Fail-open is not
+fail-silent: `CompressResult` now carries `uncompressed: { reason, count }[]`, and each entry names what
+happened — `sidecar unreachable: …`, `sidecar returned 500`, `proxy limit on the answer read: …`,
+`answer read failed: …`, `answer was not JSON`, `answer carried no "compressed" string`, `combined text
+N chars over maxChars M` — never any fragment text. `src/index.ts` logs one `warn` per request when the
+tally is non-empty, the same call-site-owns-the-logger convention `judgeTools` uses (a module-level
+`createLogger` here would capture `LOG_LEVEL` at import and be invisible to the harness). A proxy limit
+is separated from a broken sidecar so the two can be told apart, and with `failOpen = false` the throw
+now carries the real reason instead of the blanket `kompress sidecar unavailable`.
+
+A deliberate boundary: a fragment skipped *by design* — shorter than `minChars`, CJK-heavy, or an answer
+that did not shorten — is not tallied, because a per-request warn on those would bury the real failures.
+`JSON.parse` runs in its own `try` and reports the fixed phrase `answer was not JSON`, because V8's
+parse message quotes the rejected input, i.e. would leak prompt text into the log.
+
+Verified: `tests/unit/kompress-response-spool.test.ts`, seven tests on a chunked sidecar answer that can
+be watched being pulled and cancelled — a healthy answer compresses byte-identically with one spill file
+present mid-receive (`chunks + 1` pulls, one read), the cap rejects fail-open with exactly the reason
+`proxy limit on the answer read: Response body too large: exceeded 256 bytes` and the upstream cancelled,
+that same reason is what `failOpen = false` throws, the cap still applies with `enabled = false`, a §5.9
+refusal names `max_materialized_body_bytes` with all three ledgers back at 0, failures are tallied per
+reason in work order, the `maxChars` limit is reported with no sidecar call made, and a malformed answer
+carrying `TOP-SECRET-PROMPT-TEXT` reports `answer was not JSON` — the marker appears in no reason.
+Mutation check: reverting the receive to `resp.text()` fails five of the thirty-four kompress tests;
+deleting the reason tally and the `maxChars` report fails nine.
+
+Full suite 2627/2627 (531 suites), typecheck and build clean. `terminal-notifier` is not on `PATH` in
+this environment, so rule #9's notification cannot be sent for this increment.
+
+### feat(spool): §5.7 — the privacy-filter sidecar's answer is read bounded (and one receive primitive replaces two copies)
+
+`redactSidecar` (`src/utils/privacy-filter.ts`) read the sidecar's `/redact` answer with `resp.json()`,
+which buffers whatever the sidecar sends. That body is not incidental: it carries the redacted *prompt
+text* back, so it is as large as the request the filter accepted — bounded by `max_chars`, 1 024 000 by
+default — and near that cap it is larger than `SPOOL_DEFAULTS.thresholdBytes` (1 048 576). It is the
+last request-path read in `src/` whose body grows with the request. It now goes through the §5.7
+receive: `max_response_bytes` caps it, the bytes live on a spill above `threshold_bytes`, and the
+`JSON.parse` that follows is the materialization §5.9 accounts for.
+
+Two failure kinds are now separated, which is the point of the change rather than a side effect. A cap
+breach, a spill failure or a §5.9 refusal is the proxy's own limit and is rethrown as itself
+(`SpoolResponseTooLargeError` 500 `processing_error`, `SpoolCapacityError`,
+`AdmissionOverBudgetError`/`AdmissionTimeoutError`/`AdmissionQueueFullError` 503 `over_limit_error`),
+where the old single `catch` wrapped everything as `privacy filter unavailable: …` and blamed a healthy
+sidecar. An ordinary fault — unreachable, non-ok status, unparseable or wrongly shaped answer — keeps
+that wrapper, and the `fetch` failure was split out of the receive's own `try` so each kind is only ever
+reported as what it is (rule #8). The filter stays fail-closed on every path: a rejection is still a
+rejection, so no route forwards unredacted text.
+
+The receive needed a primitive that does not log. `withResponseText` emits an `upstream-response` trace
+stage with the whole text, and this body is the user's own prompt text — the same reason `doAuthRequest`
+inlined the receive in the previous increment. Rather than a third copy of that idiom, the inline
+receive is now `consumeResponseText` in `src/utils/spool-response.ts` — receive, admit, read, release,
+rethrow — and `withResponseText` is that plus its trace stage, so the two primitives cannot drift.
+`doAuthRequest` (`src/index.ts`) switches to it and drops its copy; its behaviour, including
+`if (err instanceof ClaudeProxyError) throw err`, is unchanged and its existing
+`tests/unit/index-auth-response-spool.test.ts` cases still pass.
+
+Verified: `tests/unit/privacy-filter-response-spool.test.ts`, seven tests on a chunked sidecar answer
+that can be watched being pulled and cancelled. A healthy answer still applies the same `redacted[]`
+and the same mapping, one spill file exists *mid-receive* (captured per pull, because the spill is
+released before `redactBody` returns) and is gone afterwards, and the body is pulled exactly
+`chunks + 1` times — one read, no second copy. A body past `max_response_bytes` rejects with
+`SpoolResponseTooLargeError`, message `Response body too large: exceeded 256 bytes`, and **not** with
+`privacy filter unavailable`; the upstream body is cancelled; nothing is left on disk. The same cap is
+asserted with `enabled = false`, since `max_response_bytes` bounds the body and `enabled` only decides
+whether disk is used. A §5.9 refusal (`max_materialized_body_bytes: 64`) rejects with
+`AdmissionOverBudgetError` naming `max_materialized_body_bytes`, with `getLiveSpillBytes()`,
+`getAdmittedBytes()` and the queue depth all back at 0 — a refused read holds nothing — and an admitted
+read gives its lease back before `redactBody` returns. The last test pins the surviving wrapper: an
+unparseable answer is still `privacy filter unavailable` and still not a `ClaudeProxyError`, so the
+split did not swallow the ordinary failure. Mutation check: replacing the receive with `resp.json()`
+again fails four of the seven; deleting the `instanceof ClaudeProxyError` rethrow fails the other three.
+
+Full suite 2618/2618 (527 suites), typecheck and build clean. `terminal-notifier` is not on `PATH` in
+this environment, so rule #9's notification cannot be sent for this increment.
+
+### feat(spool): §5.7 — the last two request-body tees in `src/` are gone (the `sdk://` routes)
+
+`src/handlers/claude.ts:39` and `src/handlers/messages.ts:225` read their request body through a
+conditional that cloned it on the `sdk://` route only:
+
+```ts
+const requestBody = isSdkUrl(targetUrl)
+  ? await request.clone().json() as Record<string, unknown>
+  : await request.json() as Record<string, unknown>;
+```
+
+The clone's stated purpose was "preserve body for SDK handler", and a clone *tees* the body: the branch
+nobody reads stays resident for as long as the parse runs — here a second full copy of a request that
+may carry an image, which is the shape §5.7 exists to remove. Nothing read the preserved branch. Every
+`sdk://` call site in both files (`claude.ts:113`, `messages.ts:337`, `messages.ts:575`) is handed
+`requestBody`, the *parsed object*, and the handlers behind them — `handleSdkAnthropicRequest` and
+`handleSdkOpenAIRequest` in `src/utils/sdk-handler.ts` — are explicit stubs that `void request;` and
+raise 501 `not_implemented`. Both routes now take the same one plain `await request.json()`.
+
+Consuming in place is safe here for the reason the previous two increments established: the non-SDK
+branch of this same ternary already consumed the body at this exact line, so "the handler's first act
+reads the body" was already the invariant on the path that serves real traffic. The failover ladder is
+unaffected — `buildRouteAttempt` (`src/index.ts:2093`) builds a **fresh** `Request` for every rung from
+`JSON.stringify({ ...bodyObj, model })`, so an exhausted body cannot survive into another attempt, and
+`sdk-handler.test.ts` already pins that the 501 is retryable so the ladder moves on. The only observable
+difference on the `sdk://` route is `request.bodyUsed` becoming true — the old code left it false
+because the clone, not the original, was the branch that got read.
+
+**Property this completes:** no request-body tee remains anywhere in `src/`. Every remaining `.clone()`
+outside the response-side spool paths is now inside a comment; the last three to go were the
+`request_ingress` read, the `LOG_LEVEL=debug` dump, and these two.
+
+Verified: `tests/unit/handler-request-body-read.test.ts`, five tests, each pinning a property that
+survives a broken instrument only on purpose. `Request.prototype.clone()` is counted (the
+`countClones` idiom from the response-side suites, pointed at `Request`) and asserted **0** on both
+files' `sdk://` routes — counted rather than asserted-absent because the handler's answer, a 501, is
+identical before and after, so the count is the only thing that distinguishes the two versions; a
+first test clones a request on purpose and asserts the count is 1, so the spy cannot pass vacuously.
+`request.bodyUsed` is asserted true, and the rejection is asserted to be the 501 `not_implemented`
+`ClaudeProxyError` naming both the model alias and the request id. `messages.ts` is driven on both
+formats (already-OpenAI reaches the OpenAI stub directly; native Claude reaches the Anthropic stub
+through validation and conversion), so both `sdk://` branches are covered. The fifth test proves the
+body is still *parsed* on the `sdk://` route: a malformed body fails with the JSON parse error, not with
+`not_implemented`, which is the behaviour a future "skip the parse when the target is an SDK"
+short-circuit would silently remove. Mutation check: restoring the `request.clone()` conditional in both
+files fails four of the five tests with `expected: 0 / actual: 1`, and a separate probe confirms the
+fourth property is not redundant — reading only a clone leaves the original at `bodyUsed: false`, which
+is what the old route did.
+
+Full suite 2611/2611 (523 suites), typecheck and build clean. `terminal-notifier` is not on `PATH` in
+this environment, so rule #9's notification cannot be sent for this increment.
+
+### feat(spool): §5.1/§5.7 — the `LOG_LEVEL=debug` dump reads the attempt body without a clone
+
+The last `attemptRequest.clone()` in `src/index.ts` was the debug dump (`:2541`): gated on
+`path === '/v1/messages' && env.LOG_LEVEL === 'debug'`, it cloned the attempt request, awaited the
+clone's text, and wrote `tmpdir()/test_model.log`. The clone *tees* the body, so the branch the dump
+never reads stays resident while the read runs — and this one runs immediately before dispatch, so the
+copy is of exactly the body the handler is about to send. It now receives `attemptRequest.body` through
+`receiveIngressBody` and hands the request back a stream over the same spill
+(`new Request(attemptRequest, { body: received.readStream(), duplex: 'half' })`), the idiom the ingress
+receive already uses at `:1265`. Consuming in place is not available here — the dump needs the body
+*and* so does the send — so re-wrapping is what keeps the change a substitution rather than a drop.
+
+The three deliberate decisions mirror the previous increment, for the same reasons:
+
+- **No declared length.** The attempt request has been re-serialized at least once by the ladder, so
+  its `Content-Length` describes an earlier body; §5.1 makes a declared length a hint, and a hint that
+  is wrong would spill on the wrong decision.
+- **No second §5.9 charge.** This materialization is of bytes the request's own ingress lease already
+  covers.
+- **The cap is ungated** by `[spool] enabled`, since `receiveSpooledBody` tests `total > maxBytes`
+  before consulting `spillable` — one more data point on the conflict increment 43 exposed.
+
+One behaviour change, deliberate and loud: a failed receive **consumes** the body, so the dump can no
+longer forward the request. Instead of swallowing the failure into the log line, the block now answers
+`logger.warn` plus `createErrorResponse(error, requestId)` — a debug-mode request can return 503
+`over_limit_error` (or 413) where it previously logged fine and was served. That is rule #8 applied to
+a path that used to hide its own failure; the alternative was sending an empty body upstream.
+
+The honest cost, measured: above `threshold_bytes` this is a **second** spill of a body the ingress
+already spilled. With the same subject as the previous increment (raw body 9638 bytes,
+`threshold_bytes = 1024`) and **no** `request_ingress` transform, the charges before the dump are the
+ingress receive 9638 and the rung's rebuild 4313 — peak **13951**, the clone path's number — and the
+dump's own read adds another 4313 for a peak of **18264**. The window `(13951, 18264)` is exactly where
+the two disagree. With a transform active the hook's read takes the same third charge and breaches that
+budget *first*, so the dump's charge is only separately observable on the transform-free path; the
+tests therefore install none.
+
+**Observed while writing the tests, pinned rather than designed:** with spooling on, the dump logs a
+`$spoolBlob` ref, not base64. `buildRouteAttempt` (`:2093`) serializes the *ref-bearing* body, so
+`test_model.log` shows `{"$spoolBlob":true,"kind":"chat-image-url","hash":"…","prefix":
+"data:image/png;base64,","size":5464}` where the spool-off run would show the payload. That is the
+honest reading of the file an operator opens when debugging, and a future rehydrate-before-dump would
+show up as a difference.
+
+Verified: `tests/unit/request-ingress-transform-refs.test.ts` gained a sixth block, three tests, and a
+`set: null` option on `writeConfig` (installing no transform at all, which the block needs for the
+reason above). One case runs the same body with the spool off and then on at `2x` (19276, above the
+18264 peak) and asserts the forwarded body is byte-identical to the spool-disabled one, the image is
+still expanded at the send, no ref reaches the upstream, the dumped payload position *is* a
+`$spoolBlob` ref (the rest of the dumped body equals the forwarded one), the dump does not carry the
+payload, `getLiveSpillBytes() === 0` and no file is left in `requests/`. A second case sets
+`max_total_bytes` to `1.5x` (14457, inside the window) and asserts 503 `over_limit_error`, message
+matching `live spill budget exceeded`, **zero** upstream calls, and a returned reservation. The third
+runs the identical body and budget with `LOG_LEVEL=error`, asserts no log file is written, and that the
+request is served — so the refusal belongs to the dump and not to the budget every request pays. That
+the failing charge is the dump's was settled by measurement: reverting to `attemptRequest.clone()` and
+re-running the block at the same budget returns **200** on the second case.
+
+Full suite 2606/2606 (522 suites), typecheck and build clean.
+
+### feat(spool): §5.1/§5.7 — the `request_ingress` body read is bounded
+
+`src/index.ts`'s `request_ingress` block — the hook that rewrites the inbound body before any handler
+sees it — read its subject with `await attemptRequest.clone().text()` (`:2377`, now `:2497`). It now
+receives `attemptRequest.body` through `receiveIngressBody` (`:2497`), reads it, and releases the
+reservation in a `finally`. The reason is the one §5.7 exists for: `Request.clone()` *tees* the body,
+so the branch nobody reads stays resident for as long as the read runs — a second full copy of a body
+that may carry an image. Consuming the original in place is safe and is what makes the change a
+reduction rather than a swap: the block rebuilds `attemptRequest` from the transformed body a few lines
+down (`createJsonEgressBody(transformed.body, 'att-')`), so nothing reads the original again.
+
+Three deliberate decisions, each visible in the diff:
+
+- **No declared length is passed.** `receiveIngressBody`'s `declaredLength` is a hint for the spill
+  decision (§5.1); the `Content-Length` on a request the proxy has already rebuilt describes an earlier
+  body, so passing it would spill on a length that is no longer the one being read. The cap is the
+  spool's own byte count instead. In practice `max_request_bytes` cannot fire here — the body was
+  bounded at ingress and re-serialization adds a model name — but the read is bounded either way.
+- **§5.9 is not charged a second time.** The request's own ingress lease (`:1263`) already covers this
+  materialization of the same bytes; a second charge inside that lifetime would double-count them
+  against `max_materialized_body_bytes`.
+- **The cap is applied ungated** by `[spool] enabled`: `receiveSpooledBody` tests `total > maxBytes`
+  before it ever consults `spillable`, so the bound holds with the spool off too. On *this* path it
+  cannot actually fire while `enabled = false` — with the spool off there is no extraction, so the
+  subject is the raw body the ingress already bounded — but the check is unconditional, which is one
+  more data point on the gated-vs-ungated conflict increment 43 exposed, still unresolved.
+
+The honest cost: above `threshold_bytes` the read is now a *second* spill of a body the ingress
+already spilled, so it trades RAM for disk churn, and a tight `max_total_bytes` can refuse a request
+the clone path served. That is the trade, and it is measured: with a 4000-character text message beside
+a 4096-byte image (raw body 9638 bytes, `threshold_bytes = 1024`) the ledger's three concurrent
+charges are the ingress receive 9638, the router's ref-bearing rebuild 4313, and this read 4313 —
+peak **18264** against the clone path's **13951**. The window `(13951, 18264)` is therefore exactly
+where the two implementations disagree.
+
+Verified: `tests/unit/request-ingress-transform-refs.test.ts` gained a fifth block, two tests, and an
+optional `pad` on `openaiUrlBody` (the pad is load-bearing — with an image alone the *attempt* body is
+a few hundred bytes after §5.4 extraction replaced the image with a ref, so it sits below
+`threshold_bytes` and nothing spills, which is the trap that made the first version of this test read
+200 where it expected 503). One case puts `max_total_bytes` at `1.5x` the raw body, inside the window,
+and asserts the refusal and its altitude: 503 `over_limit_error`, message matching
+`live spill budget exceeded`, **zero** upstream calls, `getLiveSpillBytes() === 0`, and no file left in
+`requests/`. The other runs the same padded body with `enabled = false` and then spooled at `2x` (above
+the window, so all four charges fit), asserting the forwarded body is byte-identical to the
+spool-disabled one, the hook's op is present, the ref was still expanded at the send, the read's
+subject really was above threshold, and both reservations came back. That the failing charge is *this*
+read's — and not the router rebuild's — was settled by measurement rather than inference: reverting
+the receive to `clone().text()` and re-running the case at the same budget returns **200**.
+
+**Reported, not fixed:** the `catch { parsedBody = {} }` beside the read silently degrades a malformed
+attempt body to an empty object, which is then re-serialized and sent upstream as `{}` — a
+pre-existing behaviour (the clone path swallowed it the same way), left alone here because changing it
+changes what the upstream receives. The `LOG_LEVEL === 'debug'` block a few lines below (`:2541`) is
+the next `attemptRequest.clone()` in this file and gets its own increment; it clones the *rebuilt*
+request, so this change does not make it worse.
+
+Full suite 2603/2603 (521 suites), typecheck and build clean.
+
+### feat(spool): §5.7 — the client-egress transform read is bounded
+
+`src/utils/request-transform.ts`'s `applyWriteoutBody` — the `response_egress` hook, which rewrites
+the body on its way *to* the client — read its body with `await response.text()` (`:982`). It was the
+last unbounded read in that module and the exact sibling of `applyAfterUpstream` (`:760`), which the
+`after_upstream` increment already routed through `withResponseText`. It now goes through the same
+primitive (`:992`): one bounded receive, `max_response_bytes` on the body with a breach cancelling it
+rather than truncating it, a §5.9 charge (response class) around the parse, the spill released in a
+`finally`, and a trace stage on the read. The ops, the malformed-JSON passthrough, and the rebuilt
+`Response` shape (status, statusText, sanitized headers) are unchanged. The dead `hookCtx` mirror —
+built and immediately `void`ed, a leftover of the copy from the sibling — is dropped with it.
+
+Two things this hook does differently, preserved rather than blended: its own gate is
+`hasHookOps('response_egress', …)` plus a content-type check, so a non-JSON body (an SSE stream, which
+is `pipeEventTransformer`'s business) is returned as the very same `Response` without being read at
+all; and its read is usually a **second** receive of a body the caller already spooled — the stats
+extraction above it re-wraps the body as `response` — so past `threshold_bytes` this costs a second
+spill rather than saving RAM. What it buys is the bound, the charge and the stage, not memory. That is
+the same honest trade increment 65 recorded on the PII-restore path.
+
+`HookContext.signal` now reaches this hook: the central wrap's `writeoutCtx` (`src/index.ts:2884`)
+carried no signal, so it gains `signal: request.signal` (`:2893`) — the *client* request's signal, as
+the handlers' `after_upstream` call sites pass. Without it a §5.9 waiter at this hook would hold its
+place until `admission_timeout_ms` after the client had gone.
+
+The cap is **not** gated on `[spool] enabled` here either (asserted, not assumed): one more data point
+on the gated-vs-ungated conflict increment 43 exposed, still unresolved.
+
+**Not changed, reported:** the trace line this site now emits is labelled `[UPSTREAM-RESP] (client
+egress)` — `withResponseText` hardcodes the `upstream-response` stage, whose label reads oddly for a
+read of a body on its way out. The repo has an `outbound` stage label for exactly this ("body after
+conversion, returned to the client"), but selecting it means adding a stage parameter to the shared
+primitive and changing what every caller logs; left alone here. The body at this point is still the
+pre-`restorePrivacyResponse` one (that runs after the attempt loop), so what the stage echoes is
+sentinel-bearing text, never the caller's own PII.
+
+Verified: `tests/unit/transform-response-spool.test.ts` gained three suites and nine tests beside the
+`after_upstream` ones — the two fast paths (op-free, and a non-JSON body that must not be read at all),
+an under-threshold answer that leaves no spill and no clone, an above-threshold body captured on disk
+mid-receive and released before the client's response is returned, its answer compared to a
+spool-disabled run of the same call, the read pulled exactly once start-to-close, a cap breach (500
+`processing_error`, upstream body cancelled, no partial spill) both with the spool on and with
+`enabled = false`, a malformed-JSON body passed through byte-for-byte through the receive, a §5.9
+refusal (503 `over_limit_error`, no bytes, no reservation), and a queued waiter dropped when the client
+aborts. Reverting the receive to `await response.text()` fails exactly the six tests that pin it and
+leaves the fast-path and under-threshold ones passing. The `writeoutCtx` signal is a call site, read
+rather than driven from these tests — as the sibling hook's handler call sites are — so it is pinned by
+the unit-level `ctx.signal` contract, not end to end. Full suite 2601/2601 (520 suites), typecheck and
+build clean.
+
+### feat(spool): §5.7 — the remote auth server's response body is bounded
+
+`src/index.ts`'s `doAuthRequest` read the auth service's answer with `await authResp.text()` — the last
+unbounded remote-body read in that file. It now receives it through the same bounded primitive every
+other remote body in the file uses:
+
+- One `receiveResponseBody` (`:1122`), so `max_response_bytes` bounds the body, and a breach cancels
+  the auth body instead of buffering it whole — 500 `processing_error`, no spill file left behind, and
+  the upstream never reached.
+- A §5.9 charge on the read (`:1129`–`:1141`, response class), charged the auth body's own byte count.
+  Response class rather than request: a deferred-auth request already holds its own ingress
+  reservation (that admission is a few lines later, `:1263`), so this read must not queue behind it
+  (hold-and-wait — see `spool-admission.ts`).
+- The fetch and the body read are now two `try` blocks. They shared one, and its `catch` answers 503
+  "Authentication service unavailable: could not reach remote auth server". A proxy-side limit must
+  not be reported as the auth server being down (rule #8), so the read has its own `catch` that
+  rethrows any `ClaudeProxyError` (cap breach, spill failure, refusal) to the terminal error mapping
+  where it is reported as itself; a transport read failure stays best-effort exactly as before.
+
+The one deliberate divergence from the other readers: the receive is **inline**, not through
+`withResponseText`. That primitive's trace stage (`spool-response.ts:166`) echoes the text it
+receives, and this body can carry `targets[].key`/`otac` — the upstream API keys the routing ladder is
+built from (`target-retry.ts`). A credential-bearing body is never echoed, so this site receives it
+without a log stage, and a test pins that no log level, trace included, prints it.
+
+The cap is **not** gated on `[spool] enabled` here (asserted, not assumed), following the repository's
+stated rule and the same choice as the four identity receives and increments 54/65 — one more data
+point on the gated-vs-ungated conflict increment 43 exposed, which is still unresolved.
+
+**Not fixed, reported:** `:1180` logs a *dropped* `targets[]` entry with `JSON.stringify(d.entry)`, so
+a malformed entry that carries `key`/`otac` is written verbatim at error level. That is pre-existing
+and independent of this read (it never passes through it), and it is on the no-echo rule's wrong side.
+
+Verified: new `tests/unit/index-auth-response-spool.test.ts`, six tests in four suites, driving the
+real `handler` with `[remote] auth_server` set and a scratch `[spool] dir` in the TOML (the config
+loader owns `setSpoolConfig`, so `[spool]` has to come from the file). Pinned: a body under the cap
+leaves the answer byte-identical to a spool-disabled run; the wire-contract `version` gate still reads
+its value from that body; a body past `max_response_bytes` is a 500 `processing_error` naming the
+response cap, leaves `upstreamCalls === 0` and no spill file — and crucially does **not** match
+`/unavailable|could not reach remote auth server/`; the same with `enabled = false`; a §5.9 refusal is
+a 503 `over_limit_error` whose message names the *auth* body's byte count rather than the ingress
+body's, with both ledgers back to zero; and the auth body's marker stays out of trace output while the
+inbound body's marker is present (a positive control, so the absence is a property of this read and
+not a dead capture). The two cap tests are the discriminating ones: replacing the bounded receive with
+`await authResp.text()` fails exactly those two and leaves the other four passing. The trace test
+drains the client response before the `afterEach` ledger check, because that response's body holds the
+*upstream* body's spill reservation until it is read — the 191 bytes the hook first reported were
+verified byte-for-byte as that reservation, not suppressed. Full suite 2592/2592 (517 suites),
+typecheck and build clean.
+
+### feat(spool): §5.7 — the PII restore reads the client-facing body through the bounded receive
+
+`src/index.ts`'s `restorePrivacyResponse` rebuilt the client-facing body with `await response.text()`
+— the last unbounded whole-body read on a response the proxy builds itself. Its two buffered branches
+(JSON, and every other content-type) are now one block that reads through `withResponseText`:
+
+- One bounded receive instead of `response.text()`, so above `threshold_bytes` the bytes the restore
+  works on live on this response's spill, `max_response_bytes` caps them, and the restore's text takes
+  its own §5.9 charge (a re-materialization downstream of the boundary, now recorded as such in
+  `spool-admission.ts`'s wiring note, whose "§5.9's per-rung re-acquisition has no caller today" claim
+  this makes false on the response side).
+- The spill and the lease are released before the restored text is handed to `new Response`, and both
+  the cap breach and the §5.9 refusal release first and propagate to the caller's error mapping, so a
+  body the proxy refused to read is never restored from a partial copy (rule #8).
+- `restorePrivacyResponse` gained a `signal?: AbortSignal` parameter; all four call sites
+  (`:3002` ladder, `:3011` fusion, `:3039` attempt loop, `:3091` single attempt) pass the client's
+  signal (`request.signal`, or `attempt.request.signal` in the loop). The SSE branch
+  (`createRestoreTransformStream`) is untouched.
+- `src/utils/spool-response.ts`'s header now lists this reader — the one whose input is a body the
+  proxy built itself, and so the one that reads back off the spool it just wrote.
+
+**Measured honestly, because the margins are thin.** There is no RAM relief on this path: the restore
+needs the whole text to replace sentinels in, so `readText()` joins exactly what `.text()` joined. The
+real effects are (a) `max_response_bytes` now applies to this read too — structurally, since a
+handler-synthesized body (a converter's, or the fusion path's) can exceed what the upstream sent;
+(b) §5.9's budget covers the one materialization that was outside it, which is what makes the budget a
+believable RAM bound; (c) a cap breach or a refusal now fails explicitly here (500 `processing_error`
+/ 503 `over_limit_error`) where the old read could only fail as I/O. The cost: the restore receives a
+body the handler's own receive still holds on disk, so a PII-active response past `threshold_bytes`
+now needs room for a **second** spill, and a `max_total_bytes` that fits only the first is a 503 where
+the old read returned 200 (measured: `live spill budget exceeded: 1988 + 1988 bytes >
+max_total_bytes 2105`). A streaming restore — the SSE branch's transform stream, applied to these
+bodies — would remove that second spill and is left as future work. Two smaller notes: the new
+receive is **not** gated on `[spool] enabled` (like the four identity receives, unlike the SSE
+framing — the gated-vs-ungated convention increment 43 exposed is still unresolved), and it emits a
+new trace-gated `[UPSTREAM-RESP] (privacy restore)` line whose payload is the *pre*-restore,
+sentinel-bearing body, which carries no PII by construction.
+
+Verified: `tests/unit/index-routing.test.ts` gains a new `§5.7 spooling of the PII restore read`
+describe with two tests, driven end-to-end (real handler, `[privacy_filter] filter_mode = "local"`,
+no sidecar — the local hash detector mints `⟦HASH:0⟧` in-process). The first pins correctness of the
+new path: the secret never leaves the proxy, the client gets the original value back out of a body
+past `threshold_bytes`, no `Response.prototype.clone()` anywhere, and an empty `responses/` dir with
+`getLiveSpillBytes() === 0` afterwards. The second is the discriminating one: with
+`max_total_bytes = upstreamBytes + 64`, the restore's second spill cannot reserve, and the answer is
+503 `over_limit_error` with no spill and no live reservation left. Reverting the restore to
+`response.text()` fails exactly that second test (it returns 200) and leaves the first passing — which
+is the honest statement of what this increment changes: the first test would have passed before, the
+second could not have. Full suite 2586/2586, typecheck and build clean. A cap-breach test for *this*
+receive was deliberately not written, because it cannot be isolated: the converted Claude body is
+~50 bytes smaller than the upstream OpenAI body, so no `max_response_bytes` value cuts between the two
+receives — a test that "passed" by breaching the handler's receive first would prove nothing.
+
+### feat(spool): §5.7 — the non-2xx remote-stats error body is bounded, and a dropped response is released
+
+`src/index.ts`'s `else if (attemptModelId)` branch — the one that records a *failed* attempt to
+`[remote] record_server` with zero usage and the real status — read the upstream's error body with
+`response.clone().json()` / `.clone().text()` (`:2764`). That is the same second copy §5.7 forbids on
+the success side, on the one path where the body is both large and of no use to the client beyond
+being relayed. With `[spool] enabled` it now goes through one bounded `receiveResponseBody`:
+
+- The read is the success-side dance verbatim: one bounded receive, one `admitResponseMaterialization`
+  on the response class (charged the received byte count, released in a `finally`), the `JSON.parse`
+  in a narrow catch of its own. A `content-type` that is not JSON is still recorded as raw text, and a
+  body advertised as JSON that is not parseable is still recorded without a body.
+- The status and headers reach the client unchanged and the bytes are streamed back out of the same
+  spill (`new Response(received.readStream(), response)`), so a failure answer is byte-identical to a
+  spool-disabled run — asserted directly, not assumed.
+- A breach, a spill write failure or a §5.9 refusal releases the spill and propagates (rule #8)
+  instead of being served as the upstream's own error. Before this change that path could not fail at
+  all; now `max_response_bytes` applies to it, so an oversized error body is a 500
+  `processing_error` and **no** record is posted for a body the proxy refused to read.
+- With `[spool] enabled = false` the branch keeps its pre-existing `clone()`, so the disabled path is
+  untouched.
+
+This increment also has to release a response the retry ladder abandons, because the two changes
+compose into a leak that did not exist before. The statuses the ladder re-hits (axis 2, an explicit
+`retry_on`) and the ones it supersedes (axis 1, a rung advance) are exactly the 429/5xx statuses this
+branch now spills for, and an abandoned spill keeps both its file and its `getLiveSpillBytes()`
+reservation until the *startup* sweep — there is no runtime reaper, so the rest of the process's
+requests pay that byte budget down. `runTargetLadder` now has one `discardOutcome` helper (`:2931`)
+and cancels the body at both drop points (`:2970`, `:2983`) — stream cancellation is the release
+mechanism (`spool-body.ts`'s `cancel: () => finish()`), so the drop is explicit rather than an
+abandonment. **Scope note:** the same exposure already exists for increments 44/45's spooled
+egresses (a discarded attempt response on a ladder path), and this helper fixes that too; it is a
+companion fix the change requires, not a separate feature.
+
+Verified: `tests/unit/index-routing.test.ts` gains five tests in a new nested `describe`. Four drive
+the non-2xx read — a 6 KB error body spilled and streamed to the client byte for byte with **no**
+`Response.prototype.clone()` and the parsed body recorded; an 8 KB body past `max_response_bytes`
+failing as 500 `processing_error` with no record and no live spill; the spool-off path keeping its one
+clone and its untouched client copy; and `record_response_body = false` reading nothing at all (zero
+clones, nothing on disk). The fifth drives the ladder — a first rung re-hit once (axis 2) and then
+superseded (axis 1), every abandoned 500 spilled and released, ending with
+`getLiveSpillBytes() === 0` and an empty `responses/` spill dir. Both new behaviours were reverted in
+turn and only the intended tests failed: `discardOutcome` made a no-op (1 fail — the ladder test), the
+spool branch forced to the disabled one (2 fail — the two spool-on error-body tests; the spool-off and
+record-off tests are correctly insensitive). Full suite 2584/2584 (2579 + 5), typecheck and build
+clean.
+
+Note on reachability, established while writing these tests: the branch only ever sees a non-2xx
+response the *handler returned*. On `/v1/messages` it is unreachable — `messages.ts` reads the error
+body itself and throws it out through `handleTargetApiError` — which is why these tests drive the
+`openai-completions` passthrough (status, headers and bytes preserved) rather than the Messages path.
+
+### feat(spool): §5.7 — the fusion pipeline's response reads are bounded
+
+`src/index.ts`'s fusion stage read three response bodies without any bound, and each of them is a body
+the client never sees: `readResponseJson` (`:2138`) — used for every panel answer (`:2221`) and for the
+judge's analysis (`:2286`) — called `resp.clone().json()`, holding a second copy of the whole body for
+as long as it parsed, and the synthesis metadata read (`:2347`) went through the same helper, so a
+panel answering with an image paid for its base64 payload twice and neither copy was ever capped. All
+three now go through the same bounded primitive as every other response:
+
+- `readResponseJson` consumes the body with one `receiveJsonResponse` (`withResponseText` + a parse),
+  fed the client's `request.signal` and the stage's own `targetUrl` for the trace line. The
+  `content-type` check and the "not JSON" answer are unchanged, but the catch is narrowed: a
+  `ClaudeProxyError` — a `max_response_bytes` breach, a spill write failure, a §5.9 refusal — now
+  propagates instead of being reported to the client as this panel's answer, which is what the old
+  bare `catch { return null; }` did (rule #8). A body advertised as JSON that is not parseable keeps
+  its pre-existing "non-JSON response" diagnostic.
+- The judge's `catch (e)` narrows the same way: a `ClaudeProxyError` is the proxy's own limit, not a
+  judge failure, and must not be degraded into a successful-looking answer. Every other judge failure
+  still degrades exactly as before — logged, and a hard error only under `judge_required`.
+- The synthesis metadata read is now one `receiveResponseBody` on §5.9's response class
+  (`admitResponseMaterialization`, charged the received byte count, released in a `finally` before the
+  body is handed on), with the `JSON.parse` in a narrow catch of its own — an unparseable synthesis
+  body is forwarded unchanged and no metadata is attached, where before the clone left the original
+  body intact for the client. The happy path is unchanged: `content-length` is still dropped from the
+  enriched answer, and when a metadata wrap does happen the spill and its reservation are released
+  before the rebuilt `Response` is returned. When no wrap happens the body the receive consumed is
+  streamed back out of its own spill (`new Response(received.readStream(), synthResp)`), so the
+  client's bytes are the upstream's bytes whether or not a spill occurred.
+- Panel and judge bodies are never forwarded, so nothing about their own bytes changes; the synthesis
+  body reaches the client byte for byte, which the new tests pin against a spool-disabled baseline.
+- The cap is applied with `[spool] enabled = false` as well, matching the rule this repository states
+  for the other egresses; increment 43's open question about that convention is unaffected.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining reads in
+  `src/index.ts` (`:1099`, `:2476`, the spool-disabled stats fallback at `:2704` and the non-2xx
+  remote-stats error body at `:2706`/`:2708`), the `restorePrivacyResponse` pair at `:237`/`:253`,
+  and the inbound `request.text()`/`request.json()` family (a different direction of travel).
+
+Verified: `tests/unit/fusion-response-spool.test.ts` is new — 6 tests over a three-target
+`[composite]` fusion alias (panel + judge + synth) — pinning that a full panel/judge/synth round trip
+with `[spool] enabled = true` performs **no** `Response.prototype.clone()` on any of the three bodies
+and still sends `panel-a` → `judge-b` → `synth-c` and returns the synthesis answer with the complete
+`fusion_metadata`; that a spilled synthesis body reaches the client byte for byte, identical to a
+spool-disabled baseline, with the spill freed; that a synthesis body advertised as JSON but not
+parseable is still forwarded unchanged; that a `max_response_bytes` breach on the judge stage fails
+the whole request (500 `processing_error`, the "Response body too large" message, no synthesis
+attempt, no live spill) rather than degrading; and that a prose judge answer still degrades to a 200
+with `analysis_present: false`. Each of the five sites was reverted in turn and only the intended
+tests failed: back to `resp.clone().json()` (1 fail), the synth receive fed a cloned body (1 fail),
+the judge narrowing removed (1 fail), the spill-backed rebuild removed (3 fail — the unparseable-body
+test on a client-visible 500, then two more on the 66-byte spill the failed test leaked), and the
+release before the enriched return removed (6 fail, the same process-wide ledger cascade). Stated
+plainly: the cap cannot by itself prove which of these reads saw a breach, because the egresses and
+the attempt loop's stats read already bound every panel/judge/synth body before fusion reads them —
+the discriminating pin is the clone count with the spool on, which is why it is asserted directly.
+Full suite 2579/2579 (2573 + 6), typecheck and build clean.
+
+### feat(spool): §5.7 — `chat-completions.ts`'s upstream *error* bodies are bounded
+
+`src/handlers/chat-completions.ts`'s two converted branches read the upstream's error body with
+`response.text()` and *returned* it to the client, so an error answer was the one body on this egress
+that no `max_response_bytes`, no spill and no §5.9 charge applied to: `:128` (an `anthropic-messages`
+upstream, converted Claude JSON → Completions JSON) and `:368` (a `gemini-generatecontent` upstream).
+Both now go through `withResponseText` on the identity consumer — the branch relays the upstream's
+own bytes and never converts them — fed the client's `request.signal`. The `openai-responses` branch
+has no such read (it forwards the identity body through the spool), so it is unchanged.
+
+- The normal case is unchanged: same upstream status, same `x-request-id`, and the relayed body byte
+  for byte, which the new tests pin against a spool-disabled baseline.
+- A cap breach, a spill write failure or a §5.9 refusal now propagates out of the handler instead of
+  being served to the client as the upstream's own 429. `handleChatCompletionsPassthrough` has no
+  enclosing try/catch — its only `try` guards the inbound JSON parse — so the error leaves it
+  unmodified, travels through the attempt loop's `outcomeFromError` to `src/index.ts`'s terminal
+  catch (`:2974`) and is rendered as itself (500 `processing_error`, 503 `over_limit_error`). As
+  before, a thrown 5xx is `isRetryableOutcome`, so a target ladder may still try its next rung
+  first — pre-existing policy, stated not changed.
+- The cap is applied with `[spool] enabled = false` as well, matching the rule this repository states
+  for the other egresses; increment 43's open question about that convention is unaffected.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining
+  `!response.ok` reads in `src/index.ts`, the fusion `readResponseJson` clone, and the inbound
+  `request.text()`/`request.json()` family (a different direction of travel).
+
+Verified: `tests/unit/chat-completions-response-spool.test.ts` grew from 10 to 16 tests — three per
+site over a two-entry `ERROR_SITES` table: the error body spilled mid-receive (asserted on disk
+part-way through) and the client's status and bytes identical to a spool-disabled baseline with no
+`Response.prototype.clone()`, a `max_response_bytes` breach raising `SpoolResponseTooLargeError`
+(500 `processing_error`) with the upstream body cancelled and no partial spill, and a §5.9 refusal
+surfacing as 503 `over_limit_error` ahead of the upstream's 429. Each site was reverted to
+`response.text()` in turn and only its own three tests failed (13 pass / 3 fail), then restored.
+Full suite 2573/2573 (2567 + 6), typecheck and build clean.
+
+### feat(spool): §5.7 — `claude.ts`'s upstream *error* body is bounded
+
+`src/handlers/claude.ts`'s `!response.ok` branch (`:184`, the native `anthropic-messages` egress of
+`/v1/messages`) read the upstream's error body with `response.text()`, so a 429/500 answer was the one
+body on that path that no `max_response_bytes`, no spill and no §5.9 charge applied to. It now goes
+through `withResponseText`, fed the client's own `request.signal`, with the identity consumer —
+`handleTargetApiError` is still given the text and still throws, so the upstream's status, type,
+message and `.upstreamBody` reach the client unchanged, and the pre-existing
+`logger.error` line and `bodyPreview` computation stay in source position.
+
+- One behaviour genuinely changed, and it is a fix: the branch's bare `catch {}` used to replace
+  *any* failure with `'(failed to read response body)'` before handing that placeholder to
+  `handleTargetApiError`. With a bounded receive inside it, that would have reported a
+  `max_response_bytes` breach, a spill write failure or a §5.9 refusal to the client as the
+  upstream's own error — a silent default success of exactly the kind rule #8 forbids. The catch now
+  keeps only a `TypeError`, which is what an unreadable upstream body throws and the one case the
+  placeholder was written for. Every other error propagates: through the attempt loop's
+  `outcomeFromError` to `src/index.ts`'s terminal catch (`:2974`), rendered as itself — 500
+  `processing_error`, 503 `over_limit_error` — in the Anthropic envelope. This follows the same
+  narrowing already used at `src/handlers/passthrough.ts:300`.
+- The cap is applied with `[spool] enabled = false` as well, matching the rule this repository states
+  for the other egresses; increment 43's open question about that convention is unaffected.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining
+  `!response.ok` reads in `chat-completions.ts` and `src/index.ts`, the fusion `readResponseJson`
+  clone, and the inbound `request.json()`/`request.text()` family (a different direction of travel).
+
+Verified: `tests/unit/claude-response-spool.test.ts` grew from 11 to 15 tests. The new section pins
+the error body spilled mid-receive (and the `UpstreamApiError` identical to a spool-disabled baseline
+in status, type, message and `upstreamBody`, with no `Response.prototype.clone()`), a
+`max_response_bytes` breach raising `SpoolResponseTooLargeError` (500 `processing_error`) with the
+upstream body cancelled and no partial spill, a §5.9 refusal surfacing as 503 `over_limit_error`
+ahead of the upstream's 429, and — the narrowing's own regression test — a `TypeError` from an
+unreadable body still yielding the placeholder. Two mutations confirm the pins: restoring the old
+`response.text()` + bare `catch` fails the first three, widening only the catch back to bare fails the
+cap and refusal tests while the placeholder test still passes. Full suite 2567/2567 (2563 + 4),
+typecheck and build clean.
+
+### feat(spool): §5.7 — `gemini.ts`'s upstream *error* bodies are bounded
+
+`src/handlers/gemini.ts`'s three `!response.ok` branches read the upstream's error body with
+`response.text()`, so a 429/500 answer was the one body through this handler that no
+`max_response_bytes`, no spill and no §5.9 charge applied to — on exactly the branch that is already
+going wrong. All three now go through `withResponseText`, the bounded receive the success bodies
+beside them already use: `:130` in `handleGeminiCountTokensRequest`, `:280` in
+`handleGeminiInteractionsRequest`, and `:493` in the native `handleGeminiGenerateContentRequest`. The
+read is fed the client's own `request.signal`, so a §5.9 refusal is decided against the same signal
+the rest of the request uses.
+
+- No new failure handling was needed. `:130` and `:280` sit under no try/catch at all, so their
+  errors leave the handler exactly as the branch already threw them, and `:493`'s enclosing `catch`
+  (`:508`) logs at error level and re-throws, so it neither swallows nor relabels the failure. A cap
+  breach, a spill failure or a §5.9 refusal therefore propagates through the attempt loop's
+  `outcomeFromError` to `src/index.ts`'s terminal catch (`:2974`) exactly as every other error from
+  this handler does, and is rendered as itself — 500 `processing_error`, 503 `over_limit_error` — in
+  the Anthropic envelope, the `/v1beta/models/…:countTokens`, `:generateContent` and
+  `/v1/interactions` routes being outside the `/v1/responses*` family. The pre-existing retry policy
+  applies to it unchanged: a thrown 5xx is `isRetryableOutcome`, so a ladder may still try its next
+  rung before the terminal catch, the same as for the upstream error these branches already threw.
+- The upstream's own error still reaches the client unchanged, which is now visible in
+  `createErrorResponse`'s `UpstreamApiError` passthrough: same status, same
+  `handleTargetApiError` type/message mapping, and `.upstreamBody` byte for byte. Each pre-existing
+  `logger.error` line and each `bodyPreview = JSON.stringify(geminiRequest).substring(0, 1000)`
+  computation stays in its source position, so the observable order stays receive → log → compute →
+  throw. As on every other `withResponseText` caller the error body is now also emitted as the
+  `upstream-response` pipeline stage, which is gated on `logger.traceEnabled` and changes nothing
+  unless tracing is on.
+- The cap is applied with `[spool] enabled = false` as well, matching the rule this repository
+  states for the other egresses and the pin already in this file's success-path tests; increment
+  43's open question about that convention is unaffected by this change.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining
+  `!response.ok` reads in `claude.ts`, `chat-completions.ts` and `src/index.ts`, the fusion
+  `readResponseJson` clone, and the inbound `request.text()` family (a different direction of
+  travel).
+
+Verified: `tests/unit/gemini-response-spool.test.ts` grew from 11 to 20 tests — three per site on a
+new three-entry `ERROR_SITES` table (`:countTokens`, `/v1/interactions`, `:generateContent`): the
+error body spilled mid-receive (asserted on disk part-way through), the client-visible
+`UpstreamApiError` identical to the spool-disabled baseline in status, type, message and
+`upstreamBody` with no `Response.prototype.clone()`, a `max_response_bytes` breach raising
+`SpoolResponseTooLargeError` (500 `processing_error`) with the upstream body cancelled and no partial
+spill, and a §5.9 refusal surfacing as 503 `over_limit_error` ahead of the upstream's 429. Each of
+the three sites was reverted to `response.text()` in turn and only its own three tests failed
+(17 pass / 3 fail), then restored. Full suite 2563/2563, typecheck and build clean — of which 2554 is
+everything except the nine tests appended here, the remaining ten having been added to this tree
+concurrently by another writer (see the notes below).
+
+### feat(spool): §5.7 — `openai.ts`'s upstream *error* bodies are bounded
+
+`src/handlers/openai.ts`'s three `!response.ok` branches read the upstream's error body with
+`response.text()`, so a 429/500 answer on the `/v1/interactions` and Gemini
+`:generateContent` egresses was the one body there that no `max_response_bytes`, no spill and no
+§5.9 charge applied to — on exactly the branch that is already going wrong. All three now go through
+`withResponseText`, the bounded receive the success bodies beside them already use: `:879` in
+`forwardCompletionsAsAnthropicMessages`, `:1035` in `forwardCompletionsAsOpenAIResponses`, and
+`:1334` in `handleOpenAIRequest`'s own `openai-completions` path.
+
+- No new failure handling was needed. `:879` and `:1035` sit under no catch at all — both forwards
+  are called from `handleOpenAIRequest` *above* its `try`, so their errors leave the handler as
+  they are — and `:1334`'s enclosing `catch` logs at debug level and re-throws, so it neither
+  swallows nor relabels the failure. A cap breach, a spill failure or a §5.9 refusal therefore
+  propagates through the attempt loop's `outcomeFromError` to `src/index.ts`'s terminal catch
+  (`:2974`) exactly as every other error from these handlers does, and is rendered as itself — 500
+  `processing_error`, 503 `over_limit_error` — in the Anthropic envelope, these routes being outside
+  the `/v1/responses*` family. The pre-existing retry policy applies to it unchanged: a thrown 5xx
+  is `isRetryableOutcome`, so a ladder may still try its next rung before the terminal catch, the
+  same as for the upstream error these branches already threw.
+- The upstream's own error still reaches the client unchanged, which is now visible in
+  `createErrorResponse`'s `UpstreamApiError` passthrough: same status, same
+  `handleTargetApiError` type/message mapping, and the raw body forwarded verbatim. Each
+  pre-existing `logger.error`/`logger.debug` line stays in its source position, so the observable
+  order stays receive → log → throw. As on every other `withResponseText` caller the error body is
+  now also emitted as the `upstream-response` pipeline stage, which is gated on `logger.traceEnabled`
+  and changes nothing unless tracing is on.
+- The cap is applied with `[spool] enabled = false` as well, matching the rule this repository
+  states for the other egresses and the pin already in this file's success-path tests; increment
+  43's open question about that convention is unaffected by this change.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining
+  `!response.ok` reads in `gemini.ts`, `claude.ts`, `chat-completions.ts` and `src/index.ts`, the
+  fusion `readResponseJson` clone, and the inbound `request.text()` family (a different direction of
+  travel).
+
+Verified: `tests/unit/openai-response-spool.test.ts` grew from 21 to 30 tests — three per site, on
+the existing three-site `SITES` table: the error body spilled mid-receive (asserted on disk
+part-way through), the client-visible `UpstreamApiError` identical to the spool-disabled baseline in
+status, type, message and `upstreamBody` with no `Response.prototype.clone()`, a
+`max_response_bytes` breach raising `SpoolResponseTooLargeError` (500 `processing_error`) with the
+upstream body cancelled and no partial spill, and a §5.9 refusal surfacing as 503 `over_limit_error`
+ahead of the upstream's 429. The suite was also run with the `:1334` site reverted to
+`response.text()` to confirm its three tests fail there. Full suite 2544/2544, typecheck and build
+clean.
+
+### feat(spool): §5.7 — `messages.ts`'s upstream *error* bodies are bounded
+
+`src/handlers/messages.ts`'s four `!response.ok` branches read the upstream's error body with
+`response.text()`, so a 429/500 answer was the one body on `/v1/messages` that no
+`max_response_bytes`, no spill and no §5.9 charge applied to — on exactly the branch that is already
+going wrong. All four now go through `withResponseText`, the bounded receive the success bodies
+beside them already use: `:401` (OpenAI-format client against an `openai-responses` upstream),
+`:505` (the same client against `openai-completions`), `:684` (Claude-format client against
+`openai-responses`) and `:822` (Claude-format client against `openai-completions`).
+
+- The landing is uniform and needed no new handling: all four sites live in the single
+  `handleMessagesRequest` and end in `handleTargetApiError`, which is typed `never`; none sits under
+  a catch of its own — the only nearby catches are `catch (_e) { /* ignore */ }` wrapping nothing but
+  the `/tmp/test_model.log` capture — so a cap breach, a spill failure or a §5.9 refusal propagates
+  to `src/index.ts`'s terminal catch exactly as each branch's success path does, and is rendered as
+  itself (500 `processing_error`, 503 `over_limit_error`) rather than as the upstream's error.
+- The upstream's own error still reaches the client unchanged: same status, same
+  `handleTargetApiError` type/message mapping, and `.upstreamBody` byte for byte. Each pre-existing
+  `activeLogger.error`/`activeLogger.debug` line stays in its source position, so the observable
+  order stays receive → log → throw, and the `upstreamBodyPreview` computations in the two
+  `openai-completions` branches are untouched. As on every other `withResponseText` caller the error
+  body is now also emitted as the `upstream-response` pipeline stage, which is gated on
+  `logger.traceEnabled` and changes nothing unless tracing is on.
+- The cap is applied with `[spool] enabled = false` as well, matching the rule this repository
+  states for the other egresses and the pin already in this file's success-path tests; increment
+  43's open question about that convention is unaffected by this change.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining
+  `!response.ok` reads in `openai.ts`, `gemini.ts`, `claude.ts`, `chat-completions.ts` and
+  `src/index.ts`, the fusion `readResponseJson` clone, and the inbound `request.text()` family
+  (a different direction of travel).
+
+Verified: `tests/unit/messages-response-spool.test.ts` gained 12 tests across a four-site table
+(both client formats against both upstream modes), three per site: the error body spilled
+mid-receive (asserted on disk part-way through), the client-visible `UpstreamApiError` identical to
+the spool-disabled baseline in status, type, message and `upstreamBody` with no
+`Response.prototype.clone()`, a `max_response_bytes` breach raising `SpoolResponseTooLargeError`
+(500 `processing_error`) with the upstream body cancelled and no partial spill, and a §5.9 refusal
+surfacing as 503 `over_limit_error` ahead of the upstream's 429. The suite was also run with one site
+reverted to `response.text()` to confirm the three tests fail there. Full suite 2535/2535, typecheck
+and build clean.
+
+### feat(spool): §5.7 — `responses.ts`'s upstream *error* bodies are bounded
+
+`src/handlers/responses.ts`'s `!response.ok` branches were the next unbounded family: eight sites
+called `response.text()` on the upstream's error body, so a 429/500 answer was the one body on those
+paths that no `max_response_bytes`, no spill and no §5.9 charge applied to — on exactly the branch
+that is already going wrong. All eight now go through `withResponseText`, the same bounded receive
+the success bodies beside them use: `:707` (`handleAsAnthropicMessages`), `:777` (`handleAsGemini`),
+`:980` (`handleAsCompletions`), `:1685` and `:1734` (`handleResponsesInputTokensRequest`'s converted
+and passthrough halves), `:1840` and `:1889` (`handleResponsesCompactRequest`'s two halves) and
+`:1989` (`handleAsPassthrough`).
+
+- The increment's content is where a failure lands, and here it is uniform: unlike the auxiliary
+  handlers, every one of these branches sits under no catch of its own — the six sub-handlers are
+  dispatched untangled from `handleResponsesRequest`, and the only nearby catches are the narrow §5.9
+  ones that release and re-throw. So a cap breach, a spill write failure or a §5.9 refusal needs no
+  new handling: it propagates to `src/index.ts`'s terminal catch exactly as these handlers' success
+  paths do, and is rendered by `createResponsesErrorResponse` as itself (500 `processing_error`,
+  503 `over_limit_error`) instead of being reported as the upstream's error.
+- The upstream's own error still reaches the client unchanged: same status, same
+  `handleResponsesApiError` type/message mapping, and `.upstreamBody` byte for byte, indentation
+  included — the raw wording is what a client matches on for capability-rejection recovery. The
+  existing `logger.error`/`logger.debug` line stays in its source position, so the observable order
+  stays receive → log → throw. One consequence, shared with every other `withResponseText` caller:
+  the error body is now also emitted as the `upstream-response` pipeline stage, which is gated on
+  `logger.traceEnabled` and so changes nothing unless tracing is on.
+- One finding, reported rather than fixed: `handleAsGemini`'s `!claudeResponse.ok` branch (`:777`) is
+  **unreachable**. `claudeResponse` comes from `handleGeminiGenerateContentRequest`, which turns any
+  non-ok upstream into `handleTargetApiError`'s throw inside its own `try` and otherwise returns only
+  200s, so that error body can never be produced or tested. It was made bounded anyway — a one-line
+  substitution of an existing statement, not new code — and the test file records why it is not
+  pinned.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining
+  `!response.ok` reads (`messages.ts`, `openai.ts`, `gemini.ts`, `chat-completions.ts`, `claude.ts`,
+  and the ones in `src/index.ts`), the fusion `readResponseJson` clone, and the in-process
+  `claudeResponse.json()` in `handleAsGemini` (an already bounded body).
+
+Verified: `tests/unit/responses-response-spool.test.ts` gained 21 tests across a seven-site table
+(the four converted readers plus the three passthrough forwards), per site: the error body spilled
+mid-receive (asserted on disk part-way through, not merely "a large read happened"), the
+client-visible `UpstreamApiError` identical to the spool-disabled baseline in status, type, message
+and `upstreamBody`, a `max_response_bytes` breach raising `SpoolResponseTooLargeError` (500
+`processing_error`) with the upstream body cancelled and no partial spill, and a §5.9 refusal
+surfacing as 503 `over_limit_error` *ahead of* the upstream's 429. The suite was also run with one
+site reverted to `response.text()` to confirm the three tests fail there. Full suite 2523/2523,
+typecheck and build clean.
+
+### feat(spool): §5.7 — the auxiliary handlers' upstream *error* bodies are bounded
+
+The `!response.ok` reads were the last unbounded family in the handlers this increment touches: five
+sites called `response.text()` on an upstream error body and parsed the result, so a 429/500 answer
+was the one body on those paths that no `max_response_bytes` and no spill applied to. Each now goes
+through `receiveJsonResponse`/`withResponseText`, the same bounded receive its own success path
+already uses: `src/handlers/models.ts:224` (`handleModelsRequest`), `:402`
+(`handleAnthropicModelsDiscovery`), `src/handlers/embeddings.ts:128`, `src/handlers/decision.ts:157`
+and `src/handlers/passthrough.ts:297`.
+
+- The increment's content is where a failure lands, and it splits two ways because the surrounding
+  code does. A cap breach, a spill write failure or a §5.9 refusal is the proxy's own limit — never
+  the upstream's error, and never a parse failure:
+  - `models.ts` ×2 answer it with `createErrorResponse` as itself. Both reads sit inside a catch that
+    already had a job (`handleModelsRequest`'s returns a 200 config-only model list;
+    `handleAnthropicModelsDiscovery`'s returns a 500 `internal_error` "Model discovery failed"), so
+    letting the limit reach either would report a proxy limit as a quietly smaller success or as a
+    broken upstream — a silent default success, forbidden by rule #8.
+  - `embeddings.ts`, `decision.ts` and `passthrough.ts` already let their success path's receive fail
+    upward, so the error body does the same and reaches the same terminal `createErrorResponse` in
+    `src/index.ts`. `passthrough.ts` is the one with a placeholder to protect: its
+    `'(failed to read response body)'` fallback would have swallowed every spool error into "the
+    upstream body could not be read", so its `catch` now re-throws unless the error is the
+    `TypeError` an unreadable stream raises — the only case that placeholder was ever for.
+- The upstream's own error still reaches the client unchanged: the same status, the same
+  `handleTargetApiError` type/message mapping, and `passthrough` still forwards `.upstreamBody` byte
+  for byte, indentation included.
+- Deliberately out of scope, still unbounded and each a separate increment: the remaining
+  `!response.ok` reads (`responses.ts`, `messages.ts`, `openai.ts`, `gemini.ts`,
+  `chat-completions.ts`, `claude.ts`, and the two in `src/index.ts`), and the fusion
+  `readResponseJson` clone. `/v1/messages/count_tokens` reads nothing on its error branch, so it is
+  listed rather than changed.
+
+Verified: `tests/unit/aux-handler-response-spool.test.ts` and
+`tests/unit/models-response-spool.test.ts` 13 new tests and
+`tests/unit/passthrough-response.test.ts` 3 new, per site where it applies: the error body spilled
+mid-receive (asserted on disk part-way through, not merely "a large read happened"), the
+client-visible error byte-identical to the spool-disabled answer, a `max_response_bytes` breach
+raising `SpoolResponseTooLargeError` (500 `processing_error`) with the upstream body cancelled and no
+partial spill, a §5.9 refusal reported as 503 `over_limit_error` rather than as that handler's own
+fallback, and passthrough's unreadable-body placeholder still covering a stream that dies mid-body.
+Full suite 2502/2502, typecheck and build clean.
+
 ### feat(spool): §5.7 — the three model-listing readers' response reads are bounded
 
 `src/handlers/models.ts` held the repo's last three whole-body upstream reads: `getModelCount` (the
@@ -217,6 +1117,75 @@ The lease-hold evidence was extended to cover the auth fetch itself: the idle sw
 every external call (upload, auth POST, store GET, upstream send) and must expire nothing.
 
 Verified: 9/9 in `index-auth-projection`.
+
+### fix(spool): §5.9 two-class admission — response reads can no longer deadlock behind request waiters
+
+The new concurrent-traffic evidence exposed a hold-and-wait deadlock under a contended
+`max_materialized_body_bytes`: a non-ref request holds its materialization reservation through
+the attempt loop (the recorded single-parse deviation), and its *response-side* admission — the
+attempt loop's stats parse, or a converting handler's response parse — queued FIFO behind
+waiting *request* bodies. The waiters needed the lease the in-flight exchange was holding; the
+exchange needed the admission the waiters were blocking. Two admitted requests held the budget
+until `admission_timeout_ms` fired, and the client got 503s for traffic that should have drained.
+
+`src/utils/spool-admission.ts` now runs two waiter classes on the one budget. Request bodies use
+`admitMaterialization` as before; every response-side read uses the new
+`admitResponseMaterialization`, which is admitted ahead of queued request bodies whenever its
+bytes fit and is drained first on every release. The hard cap, per-class arrival order, the
+shared queue cap, and the timeout/abort refusals are unchanged; a response that genuinely does
+not fit waits (ahead of the request queue) and can still time out — the honest answer to an
+over-committed budget. The SSE-event parse stays request-class: it runs after the request lease
+is released, so it queues safely and keeps the plan's "pause upstream reads while waiting"
+behavior. The seven response callsites (`passthrough`, `claude`, `chat-completions`, `gemini`
+×2, `responses` ×3, `spool-response.ts`, the attempt-loop stats read) were switched; plan §5.9
+records the rule.
+
+Tests: three new two-class cases in `spool-admission.test.ts` (jump-when-fits liveness,
+drain-response-first on release, per-class arrival order plus shared queue cap), and the
+end-to-end regression in `index-concurrent-traffic.test.ts` below.
+
+### fix(spool): concurrent `putBlob` of one new payload no longer loses lease counts
+
+`putBlob`'s "lookup and lease are one atomic operation" was not: the index check and
+`index.set(refs: 1)` were separated by the write's `await`s, so N concurrent requests carrying
+the *same new* payload all missed the index, all wrote the file, and each set `refs: 1` — last
+write won, every caller believed it held a lease, and the Nth release threw
+`refs already 0` in the request `finally` (a 500 for traffic that should dedupe). `putBlob` now
+gates one in-flight write per hash; racers chain onto the gate and take the ordinary refs+=1
+hit once the entry exists, and a failed write lets the next racer retry as writer. Regression:
+`index-concurrent-traffic.test.ts` drives eight concurrent identical requests to one stored
+blob with every lease returned.
+
+### test(spool): §12 evidence — concurrent traffic, §5.7 predicate matrix, mid-stream failures
+
+- `tests/unit/index-concurrent-traffic.test.ts` (new): a mixed burst of 8 binary + 8 large
+  non-ref requests through the real handler, with §5.9 admission enabled-and-contended and
+  disabled. Asserts every request is answered, each upstream body carries exactly its own
+  request's payload with no ref marker and no cross-contamination, both ledgers return to zero,
+  and the extracted blobs are idle-releasable afterwards.
+- §5.7 completed-JSON predicate matrix closed: `spool-response.test.ts` gains a
+  `responses-image-generation-result` round trip (byte-exact, exact `Content-Length`, scratch
+  cleanup) through `createConvertedResponseBody` — the only completed-JSON extraction point
+  for that predicate today; `gemini-response-spool.test.ts` gains the Interactions converted
+  egress at handler level (extracted image streamed back with exact length, receive spill
+  released before the answer, scratch deleted on completion and on client disconnect).
+- Mid-stream failure matrix closed: `spool-events.test.ts` gains the missing-file case — a
+  scratch blob *deleted* between the envelope and its chunks errors the stream, emits no
+  `[DONE]`, cancels upstream, and leaves nothing on disk.
+- The §12 checklist lines for §5.4/§5.7 predicates, mid-stream failures, and §5.8 auth links
+  are now checked.
+
+### perf(spool): Phase-3 gate measurement — parse is not the top allocator; Phase 3 stays deferred
+
+`tests/perf/parse-transient.ts` (new, `node --expose-gc --import tsx`) measures the §9.2 reopen
+condition with real modules: the full-parse window is **~1.3× body** while the end-to-end
+per-exchange peak through the handler is **~5.0–5.6× body** (4 MiB inline-image bodies,
+4-concurrent burst, distinct payloads) — parse is ~25–27% of the peak, dominated by the
+serialize/re-serialize chain and receive buffers. Removing the entire parse window would
+reclaim at most a quarter of the peak, so §9.2's reopen condition is not met and Phase 3 (the
+lexical scanner) stays deferred; the script is the rerun harness if the serialize chain ever
+flattens enough to move parse to the top. Plan §6/§9.2 record the numbers and the caveat that
+V8 string slicing can make the parse window read low.
 
 ### feat(spool): §5.7 bounds the two identity forwards in `responses.ts`
 

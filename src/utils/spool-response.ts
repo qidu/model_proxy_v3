@@ -33,19 +33,28 @@
  * `src/index.ts` and `src/handlers/passthrough.ts`. The attempt loop's JSON
  * stats read (`src/index.ts`) uses this module too: one bounded receive, one
  * parse, and the client's copy streamed from that same spool — never a
- * `response.clone()`. {@link receiveJsonResponse} is the converted egress's
+ * `response.clone()`. Its non-2xx sibling — the error body attached to a failed
+ * attempt's zero-usage `[remote] record_server` record — takes the same bounded
+ * receive with the spill handed back under the response, because that body is
+ * relayed to the client as the upstream's own error. {@link receiveJsonResponse}
+ * is the converted egress's
  * receive: the handlers that must parse the body to convert it (`/v1/messages`,
  * `/v1/chat/completions`, and `openai.ts`'s cross-mode egresses for a Gemini
  * client, `responses.ts`'s four converting readers) get one bounded receive, one
  * parse, and the spill back before the client is answered. Its primitive is
  * {@link withResponseText}, which the small endpoints' own readers use
  * (`embeddings.ts`, `token-counting.ts`, and `decision.ts`, whose egress is the
- * upstream body verbatim).
+ * upstream body verbatim), along with `src/index.ts`'s PII restore
+ * (`restorePrivacyResponse`) — the one reader whose input is a body the proxy
+ * built itself, and so the one that reads it back off the spool it just wrote.
+ * {@link consumeResponseText} is that same receive *without* the trace stage, for
+ * the two readers whose body must not be echoed: the remote auth response
+ * (`targets[].key`/`otac`) and the privacy-filter sidecar's redacted prompt text.
  */
 
 import { ClaudeProxyError } from './errors.js';
 import { logPipelineStage, type Logger } from './logger.js';
-import { admitMaterialization, type AdmissionLease } from './spool-admission.js';
+import { admitResponseMaterialization, type AdmissionLease } from './spool-admission.js';
 import { extractResponseBlobs, releaseExtractedBlobs, type InlineExtraction } from './blob-refs.js';
 import { createRefAwareJsonBody } from './ref-serializer.js';
 import { RESPONSE_BLOB_SCOPE, ResponseBlobStore } from './response-blobs.js';
@@ -127,6 +136,41 @@ export async function receiveJsonResponse<T>(
  * Receive an upstream response body into text with bounded memory, and hand that
  * text to `consume` while the §5.9 budget and the spill are still held (§5.7).
  *
+ * {@link withResponseText} is this plus the `upstream-response` trace stage. A
+ * caller whose body must not be written to the log uses this one: `src/index.ts`'s
+ * remote auth read, whose body carries upstream credentials, and
+ * `privacy-filter.ts`'s sidecar read, whose body is the user's own prompt text —
+ * both would be echoed in full by that stage.
+ *
+ * A `consume` that throws still releases the lease and the spill first, and a
+ * §5.9 refusal releases the spill before it propagates, so a failed receive
+ * leaves neither bytes on disk nor a reservation (rule #8).
+ */
+export async function consumeResponseText<T>(
+  body: ReadableStream<Uint8Array> | null | undefined,
+  consume: (text: string) => T,
+  signal?: AbortSignal
+): Promise<T> {
+  const received = await receiveResponseBody(body);
+  let lease: AdmissionLease;
+  try {
+    lease = await admitResponseMaterialization(received.size, signal);
+  } catch (error) {
+    await received.release();
+    throw error;
+  }
+  try {
+    return consume(await received.readText());
+  } finally {
+    lease.release();
+    await received.release();
+  }
+}
+
+/**
+ * Receive an upstream response body into text with bounded memory, and hand that
+ * text to `consume` while the §5.9 budget and the spill are still held (§5.7).
+ *
  * The primitive behind {@link receiveJsonResponse} and the egresses that cannot
  * use it. A caller that wants the parsed value passes `JSON.parse` and so pays,
  * inside the same lease, for the materialization the §5.9 budget exists for. A
@@ -147,22 +191,14 @@ export async function withResponseText<T>(
   consume: (text: string) => T,
   signal?: AbortSignal
 ): Promise<T> {
-  const received = await receiveResponseBody(response.body);
-  let lease: AdmissionLease;
-  try {
-    lease = await admitMaterialization(received.size, signal);
-  } catch (error) {
-    await received.release();
-    throw error;
-  }
-  try {
-    const text = await received.readText();
-    logPipelineStage(logger, requestId, 'upstream-response', stageUrl, text);
-    return consume(text);
-  } finally {
-    lease.release();
-    await received.release();
-  }
+  return await consumeResponseText(
+    response.body,
+    (text) => {
+      logPipelineStage(logger, requestId, 'upstream-response', stageUrl, text);
+      return consume(text);
+    },
+    signal
+  );
 }
 
 /** A converted response body, ready to hand to `new Response` (§5.7). */

@@ -17,6 +17,7 @@ import {
   AdmissionQueueFullError,
   AdmissionTimeoutError,
   admitMaterialization,
+  admitResponseMaterialization,
   getAdmissionQueueDepth,
   getAdmittedBytes,
   resetAdmission,
@@ -369,6 +370,98 @@ describe('spool admission (§5.9)', () => {
     assert.equal(waiting.value()?.nominalBytes, 800);
     assert.equal(getAdmittedBytes(), 800);
     waiting.value()?.release();
+    assert.equal(getAdmittedBytes(), 0);
+    assert.equal(getAdmissionQueueDepth(), 0);
+  });
+
+  it('admits a response read ahead of queued request bodies when it fits — the hold-and-wait case', async () => {
+    configure({ maxMaterializedBodyBytes: 1000, materializationFactor: 1, maxAdmissionQueue: 8 });
+
+    // A non-ref request holds most of the budget through its attempt loop, and
+    // two more request bodies are queued for the rest. The in-flight request's
+    // response read must not queue behind them: the waiters are waiting on the
+    // lease this exchange will release only once it completes.
+    const inFlight = await admitMaterialization(800);
+    const first = track(admitMaterialization(500));
+    const second = track(admitMaterialization(500));
+    await tick();
+    assert.equal(getAdmissionQueueDepth(), 2);
+
+    const response = track(admitResponseMaterialization(200));
+    await tick();
+    assert.equal(response.settled(), true, 'a fitting response read jumps the request queue');
+    assert.equal(response.value()?.nominalBytes, 200);
+    assert.equal(first.settled(), false, 'request waiters keep waiting — the budget is still full');
+    assert.equal(second.settled(), false);
+
+    // The exchange completes: its response read and its request lease go back,
+    // and the request queue drains in arrival order.
+    response.value()?.release();
+    inFlight.release();
+    await tick();
+    assert.equal(first.value()?.nominalBytes, 500, 'the queue drains once the exchange frees its bytes');
+    first.value()?.release();
+    await tick();
+    assert.equal(second.value()?.nominalBytes, 500);
+    second.value()?.release();
+    assert.equal(getAdmittedBytes(), 0);
+    assert.equal(getAdmissionQueueDepth(), 0);
+  });
+
+  it('drains a waiting response ahead of waiting requests when bytes free', async () => {
+    configure({ maxMaterializedBodyBytes: 1000, materializationFactor: 1, maxAdmissionQueue: 8 });
+
+    const held = await admitMaterialization(1000);
+    const request = track(admitMaterialization(700));
+    const response = track(admitResponseMaterialization(400));
+    await tick();
+    assert.equal(getAdmissionQueueDepth(), 2);
+    assert.equal(response.settled(), false, 'a response that does not fit waits too');
+
+    // Bytes free: the response goes first even though it queued second, because
+    // it is what completes an exchange; the request follows only if bytes remain.
+    held.release();
+    await tick();
+    assert.equal(response.value()?.nominalBytes, 400);
+    assert.equal(request.settled(), false, 'the response took the freed bytes first');
+
+    response.value()?.release();
+    await tick();
+    assert.equal(request.value()?.nominalBytes, 700);
+    request.value()?.release();
+    assert.equal(getAdmittedBytes(), 0);
+  });
+
+  it('keeps arrival order inside the response class, and counts both classes against the queue cap', async () => {
+    configure({ maxMaterializedBodyBytes: 1000, materializationFactor: 1, maxAdmissionQueue: 3 });
+
+    const held = await admitMaterialization(1000);
+    const first = track(admitResponseMaterialization(600));
+    const second = track(admitResponseMaterialization(500));
+    await tick();
+    const third = track(admitMaterialization(100));
+    await tick();
+    assert.equal(getAdmissionQueueDepth(), 3);
+
+    await assertRefused(
+      admitResponseMaterialization(50),
+      AdmissionQueueFullError,
+      503,
+      'over_limit_error',
+      'max_admission_queue',
+    );
+
+    held.release();
+    await tick();
+    assert.equal(first.value()?.nominalBytes, 600, 'the older response is admitted first');
+    assert.equal(second.settled(), false, 'even though 500 + 100 would leave the queue shorter');
+    first.value()?.release();
+    await tick();
+    assert.equal(second.value()?.nominalBytes, 500);
+    second.value()?.release();
+    await tick();
+    assert.equal(third.value()?.nominalBytes, 100, 'the request runs once the responses have drained');
+    third.value()?.release();
     assert.equal(getAdmittedBytes(), 0);
     assert.equal(getAdmissionQueueDepth(), 0);
   });

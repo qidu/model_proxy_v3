@@ -893,13 +893,103 @@ The full field-by-field reference lives in
   `response.text()` (`/decision` keeps the text, because its answer is the upstream body verbatim) —
   and on a route's `after_upstream` transforms, which receive the body they transform rather than
   reading it whole with `response.text()`, so the ops run on a bounded body and the handler's own
-  receive no longer re-bounds an already-materialized copy — and on the three model-listing
+  receive no longer re-bounds an already-materialized copy — and on a route's `response_egress`
+  transforms, the client-egress hook `applyWriteoutBody` runs in `request-transform.ts`, bounded the
+  same way and with the same limited scope: the hook still returns a non-JSON body (`text/event-stream`
+  among them) as the very `Response` it was handed, unread, so only a JSON answer is received — its
+  ops therefore run on a bounded body, and the client-egress read is usually a *second* receive of a
+  body the attempt's stats extraction already spooled, which above `threshold_bytes` costs a second
+  spill and buys no RAM relief — and on a route's `request_ingress` transforms, whose hook runs on the
+  attempt body read through the request-side spool rather than on a `Request.clone()`: a clone tees the
+  body, so the branch nobody reads stays resident for as long as the read runs, which is the second
+  full copy of an image-bearing body §5.7 exists to avoid. The original is consumed in place — the same
+  block rebuilds the request from the transformed body, so nothing reads it again — `max_request_bytes`
+  (10 MiB) bounds the read, and no declared length is passed, so it is the spool's own byte count that
+  is capped rather than a `Content-Length` left over from an earlier body. Above `threshold_bytes` the
+  read is a *second* spill of a body the ingress already spilled, so it costs disk churn instead of RAM
+  and a tight `max_total_bytes` can refuse a request the clone path served. §5.9 is not charged twice:
+  the request's own ingress lease already covers this materialization of the same bytes — and in the
+  `LOG_LEVEL === 'debug'` routing dump, the other place `src/index.ts` read the attempt body through
+  `Request.clone()`: it receives the body through the same request-side spool and hands the request
+  back a stream over that spill, because unlike the hook it cannot consume the body — the handler sends
+  it immediately after. So the dump logs what is sent (with spooling on, the `$spoolBlob` ref rather
+  than the base64, since the ladder has already replaced the payload), and a receive that fails is
+  answered as the request's error instead of being forwarded as an empty body — and on the two handler
+  entry points that can be routed to an `sdk://` target, `claude.ts` and `messages.ts`, whose body read
+  cloned the request on that route alone "to preserve body for SDK handler": a clone tees the body, so
+  the unread branch stayed resident for the length of the parse, a second full copy of a body that may
+  carry an image, and nothing ever read it — every `sdk://` branch is handed the *parsed* object and the
+  SDK handlers behind them are stubs that raise 501, so the two routes now take the same one
+  `await request.json()`, consumed in place exactly as the non-SDK branch of that ternary always did
+  (the failover ladder rebuilds a fresh `Request` per rung, so an exhausted body cannot reach another
+  attempt) — and on the
+  three model-listing
   readers in `models.ts` (the model count behind `GET /v1/models`' 404 check, the listing itself,
   and the Anthropic model-discovery reader), each a bounded receive where `response.text()`/`response.json()`
   stood, with a §5.7 cap, a spill failure or a §5.9 refusal surfacing as itself while a malformed
   body keeps that reader's own pre-existing answer (the count reader still answers a count of 0 and
   its caller its usual 404 — logged at error level, but indistinguishable to the client from an
-  empty upstream) — and in the attempt
+  empty upstream) — and on the upstream *error* bodies of `/v1/embeddings`, `/decision`, `/passthrough`
+  and the two `models.ts` readers above, each a bounded receive on the `!response.ok` branch where
+  `response.text()` stood, so `max_response_bytes` bounds an error answer too and a cap breach or a
+  §5.9 refusal surfaces as itself instead of as the upstream's error — and on every `/v1/responses`
+  branch's upstream *error* body (`POST /v1/responses`, `/input_tokens` and `/compact`, converted and
+  passthrough alike), where the same bounded receive means a cap breach or a §5.9 refusal reaches the
+  client as its own error (`processing_error` / `over_limit_error`) rather than as the upstream's
+  status — and on `/v1/messages`' four upstream *error* bodies (either client format against an
+  `openai-responses` or `openai-completions` upstream), where the upstream's status, type, message
+  and raw body still reach the client unchanged while a cap breach or a §5.9 refusal reaches it as
+  its own error — and on `openai.ts`'s three upstream *error* bodies (the two cross-mode forwards,
+  to an `anthropic-messages` and to an `openai-responses` upstream, and the plain
+  `openai-completions` egress), bounded the same way and with the same split: the upstream's status,
+  type, message and raw body still reach the client unchanged, while a cap breach or a §5.9 refusal
+  reaches it as its own error — and on `gemini.ts`'s three upstream *error* bodies (`:countTokens`,
+  `/v1/interactions` and the native `:generateContent`), bounded the same way and with the same
+  split: the upstream's status, type, message and raw body still reach the client unchanged, while a
+  cap breach or a §5.9 refusal reaches it as its own error — and on `claude.ts`'s single upstream
+  *error* body (the native `anthropic-messages` egress), where the branch's placeholder for an
+  unreadable body now applies only to a `TypeError`, so a cap breach or a refusal reaches the client
+  as itself instead of as the upstream's error — and on `/v1/chat/completions`' two converted upstream
+  *error* bodies (`anthropic-messages` and `gemini-generatecontent`), where the relayed status and
+  bytes are unchanged while a cap breach or a refusal propagates as itself — and on the fusion
+  pipeline's three response reads in `src/index.ts` (each panel answer, the judge's analysis and the
+  synthesis body the metadata wrap re-reads), which no longer call `resp.clone().json()`: they receive
+  once, so an image panel's base64 payload is never held twice, a cap breach or a §5.9 refusal on a
+  panel or judge answer fails the request instead of being read as "this model did not answer", and
+  the synthesis body reaches the client byte for byte either as the rebuilt metadata answer or
+  streamed back out of its spill — and on `src/index.ts`'s non-2xx remote-stats error body (the read
+  behind a failed attempt's zero-usage record for `[remote] record_server`), where the same bounded
+  receive replaces `clone().json()`/`clone().text()`, the failure's status, headers and bytes still
+  reach the client unchanged, and a cap breach, a spill failure or a refusal propagates as itself
+  with no record posted for a body the proxy refused to read — and on the remote auth server's own
+  pre-dispatch body in `src/index.ts`'s `doAuthRequest`, bounded like the rest but received *without*
+  a trace stage on purpose, because that answer can carry `targets[].key`/`otac` while the other
+  readers' `withResponseText` echoes the text it takes: its cap breach, spill failure or §5.9 refusal
+  is reported as itself (500 `processing_error` / 503 `over_limit_error`) instead of as the auth
+  server being unreachable — the two no-traces readers now share one primitive,
+  `consumeResponseText`, which is `withResponseText` without the trace stage — and on the privacy
+  filter's sidecar answer (`POST ${PRIVACY_FILTER_URL}/redact`), which goes through that same receive
+  because the body it returns is the redacted *prompt text*: as large as the request the filter
+  accepted (`max_chars`, 1 024 000 by default), so `max_response_bytes` bounds it, above
+  `threshold_bytes` it is received onto a spill the parse then reads back, and a cap breach or a
+  §5.9 refusal reaches the client as itself rather than as "privacy filter unavailable" (the request
+  still fails closed — no path returns unredacted text) — and on the kompress sidecar's answer
+  (`POST ${KOMPRESS_URL}/compress`), received through that same no-trace-stage primitive because the
+  answer is compressed *prompt* text: `max_response_bytes` bounds it, a spill holds it above
+  `threshold_bytes`, and a cap breach or a §5.9 refusal is reported as the proxy's own limit rather
+  than as a broken sidecar, while the request still fails open by default and forwards the original
+  text — this fail-open is no longer fail-silent: unreadable, failing or refused fragments and a batch
+  suppressed by `max_chars` are tallied by reason in the compress result and logged by the caller
+  (short reasons only, never fragment text) — and on the tool judge sidecar's answers (`/judge` and
+  the Clef `/decision` API, `src/utils/tool-judge-sidecar.ts`), the last unbounded request-path read in
+  `src/`: both are received through that same primitive, so `max_response_bytes` bounds an answer
+  derived from the tools and the user's prompt, a spill holds it above `threshold_bytes`, and a cap
+  breach, spill failure or §5.9 refusal is named a proxy limit instead of sending a health check after
+  a healthy sidecar — the judge still fails open, so the answer is discarded and every tool is accounted
+  unjudged, never erased from a read that could not finish — and, on the remote target-retry
+  ladder, on the bodies of the responses it *abandons*: a re-hit rung (axis 2) or a superseded one
+  (axis 1) has its body cancelled at the drop point instead of being left to hold a spill and its
+  reservation until the next startup sweep — and in the attempt
   loop's JSON usage/tool stats read: that read is
   one pass over the spooled body instead of a `response.clone()` that keeps every remaining byte
   alive for as long as it parses, and the client is sent a stream over the same spill. Above

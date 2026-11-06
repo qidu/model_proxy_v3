@@ -48,10 +48,11 @@
  *  - `Response.prototype.clone()` is never called: a bounded receive exists so
  *    that no second copy of the body is held.
  *
- * Deliberately out of scope, and left as they are (each is a separate item): the
- * `!response.ok` upstream *error* reads beside two of these sites
- * (`src/handlers/models.ts:217`, `:358`), which are part of the repo-wide
- * error-body item in `docs/architecture/todos-of-spool-design.md`.
+ * The `!response.ok` upstream *error* reads beside two of these sites
+ * (`handleModelsRequest`, `handleAnthropicModelsDiscovery`) are bounded the same
+ * way and pinned at the end of this file: an error body used to be the one body
+ * these handlers read whole. A cap breach on it now answers the limit as itself
+ * instead of leaving each catch-all to absorb it into its own smaller answer.
  */
 
 import { after, afterEach, beforeEach, describe, it } from 'node:test';
@@ -506,6 +507,115 @@ describe('getModelCount degradation (§5.7)', () => {
     assert.deepEqual(answer, { count: 0, cached: false });
     assert.equal(errors.length, 1, 'the cap must be reported exactly once, not swallowed');
     assert.match(errors[0], /too large/);
+    assert.deepEqual(spillFiles(config), []);
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.7: the upstream error body is bounded too
+// ---------------------------------------------------------------------------
+
+/**
+ * Both handlers' `!response.ok` branch read `response.text()` — the last whole-body
+ * read in the file. They differ in where the text lands: `handleModelsRequest`
+ * hands it to `handleTargetApiError`, whose throw the handler's own catch-all
+ * absorbs into the config-only list; `handleAnthropicModelsDiscovery` embeds it in
+ * its `upstream_error` message. Neither may absorb the proxy's own cap.
+ */
+describe('upstream error bodies (§5.7)', () => {
+  /** A 400 answer whose body is large enough to spill, as a stream we can watch. */
+  function errorUpstream(marker: string): { src: Sourced; chunks: Uint8Array[]; body: string } {
+    const body = JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `upstream said ${marker}` } });
+    const chunks = twoChunks(body);
+    return { src: source(chunks), chunks, body };
+  }
+
+  it('handleModelsRequest still answers its config-only list, having spilled the error body', async () => {
+    const config = configureSpool();
+    const body = JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `upstream said ${'x'.repeat(200)}` } });
+    const chunks = twoChunks(body);
+    assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the fixture must spill');
+    const seen: Array<{ files: number; bytes: number }> = [];
+    const src = source(chunks, (index) => {
+      seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+    });
+    stubUpstream(() => new Response(src.stream, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+
+    const response = await handleModelsRequest(modelsRequest(), MODELS_TARGET, AUTH, REQUEST_ID, LOGGER, ENV);
+
+    // The body really went through the spill, or this test would pass on a
+    // whole-body read too.
+    assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the error body must have been on disk mid-receive');
+    // The pre-existing contract, unchanged: `handleTargetApiError` throws, the
+    // handler's catch-all turns any upstream failure into the list it knows from
+    // config. Bounding the read must not change that answer.
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-cache'), 'MISS');
+    assert.deepEqual(await response.json(), { object: 'list', data: [] });
+    assert.deepEqual(spillFiles(config), [], 'the spill is released before the answer');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('handleModelsRequest answers an over-cap error body as itself, not as a smaller list', async () => {
+    const config = configureSpool({ maxResponseBytes: 256 });
+    const body = JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'z'.repeat(400) } });
+    const chunks = slices(body, 160);
+    assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+    assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+    const src = source(chunks);
+    stubUpstream(() => new Response(src.stream, { status: 404, headers: { 'Content-Type': 'application/json' } }));
+
+    const response = await handleModelsRequest(modelsRequest(), MODELS_TARGET, AUTH, REQUEST_ID, LOGGER, ENV);
+
+    // The catch-all below the read would have answered 200 with the config-only
+    // list — a smaller success standing in for a proxy limit (rule #8).
+    assert.equal(response.status, 500);
+    assert.equal(response.headers.get('x-request-id'), REQUEST_ID);
+    const payload = await response.json() as { type: string; error: { type: string; message: string } };
+    assert.equal(payload.type, 'error');
+    assert.equal(payload.error.type, 'processing_error');
+    assert.match(payload.error.message, /too large/);
+    assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+    assert.deepEqual(spillFiles(config), [], 'a rejected error body removes its partial spill');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('handleAnthropicModelsDiscovery embeds the spilled error body in its own envelope', async () => {
+    const config = configureSpool();
+    const marker = 'y'.repeat(200);
+    const { src, chunks } = errorUpstream(marker);
+    assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the fixture must spill');
+    stubUpstream(() => new Response(src.stream, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+
+    const response = await handleAnthropicModelsDiscovery(modelsRequest(), MODELS_TARGET, AUTH, REQUEST_ID, LOGGER, DISCOVERY_ENV);
+
+    // The upstream status and the body text both reach the client on this branch,
+    // so the marker is the tell that the spilled bytes were kept, not dropped.
+    assert.equal(response.status, 400);
+    const payload = await response.json() as { error: { type: string; message: string } };
+    assert.equal(payload.error.type, 'upstream_error');
+    assert.ok(payload.error.message.includes(marker), 'the error body must survive the bounded read');
+    assert.deepEqual(spillFiles(config), [], 'the spill is released before the answer');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('handleAnthropicModelsDiscovery answers an over-cap error body as itself, not as internal_error', async () => {
+    const config = configureSpool({ maxResponseBytes: 256 });
+    const body = JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'z'.repeat(400) } });
+    const chunks = slices(body, 160);
+    assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+    const src = source(chunks);
+    stubUpstream(() => new Response(src.stream, { status: 404, headers: { 'Content-Type': 'application/json' } }));
+
+    const response = await handleAnthropicModelsDiscovery(modelsRequest(), MODELS_TARGET, AUTH, REQUEST_ID, LOGGER, DISCOVERY_ENV);
+
+    assert.equal(response.status, 500);
+    const payload = await response.json() as { type: string; error: { type: string; message: string } };
+    assert.equal(payload.error.type, 'processing_error', 'not the 500 that claims the upstream broke');
+    assert.match(payload.error.message, /too large/);
+    assert.equal(src.cancelled, true);
     assert.deepEqual(spillFiles(config), []);
     assert.equal(getLiveSpillBytes(), 0);
   });

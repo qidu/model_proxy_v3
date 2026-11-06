@@ -13,7 +13,7 @@ import type { Env, Logger } from '../types/shared.js';
 import { createErrorResponse } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
-import { receiveJsonResponse } from '../utils/spool-response.js';
+import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 
 /**
  * Reshape an OpenAI `/v1/embeddings` body into Ollama's `POST /api/embed` body.
@@ -121,8 +121,18 @@ export async function handleEmbeddingsRequest(
 
   if (!upstreamResponse.ok) {
     logger.error(requestId, `Upstream embedding error: ${upstreamResponse.status}`);
-    // Forward upstream error as-is
-    const errorText = await upstreamResponse.text();
+    // Forward upstream error as-is. §5.7: one bounded receive, as on the success
+    // path below — `max_response_bytes` bounds an error body too, and a cap
+    // breach, a spill write failure or a §5.9 refusal propagates as itself rather
+    // than being forwarded as though it came from the upstream (rule #8).
+    const errorText = await withResponseText(
+      upstreamResponse,
+      requestId,
+      logger,
+      targetUrl,
+      (text) => text,
+      request.signal,
+    );
     return new Response(errorText, {
       status: upstreamResponse.status,
       headers: {

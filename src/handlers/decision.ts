@@ -149,8 +149,19 @@ export async function handleDecisionRequest(
 
   if (!upstreamResponse.ok) {
     logger.error(requestId, `Upstream decision error: ${upstreamResponse.status}`);
-    // Forward upstream error as-is (status + body + x-request-id)
-    const errorText = await upstreamResponse.text();
+    // Forward upstream error as-is (status + body + x-request-id). §5.7: one
+    // bounded receive, as on the success path below — `max_response_bytes` bounds
+    // an error body too, and a cap breach, a spill write failure or a §5.9 refusal
+    // propagates as itself rather than being forwarded as the upstream's own
+    // (rule #8).
+    const errorText = await withResponseText(
+      upstreamResponse,
+      requestId,
+      logger,
+      url,
+      (text) => text,
+      signal,
+    );
     return new Response(errorText, {
       status: upstreamResponse.status,
       headers: {

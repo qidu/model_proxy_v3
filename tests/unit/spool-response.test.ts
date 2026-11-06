@@ -336,6 +336,49 @@ describe('createConvertedResponseBody — the converted response egress (§5.7)'
       'a converted response must not populate the cross-request cache (§5.7)');
   });
 
+  it('streams a completed Responses image_generation_call result back byte for byte', async () => {
+    // The §5.7 allowlist's second predicate in a *completed JSON* body: no
+    // converter in src/ constructs this output today, so this egress utility is
+    // the only completed-JSON extraction point for it — the SSE-event half is
+    // covered in spool-events.test.ts.
+    const config = configure();
+    const result = base64(200_000, 23);
+    const value = {
+      id: 'resp_1',
+      object: 'response',
+      status: 'completed',
+      output: [
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'here' }] },
+        { id: 'ig_1', type: 'image_generation_call', status: 'completed', result },
+      ],
+      usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+    };
+    const expected = JSON.stringify(value);
+    const expectedLength = Buffer.byteLength(expected, 'utf8');
+
+    const converted = await createConvertedResponseBody(value);
+
+    assert.notEqual(typeof converted.body, 'string', 'a response with a payload streams');
+    assert.equal(converted.contentLength, expectedLength, 'the declared length is the unextracted serialization');
+
+    const ref = (value.output[1] as any).result;
+    assert.equal(isBlobRef(ref), true, 'the result payload left the value tree for a ref');
+    assert.equal(ref.kind, 'responses-image-generation-result');
+    assert.equal(ref.hash, sha256(Buffer.from(result)));
+    assert.equal(scratchFiles(config).length, 1, 'the payload is on disk while the response is in flight');
+
+    const { bytes, chunks } = await readBody(converted.body);
+    assert.equal(bytes.length, expectedLength);
+    assert.equal(sha256(bytes), sha256(Buffer.from(expected, 'utf8')), 'the client got the unextracted bytes');
+    assert.ok(chunks > 1, `the payload must be streamed in chunks, saw ${chunks}`);
+    assert.equal(bytes.toString('utf8').includes(result), true, 'the payload is on the wire, not just a marker');
+    assert.equal(bytes.toString('utf8').includes(BLOB_REF_MARKER), false, 'the ref itself must never reach a client');
+
+    assert.deepEqual(scratchFiles(config), [], 'the last byte deletes the scratch file');
+    assert.deepEqual(getBlobStoreStats(), { cacheBytes: 0, cacheEntries: 0, diskBytes: 0, diskEntries: 0 },
+      'a converted response must not populate the cross-request cache (§5.7)');
+  });
+
   it('deletes the scratch file when the client cancels mid-payload', async () => {
     const config = configure();
     const image = base64(200_000, 19);

@@ -128,13 +128,18 @@ interface Sourced {
   cancelled: boolean;
 }
 
-/** An upstream body we can watch being cancelled when the proxy gives up on it. */
-function source(chunks: Uint8Array[]): Sourced {
+/**
+ * An upstream body we can watch being cancelled when the proxy gives up on it.
+ * `onPull(i)` runs when the proxy asks for chunk `i`, i.e. after chunks `0…i-1`
+ * have been read.
+ */
+function source(chunks: Uint8Array[], onPull?: (index: number) => void): Sourced {
   let index = 0;
   const state: Sourced = { cancelled: false, stream: null as unknown as ReadableStream<Uint8Array> };
   state.stream = new ReadableStream<Uint8Array>(
     {
       pull(controller) {
+        onPull?.(index);
         if (index >= chunks.length) {
           controller.close();
           return;
@@ -315,6 +320,104 @@ describe('passthrough non-SSE response (§5.7)', () => {
     assert.ok(caught instanceof SpoolWriteError, `expected SpoolWriteError, got ${String(caught)}`);
     assert.equal(bodyChunks, 0, 'not one byte of a short spill may reach the client');
     assert.deepEqual(spillFiles(config), [], 'a failed read still frees the spill');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+});
+
+/**
+ * The upstream *error* body (§5.7). `!response.ok` used to call
+ * `response.text()`, so an upstream error body was the one body on this path that
+ * nothing bounded. It now goes through the same `withResponseText` as a success
+ * body, and the raw text still reaches `handleTargetApiError` verbatim.
+ */
+describe('passthrough upstream error body (§5.7)', () => {
+  /** A 429 answer whose body is large enough to spill, indented so bytes matter. */
+  function errorPayload(marker: string): string {
+    return JSON.stringify(
+      { type: 'error', error: { type: 'rate_limit_error', message: `upstream said ${marker}` } },
+      null,
+      2,
+    );
+  }
+
+  /** Run the handler and return whatever it threw: `handleTargetApiError` throws. */
+  async function caughtFromHandler(): Promise<any> {
+    try {
+      await callHandler({ request: post('claude-err') });
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  }
+
+  it('receives an error body through the spill and carries it verbatim', async () => {
+    const config = configureSpool();
+    const payload = errorPayload('x'.repeat(200));
+    const bytes = new TextEncoder().encode(payload);
+    const half = Math.floor(bytes.byteLength / 2);
+    const chunks = [bytes.subarray(0, half), bytes.subarray(half)];
+    assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the fixture must spill');
+    const seen: Array<{ files: number; bytes: number }> = [];
+    const src = source(chunks, (index) => {
+      seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+    });
+    stubUpstream(() => new Response(src.stream, { status: 429, headers: { 'Content-Type': 'application/json' } }));
+
+    const caught = await caughtFromHandler();
+
+    // The error body really went through the spill, or a whole-body read would
+    // leave nothing on disk part-way through.
+    assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the error body must have been on disk mid-receive');
+    assert.equal(caught?.status, 429, 'the upstream status still reaches the client');
+    assert.equal(caught?.type, 'rate_limit_error');
+    // The raw body is what the client receives on this path, so equality here is
+    // the property that matters: indentation, order and the marker all survived.
+    assert.equal(caught?.upstreamBody, payload, 'the error body must reach the client byte for byte');
+    assert.deepEqual(spillFiles(config), [], 'the spill is released before the error is thrown');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('fails loudly past max_response_bytes instead of carrying a truncated error body', async () => {
+    const config = configureSpool({ maxResponseBytes: 256 });
+    const payload = errorPayload('z'.repeat(400));
+    const bytes = new TextEncoder().encode(payload);
+    const chunks: Uint8Array[] = [];
+    for (let offset = 0; offset < bytes.byteLength; offset += 160) chunks.push(bytes.subarray(offset, offset + 160));
+    assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+    const src = source(chunks);
+    stubUpstream(() => new Response(src.stream, { status: 429, headers: { 'Content-Type': 'application/json' } }));
+
+    const caught = await caughtFromHandler();
+
+    // The proxy's cap, not the upstream's 429: the client is told what actually
+    // stopped the body (rule #8).
+    assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+    assert.equal(caught.status, 500);
+    assert.match(caught.message, /too large/);
+    assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+    assert.deepEqual(spillFiles(config), [], 'a rejected error body removes its partial spill');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  it('keeps its unreadable-body placeholder when the error stream itself breaks', async () => {
+    configureSpool();
+    // What a socket that dies mid-body does: the read rejects with a `TypeError`.
+    const broken = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new TypeError('terminated'));
+      },
+    });
+    stubUpstream(() => new Response(broken, { status: 429, headers: { 'Content-Type': 'application/json' } }));
+
+    const caught = await caughtFromHandler();
+
+    // The one thing that placeholder was ever for: an unreadable body must not
+    // replace the upstream's error with a crash; anything else (a cap, a write
+    // failure, a §5.9 refusal) is the proxy's own limit and propagates as itself.
+    assert.equal(caught?.status, 429);
+    assert.equal(caught?.type, 'rate_limit_error');
+    assert.equal(caught?.upstreamBody, '(failed to read response body)');
     assert.equal(getLiveSpillBytes(), 0);
   });
 });

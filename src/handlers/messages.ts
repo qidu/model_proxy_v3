@@ -32,7 +32,7 @@ import { collectBlobRefs, rehydrateInlineBlobs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
 import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
 import { getSpoolConfig } from '../utils/spool.js';
-import { receiveJsonResponse } from '../utils/spool-response.js';
+import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 
 /**
  * Get token counting configuration from environment
@@ -220,9 +220,17 @@ export async function handleMessagesRequest(
 ): Promise<Response> {
   const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
 
-  // Clone request before parsing body to preserve body for SDK handler
-  // Parse request body from cloned request
-  const requestBody = isSdkUrl(targetUrl) ? await request.clone().json() as Record<string, unknown> : await request.json() as Record<string, unknown>;
+  // §5.7: the body is read once, in place. The `sdk://` route used to read it
+  // through `request.clone()` "to preserve body for SDK handler", and a clone
+  // *tees* the body: the branch nobody reads stays resident for as long as the
+  // parse runs, i.e. a second full copy of a body that may carry an image.
+  // Nothing reads that branch — both `sdk://` branches below are handed
+  // `requestBody`, the parsed object, and the SDK handlers are stubs that never
+  // touch the request they are given. The non-SDK route already consumed the
+  // body here, so this only makes the two routes the same read. An SDK handler
+  // that ever does need the wire body must be handed one explicitly (a receive,
+  // as the ingress does) rather than by teeing this one.
+  const requestBody = await request.json() as Record<string, unknown>;
   // §5.3 egress shape. The send boundary forwards refs, not payloads, so each
   // branch below decides at its own send whether to put the payloads back (shape 2)
   // or to hand the refs to a serializer that streams each payload at the offset its
@@ -398,7 +406,7 @@ export async function handleMessagesRequest(
       recordUpstreamRateLimit(model, (name) => responsesResponse.headers.get(name), targetUrl);
 
       if (!responsesResponse.ok) {
-        const upstreamResponseBody = await responsesResponse.text();
+        const upstreamResponseBody = await withResponseText(responsesResponse, requestId, activeLogger, targetUrl, (text) => text, request.signal);
         activeLogger.error(requestId, `Messages->Responses API error (openai-passthrough): ${responsesResponse.status}, URL: ${targetUrl}, upstream body: ${upstreamResponseBody.substring(0, 500)}`);
         handleTargetApiError(responsesResponse, 'Messages API (via Responses)', { url: targetUrl, body: JSON.stringify(responsesBody), upstreamBody: upstreamResponseBody });
       }
@@ -502,7 +510,7 @@ export async function handleMessagesRequest(
       const bodyPreview = typeof requestBody === 'string'
         ? requestBody
         : JSON.stringify(requestBody);
-      const upstreamResponseBody = await response.text();
+      const upstreamResponseBody = await withResponseText(response, requestId, activeLogger, targetUrl, (text) => text, request.signal);
       const upstreamBodyPreview = upstreamResponseBody.length > 500
         ? `${upstreamResponseBody.substring(0, 500)}...`
         : upstreamResponseBody;
@@ -681,7 +689,7 @@ export async function handleMessagesRequest(
     recordUpstreamRateLimit(targetModelId, (name) => responsesResponse.headers.get(name), targetUrl);
 
     if (!responsesResponse.ok) {
-      const upstreamResponseBody = await responsesResponse.text();
+      const upstreamResponseBody = await withResponseText(responsesResponse, requestId, activeLogger, targetUrl, (text) => text, request.signal);
       activeLogger.error(requestId, `Messages->Responses API error: ${responsesResponse.status}, URL: ${targetUrl}, upstream body: ${upstreamResponseBody.substring(0, 500)}`);
       handleTargetApiError(responsesResponse, 'Messages API (via Responses)', { url: targetUrl, body: JSON.stringify(responsesBody), upstreamBody: upstreamResponseBody });
     }
@@ -819,7 +827,7 @@ export async function handleMessagesRequest(
     const bodyPreview = typeof openaiRequest === 'string'
       ? openaiRequest
       : JSON.stringify(openaiRequest);
-    const upstreamResponseBody = await response.text();
+    const upstreamResponseBody = await withResponseText(response, requestId, activeLogger, targetUrl, (text) => text, request.signal);
     const upstreamBodyPreview = upstreamResponseBody.length > 500
       ? `${upstreamResponseBody.substring(0, 500)}...`
       : upstreamResponseBody;

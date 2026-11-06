@@ -557,6 +557,43 @@ describe('streamResponseEvents — binary payload extraction (§5.7)', () => {
     assert.equal(getLiveSpillBytes(), 0);
   });
 
+  it('errors mid-event when the scratch blob is gone, instead of delivering a short payload', async () => {
+    const config = configure({ thresholdBytes: 1024, maxResponseBytes: 200_000 });
+    const src = source([geminiImageEvent(imageBase64(4096, 3)), 'data: never\n\n']);
+    const reader = streamResponseEvents(src.stream).getReader();
+
+    const first = await reader.read(); // the envelope chunk: the payload is still on disk
+    assert.equal(decoder.decode(first.value), 'data: ');
+    const [blob] = scratchBlobs(config);
+    assert.equal(typeof blob, 'string');
+    // The missing-file case: the payload is deleted between the envelope and the
+    // chunks that were supposed to carry it.
+    rmSync(join(eventSpillDir(config), blob));
+
+    const chunks: Uint8Array[] = [first.value!];
+    let total = first.value!.byteLength;
+    let error: unknown;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          total += value.byteLength;
+        }
+      }
+    } catch (readError) {
+      error = readError;
+    }
+    const bytes = concat(chunks, total);
+
+    assert.ok(error instanceof Error, `a missing payload must error the stream, got clean bytes: ${decoder.decode(bytes)}`);
+    assert.equal(decoder.decode(bytes).includes('[DONE]'), false, 'no terminal success may follow a failed payload');
+    assert.equal(src.cancelled(), true, 'the upstream must be cancelled, not left flowing');
+    assert.deepEqual(eventSpillFiles(config), [], 'the failed event leaves no spill and no scratch blob behind');
+    assert.equal(getLiveSpillBytes(), 0);
+  });
+
   it('refuses to parse an event the materialization budget cannot admit, and aborts', async () => {
     const config = configure({
       thresholdBytes: 1024,

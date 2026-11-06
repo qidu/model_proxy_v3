@@ -15,8 +15,8 @@ import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount }
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { collectBlobRefs, rehydrateInlineBlobs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
-import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
-import { receiveResponseBody } from '../utils/spool-response.js';
+import { admitResponseMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { receiveResponseBody, withResponseText } from '../utils/spool-response.js';
 import { getSpoolConfig } from '../utils/spool.js';
 
 /**
@@ -34,9 +34,17 @@ export async function handleClaudeRequest(
 ): Promise<Response> {
     const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
 
-    // Clone request before parsing body to preserve body for SDK handler
-    // Parse request body from cloned request
-    const requestBody = isSdkUrl(targetUrl) ? await request.clone().json() as Record<string, unknown> : await request.json() as Record<string, unknown>;
+    // §5.7: the body is read once, in place. The `sdk://` route used to read it
+    // through `request.clone()` "to preserve body for SDK handler", and a clone
+    // *tees* the body: the branch nobody reads stays resident for as long as the
+    // parse runs, i.e. a second full copy of a body that may carry an image.
+    // Nothing reads that branch — every `sdk://` branch below is handed
+    // `requestBody`, the parsed object, and the SDK handlers are stubs that never
+    // touch the request they are given. The non-SDK route already consumed the
+    // body here, so this only makes the two routes the same read. An SDK handler
+    // that ever does need the wire body must be handed one explicitly (a receive,
+    // as the ingress does) rather than by teeing this one.
+    const requestBody = await request.json() as Record<string, unknown>;
     // Parse request body
     //const requestBody = await request.json() as Record<string, unknown>;
     // §5.3 egress shape. Shape 2 (the default, and every other handler today):
@@ -185,9 +193,15 @@ export async function handleClaudeRequest(
         // Read upstream response body for diagnostics
         let upstreamErrorBody = '';
         try {
-            upstreamErrorBody = await response.text();
+            // §5.7: the error body goes through the same bounded receive as a success
+            // body, so `max_response_bytes` bounds it too. Only an unreadable body — the
+            // one thing the placeholder below was ever for — keeps it; a cap breach, a
+            // spill write failure or a §5.9 refusal is the proxy's own limit and must
+            // surface as itself, not as "the upstream body could not be read" (rule #8).
+            upstreamErrorBody = await withResponseText(response, requestId, activeLogger, targetUrl, (text) => text, request.signal);
             activeLogger.error(requestId, `Upstream error response (${response.status}): ${upstreamErrorBody.substring(0, 2000)}`);
-        } catch {
+        } catch (error) {
+            if (!(error instanceof TypeError)) throw error;
             upstreamErrorBody = '(failed to read response body)';
         }
         const bodyPreview = JSON.stringify(requestBody).substring(0, 300);
@@ -237,7 +251,7 @@ export async function handleClaudeRequest(
         // neither the received bytes on disk nor a reservation on the ledger (#8).
         let lease: AdmissionLease;
         try {
-            lease = await admitMaterialization(received.size, request.signal);
+            lease = await admitResponseMaterialization(received.size, request.signal);
         } catch (error) {
             await received.release();
             throw error;

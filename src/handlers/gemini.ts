@@ -20,8 +20,8 @@ import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
-import { createConvertedResponseBody, receiveJsonResponse, receiveResponseBody, type ConvertedResponseBody } from '../utils/spool-response.js';
-import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { createConvertedResponseBody, receiveJsonResponse, receiveResponseBody, withResponseText, type ConvertedResponseBody } from '../utils/spool-response.js';
+import { admitResponseMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
 
 /**
  * Check if request is in native Gemini format
@@ -127,7 +127,7 @@ async function handleGeminiCountTokensRequest(
     recordUpstreamRateLimit(modelId, (name) => response.headers.get(name), targetUrl);
 
     if (!response.ok) {
-        const errorText = await response.text();
+        const errorText = await withResponseText(response, requestId, activeLogger, targetUrl, (text) => text, request.signal);
         activeLogger.error(requestId, `Gemini countTokens error: ${errorText}`);
         handleTargetApiError(response, 'Gemini API', { url: targetUrl, upstreamBody: errorText });
     }
@@ -277,7 +277,7 @@ async function handleGeminiInteractionsRequest(
     recordUpstreamRateLimit((requestBody.model as string) || modelId, (name) => response.headers.get(name), fullTargetUrl);
 
     if (!response.ok) {
-        const errorText = await response.text();
+        const errorText = await withResponseText(response, requestId, activeLogger, fullTargetUrl, (text) => text, request.signal);
         activeLogger.error(requestId, `Gemini API error: ${errorText}`);
         const bodyPreview = JSON.stringify(geminiRequest).substring(0, 1000);
         handleTargetApiError(response, 'Gemini API', { url: fullTargetUrl, body: bodyPreview, upstreamBody: errorText });
@@ -301,7 +301,7 @@ async function handleGeminiInteractionsRequest(
         // capacity here waits before any of it has been materialized. The charge
         // is the received byte count, never a guess from `Content-Length`. A
         // refusal must leave neither bytes on disk nor a reservation (rule #8).
-        lease = await admitMaterialization(received.size, request.signal);
+        lease = await admitResponseMaterialization(received.size, request.signal);
     } catch (error) {
         await received.release();
         throw error;
@@ -490,7 +490,7 @@ async function handleGeminiGenerateContentRequest(
 
         // Handle target API errors
         if (!response.ok) {
-            const upstreamErrorBody = await response.text();
+            const upstreamErrorBody = await withResponseText(response, requestId, activeLogger, fullTargetUrl, (text) => text, request.signal);
             const bodyPreview = JSON.stringify(geminiRequest).substring(0, 1000);
             handleTargetApiError(response, 'Gemini API', { url: fullTargetUrl, body: bodyPreview, upstreamBody: upstreamErrorBody });
         }
@@ -643,7 +643,7 @@ async function relayNativeGeminiResponse(
         // leave neither bytes on disk nor a reservation (rule #8).
         let lease: AdmissionLease;
         try {
-            lease = await admitMaterialization(received.size, signal);
+            lease = await admitResponseMaterialization(received.size, signal);
         } catch (error) {
             await received.release();
             throw error;

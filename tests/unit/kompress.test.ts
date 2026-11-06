@@ -6,7 +6,12 @@
  * isCjkHeavy (CJK ranges, non-ASCII threshold, pure ASCII), and compressBody
  * (compressible ref collection — user/tool text only, system/assistant/schema
  * untouched — minChars / CJK / maxChars guards, fail-open vs fail-closed,
- * saved-chars accounting, skipped non-shrinking fragments).
+ * saved-chars accounting, skipped non-shrinking fragments, and the per-reason
+ * reporting of every fragment the sidecar did not compress).
+ *
+ * The §5.7 bounded read of the sidecar's answer — the cap, the spill, §5.9 and
+ * what the reasons must never contain — is covered separately in
+ * `tests/unit/kompress-response-spool.test.ts`.
  *
  * Run with: npx tsx --test tests/unit/kompress.test.ts
  */
@@ -248,28 +253,35 @@ describe('compressBody', () => {
     assert.equal((body.messages as any)[0].content, cjk, 'CJK fragment forwarded verbatim');
   });
 
-  it('skips everything when combined text exceeds maxChars', async () => {
+  it('skips everything when combined text exceeds maxChars, and reports the limit', async () => {
     globalThis.fetch = (async () => okSidecar('xx')) as any;
     const body = { messages: [{ role: 'user', content: LONG }, { role: 'tool', content: LONG }] };
     const result = await compressBody(config({ maxChars: 100 }), body);
     assert.equal(result.fragments, 0);
     assert.equal((body.messages as any)[0].content, LONG);
+    // Rule #8: the cap that suppressed the batch is reported, not a silent no-op.
+    assert.deepEqual(result.uncompressed, [{
+      reason: `combined text ${LONG.length * 2} chars over maxChars 100`,
+      count: 2,
+    }]);
   });
 
-  it('fails open: a sidecar outage forwards the original text', async () => {
+  it('fails open: a sidecar outage forwards the original text — and says why', async () => {
     globalThis.fetch = (async () => { throw new Error('ECONNREFUSED'); }) as any;
     const body = { messages: [{ role: 'user', content: LONG }] };
     const result = await compressBody(config({ failOpen: true }), body);
     assert.equal(result.fragments, 0);
     assert.equal((body.messages as any)[0].content, LONG);
+    // Rule #8: failing open is not failing silently — the reason is reported.
+    assert.deepEqual(result.uncompressed, [{ reason: 'sidecar unreachable: ECONNREFUSED', count: 1 }]);
   });
 
-  it('fails closed: throws when failOpen=false and the sidecar errors', async () => {
+  it('fails closed: throws with the sidecar\'s own reason when failOpen=false', async () => {
     globalThis.fetch = (async () => new Response('boom', { status: 500 })) as any;
     const body = { messages: [{ role: 'user', content: LONG }] };
     await assert.rejects(
       compressBody(config({ failOpen: false }), body),
-      /kompress sidecar unavailable/,
+      /kompress sidecar unavailable: sidecar returned 500/,
     );
   });
 
@@ -290,11 +302,12 @@ describe('compressBody', () => {
     const result = await compressBody(config(), body);
     assert.equal(result.fragments, 0);
     assert.equal((body.messages as any)[0].content, LONG);
+    assert.deepEqual(result.uncompressed, [{ reason: 'answer carried no "compressed" string', count: 1 }]);
   });
 
   it('returns zero stats when there is nothing compressible', async () => {
     const body = { model: 'x', messages: [{ role: 'assistant', content: LONG }] };
     const result = await compressBody(config(), body);
-    assert.deepEqual(result, { body, fragments: 0, savedChars: 0, savedPct: 0 });
+    assert.deepEqual(result, { body, fragments: 0, savedChars: 0, savedPct: 0, uncompressed: [] });
   });
 });

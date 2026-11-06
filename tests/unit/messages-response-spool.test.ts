@@ -12,6 +12,12 @@
  * `receiveJsonResponse`: received with bounded memory (§5.7's threshold and
  * cap), parsed once, and the spill released before the client is answered.
  *
+ * The same handler reads an upstream *error* body whole on four further paths —
+ * the two `handleTargetApiError` sites in its passthrough branch and the two in
+ * its converted branch. Those now share `withResponseText`, so the same
+ * threshold, cap and §5.9 charge bound the body the client's error quotes, and
+ * the raw body still reaches `UpstreamApiError.upstreamBody` whole.
+ *
  * What these tests pin, and why each assertion is worth its space:
  *  - the converted body every client receives is unchanged, both under the
  *    threshold and above it (the spool must not change an answer);
@@ -42,7 +48,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { handleMessagesRequest } from '../../src/handlers/messages.js';
-import { ClaudeProxyError } from '../../src/utils/errors.js';
+import { ClaudeProxyError, UpstreamApiError } from '../../src/utils/errors.js';
 import { SpoolResponseTooLargeError } from '../../src/utils/spool-response.js';
 import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
 import { SPOOL_DEFAULTS, responseSpillDir, setSpoolConfig, type SpoolConfig } from '../../src/utils/spool.js';
@@ -704,3 +710,136 @@ describe('messages.ts /tmp/test_model.log capture (§5.7)', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// §5.7: the upstream *error* body
+// ---------------------------------------------------------------------------
+
+/**
+ * One of the four `!response.ok` reads in `handleMessagesRequest`. Each one read
+ * the body with `response.text()` and now goes through `withResponseText`. All
+ * four end in `handleTargetApiError`, which is typed `never`, and neither site
+ * sits inside a catch of its own — the two nearby `catch (_e)` blocks wrap only
+ * the `/tmp/test_model.log` capture — so the failure lands exactly where each
+ * handler's success path does: `src/index.ts`'s terminal catch.
+ */
+interface ErrorSite {
+  name: string;
+  post: () => Promise<Response>;
+}
+
+const ERROR_SITES: ErrorSite[] = [
+  { name: 'openai-passthrough <- responses', post: () => post(openaiClientRequest(), 'openai-responses') },
+  { name: 'openai-passthrough <- completions', post: () => post(openaiClientRequest(), 'openai-completions') },
+  { name: 'claude->responses', post: () => post(claudeClientRequest(), 'openai-responses') },
+  { name: 'claude->openai', post: () => post(claudeClientRequest(), 'openai-completions') },
+];
+
+/** An upstream error body: 429, with a message the client-facing error quotes. */
+function errorPayload(marker: string): string {
+  return JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `upstream said ${marker}` } }, null, 2);
+}
+
+function errorResponse(body: ReadableStream<Uint8Array> | string): Response {
+  return new Response(body, { status: 429, headers: { 'Content-Type': 'application/json' } });
+}
+
+/** Run `run`, require that it failed, and hand back the error. */
+async function caughtFrom(run: () => Promise<unknown>): Promise<Error> {
+  try {
+    await run();
+  } catch (error) {
+    assert.ok(error instanceof Error, `expected an Error, got ${String(error)}`);
+    return error;
+  }
+  assert.fail('the handler must raise the upstream error, not answer with one');
+}
+
+for (const site of ERROR_SITES) {
+  describe(`messages.ts upstream error body, ${site.name} (§5.7)`, () => {
+    it('receives the error body through the spill and carries it verbatim', async () => {
+      const payload = errorPayload('x'.repeat(400));
+      const chunks = twoChunks(payload);
+
+      // The baseline runs with the spool off, so the two runs differ in nothing
+      // but the way the body was received.
+      setSpoolConfig(SPOOL_DEFAULTS);
+      const { calls: baselineCalls } = stubUpstream(() => errorResponse(payload));
+      const baseline = await caughtFrom(site.post);
+      assert.ok(baseline instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(baseline)}`);
+      assert.equal(baseline.status, 429);
+      assert.equal(baseline.type, 'rate_limit_error');
+      assert.equal(baseline.upstreamBody, payload);
+
+      const config = configureSpool();
+      assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the first chunk must cross the threshold');
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+        if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+      });
+      const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+      const { result: spooled, clones } = await countClones(() => caughtFrom(site.post));
+
+      // The spill is the live body while it is received — and this path releases
+      // it before it throws, so the end state alone could not tell it apart.
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the received prefix must be on disk, charged');
+      assert.ok(spooled instanceof UpstreamApiError, `expected UpstreamApiError, got ${String(spooled)}`);
+      assert.equal(spooled.status, baseline.status);
+      assert.equal(spooled.type, baseline.type);
+      assert.equal(spooled.message, baseline.message, 'the client-facing message must be the upstream one, unchanged');
+      assert.equal(spooled.upstreamBody, payload, 'the raw body must reach the error whole');
+      assert.equal(calls(), 1);
+      assert.equal(baselineCalls(), 1);
+      assert.deepEqual(spillFiles(config), [], 'the error path must release the spill before it throws');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(clones, 0, 'the bounded receive holds no second copy of the body');
+    });
+
+    it('fails loudly past max_response_bytes, and cancels the upstream body', async () => {
+      const config = configureSpool({ maxResponseBytes: 256 });
+      const payload = errorPayload('z'.repeat(400));
+      // 160-byte slices: the first crosses `threshold_bytes` (64) but not the cap,
+      // so a spill file really exists when the second slice breaches it.
+      const chunks = slices(payload, 160);
+      assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+      assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      });
+      const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+      const caught = await caughtFrom(site.post);
+
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'a spill must have been live when the cap was breached');
+      assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+      assert.equal(caught.status, 500, 'the client sent a legal request: not a 4xx');
+      assert.equal(caught.type, 'processing_error');
+      assert.match(caught.message, /too large/);
+      assert.equal(calls(), 1);
+      assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+      assert.deepEqual(spillFiles(config), [], 'a rejected error body removes its partial spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('surfaces a §5.9 refusal ahead of the upstream error, releasing the spill', async () => {
+      const payload = errorPayload('b'.repeat(400));
+      const bodyBytes = new TextEncoder().encode(payload).byteLength;
+      const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
+      assert.ok(bodyBytes > config.thresholdBytes, 'the fixture must spill, so a leak here would be visible on disk');
+      const { calls } = stubUpstream(() => errorResponse(payload));
+
+      const caught = await caughtFrom(site.post);
+
+      assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+      assert.equal(caught.status, 503);
+      assert.equal(caught.type, 'over_limit_error', 'the type the client switches on');
+      assert.equal(calls(), 1, 'the charge is the received byte count, so the body was received first');
+      assert.deepEqual(spillFiles(config), [], 'a refused error body must not leave its bytes on disk');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(getAdmittedBytes(), 0);
+    });
+  });
+}

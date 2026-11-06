@@ -26,11 +26,26 @@
  *     straight to the next waiter, in arrival order. Nothing here survives a
  *     restart.
  *
- * A waiter is admitted only from the head of the queue. A small body is never
- * admitted past a waiting large one, because "first body that fits" is how a
- * byte budget starves its own queue. For the same reason an empty body — 0
+ * A waiter is admitted only from the head of its class's queue. A small body is
+ * never admitted past a waiting large one, because "first body that fits" is how
+ * a byte budget starves its own queue. For the same reason an empty body — 0
  * nominal bytes — is admitted immediately rather than queued: it takes no bytes
  * from anyone.
+ *
+ * Two waiter classes share the one budget. Request bodies wait in the request
+ * class; response-side reads (the attempt loop's stats parse, the converting
+ * handlers' response parses) wait in the response class, which is admitted and
+ * drained first. The split exists for liveness, not priority: a response read
+ * can run while its own exchange still holds a request-side lease (a non-ref
+ * request keeps its reservation through the attempt loop), so a response read
+ * queued *behind* request waiters is hold-and-wait deadlock — the waiters need
+ * the lease the response's exchange is holding, and the exchange needs the
+ * admission the waiters are blocking. Response-class jumping is bounded: only an
+ * already-admitted exchange can produce one, each exchange produces few, and
+ * the lease is held for a parse, so a waiting request body is delayed by the
+ * in-flight exchanges' drains, not starved by new arrivals. The hard cap is
+ * unchanged — a response that does not fit waits (ahead of the request queue),
+ * and its timeout is the honest answer to a genuinely over-committed budget.
  *
  * This is not the best-effort L1 promotion that `blob-store.ts` also calls
  * "admission". That one asks whether a payload is worth caching and skips when
@@ -56,23 +71,29 @@
  * it is parsed (`admitMaterialization(spool.size, request.signal)`) and returns the
  * reservation at the send boundary once the body's inline binary has been reduced
  * to refs — §5.9's "binary reduced to refs: release after extraction" — with the
- * request's `finally` as the backstop for every other path;
- * `src/handlers/passthrough.ts`, `src/handlers/gemini.ts`, `src/handlers/responses.ts`
- * and `src/utils/spool-events.ts` do the same around their materialized response
- * bodies and SSE events, and so does the attempt loop's JSON stats read in
+ * request's `finally` as the backstop for every other path. The response-side
+ * callers use {@link admitResponseMaterialization} (the response class, above):
+ * `src/handlers/passthrough.ts`, `src/handlers/claude.ts`,
+ * `src/handlers/chat-completions.ts`, `src/handlers/gemini.ts`,
+ * `src/handlers/responses.ts` and `src/utils/spool-response.ts` around their
+ * materialized response bodies, the attempt loop's JSON stats read in
  * `src/index.ts` — the one response parse that runs for every completed JSON
- * response. That last one charges only when the spool is on: it is the spooled
+ * response — and the PII restore read in `src/index.ts`
+ * (`restorePrivacyResponse`), which receives the client-facing body the handler
+ * built. The stats read charges only when the spool is on: it is the spooled
  * receive path that §5.7 substitutes for `response.clone()`, and with the spool
  * off that path is the pre-spool one. §5.9's reservation *before the request path reads* is
- * otherwise still the ingress spool read into text. No rung downstream of the
+ * otherwise still the ingress spool read into text. No send downstream of the
  * boundary re-materializes a payload the boundary already released: every send
  * decides its own §5.3 shape from the refs it is handed, and a body that still has
  * refs is streamed rather than expanded, so §5.9's per-rung re-acquisition has no
- * caller today. Two expansions exist outside that rule and both are bounded: the
- * `sdk://` branches of `src/handlers/claude.ts` and `src/handlers/messages.ts`
- * expand before their handler answers 501, and `auth_with_body` expands a throwaway
- * clone while the leased body keeps its refs. This module is the accounting a future
- * rung would call.
+ * caller on the send path today. Two expansions exist outside that rule and both
+ * are bounded: the `sdk://` branches of `src/handlers/claude.ts` and
+ * `src/handlers/messages.ts` expand before their handler answers 501, and
+ * `auth_with_body` expands a throwaway clone while the leased body keeps its refs.
+ * The one response-side re-materialization is the PII restore above: it rebuilds
+ * the client-facing body from the text it received, so that text takes its own
+ * §5.9 charge — and, past `threshold_bytes`, its own spill.
  */
 
 import { ClaudeProxyError } from './errors.js';
@@ -116,8 +137,15 @@ export interface AdmissionLease {
   release(): void;
 }
 
+/**
+ * Which side of an exchange is asking. Response-class waiters are admitted and
+ * drained first — see the module header's hold-and-wait note.
+ */
+type WaiterKind = 'request' | 'response';
+
 /** One body waiting for capacity. */
 interface Waiter {
+  readonly kind: WaiterKind;
   readonly nominalBytes: number;
   /** Set once the waiter has been admitted, refused, or voided, so a late timer or abort is a no-op. */
   settled: boolean;
@@ -134,8 +162,20 @@ interface Waiter {
  */
 let admittedBytes = 0;
 
-/** Bodies waiting for capacity, oldest first. */
-const waiters: Waiter[] = [];
+/** Request bodies waiting for capacity, oldest first. */
+const requestWaiters: Waiter[] = [];
+
+/**
+ * Response-side reads waiting for capacity, oldest first. Drained first: they
+ * complete the in-flight exchanges whose request leases the request queue is
+ * waiting on.
+ */
+const responseWaiters: Waiter[] = [];
+
+/** The queue one waiter class waits in. */
+function queueOf(kind: WaiterKind): Waiter[] {
+  return kind === 'response' ? responseWaiters : requestWaiters;
+}
 
 /**
  * Bumped by {@link resetAdmission}. A lease remembers the epoch it was made in,
@@ -150,9 +190,9 @@ export function getAdmittedBytes(): number {
   return admittedBytes;
 }
 
-/** Bodies waiting for capacity right now. */
+/** Bodies waiting for capacity right now, across both classes. */
 export function getAdmissionQueueDepth(): number {
-  return waiters.length;
+  return requestWaiters.length + responseWaiters.length;
 }
 
 /**
@@ -164,8 +204,27 @@ export function getAdmissionQueueDepth(): number {
  * {@link AdmissionTimeoutError} when the wait was too long; an aborted `signal`
  * rejects with its own reason. The caller holds nothing on any rejection, so
  * there is nothing to release.
+ *
+ * This is the request-side entry: it queues behind every waiter of either
+ * class, because a body that holds nothing yet can always wait safely.
  */
 export async function admitMaterialization(bytes: number, signal?: AbortSignal): Promise<AdmissionLease> {
+  return admit(bytes, signal, 'request');
+}
+
+/**
+ * The response-side half of {@link admitMaterialization}: admitted ahead of
+ * queued request bodies (and drained first) whenever the bytes fit, because a
+ * response read can run while its own exchange still holds a request-side
+ * lease — queueing it behind request waiters is hold-and-wait deadlock. The
+ * hard cap is unchanged; a response that does not fit waits ahead of the
+ * request queue and can still time out.
+ */
+export async function admitResponseMaterialization(bytes: number, signal?: AbortSignal): Promise<AdmissionLease> {
+  return admit(bytes, signal, 'response');
+}
+
+async function admit(bytes: number, signal: AbortSignal | undefined, kind: WaiterKind): Promise<AdmissionLease> {
   if (!Number.isFinite(bytes) || bytes < 0) {
     throw new Error(`[spool] admission needs a non-negative byte count, got ${String(bytes)}`);
   }
@@ -190,20 +249,24 @@ export async function admitMaterialization(bytes: number, signal?: AbortSignal):
     );
   }
 
-  // Arrival order is absolute: a waiter ahead of us means we queue even if our
-  // own bytes happen to fit right now.
-  if (waiters.length === 0 && admittedBytes + nominalBytes <= budget) {
+  // Arrival order is absolute within a class: a waiter ahead of us means we
+  // queue even if our own bytes happen to fit right now. A response-class read
+  // is blocked only by response-class waiters — request bodies queued ahead of
+  // it are exactly what its exchange's completion will unblock.
+  const queue = queueOf(kind);
+  const blockedByEarlierClass = kind === 'request' && responseWaiters.length > 0;
+  if (!blockedByEarlierClass && queue.length === 0 && admittedBytes + nominalBytes <= budget) {
     admittedBytes += nominalBytes;
     return makeLease(nominalBytes);
   }
 
-  if (waiters.length >= config.maxAdmissionQueue) {
+  if (requestWaiters.length + responseWaiters.length >= config.maxAdmissionQueue) {
     throw new AdmissionQueueFullError(
-      `[spool] admission queue is full: ${waiters.length} bodies await max_admission_queue ${config.maxAdmissionQueue}`,
+      `[spool] admission queue is full: ${requestWaiters.length + responseWaiters.length} bodies await max_admission_queue ${config.maxAdmissionQueue}`,
     );
   }
 
-  return enqueue(nominalBytes, config.admissionTimeoutMs, signal);
+  return enqueue(nominalBytes, config.admissionTimeoutMs, signal, kind);
 }
 
 /**
@@ -216,16 +279,16 @@ export async function admitMaterialization(bytes: number, signal?: AbortSignal):
 export function resetAdmission(): void {
   epoch += 1;
   admittedBytes = 0;
-  for (const waiter of waiters.splice(0)) {
+  for (const waiter of [...responseWaiters, ...requestWaiters]) {
     settle(waiter);
     waiter.reject(new Error(`[spool] admission was reset with ${waiter.nominalBytes} nominal bytes still queued`));
   }
 }
 
 /** Wait for capacity in arrival order, bounded by the timeout and the caller's abort. */
-function enqueue(nominalBytes: number, timeoutMs: number, signal: AbortSignal | undefined): Promise<AdmissionLease> {
+function enqueue(nominalBytes: number, timeoutMs: number, signal: AbortSignal | undefined, kind: WaiterKind): Promise<AdmissionLease> {
   return new Promise<AdmissionLease>((resolve, reject) => {
-    const waiter: Waiter = { nominalBytes, settled: false, timer: undefined, signal, onAbort: undefined, resolve, reject };
+    const waiter: Waiter = { kind, nominalBytes, settled: false, timer: undefined, signal, onAbort: undefined, resolve, reject };
 
     // Not unref'd: a queued body is real pending work, and its client abort
     // clears the timer through the listener below.
@@ -236,7 +299,8 @@ function enqueue(nominalBytes: number, timeoutMs: number, signal: AbortSignal | 
       reject(
         new AdmissionTimeoutError(
           `[spool] admission timed out after ${timeoutMs} ms: ${admittedBytes} of ` +
-            `${getSpoolConfig().maxMaterializedBodyBytes} nominal bytes admitted, ${waiters.length} still waiting`,
+            `${getSpoolConfig().maxMaterializedBodyBytes} nominal bytes admitted, ` +
+            `${responseWaiters.length + requestWaiters.length} still waiting`,
         ),
       );
     }, timeoutMs);
@@ -250,16 +314,16 @@ function enqueue(nominalBytes: number, timeoutMs: number, signal: AbortSignal | 
       signal.addEventListener('abort', waiter.onAbort, { once: true });
     }
 
-    waiters.push(waiter);
+    queueOf(kind).push(waiter);
   });
 }
 
 /**
- * Mark a waiter done, drop its timer and abort listener, and take it out of the
- * queue. Returns false when it was already settled, so a late timer or abort
- * cannot refuse a body that was admitted in the meantime. Removing it here is
- * what makes "queued" and "not settled" the same thing, so {@link drain} never
- * has to skip a waiter.
+ * Mark a waiter done, drop its timer and abort listener, and take it out of
+ * its queue. Returns false when it was already settled, so a late timer or
+ * abort cannot refuse a body that was admitted in the meantime. Removing it
+ * here is what makes "queued" and "not settled" the same thing, so
+ * {@link drain} never has to skip a waiter.
  */
 function settle(waiter: Waiter): boolean {
   if (waiter.settled) return false;
@@ -272,31 +336,43 @@ function settle(waiter: Waiter): boolean {
     waiter.signal.removeEventListener('abort', waiter.onAbort);
     waiter.onAbort = undefined;
   }
-  const index = waiters.indexOf(waiter);
+  const queue = queueOf(waiter.kind);
+  const index = queue.indexOf(waiter);
   if (index >= 0) {
-    waiters.splice(index, 1);
+    queue.splice(index, 1);
   }
   return true;
 }
 
 /**
- * Hand freed bytes to the queue from the head down, stopping at the first waiter
- * that does not fit so arrival order holds.
+ * Hand freed bytes to the queues, response class first: those reads complete
+ * in-flight exchanges, and a completed exchange releases the request lease its
+ * holder may still hold. A response head that does not fit stops the drain for
+ * both classes — admitting request bodies past it is the hold-and-wait this
+ * ordering exists to prevent. Within a class, stop at the first waiter that
+ * does not fit so arrival order holds.
  */
 function drain(): void {
+  if (!drainQueue(responseWaiters)) return;
+  drainQueue(requestWaiters);
+}
+
+/** Admit from `queue`'s head down while the head fits. False when the head did not fit. */
+function drainQueue(queue: Waiter[]): boolean {
   const budget = getSpoolConfig().maxMaterializedBodyBytes;
-  while (waiters.length > 0) {
-    const head = waiters[0];
-    if (admittedBytes + head.nominalBytes > budget) return;
+  while (queue.length > 0) {
+    const head = queue[0];
+    if (admittedBytes + head.nominalBytes > budget) return false;
     if (!settle(head)) {
       // Unreachable: settling a waiter takes it out of the queue, so a settled
       // waiter cannot be the head. Loud rather than a double-resolve that would
       // charge bytes no lease owns.
-      throw new Error(`[spool] admission queue holds a settled waiter with ${waiters.length} waiting`);
+      throw new Error(`[spool] admission queue holds a settled waiter with ${queue.length} waiting`);
     }
     admittedBytes += head.nominalBytes;
     head.resolve(makeLease(head.nominalBytes));
   }
+  return true;
 }
 
 function makeLease(nominalBytes: number): AdmissionLease {

@@ -22,8 +22,8 @@ import { collectBlobRefs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
 import { getSpoolConfig } from '../utils/spool.js';
-import { receiveJsonResponse, receiveResponseBody } from '../utils/spool-response.js';
-import { admitMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { receiveJsonResponse, receiveResponseBody, withResponseText } from '../utils/spool-response.js';
+import { admitResponseMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
 
 
 export async function handleChatCompletionsPassthrough(
@@ -125,7 +125,12 @@ export async function handleChatCompletionsPassthrough(
     logger.debug(requestId, `${path} resp: status=${upstreamResponse.status} stream=${isStreaming}`);
 
     if (!upstreamResponse.ok) {
-      const errText = await upstreamResponse.text();
+      // §5.7: the error body goes through the same bounded receive as a success
+      // body, on the identity consumer — this branch relays the upstream's own
+      // error bytes, it never converts them. A cap breach, a spill write failure
+      // or a §5.9 refusal therefore propagates as itself instead of being served
+      // to the client as the upstream's answer (rule #8).
+      const errText = await withResponseText(upstreamResponse, requestId, logger, targetUrl, (text) => text, request.signal);
       return new Response(errText, {
         status: upstreamResponse.status,
         headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
@@ -293,7 +298,7 @@ export async function handleChatCompletionsPassthrough(
       // only thing charged, and the lease is given back as soon as it is read.
       let lease: AdmissionLease;
       try {
-        lease = await admitMaterialization(received.size, request.signal);
+        lease = await admitResponseMaterialization(received.size, request.signal);
       } catch (error) {
         await received.release();
         throw error;
@@ -365,7 +370,8 @@ export async function handleChatCompletionsPassthrough(
     logger.debug(requestId, `${path} resp: status=${geminiUpstreamResponse.status} stream=${isStreaming}`);
 
     if (!geminiUpstreamResponse.ok) {
-      const errText = await geminiUpstreamResponse.text();
+      // §5.7: bounded on the same identity consumer as the anthropic branch above.
+      const errText = await withResponseText(geminiUpstreamResponse, requestId, logger, geminiTargetUrl, (text) => text, request.signal);
       return new Response(errText, {
         status: geminiUpstreamResponse.status,
         headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },

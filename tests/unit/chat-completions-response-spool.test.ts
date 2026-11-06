@@ -40,6 +40,13 @@
  *    parts) and it is why this egress extracts no payloads: there is no
  *    converted position to extract from. Pinned here so the limitation cannot
  *    regress into a claim that images survive this path.
+ *
+ * The last section covers the same two branches' `!response.ok` reads (`:128`,
+ * `:368`), which read the upstream's error body with `response.text()` and
+ * returned it to the client. Both now use `withResponseText` on the identity
+ * consumer, so the relayed bytes are unchanged while a cap breach or a §5.9
+ * refusal propagates out of the handler instead of reaching the client as the
+ * upstream's answer.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
@@ -551,3 +558,136 @@ describe('chat-completions.ts openai-responses passthrough, trace admission (§5
     assert.equal(getAdmittedBytes(), 0, 'the lease is given back once the trace line is built');
   });
 });
+
+// ---------------------------------------------------------------------------
+// §5.7: the upstream *error* body
+// ---------------------------------------------------------------------------
+
+/**
+ * The two converted branches' `!response.ok` reads (`:128` for an
+ * `anthropic-messages` upstream, `:368` for `gemini-generatecontent`) called
+ * `response.text()` and *returned* the text to the client, so an error answer was
+ * the one body on this egress that no `max_response_bytes`, no spill and no §5.9
+ * charge applied to. Both now go through `withResponseText` on the identity
+ * consumer: the relayed bytes are unchanged, while a cap breach, a spill failure
+ * or a §5.9 refusal propagates out of the handler instead of being handed to the
+ * client as the upstream's own error. The handler has no enclosing try/catch, so
+ * that propagation leaves it unmodified — the same path every other error on this
+ * egress takes.
+ */
+
+const ERROR_SITES = [
+  { name: 'anthropic-messages', mode: 'anthropic-messages' },
+  { name: 'gemini-generatecontent', mode: 'gemini-generatecontent' },
+];
+
+function errorPayload(marker: string): string {
+  return JSON.stringify({ error: { type: 'rate_limit_error', message: `upstream said ${marker}` } }, null, 2);
+}
+
+function errorResponse(body: ReadableStream<Uint8Array> | string): Response {
+  return new Response(body, { status: 429, headers: { 'Content-Type': 'application/json' } });
+}
+
+/** Run `run`, require that it failed, and hand back the error. */
+async function thrownBy(run: () => Promise<unknown>): Promise<Error> {
+  let caught: unknown;
+  try {
+    await run();
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof Error, `expected an Error, got ${String(caught)}`);
+  return caught;
+}
+
+for (const site of ERROR_SITES) {
+  describe(`chat-completions.ts ${site.name} upstream error body (§5.7)`, () => {
+    it('relays the error body through the spill, byte for byte', async () => {
+      const payload = errorPayload('x'.repeat(400));
+
+      // Baseline: spooling off, which is the `response.text()` behaviour this
+      // replaces — the same request must still answer the same way.
+      setSpoolConfig(SPOOL_DEFAULTS);
+      stubUpstream(() => errorResponse(payload));
+      const baseline = await post(site.mode);
+      const baselineText = await baseline.text();
+      assert.equal(baseline.status, 429);
+      assert.equal(baselineText, payload);
+
+      const chunks = twoChunks(payload);
+
+      // Captured after the baseline run, because every `configureSpool` call makes
+      // a fresh directory: this is the config whose `responses/` the spill lands in.
+      const config = configureSpool();
+      assert.ok(chunks[0].byteLength > config.thresholdBytes, 'the first chunk must cross the threshold');
+
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+        if (index > 2) throw new Error(`receive asked for too many chunks: ${index}`);
+      });
+      const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+      const { result: response, clones } = await countClones(() => post(site.mode));
+      const text = await response.text();
+
+      // The spill is the live body while it is received — and this path releases it
+      // before it answers, so the end state alone could not tell it apart.
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the received prefix must be on disk, charged');
+      assert.equal(response.status, baseline.status, 'the upstream status is still the client’s');
+      assert.equal(response.headers.get('x-request-id'), 'req-chat-response');
+      assert.equal(text, baselineText, 'the relayed error body must be byte-identical');
+      assert.equal(calls(), 1);
+      assert.deepEqual(spillFiles(config), [], 'the spill must be released before the response is returned');
+      assert.equal(getLiveSpillBytes(), 0);
+      assert.equal(clones, 0, 'no `response.clone()` for an error body either');
+    });
+
+    it('fails loudly past max_response_bytes and cancels the upstream body', async () => {
+      const config = configureSpool({ maxResponseBytes: 256 });
+      // 160-byte slices: the first crosses `threshold_bytes` (64) but not the cap,
+      // so a spill file really exists when the second slice breaches it.
+      const chunks = slices(errorPayload('y'.repeat(400)), 160);
+      assert.ok(chunks[0].byteLength > config.thresholdBytes && chunks[0].byteLength <= config.maxResponseBytes);
+      assert.ok(chunks[0].byteLength + chunks[1].byteLength > config.maxResponseBytes);
+      const seen: Array<{ files: number; bytes: number }> = [];
+      const src = source(chunks, (index) => {
+        seen.push({ files: spillFiles(config).length, bytes: getLiveSpillBytes() });
+      });
+      const { calls } = stubUpstream(() => errorResponse(src.stream));
+
+      const caught = await thrownBy(() => post(site.mode));
+
+      assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'a spill must have been live when the cap was breached');
+      // A `response.text()` here would have answered the client the upstream's 429;
+      // the proxy's own limit must surface as itself (rule #8).
+      assert.ok(caught instanceof SpoolResponseTooLargeError, `expected SpoolResponseTooLargeError, got ${String(caught)}`);
+      assert.equal(caught.status, 500, 'the client sent a legal request: not a 4xx');
+      assert.equal(caught.type, 'processing_error');
+      assert.match(caught.message, /too large/);
+      assert.equal(calls(), 1);
+      assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
+      assert.deepEqual(spillFiles(config), [], 'a rejected response removes its partial spill');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('surfaces a §5.9 refusal instead of the upstream error, and holds no lease', async () => {
+      const payload = errorPayload('z'.repeat(400));
+      const bodyBytes = new TextEncoder().encode(payload).byteLength;
+      const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
+      assert.ok(bodyBytes > config.thresholdBytes, 'the body must spill, so a refusal has bytes to clean up');
+      stubUpstream(() => errorResponse(payload));
+
+      const caught = await thrownBy(() => post(site.mode));
+
+      assert.ok(caught instanceof AdmissionOverBudgetError, `expected AdmissionOverBudgetError, got ${String(caught)}`);
+      assert.equal(caught.status, 503);
+      assert.equal(caught.type, 'over_limit_error', 'the type the client switches on');
+      assert.match(caught.message, /exceed max_materialized_body_bytes/);
+      assert.deepEqual(spillFiles(config), [], 'a refused error body must not leave its bytes on disk');
+      assert.equal(getLiveSpillBytes(), 0, 'nor hold them against max_total_bytes');
+      assert.equal(getAdmittedBytes(), 0);
+    });
+  });
+}

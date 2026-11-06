@@ -927,6 +927,18 @@ Admission behavior:
 - If capacity is available, proceed immediately. Otherwise queue in arrival
   order while the raw body remains on disk; pause upstream response/event reads
   while their admission is waiting.
+- Two waiter classes share the one budget. Request bodies queue behind every
+  waiter; response-side reads (the attempt loop's stats parse, the converting
+  handlers' response parses) are admitted and drained ahead of queued request
+  bodies whenever their bytes fit. The split is a liveness rule, not a
+  priority: a non-ref request holds its reservation through the attempt loop,
+  so a response read queued behind request waiters is hold-and-wait deadlock —
+  the waiters need the lease the response's exchange holds, and the exchange
+  needs the admission the waiters block. Response-class overtaking is bounded:
+  only already-admitted exchanges produce response reads, each produces few,
+  and the read's lease is held for a parse. The hard cap is unchanged — a
+  response that does not fit waits (ahead of the request queue) and can time
+  out, which is the honest answer to a genuinely over-committed budget.
 - Bound the queue by `max_admission_queue` and each wait by
   `admission_timeout_ms`. On timeout/overflow, return `429` or `503` with an
   explicit error before client response headers; never begin materialization
@@ -1011,9 +1023,11 @@ Constant memory *through* parse via a schema-aware pre-scan that rewrites only
 
 **Status: deferred.** Do not start it. The trigger to reopen is the Phase 2
 measurement of §7: if the full-parse transient is still the top allocator under
-real inline-binary traffic, the scanner is worth the lexing risk; until that
-number exists, it is speculation against a real behavior change. A context-free
-`"data":"…"` scanner is not approved.
+real inline-binary traffic, the scanner is worth the lexing risk. That number
+now exists (§9.2, 2026-11): parse is ~25–27% of the per-exchange peak
+(~1.3× body of ~5× body), so the trigger is **not** met and Phase 3 stays
+deferred; rerun `tests/perf/parse-transient.ts` after any change that flattens
+the serialize chain. A context-free `"data":"…"` scanner is not approved.
 
 ---
 
@@ -1115,6 +1129,23 @@ Not approved, not rejected. The trigger to reopen is stated in §6, Phase 3:
 the full-parse transient must still be the top allocator under real
 inline-binary traffic. Recording it as deferred rather than rejected matters —
 the reason is "we don't have the number yet", not "we judged it unsound".
+
+**Gate measurement (2026-11, `tests/perf/parse-transient.ts`):** the condition
+is not met. With a 4 MiB inline-image body and a 4-concurrent burst through
+the real handler (spool on, distinct payloads):
+
+- the full-parse window is **~1.3× body** (text plus parsed tree);
+- the end-to-end per-exchange peak is **~5.0–5.6× body** — parse is only
+  ~25–27% of it; the serialize/re-serialize chain and receive buffers dominate;
+- the post-extraction steady state is ~1.4× body, almost all of it the bounded
+  L1 cache (capped, not per-concurrency).
+
+Parse is therefore *not* the top allocator after Phase 2, and a scanner that
+removed the entire parse window would reclaim at most a quarter of the peak.
+Phase 3 stays deferred; rerun the script after any change that flattens the
+serialize chain (§2's copy inventory), because that is what would move parse
+to the top. Caveat: V8 string slicing can make the parse window read low
+(sliced strings share a backing store); even at 2× body the conclusion holds.
 
 A lexical `"data":"…"` rewrite could make parse itself constant-memory, but a
 context-free rewrite is not compliant with §9.3. It can change what
@@ -1352,17 +1383,17 @@ Decisions are recorded (§9); what remains is evidence.
       the documented payload-length estimate with upstream usage preferred.
 - [ ] Paused-client tests prove bounded response queues and upstream read
       backpressure across logging, keep-alive, converters, and the Node adapter.
-- [ ] Mid-stream missing-file/disk/parse failure tests prove client connection
+- [x] Mid-stream missing-file/disk/parse failure tests prove client connection
       abort, error logging, upstream cancellation, and complete lease/spill
       cleanup without a false success terminator.
-- [ ] Every §5.4 request predicate has round-trip and mid-stream retention
+- [x] Every §5.4 request predicate has round-trip and mid-stream retention
       evidence; every §5.7 response predicate has completed-JSON and applicable
       SSE-event round-trip/cleanup evidence. Non-ref tests separately report
       ungated O(N×B) processing and prove object release before network I/O.
 - [x] Optional §5.9 tests prove pre-parse byte reservation, binary early release,
       non-ref retention through serialization, bounded queue/timeout, abort and
       failure cleanup, and no admission held during network/SSE streaming.
-- [ ] §5.8 auth-link tests prove post-sidecar auth content, binary-free auth
+- [x] §5.8 auth-link tests prove post-sidecar auth content, binary-free auth
       projections, unchanged upstream inline bytes, lease holding past the idle
       TTL, failure handling, URL redaction, and external-object cleanup.
 - [ ] `CHANGELOG.md` + `README.md` updated in the same change as any

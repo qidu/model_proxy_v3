@@ -1,9 +1,13 @@
-import { describe, it } from 'node:test';
+import { describe, it, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createServer, request as httpRequest, type IncomingMessage } from 'node:http';
 import { createHash } from 'node:crypto';
-import type { AddressInfo } from 'node:net';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Writable } from 'node:stream';
+import type { AddressInfo, Socket } from 'node:net';
 import {
   buildNodeEnv,
   createNodeBodyStream,
@@ -13,6 +17,9 @@ import {
 } from '../../src/server.js';
 import { attachActiveRequestRelease, getActiveRequestCount, incrementActiveRequests } from '../../src/utils/dashboard-stats.js';
 import { wrapSseStreamWithKeepAlive } from '../../src/utils/sse-keepalive.js';
+import { receiveResponseBody } from '../../src/utils/spool-response.js';
+import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
+import { SPOOL_DEFAULTS, responseSpillDir, setSpoolConfig, type SpoolConfig } from '../../src/utils/spool.js';
 
 type FetchHandler = (request: Request, env: NodeEnv) => Promise<Response>;
 
@@ -516,5 +523,300 @@ describe('createNodeRequestHandler — request upload', () => {
       assert.deepEqual(JSON.parse(response.body), { error: 'unauthorized' });
       assert.equal(drained, true);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §12: paused-client backpressure evidence
+// ---------------------------------------------------------------------------
+
+/**
+ * Plan §12: "Paused-client tests prove bounded response queues and upstream read
+ * backpressure across logging, keep-alive, converters, and the Node adapter."
+ *
+ * §5.7's implementation is what these tests measure: the adapter pipes with
+ * `pipeline()` instead of writing into a PassThrough whose `false` was ignored,
+ * the keep-alive wrapper and the ref serializer are pull-driven, and the
+ * parse/logging path receives the body into a spill rather than a second copy.
+ * Each test below pins the observable that follows — how many chunks the
+ * upstream was asked for while the client accepted nothing — rather than the
+ * mechanism, so a regression to any of the old shapes fails on a count.
+ *
+ * What these tests cannot show is *resident bytes*: a chunk count bounds the
+ * queues the proxy builds, not the allocator's high-water mark. That is the
+ * heap/allocation item in §12 and stays open; these are the bounded-queue half.
+ */
+
+const CHUNK_BYTES = 64 * 1024;
+
+interface CountedBody {
+  body: ReadableStream<Uint8Array>;
+  /** Reads the upstream has served. The consumer's demand is what must drive this. */
+  pulls: () => number;
+  /** Whether the consumer cancelled the body — a teardown, not a pause. */
+  cancelled: () => boolean;
+}
+
+/** An upstream body of `chunks` identical chunks, counting the reads made of it. */
+function countedBody(chunks: number, chunkBytes = CHUNK_BYTES): CountedBody {
+  const chunk = Buffer.alloc(chunkBytes, 0x62);
+  let pulls = 0;
+  let served = 0;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls += 1;
+      if (served >= chunks) {
+        controller.close();
+        return;
+      }
+      served += 1;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return { body, pulls: () => pulls, cancelled: () => cancelled };
+}
+
+/** The digest of the bytes `countedBody(chunks)` emits, computed off the same pattern. */
+function patternDigest(chunks: number, chunkBytes = CHUNK_BYTES): string {
+  const hash = createHash('sha256');
+  const chunk = Buffer.alloc(chunkBytes, 0x62);
+  for (let index = 0; index < chunks; index += 1) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+/**
+ * A destination that never accepts a byte: the client socket with a closed
+ * window, without a socket's timing. `Writable`'s own buffer fills on the first
+ * `write`, so `pipeline()` has nowhere to put the second chunk and stops pulling
+ * the source. Deterministic, so the assertion below can be a small number.
+ */
+class StalledSink extends Writable {
+  status = 0;
+
+  constructor() {
+    super({ highWaterMark: 16 * 1024 });
+  }
+
+  writeHead(status: number): void {
+    this.status = status;
+  }
+
+  _write(_chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    // Never called back: nothing drains, so the next `write()` returns false.
+    void callback;
+  }
+}
+
+/** A GET request object, without a socket: enough for the adapter's non-body paths. */
+function fakeRequest(path: string): IncomingMessage {
+  return {
+    method: 'GET',
+    url: path,
+    headers: { host: '127.0.0.1' },
+    socket: { remoteAddress: '127.0.0.1', remotePort: 4321 },
+  } as unknown as IncomingMessage;
+}
+
+interface StalledClient {
+  /** Bytes the client process has taken off the socket so far. */
+  bytesRead: () => number;
+  /** Start reading, and resolve once the response body has ended. */
+  resume: () => Promise<{ status: number; bytes: number; digest: string }>;
+}
+
+/**
+ * GET `path` and then stop reading it, as a slow client does.
+ *
+ * `res.pause()` is explicit rather than relying on the message stream being
+ * unread: the stall is the premise of every assertion below, so it must not
+ * depend on how the client decides to flow.
+ */
+function stalledClient(baseUrl: string, path: string): StalledClient {
+  const url = new URL(baseUrl);
+  let socket: Socket | undefined;
+  const responseArrived = new Promise<IncomingMessage>((resolve, reject) => {
+    const request = httpRequest({ host: url.hostname, port: url.port, method: 'GET', path }, (res) => {
+      res.pause();
+      resolve(res);
+    });
+    request.on('socket', (opened: Socket) => { socket = opened; });
+    request.on('error', reject);
+    request.end();
+  });
+
+  return {
+    bytesRead: () => socket?.bytesRead ?? 0,
+    resume: async () => {
+      const res = await responseArrived;
+      const hash = createHash('sha256');
+      let bytes = 0;
+      res.on('data', (piece: Buffer) => {
+        bytes += piece.byteLength;
+        hash.update(piece);
+      });
+      const ended = new Promise<void>((resolve) => res.on('end', resolve));
+      res.resume();
+      await ended;
+      return { status: res.statusCode ?? 0, bytes, digest: hash.digest('hex') };
+    },
+  };
+}
+
+const scratchDirs: string[] = [];
+
+after(() => {
+  for (const dir of scratchDirs) {
+    try {
+      chmodSync(dir, 0o700);
+    } catch { /* already writable or already gone */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Spool enabled with a small threshold, so a whole response spills. */
+function configureSpool(): SpoolConfig {
+  const dir = mkdtempSync(join(tmpdir(), 'server-backpressure-test-'));
+  scratchDirs.push(dir);
+  const config: SpoolConfig = {
+    ...SPOOL_DEFAULTS,
+    enabled: true,
+    dir,
+    thresholdBytes: 64,
+    maxRequestBytes: 1 << 20,
+    maxResponseBytes: 32 << 20,
+    maxTotalBytes: 64 << 20,
+  };
+  setSpoolConfig(config);
+  return config;
+}
+
+describe('createNodeRequestHandler — a paused client', () => {
+  afterEach(() => {
+    setSpoolConfig(SPOOL_DEFAULTS);
+    assert.equal(getLiveSpillBytes(), 0, 'every spool must return its reservation');
+  });
+
+  it('stops reading upstream when the destination accepts nothing', async () => {
+    const upstream = countedBody(1024); // 64 MiB offered
+    const sink = new StalledSink();
+    const handler = createNodeRequestHandler(buildNodeEnv({}), async () =>
+      new Response(upstream.body, { headers: { 'Content-Type': 'application/octet-stream' } }),
+    );
+
+    await handler(fakeRequest('/v1/messages'), sink as unknown as import('node:http').ServerResponse);
+    await delay(100);
+
+    assert.equal(sink.status, 200);
+    const pulls = upstream.pulls();
+    assert.ok(
+      pulls <= 8, // measured 3 on macOS, 2026-11-05; the shape it guards reads all 1024
+      `a destination that accepts nothing must stop the read, but ${pulls} of 1024 chunks were read`,
+    );
+    assert.equal(upstream.cancelled(), false, 'backpressure is a pause, not a teardown');
+
+    // A pending `pipeline()` rejects on destroy; the adapter's own catch handles it.
+    sink.destroy();
+    await delay(10);
+  });
+
+  it('bounds upstream reads for a real stalled socket, then delivers every byte', { timeout: 15000 }, async () => {
+    const upstream = countedBody(1024); // 64 MiB: far past any socket buffer
+    await withServer(
+      async () => new Response(upstream.body, { headers: { 'Content-Type': 'application/octet-stream' } }),
+      async (baseUrl) => {
+        const client = stalledClient(baseUrl, '/v1/messages');
+        await delay(300);
+
+        const stalled = upstream.pulls();
+        assert.ok(
+          stalled <= 256, // measured 15 on macOS, 2026-11-05, with 192 KiB of 960 KiB at the client
+          `a stalled client must bound the read, but ${stalled} of 1024 chunks were read`,
+        );
+        assert.ok(client.bytesRead() < 1024 * CHUNK_BYTES, 'the client must not have taken the whole body');
+        assert.equal(upstream.cancelled(), false, 'the connection is merely slow, not torn down');
+
+        // The demand resumes: every chunk is read once, in order, and intact.
+        const result = await client.resume();
+        assert.equal(result.status, 200);
+        assert.equal(result.bytes, 1024 * CHUNK_BYTES);
+        assert.equal(result.digest, patternDigest(1024));
+        assert.equal(upstream.pulls(), 1025, 'each chunk exactly once, plus the read that ends the stream');
+      },
+    );
+  });
+
+  it('bounds upstream reads on the SSE path, keep-alive wrapper included', { timeout: 15000 }, async () => {
+    const upstream = countedBody(1024);
+    // The shape `src/index.ts` hands over for a pingless upstream: the wrapper is
+    // itself pull-driven (highWaterMark 0), so a stalled socket must gate it too.
+    const body = wrapSseStreamWithKeepAlive(upstream.body, 60_000);
+    await withServer(
+      async () => new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }),
+      async (baseUrl) => {
+        const client = stalledClient(baseUrl, '/v1/stream');
+        await delay(300);
+
+        const stalled = upstream.pulls();
+        assert.ok(
+          stalled <= 256, // measured 22 on macOS, 2026-11-05, with 192 KiB of 1.4 MiB at the client
+          `a stalled SSE client must bound the read, but ${stalled} of 1024 chunks were read`,
+        );
+        assert.equal(upstream.cancelled(), false);
+
+        const result = await client.resume();
+        assert.equal(result.status, 200);
+        assert.equal(result.bytes, 1024 * CHUNK_BYTES, 'the 60s ping interval never elapses, so the bytes are the chunks');
+        assert.equal(result.digest, patternDigest(1024));
+        assert.equal(upstream.pulls(), 1025);
+      },
+    );
+  });
+
+  it('serves a spooled response from disk while the client is stalled', { timeout: 20000 }, async () => {
+    const config = configureSpool();
+    // 16 MiB, not "bigger than the threshold": a loopback socket buffer absorbs a
+    // 512 KiB body whole (measured 2026-11-05 — the spill was already released at
+    // the stall), so the body has to outgrow the buffers for a stall to exist.
+    const chunks = 256; // 16 MiB
+    const upstream = countedBody(chunks);
+    await withServer(
+      async () => {
+        // The parse/logging shape: the body is received once, bounded, before the
+        // client is answered. What the stalled client then costs is the spill.
+        const received = await receiveResponseBody(upstream.body);
+        return new Response(received.readStream(), {
+          headers: { 'Content-Type': 'application/octet-stream' },
+        });
+      },
+      async (baseUrl) => {
+        const client = stalledClient(baseUrl, '/v1/messages');
+        await delay(300);
+
+        assert.equal(upstream.pulls(), chunks + 1, 'the bounded receive reads the whole body once, then sees the end');
+        assert.ok(
+          client.bytesRead() < chunks * CHUNK_BYTES,
+          `the client must still be short of the body, but it has taken ${client.bytesRead()} bytes`,
+        );
+        assert.equal(getLiveSpillBytes(), chunks * CHUNK_BYTES, 'the client’s copy is accounted as a spill');
+        const files = readdirSync(responseSpillDir(config));
+        assert.equal(files.length, 1, `expected one response spill, got ${files.join(', ')}`);
+        assert.equal(
+          statSync(join(responseSpillDir(config), files[0])).size,
+          chunks * CHUNK_BYTES,
+          'the bytes the stalled client has not read are on disk',
+        );
+
+        const result = await client.resume();
+        assert.equal(result.status, 200);
+        assert.equal(result.bytes, chunks * CHUNK_BYTES);
+        assert.equal(result.digest, patternDigest(chunks));
+        assert.equal(getLiveSpillBytes(), 0, 'the spill is released once the client has read it');
+        assert.deepEqual(readdirSync(responseSpillDir(config)), [], 'and removed from disk');
+      },
+    );
   });
 });

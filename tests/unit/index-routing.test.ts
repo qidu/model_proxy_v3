@@ -1091,7 +1091,7 @@ ${args.extra ?? ''}
   });
 });
 
-describe('§5.7 spooling of the JSON stats read', () => {
+describe('§5.7 spooling of the attempt loop\'s response reads', () => {
   // `runAttempt` (index.ts) parses a completed JSON response once for usage and
   // tool-name stats. §5.7 forbids paying for that with `response.clone()` — the
   // clone holds every remaining byte while it is parsed — so with the spool on
@@ -1191,5 +1191,334 @@ ${args.extra ?? ''}
     assert.match(payload.error.message, /Response body too large/);
     assert.deepEqual(responseSpills(), [], 'the refused body leaves no spill behind');
     assert.equal(getLiveSpillBytes(), 0);
+  });
+
+  describe('the non-2xx error body, when it is recorded to the collector', () => {
+    // The same block's `else if (attemptModelId)` branch attaches the upstream's
+    // error body to the zero-usage record for `[remote] record_server`. That read
+    // used to be a `clone()` too, so a failed attempt paid a second copy of the
+    // error body — the one path where the body is otherwise large and useless.
+    //
+    // These tests drive the openai-completions passthrough, not `/v1/messages`:
+    // the branch only sees a non-2xx response the handler *returned*, and
+    // `messages.ts` reads the error body itself and throws it out through
+    // `handleTargetApiError`. The passthrough hands the upstream's status, headers
+    // and bytes back untouched, so the client-side copy can be asserted exactly.
+    const RECORD_URL = 'http://collector.test/usage';
+
+    function completionsRequest(): Request {
+      return new Request('http://proxy/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'test', messages: [{ role: 'user', content: 'hi' }] }),
+      });
+    }
+
+    /** Upstream answers `status` with `body`; the collector POST is captured. */
+    function upstreamError(body: string, status: number): { records: any[] } {
+      const records: any[] = [];
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url === RECORD_URL) {
+          records.push(JSON.parse(String(init?.body)));
+          return new Response('{}', { status: 204 });
+        }
+        return new Response(body, { status, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch;
+      return { records };
+    }
+
+    /** Counts `Response.prototype.clone` while `body` runs. */
+    async function countingClones<T>(body: () => Promise<T>): Promise<{ value: T; clones: number }> {
+      let clones = 0;
+      const originalClone = Response.prototype.clone;
+      Response.prototype.clone = function (this: Response) {
+        clones += 1;
+        return originalClone.call(this);
+      } as typeof originalClone;
+      try {
+        return { value: await body(), clones };
+      } finally {
+        Response.prototype.clone = originalClone;
+      }
+    }
+
+    /** The fire-and-forget record POST; one macrotask is enough to land it. */
+    async function settleRecord(): Promise<void> {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    const REMOTE = `\n[remote]\nrecord_server = ${JSON.stringify(RECORD_URL)}\n`;
+
+    it('spills the error body past threshold_bytes, never clones it, and streams the same bytes to the client', async () => {
+      const message = `upstream exploded: ${'e'.repeat(6000)}`;
+      const upstreamBody = JSON.stringify({ error: { message, type: 'server_error' } });
+      assert.ok(Buffer.byteLength(upstreamBody, 'utf8') > 4096, 'the fixture has to cross the threshold');
+      const { records } = upstreamError(upstreamBody, 500);
+      writeConfig({ enabled: true, extra: `threshold_bytes = 1024\n${REMOTE}record_response_body = true\n` });
+
+      const { value: response, clones } = await countingClones(() => handler.fetch(completionsRequest(), env()));
+
+      assert.equal(response.status, 500, 'the upstream failure still reaches the client as itself');
+      assert.equal(clones, 0, '§5.7: the error-body read must not clone the response');
+      assert.equal(responseSpills().length, 1, 'the error body is on disk while the client holds it');
+      const clientText = await response.text();
+      await settleRecord();
+
+      assert.equal(clientText, upstreamBody, 'the client receives the upstream error byte for byte, out of the spool');
+      assert.equal(records.length, 1, 'the failure is still recorded to the collector');
+      assert.equal(records[0].response_status, 500);
+      assert.deepEqual(records[0].response_body, { error: { message, type: 'server_error' } },
+        'the collector gets the upstream error body, not a truncation of it');
+      assert.deepEqual(responseSpills(), [], 'the spill is released once the client has drained it');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('fails an error body past max_response_bytes explicitly instead of recording a truncated one', async () => {
+      const { records } = upstreamError(JSON.stringify({ error: { message: 'x'.repeat(8192) } }), 502);
+      writeConfig({
+        enabled: true,
+        extra: `threshold_bytes = 512\nmax_response_bytes = 2048\n${REMOTE}record_response_body = true\n`,
+      });
+
+      const response = await handler.fetch(completionsRequest(), env());
+      await settleRecord();
+
+      assert.equal(response.status, 500, 'the cap breach is a spool failure, not the upstream 502');
+      const payload = await response.json() as { type: string; error: { type: string; message: string } };
+      assert.equal(payload.error.type, 'processing_error');
+      assert.match(payload.error.message, /Response body too large/);
+      assert.deepEqual(records, [], 'no record is posted for a body the proxy refused to read');
+      assert.deepEqual(responseSpills(), [], 'the refused body leaves no spill behind');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+
+    it('leaves the error path byte-identical when the spool is off, and still records the parsed body', async () => {
+      const upstreamBody = JSON.stringify({ error: { message: `legacy ${'l'.repeat(6000)}`, type: 'server_error' } });
+      const { records } = upstreamError(upstreamBody, 500);
+      writeConfig({ enabled: false, extra: `threshold_bytes = 1024\n${REMOTE}record_response_body = true\n` });
+
+      const { value: response, clones } = await countingClones(() => handler.fetch(completionsRequest(), env()));
+      const clientText = await response.text();
+      await settleRecord();
+
+      // The pre-existing shape of this branch: the clone is what the disabled
+      // path does, which is why the spool turns it into a bounded receive.
+      assert.equal(clones, 1, 'with the spool off the error body is still read through a clone');
+      assert.equal(records.length, 1);
+      assert.deepEqual(records[0].response_body, JSON.parse(upstreamBody));
+      assert.equal(clientText, upstreamBody, 'the clone leaves the client copy untouched');
+      assert.equal(responseSpills().length, 0, 'nothing is spilled when the spool is off');
+    });
+
+    it('does not read the error body at all when record_response_body is off', async () => {
+      const upstreamBody = JSON.stringify({ error: { message: `unread ${'u'.repeat(6000)}`, type: 'server_error' } });
+      const { records } = upstreamError(upstreamBody, 500);
+      writeConfig({ enabled: true, extra: `threshold_bytes = 1024\n${REMOTE}record_response_body = false\n` });
+
+      const { value: response, clones } = await countingClones(() => handler.fetch(completionsRequest(), env()));
+      assert.equal(clones, 0, 'no body read, so nothing to clone');
+      assert.deepEqual(responseSpills(), [], 'and nothing brought to disk on the way');
+      const clientText = await response.text();
+      await settleRecord();
+
+      assert.equal(clientText, upstreamBody);
+      assert.equal(records.length, 1, 'the failure is still recorded, just without a body');
+      assert.equal(records[0].response_status, 500);
+      assert.equal('response_body' in records[0], false, 'the record carries no body');
+      assert.equal(getLiveSpillBytes(), 0);
+    });
+  });
+
+  describe('the ladder\'s abandoned responses, when the spool holds them', () => {
+    // A retried or superseded rung's Response never reaches the client, so
+    // nothing drains the body the error read above attached a spill to. The
+    // startup sweep is the only other reaper, so an abandoned spill would pin
+    // its file and its §5.9 reservation for the life of the process — a budget
+    // every later request pays for. The ladder cancels the body at both drop
+    // points instead.
+    const AUTH_URL = 'https://auth.example/validate';
+    const RECORD_URL = 'http://collector.test/usage';
+    const RUNG_A = 'https://up.example/a';
+    const RUNG_B = 'https://up.example/b';
+    /** The auth sidecar that hands back the ladder, plus the stats collector. */
+    const REMOTE_AUTH = `\n[remote]\nauth_server = ${JSON.stringify(AUTH_URL)}\nrecord_server = ${JSON.stringify(RECORD_URL)}\n`;
+
+    function ladderRequest(): Request {
+      return new Request('http://proxy/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'test', messages: [{ role: 'user', content: 'hi' }] }),
+      });
+    }
+
+    it('releases the spill of a re-hit rung and of a superseded one', async () => {
+      const upstreamBody = JSON.stringify({ error: { message: `rung a says no ${'e'.repeat(6000)}` } });
+      assert.ok(Buffer.byteLength(upstreamBody, 'utf8') > 4096, 'the fixture has to cross the threshold');
+      writeConfig({
+        enabled: true,
+        extra: `threshold_bytes = 1024\n${REMOTE_AUTH}record_response_body = true\n`,
+      });
+
+      const upstreamCalls: string[] = [];
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url === AUTH_URL) {
+          return new Response(JSON.stringify({
+            version: '1',
+            targets: [
+              { target: 'rung-a', base: RUNG_A, mode: 'openai-completions', retry_on: [500], retry: 1 },
+              { target: 'rung-b', base: RUNG_B, mode: 'openai-completions' },
+            ],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (url === RECORD_URL) return new Response('{}', { status: 204 });
+        upstreamCalls.push(url);
+        if (url.startsWith(RUNG_A)) {
+          return new Response(upstreamBody, { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(chatCompletion('rung b ok'), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch;
+
+      const response = await handler.fetch(ladderRequest(), env());
+      const clientText = await response.text();
+
+      assert.equal(response.status, 200, 'the ladder falls through to the second rung');
+      assert.equal(clientText, chatCompletion('rung b ok'));
+      assert.equal(upstreamCalls.filter(url => url.startsWith(RUNG_A)).length, 2,
+        'the first rung is re-hit once (axis 2), then superseded (axis 1)');
+      assert.deepEqual(responseSpills(), [], 'both abandoned spills were released at their drop point');
+      assert.equal(getLiveSpillBytes(), 0, 'and their disk reservations with them');
+    });
+  });
+});
+
+describe('§5.7 spooling of the PII restore read', () => {
+  // `restorePrivacyResponse` (index.ts) rebuilt the client-facing body from
+  // `response.text()` — the last unbounded whole-body read on a response the
+  // proxy builds itself. §5.7: the restore now runs inside the bounded receive,
+  // so the body is capped and the spill it was received into is released before
+  // the restored text goes out (rule #8 — no partial copy is ever restored).
+  // Local `[privacy_filter]` mode mints the `⟦HASH:n⟧` sentinel in-process, so
+  // the whole redact → upstream → restore cycle is drivable without a sidecar.
+  const SECRET = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  const SENTINEL = '⟦HASH:0⟧';
+  const FILLER = 'filler '.repeat(256);
+
+  function writeConfig(args: { extra: string }): void {
+    writeFileSync(configPath, `
+[models.default]
+upstream_mode = "openai-completions"
+base_url = "https://upstream.example"
+api_key = "upstream-key"
+
+[spool]
+enabled = true
+dir = ${JSON.stringify(join(tempDir, 'spool'))}
+${args.extra}
+`, 'utf8');
+    clearProxyConfigCache();
+    resetBlobStore();
+  }
+
+  /** The local filter has no sidecar, so activation is the toml section alone. */
+  const LOCAL_FILTER = '[privacy_filter]\nfilter_mode = "local"\n';
+
+  /** File names currently in `<spool>/responses`, or `[]` when the dir is absent. */
+  function responseSpills(): string[] {
+    const dir = responseSpillDir(getSpoolConfig());
+    return existsSync(dir) ? readdirSync(dir).sort() : [];
+  }
+
+  /** One OpenAI chat-completions response whose only content is `text`. */
+  function chatCompletion(text: string): string {
+    return JSON.stringify({
+      id: 'chat-json-spill', object: 'chat.completion', created: 1, model: 'test',
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    });
+  }
+
+  /** Upstream answers every call with `upstreamBody`, and the sent body is captured. */
+  function upstreamEcho(upstreamBody: string): { sent: () => string } {
+    let sent = '';
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      sent = await sentBodyText(init);
+      return new Response(upstreamBody, { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+    return { sent: () => sent };
+  }
+
+  function messagesRequest(): Request {
+    return new Request('http://proxy/v1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'test',
+        max_tokens: 32,
+        messages: [{ role: 'user', content: `my key is ${SECRET}` }],
+      }),
+    });
+  }
+
+  /** Counts `Response.prototype.clone` while `body` runs. */
+  async function countingClones<T>(body: () => Promise<T>): Promise<{ value: T; clones: number }> {
+    let clones = 0;
+    const originalClone = Response.prototype.clone;
+    Response.prototype.clone = function (this: Response) {
+      clones += 1;
+      return originalClone.call(this);
+    } as typeof originalClone;
+    try {
+      return { value: await body(), clones };
+    } finally {
+      Response.prototype.clone = originalClone;
+    }
+  }
+
+  it('restores a sentinel out of the spooled body, never cloning it, and leaves no spill behind', async () => {
+    const upstreamBody = chatCompletion(`${SENTINEL} ${FILLER}`);
+    assert.ok(Buffer.byteLength(upstreamBody, 'utf8') > 1024, 'the fixture has to cross the threshold');
+    writeConfig({ extra: `threshold_bytes = 1024\n${LOCAL_FILTER}` });
+    const upstream = upstreamEcho(upstreamBody);
+
+    const { value: response, clones } = await countingClones(() => handler.fetch(messagesRequest(), env()));
+
+    assert.equal(response.status, 200);
+    assert.equal(clones, 0, '§5.7: neither consumer may hold a second copy of the body');
+    const sentBody = JSON.parse(upstream.sent()) as { messages: Array<{ content: string }> };
+    assert.equal(sentBody.messages[0].content, `my key is ${SENTINEL}`, 'the secret itself never leaves the proxy');
+    assert.ok(!upstream.sent().includes(SECRET));
+
+    const body = await response.json() as { content: Array<{ type: string; text: string }> };
+    assert.deepEqual(body.content, [{ type: 'text', text: `${SECRET} ${FILLER}` }],
+      'the restored body carries the original value, not the sentinel');
+    assert.deepEqual(responseSpills(), [], 'the restore releases the spill it received the body into');
+    assert.equal(getLiveSpillBytes(), 0, 'and puts its disk reservation back');
+  });
+
+  it('fails a restore it cannot receive, and leaves nothing reserved', async () => {
+    // The restore receives the client-facing body, which the handler's own
+    // receive still holds on disk, so a PII-active response past the threshold
+    // needs room for a second spill — the measured cost of §5.7's bounded
+    // restore. A budget that fits only the first fails here, explicitly, rather
+    // than restoring from a body the spool had to truncate. (The converted
+    // Claude body is ~50 bytes smaller than the upstream OpenAI body, so
+    // `max_response_bytes` cannot cut between the two receives; `max_total_bytes`
+    // can.)
+    const upstreamBody = chatCompletion(`${SENTINEL} ${FILLER}`);
+    const upstreamBytes = Buffer.byteLength(upstreamBody, 'utf8');
+    writeConfig({ extra: `threshold_bytes = 512\nmax_total_bytes = ${upstreamBytes + 64}\n${LOCAL_FILTER}` });
+    upstreamEcho(upstreamBody);
+
+    const response = await handler.fetch(messagesRequest(), env());
+
+    assert.equal(response.status, 503, 'a body the spool cannot hold is refused, not restored from a partial copy');
+    const payload = await response.json() as { type: string; error: { type: string; message: string } };
+    assert.equal(payload.type, 'error');
+    assert.equal(payload.error.type, 'over_limit_error');
+    assert.match(payload.error.message, /live spill budget exceeded/);
+    assert.deepEqual(responseSpills(), [], 'the refused receive leaves no spill behind');
+    assert.equal(getLiveSpillBytes(), 0, 'and no disk reservation either');
   });
 });

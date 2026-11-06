@@ -356,23 +356,57 @@ export async function putBlob(base64: string): Promise<LeasedBlob> {
   const now = Date.now();
   await evictIdle(now);
 
-  const existing = index.get(hash);
-  if (existing) {
-    existing.refs += 1;
-    existing.lastUsed = now;
-    // A recurring payload is the hit this cache exists for: promote it for the
-    // rehydrating read that is about to follow.
-    cachePut(hash, base64, existing.size);
-    return { hash, size: existing.size, cached: true };
-  }
+  // Lookup and lease must be one atomic operation (§5.5), but the write between
+  // them awaits, so two concurrent puts of the same *new* payload would both
+  // miss the index, both write, and both `index.set(refs: 1)` — last write
+  // wins, every caller believes it holds a lease, and the extra releases throw
+  // (or worse, an idle sweep deletes a blob still being read). The gate makes
+  // the race deterministic: the first put writes, the rest chain onto it and
+  // take the ordinary refs+=1 hit once the entry exists.
+  for (;;) {
+    const pending = inflightPuts.get(hash);
+    if (pending) {
+      // A failed put resolves its gate too, so a racer simply retries as the
+      // writer — the last one standing gets the real error (rule #8).
+      await pending;
+    }
 
-  await reserveDiskBytes(size, config);
-  await writeBlobFile(hash, base64);
-  index.set(hash, { size, lastUsed: now, refs: 1 });
-  diskBytes += size;
-  cachePut(hash, base64, size);
-  return { hash, size, cached: false };
+    const existing = index.get(hash);
+    if (existing) {
+      existing.refs += 1;
+      existing.lastUsed = now;
+      // A recurring payload is the hit this cache exists for: promote it for the
+      // rehydrating read that is about to follow.
+      cachePut(hash, base64, existing.size);
+      return { hash, size: existing.size, cached: true };
+    }
+
+    // Register before the first yield, so a racing put sees the gate. If a
+    // racer registered between our check and here, loop and take its hit.
+    if (inflightPuts.has(hash)) continue;
+    let done!: () => void;
+    const gate = new Promise<void>((resolve) => { done = resolve; });
+    inflightPuts.set(hash, gate);
+    try {
+      await reserveDiskBytes(size, config);
+      await writeBlobFile(hash, base64);
+      index.set(hash, { size, lastUsed: now, refs: 1 });
+      diskBytes += size;
+      cachePut(hash, base64, size);
+      return { hash, size, cached: false };
+    } finally {
+      inflightPuts.delete(hash);
+      done();
+    }
+  }
 }
+
+/**
+ * One in-flight write per hash. A put of a payload already being written
+ * chains onto the gate and takes the index hit instead of writing again —
+ * see {@link putBlob}'s atomicity note.
+ */
+const inflightPuts = new Map<string, Promise<void>>();
 
 /**
  * Take one more ref on an existing blob, for an owner that shares its lease
