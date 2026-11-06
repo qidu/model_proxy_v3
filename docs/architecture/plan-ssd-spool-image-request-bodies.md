@@ -1393,9 +1393,21 @@ Decisions are recorded (§9); what remains is evidence.
       Still open below: the heap-allocation profile, per-payload-family bodies,
       full-parse concurrency, and p50/p95/p99.
 - [ ] Heap/allocation profile confirms or corrects §2's copy inventory.
-- [ ] Mid-stream SSE profiles show no full request body retained on supported
+- [x] Mid-stream SSE profiles show no full request body retained on supported
       converted paths; non-binary accounting is unchanged and binary usage uses
       the documented payload-length estimate with upstream usage preferred.
+      The retention half is covered by `tests/unit/index-admission.test.ts`
+      (headers in hand and not one event read, `getAdmittedBytes() === 0`); the
+      binary-usage half by `tests/unit/ref-input-usage.test.ts` at both SSE
+      seams — the reported `input_tokens` moves by exactly 1000 for a
+      4000 → 8000 base64-character ref, measured against a payload-free body of
+      the same text, on the config-gated `handleStreamingResponse` and on
+      `handleResponsesStreamAsClaude`, which never consults that config, and
+      upstream-reported usage replaces the estimate exactly rather than being
+      blended with it. "Non-binary accounting is unchanged" has no test of its
+      own, deliberately: on a body with no ref the two configurations run the
+      same computation, so that assertion would compare an expression with
+      itself.
 - [x] Paused-client tests prove bounded response queues and upstream read
       backpressure across logging, keep-alive, converters, and the Node adapter.
 - [x] Mid-stream missing-file/disk/parse failure tests prove client connection
