@@ -4,7 +4,7 @@ Plan: `docs/architecture/plan-ssd-spool-image-request-bodies.md`
 
 Status values: `[ ]` pending, `[~]` in progress, `[x]` complete with verification.
 
-Current verification: typecheck clean, build clean, 2,638/2,638 unit tests pass, plus the `tests/perf/parse-transient.ts` Phase-3 gate measurement. All P0–P2 items and the §12 evidence items named below are complete; the open P3 items are the remaining heap/latency profiles and the real restart/win32/tmpfs runs.
+Current verification: typecheck clean, build clean, 2,640/2,640 unit tests pass, plus the `tests/perf/parse-transient.ts` Phase-3 gate measurement. All P0–P2 items and the §12 evidence items named below are complete; the open P3 items are the remaining heap/latency profiles, the win32 and tmpfs-mount runs, and the §10 restart bullet is evidenced for the spill half only.
 
 ## P0 — Correctness and lifecycle defects
 
@@ -376,14 +376,18 @@ Current verification: typecheck clean, build clean, 2,638/2,638 unit tests pass,
 
 ## P3 — Acceptance evidence and documentation
 
-- [ ] **Measure the actual memory goals**
-  - Capture heap/allocation profiles for slow upload, slow upstream send, downstream JSON, and long/large-event SSE.
-  - Include mid-stream request-body reachability and external-buffer accounting.
-  - Record before/after memory and p50/p95/p99 latency.
+- [ ] **Measure the actual memory goals** — the four named windows are measured (2026-11-06, `tests/perf/spool-memory.ts`); the profile, concurrency and percentile halves are not.
+  - [x] Capture heap/allocation profiles for slow upload, slow upstream send, downstream JSON, and long/large-event SSE.
+    `tests/perf/spool-memory.ts` drives the real handler in-process with a scripted `globalThis.fetch`, once with `[spool] enabled = false` and once with `true` and nothing else changed (the toggle isolates the change: `receiveSpooledBody`'s `spillable = config.enabled` and every extraction/admission site gate on it). Live bytes (`heapUsed + arrayBuffers` after a forced collection) at named checkpoints, min–max over eight runs (six with test logs silenced, two not; the configurations differ by up to ~1 MiB because log strings are live): upload-end 10.90–10.95 → 0.17–4.42 MiB (image) and 10.94 → −0.33–3.43 MiB (the non-ref text control, which separates ingress spooling from extraction), request-sent 64.65–64.70 → 10.91–10.93 MiB (against 63.70–64.64 → 52.33–53.30 MiB for the control), request-read 75.40–75.45 → 21.69–32.54 MiB, downstream JSON response-sent 16.29–16.31 → 8.21–10.71 MiB, SSE response-sent 1.15–1.16 → 1.01–1.02 MiB (non-binary events are not spilled per event, so that row is a wash by design). Latency: slow upstream send **+295–335 ms** (§7's disk-I/O trade, visible because the send is the bottleneck); the SSE total improves 1259–1336 → 976–996 ms (20–27 %), which the harness does not isolate.
+  - [x] Include mid-stream request-body reachability and external-buffer accounting.
+    Reachability is what the checkpoints measure — an unreachable buffer is invisible to them by construction, and the A/A2 pair attributes a changed window to extraction or to the ingress spool rather than to spooling in general. `arrayBuffers` is counted, **but only after a forced collection**: a 1 ms sampler of the same sum counts uncollected garbage (measured: 63.87 MiB live at the send boundary with the spool off, sampler peak 13.90 MiB) and aliases transient spikes, which is how it first reported the spool as 639 % worse.
+  - [ ] Record before/after memory and p50/p95/p99 latency.
+    Totals are recorded per scenario; percentile latency and full-parse concurrency are not, and `p50/p95/p99` needs a load-driving harness rather than this single-exchange one.
+  - Still open for §12's second bullet: the heap-allocation profile against §2's copy inventory (the measured ~6 live body copies off / ~1 on at the send boundary is a partial result), and per-payload-family response bodies (Gemini `inlineData`, Responses generated images), which is where a *binary* SSE event would exercise §5.7's per-event spill.
 - [ ] **Complete end-to-end test evidence**
   - Full request/response predicate matrix across applicable conversions and SSE variants.
   - Concurrent binary and non-ref traffic with admission enabled and disabled.
-  - Real restart, win32, and tmpfs-mount tests.
+  - Real restart test now in place (§10 "Restart is discard-only", spill half — see the item below); win32 and tmpfs-mount runs remain.
 - [x] **Align documentation**
   - README's response-cap status: verified correct — `max_response_bytes` breaches return **500** (`SpoolResponseTooLargeError`), `max_total_bytes` returns **503** (`SpoolCapacityError`), and the README says exactly that (`:832`, `:922`).
   - Record deliberate deviations in the plan: §5.5 active-ref pinning, §5.9 single-parse/across-rung hold plus the two-class waiter rule, §5.8 no-proxy-delete, §9.2 the gate measurement keeping Phase 3 deferred.
@@ -405,3 +409,9 @@ Current verification: typecheck clean, build clean, 2,638/2,638 unit tests pass,
   - "Paused-client tests prove bounded response queues and upstream read backpressure across … the Node adapter." `tests/unit/server.test.ts` gains a `createNodeRequestHandler — a paused client` block that pins read counts, not mechanisms: a `Writable` that never accepts a byte (deterministic, measured 3 of 1024 chunks for a 64 MiB body); a real `res.pause()` client (15 chunks read, 192 KiB of 960 KiB delivered, `cancelled === false`, then all bytes and exactly `chunks + 1` reads after `resume()`); the same through the SSE branch with a keep-alive-wrapped body (22 chunks, then byte-exact); and a `receiveResponseBody`-spooled response, where the stalled client's unread copy is 16 MiB accounted as a live spill with one full-size file in `responses/`, released and removed once read.
   - Mutations: buffering the non-SSE branch fails three of the four; buffering the SSE branch fails the SSE test and *hangs* the pre-existing disconnect test (an un-cancelled upstream body never settles); forcing `threshold_bytes` to infinity fails the spooled test.
   - Limit recorded: a pull count bounds the queues the proxy builds, not resident bytes. The heap/allocation half of §12 stays open under "Measure the actual memory goals".
+- [x] **Close the restart-is-discard-only evidence (§10, §5.4/§5.5)**
+  - "Seed request/response/event spills and blobs from a previous process, then restart. … An orphan older than the age threshold is removed; a freshly written file belonging to a concurrently active worker is not removed." The blob half already existed; the **spill** half did not: `sweepStaleSpills(startupSpool)` (`src/utils/config-loader.ts:3278`) had no test, and removing the call from the real startup path passed all 227 tests in `config-loader.test.ts`.
+  - `tests/unit/config-loader.test.ts` `[spool] startup resolution` gains two cases through the real `loadProxyConfig`. (1) A stale (2 h) and a fresh spill seeded in each of `requests/`, `responses/`, `events/`: startup deletes all three stale files, keeps the three recent ones byte-identical, and `getLiveSpillBytes()` stays 0. (2) `enabled = false` with a `dir` holding a stale spill: the dir still resolves, nothing is created or swept (§9.1 — a disabled spool owns no spills).
+  - Mutations: an empty sweep result instead of `sweepStaleSpills(startupSpool)` fails (1) and nothing else; `minAgeMs = 0` fails (1) on the kept-recent assertion; moving the sweep above the `enabled` gate fails (2).
+  - Already covered: L2 index empty and never rebuilt from disk (`config-loader.test.ts` blob-sweep case, `blob-store.test.ts` `sweepStaleBlobs`), no cache hit from an old file (`blob-store.test.ts` "does not resurrect a fresh-process blob from a stale file").
+  - Limit recorded: "no old body/event is parsed or forwarded, no exchange is resumed" is evidenced by the absence of any code path that enumerates a spill directory (the sweep is the only one) plus the empty ledger — there is no replay path to exercise. The same §10 bullet's win32 and tmpfs-mount halves are not runnable here.

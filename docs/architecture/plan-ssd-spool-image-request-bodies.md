@@ -1374,14 +1374,29 @@ Test-process hygiene: locate with `pgrep`/`lsof` then `kill`; no `pkill` (repo r
 Decisions are recorded (§9); what remains is evidence.
 
 - [x] `§9.1`–`§9.5` decided and recorded (2026-11-02).
-- [ ] Combined Phases 0–2 change landed, with before/after memory and latency
+- [x] Combined Phases 0–2 change landed, with before/after memory and latency
       numbers for slow upload, upstream request send, downstream JSON response,
       and long/large-event SSE response.
+      Measured 2026-11-06 by `tests/perf/spool-memory.ts` (run directly, not by
+      `npm run test:unit`): the four windows above, off-vs-on through the
+      `[spool] enabled` toggle, live bytes at named checkpoints. Headlines
+      (min–max over eight runs; the ranges span two log configurations that
+      differ by up to ~1 MiB): upload-end 10.90–10.95 → 0.17–4.42 MiB,
+      request-sent 64.65–64.70 → 10.91–10.93 MiB, request-read 75.40–75.45 →
+      21.69–32.54 MiB, downstream JSON response-sent 16.29–16.31 → 8.21–10.71
+      MiB, SSE response-sent 1.15–1.16 → 1.01–1.02 MiB (non-binary events
+      are not spilled per event, so that row is expected flat, not a result).
+      Latency: slow upstream send **+295–335 ms** (§7's disk-I/O cost, in the
+      window where the send is the bottleneck); the other four are within run
+      noise, plus one unexplained improvement (SSE, 1259–1336 → 976–996 ms)
+      the harness does not isolate.
+      Still open below: the heap-allocation profile, per-payload-family bodies,
+      full-parse concurrency, and p50/p95/p99.
 - [ ] Heap/allocation profile confirms or corrects §2's copy inventory.
 - [ ] Mid-stream SSE profiles show no full request body retained on supported
       converted paths; non-binary accounting is unchanged and binary usage uses
       the documented payload-length estimate with upstream usage preferred.
-- [ ] Paused-client tests prove bounded response queues and upstream read
+- [x] Paused-client tests prove bounded response queues and upstream read
       backpressure across logging, keep-alive, converters, and the Node adapter.
 - [x] Mid-stream missing-file/disk/parse failure tests prove client connection
       abort, error logging, upstream cancellation, and complete lease/spill

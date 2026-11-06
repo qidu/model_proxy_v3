@@ -55,7 +55,11 @@ import {
 } from '../../src/utils/config-loader.js';
 import { UPSTREAM_MODES } from '../../src/utils/upstream-modes.js';
 import { getBlobStoreStats } from '../../src/utils/blob-store.js';
-import { SPOOL_DEFAULTS, SpoolConfigError, getSpoolConfig, setSpoolConfig } from '../../src/utils/spool.js';
+import { getLiveSpillBytes } from '../../src/utils/spool-body.js';
+import {
+  EVENT_SPILL_SUBDIR, REQUEST_SPILL_SUBDIR, RESPONSE_SPILL_SUBDIR,
+  SPOOL_DEFAULTS, SpoolConfigError, getSpoolConfig, setSpoolConfig,
+} from '../../src/utils/spool.js';
 import type { Env } from '../../src/types/shared.js';
 
 // ---------------------------------------------------------------------------
@@ -3246,6 +3250,71 @@ dir = "${target}"
       getBlobStoreStats(),
       { cacheBytes: 0, cacheEntries: 0, diskBytes: 0, diskEntries: 0 },
       'startup must never turn an old blob file into a cache hit (§5.4)',
+    );
+  });
+
+  it('sweeps every spill directory left by an earlier process, and leaves a fresh spill alone', async () => {
+    const target = join(dir, 'spool-spills');
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const spillDirs = [REQUEST_SPILL_SUBDIR, RESPONSE_SPILL_SUBDIR, EVENT_SPILL_SUBDIR];
+    // One stale and one recent spill per directory: the sweep has to reach all
+    // three kinds (§5.5 lists them in one place) and must not delete a file a
+    // worker starting alongside this one may still be filling.
+    for (const subdir of spillDirs) {
+      const spill = join(target, subdir);
+      mkdirSync(spill, { recursive: true });
+      writeFileSync(join(spill, 'stale.body'), `stale ${subdir}`);
+      writeFileSync(join(spill, 'fresh.body'), `fresh ${subdir}`);
+      utimesSync(join(spill, 'stale.body'), twoHoursAgo, twoHoursAgo);
+    }
+
+    await load(`
+[spool]
+enabled = true
+dir = "${target}"
+`);
+
+    for (const subdir of spillDirs) {
+      const spill = join(target, subdir);
+      assert.equal(
+        existsSync(join(spill, 'stale.body')),
+        false,
+        `a ${subdir} spill from a process that is gone is unreachable garbage — the restart must delete it`,
+      );
+      assert.equal(
+        existsSync(join(spill, 'fresh.body')),
+        true,
+        `a recent ${subdir} spill belongs to a worker starting alongside this one — the restart must keep it`,
+      );
+      assert.equal(readFileSync(join(spill, 'fresh.body'), 'utf8'), `fresh ${subdir}`);
+    }
+
+    // The restart must not adopt what it left on disk: the spill ledger counts
+    // bytes this process is holding, and a file an earlier process wrote
+    // contributes nothing to it (§5.4 — no manifest, no replay, no recovery).
+    assert.equal(getLiveSpillBytes(), 0, 'a restart starts with no live spill bytes, whatever the disk holds');
+  });
+
+  it('does not sweep or create anything for a disabled spool, even with stale spills under it (§9.1)', async () => {
+    const target = join(dir, 'spool-disabled');
+    const spill = join(target, REQUEST_SPILL_SUBDIR);
+    mkdirSync(spill, { recursive: true });
+    const stale = join(spill, 'stale.body');
+    writeFileSync(stale, 'stale request');
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, twoHoursAgo, twoHoursAgo);
+
+    await load(`
+[spool]
+enabled = false
+dir = "${target}"
+`);
+
+    assert.equal(getSpoolConfig().dir, target, 'a disabled spool still resolves its configured dir');
+    assert.equal(
+      readFileSync(stale, 'utf8'),
+      'stale request',
+      'a disabled spool produces no spills of its own, so it must not delete files an enabled run left behind (§9.1)',
     );
   });
 

@@ -5,6 +5,119 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### perf(spool): §12's before/after numbers for the four named windows — and the instrument that has to be used to get them
+
+Plan §12's line ("Combined Phases 0–2 change landed, with before/after memory and latency numbers for
+slow upload, upstream request send, downstream JSON response, and long/large-event SSE response") now
+has a runnable harness: **`tests/perf/spool-memory.ts`**, deliberately outside `npm run test:unit`
+because it produces measurements, not assertions. It drives the real handler in-process with
+`globalThis.fetch` stubbed by a scripted upstream, once with `[spool] enabled = false` and once with
+`true` and everything else identical, and prints the same named windows for both. **"Before" is that
+toggle, not an older checkout:** `receiveSpooledBody`'s `const spillable = config.enabled` and every
+extraction/admission site gate on it, so off-vs-on isolates this change without a second tree.
+
+**The instrument, because the obvious one lies.** `live()` = `process.memoryUsage()`'s
+`heapUsed + arrayBuffers` **after a forced collection**, read at named checkpoints (`upload-end`,
+`request-sent`, `request-read`, `response-sent`, `response-drained`) — not sampled. A 1 ms sampler was
+written first and is wrong twice over: `arrayBuffers` counts a backing store until a collection
+reclaims it, so the harness's own per-pull encoder output read as if the proxy held it (~12 MiB of
+floor in *both* modes), and a real spike is aliased away. Measured: with the spool **off**, 63.87 MiB
+was live at the send boundary while the sampler never saw more than 13.90 MiB; with it **on**, the
+slower send kept the same spike visible (sampler peak 64.81 MiB) — so the sampler reported the spool as
+639 % *worse* than the code it improves. What checkpoints cannot see: transients *between* readings
+(§7 predicts no change there). Each checkpoint forces a collection, so a window's wall clock includes
+it, symmetrically in both modes; the upload window, which contains none, is the clean latency figure.
+
+Scenarios, all 200 and all releasing their spills (`getLiveSpillBytes() === 0` asserted per run): **A**
+8 MiB inline image, client dribbling at 16 MiB/s; **A2** the same bytes as non-allowlisted text — the
+control that separates ingress spooling from extraction; **B** the image with an instantaneous upload
+and an upstream reading at 8 MiB/s; **C** an 8 MiB JSON completion, client at 64 MiB/s; **D** 100 ×
+256 KiB SSE events, client at 64 MiB/s. Spool `threshold_bytes = 65536` and `max_blob_cache_bytes =
+65536`, so a cache hit cannot mask extraction. Ranges are the min–max over eight runs, six of them with
+the documented command and two with test logs silenced — the two configurations differ by up to ~1 MiB
+(log strings are live), so a range is the honest unit here, not a mean; each run measures both modes in
+one configuration, so the on/off ratios are unaffected. One throwaway exchange per mode precedes the
+loop: the first measured run without it inflated A's upload window by ~2.2 MiB of lazily initialized
+request-path code that is *live*.
+
+| Scenario | Window | spool off | spool on | on/off | exchange, off → on |
+|---|---|---|---|---|---|
+| A image, slow upload | upload-end | 10.90–10.95 MiB | 0.17–4.42 MiB | 2–41 % | 869–890 → 869–876 ms |
+| A | request-sent | 64.65–64.70 MiB | 10.91–10.93 MiB | 17 % | |
+| A | request-read | 75.40–75.45 MiB | 21.69–32.54 MiB | 29–43 % | |
+| A2 same bytes, non-ref text | upload-end | 10.94 MiB | −0.33–3.43 MiB | ~0–31 % | 910–937 → 911–944 ms |
+| A2 | request-sent | 63.70–64.64 MiB | 52.33–53.30 MiB | 81–84 % | |
+| A2 | request-read | 74.44–75.38 MiB | 63.07–64.04 MiB | 84–86 % | |
+| B image, slow upstream send | upload-end | 10.79 MiB | −0.31–0.21 MiB | ~0–2 % | 1417–1428 → 1723–1750 ms |
+| B | request-sent | 64.48–64.49 MiB | 10.30–10.81 MiB | 16–17 % | |
+| B | request-read | 64.48–64.49 MiB | 11.04–15.75 MiB | 17–24 % | |
+| C 8 MiB JSON response | response-sent | 16.29–16.31 MiB | 8.21–10.71 MiB | 50–66 % | 535–560 → 544–565 ms |
+| D 100 × 256 KiB SSE | response-sent | 1.15–1.16 MiB | 1.01–1.02 MiB | 87–89 % | 1259–1336 → 976–996 ms |
+
+Every `response-drained` row is at the noise floor (`NOISE = 1 MiB`, printed `~0`) except C's
+0.47 → 1.17 MiB, inside that band; a window can print slightly negative because the post-baseline
+collections also release code that was live when the baseline was taken. What the numbers say:
+
+- **Slow upload: O(N×B) → O(N×C) outside parse, as §7 predicts.** The 10.90–10.95 MiB held at the
+  last chunk becomes 0.17–4.42 MiB; the residual is in-flight stream/queue state, not spill
+  accounting, and the ledger is 0 at the end. The A/A2 pair attributes the rest: at the send
+  boundary the *non-ref* text control only reaches 52.33–53.30 MiB (one body copy saved), while the
+  image reaches 10.91–10.93 MiB — the difference is §5.4 extraction, not the ingress spool.
+- **Upstream request send: O(N×B) → O(N×C) for shape 3.** Both A and B land at ~10.3–10.9 MiB with the
+  spool on against 64.5–64.7 MiB off (~6 live copies of the body off, ~1 with it on), which
+  corroborates §2's copy inventory at the boundary where it is largest.
+- **Downstream JSON: 16.29–16.31 → 8.21–10.71 MiB (50–66 %),** a partial win only — this path still
+  materializes the whole body to convert it, exactly as §7's "outside full parse/serialization"
+  caveat says.
+- **Long SSE: 1.15–1.16 → 1.01–1.02 MiB (87–89 %), a wash.** These events are non-binary, and §5.7
+  spills binary payloads only, so the row is expected to be flat; it is reported as flat rather than
+  generalized.
+- **Latency, the honest cost:** B is **+295–335 ms** — §7's disk-I/O trade, visible because the send is
+  the bottleneck. D is **−265 to −360 ms (20–27 % faster)**, which this harness does *not* isolate (it
+  is consistent with §5.7's tee removal and real backpressure, not with spooling); A, A2 and C are
+  within run noise.
+
+Gates, so a bad run fails instead of printing a happy table: a non-200, an empty response body, live
+spill bytes left after the exchange, a window reached in one mode only, or an upload window that did
+not shrink. A later window growing by ≥ 1 MiB prints a `worse:` line and exits non-zero — the plan
+buys bounded streaming outside the parse, not a smaller full-parse peak (§7). **Not measured here:**
+per-payload-family response bodies (Gemini `inlineData`, Responses generated images), full-parse
+concurrency, p50/p95/p99 latency, and §7's heap-allocation profile against §2's copy inventory — §12's
+second bullet and the rest of the third stay open.
+
+**This increment produces evidence, not unit tests: no `src/` file changed and no test was added.**
+Verified: harness exits 0 with every scenario at 200, eight runs stable in direction (the ranges above
+are the min–max across them, spanning the two log configurations);
+`npm run typecheck`, `npm run build`, `npm run test:unit` unchanged at 2640/2640.
+
+### test(spool): §10/§5.5 — a restart sweeps the spill directories and adopts nothing from them
+
+The plan's restart evidence ask the question this suite could not answer: seed spills from a previous
+process, restart, and prove the restart only discards. The blob half was already pinned (`config-loader.test.ts`'s
+blob-sweep case, `blob-store.test.ts`'s "does not resurrect a fresh-process blob from a stale file"); the
+**spill** half was not — `sweepStaleSpills(startupSpool)` at `src/utils/config-loader.ts:3278` was wired
+with no test behind it, and deleting the call left the file's 227 tests all green. Two cases in
+`tests/unit/config-loader.test.ts`'s `[spool] startup resolution` now run the real `loadProxyConfig` path:
+
+- **The sweep reaches every spill kind, and only the old files.** A stale (2 h) and a fresh spill are
+  seeded in *each* of `requests/`, `responses/` and `events/`; startup deletes the three stale ones,
+  keeps the three recent ones byte-identical (a worker starting alongside this one may still be filling
+  them), and `getLiveSpillBytes()` is 0 — the restart holds nothing it found on disk, which is the
+  observable form of "no old body/event is parsed or forwarded, no exchange is resumed" given that no
+  code path enumerates a spill directory at all.
+- **A disabled spool neither creates nor sweeps** (§9.1). With `enabled = false` and a `dir` holding a
+  stale spill, the dir still resolves but nothing is created or deleted: a disabled spool produces no
+  spills of its own, so files under that path belong to some other run.
+
+Mutations: returning an empty sweep result (the call effectively off) fails the first case — and today
+would fail nothing else; `sweepStaleSpills(startupSpool, 0)` fails it on the kept-recent assertion; moving
+the sweep above the `enabled` gate fails the second. Verified: 229/229 in `config-loader.test.ts`, full
+suite **2640/2640** (536 suites), typecheck and build clean. No production change.
+
+**Stated limit:** what these tests prove about "no old body/event is parsed or forwarded" is the absence
+of an adoption path plus an empty ledger, not the behaviour of a replay path — there is no replay path to
+exercise, by design. The win32 and tmpfs-mount halves of the same plan bullet remain unrun here.
+
 ### feat(spool): §5.7 — the tool judge sidecar's answer is read bounded (the last unbounded request-path read in `src/`)
 
 `callJudgeSidecar` (`/judge`) and `callDecisionApi` (`/decision`) in
