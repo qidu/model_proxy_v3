@@ -265,10 +265,12 @@ describe('messages.ts ref-aware converted egress (§5.3 shape 3)', () => {
     // The Responses body is built by `completionsMessagesToResponsesInput`, which
     // relays the Chat image part by reference — so this position is where the
     // converter's re-prefixed ref ends up, not where the client's ref started.
+    // Responses spells `image_url` as a string (not the Chat `{url}` object), so
+    // the ref lands one level shallower than on the Chat egress above.
     // (Item 0 is the system message the converter emits first.)
     const sent = JSON.parse(call.text);
     assert.equal(sent.input[1].content[1].type, 'input_image');
-    assert.equal(sent.input[1].content[1].image_url.url, DATA_URL);
+    assert.equal(sent.input[1].content[1].image_url, DATA_URL);
   });
 
   it('places each payload where its ref ended up, in order, with two refs in one body', async () => {
@@ -315,6 +317,49 @@ describe('messages.ts ref-aware converted egress (§5.3 shape 3)', () => {
     assert.equal(call.headers['content-length'], undefined, 'the handler must not invent a length for a string body');
     const sent = JSON.parse(call.text);
     assert.equal(sent.messages[1].content[1].image_url.url, DATA_URL);
+  });
+
+  it('passes an Anthropic URL image source through as a string URL on both egresses', async () => {
+    // Neither upstream format needs a fetch here: Chat Completions' `image_url.url`
+    // and Responses' `image_url` both accept a fully qualified URL, so the only
+    // correct conversion is passthrough. The regression this pins is the
+    // `data:undefined;base64,undefined` the base64-only branch used to build for a
+    // `source.type: 'url'` block, plus the Chat-shaped `{url}` object that used to
+    // reach the Responses body.
+    setSpoolConfig(resolveSpoolConfig({ enabled: false }));
+    resetBlobStore();
+    const url = 'https://example.com/cat.png';
+    const body = {
+      model: 'claude-test',
+      max_tokens: 16,
+      system: 'be brief',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look' },
+          { type: 'image', source: { type: 'url', url } },
+        ],
+      }],
+    };
+
+    const chat = JSON.parse((await send(structuredClone(body), 'openai-completions')).text);
+    assert.deepEqual(chat.messages[1].content[1], { type: 'image_url', image_url: { url } });
+
+    const responses = JSON.parse((await send(structuredClone(body), 'openai-responses')).text);
+    assert.deepEqual(responses.input[1].content[1], { type: 'input_image', image_url: url });
+    assert.ok(!JSON.stringify(responses).includes('data:undefined'), 'no placeholder data URL may reach the upstream');
+  });
+
+  it('hoists a Chat `detail` to a sibling of `image_url` on the pass-through Responses path', async () => {
+    // The already-OpenAI branch forwards the client's own Chat parts, which can
+    // carry `detail` nested inside `image_url` — a position Responses does not have.
+    setSpoolConfig(resolveSpoolConfig({ enabled: false }));
+    resetBlobStore();
+    const body = openaiImageBody();
+    (body.messages as any)[0].content[0].image_url.detail = 'high';
+
+    const sent = JSON.parse((await send(body, 'openai-responses')).text);
+    assert.deepEqual(sent.input[0].content[0], { type: 'input_image', image_url: DATA_URL, detail: 'high' });
   });
 
   it('accepts a spooled image through validation, which sees the ref rather than a payload', async () => {

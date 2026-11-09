@@ -84,7 +84,12 @@ function completionsMessagesToResponsesInput(messages: unknown[]): unknown[] {
         if (pType === 'text') {
           parts.push({ type: textType, text: part.text ?? '' });
         } else if (pType === 'image_url') {
-          parts.push({ type: 'input_image', image_url: part.image_url });
+          // Mirrors the real converter: `image_url` is a string in Responses,
+          // with `detail` as a sibling (see handlers/messages.ts).
+          const img = part.image_url as { url?: unknown; detail?: unknown } | undefined;
+          const imagePart: Record<string, unknown> = { type: 'input_image', image_url: img?.url };
+          if (img?.detail !== undefined) imagePart.detail = img.detail;
+          parts.push(imagePart);
         } else if (pType === 'thinking') {
           input.push({
             type: 'reasoning',

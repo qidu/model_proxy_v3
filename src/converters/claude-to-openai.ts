@@ -53,6 +53,19 @@ function convertClaudeContentToOpenAI(content: ClaudeContent): OpenAIMessage['co
         if (block.type === 'text') {
             return { type: 'text' as const, text: block.text };
         } else if (block.type === 'image') {
+            if (block.source.type === 'url') {
+                // Anthropic URL sources pass straight through: Chat Completions'
+                // `image_url.url` accepts "either a URL of the image or the
+                // base64 encoded image data", so no server-side fetch is needed
+                // here. (image-fetch.ts exists for targets with no URL slot,
+                // e.g. Gemini `inline_data`.) Validation already guarantees a
+                // non-empty string; throwing beats emitting an empty field.
+                const url = block.source.url;
+                if (!url) {
+                    throw new Error('image block with source.type "url" has no source.url');
+                }
+                return { type: 'image_url' as const, image_url: { url } };
+            }
             const prefix = `data:${block.source.media_type};base64,`;
             const data: unknown = block.source.data;
             return {

@@ -108,6 +108,42 @@ describe('convertClaudeToOpenAIRequest — messages', () => {
     ]);
   });
 
+  it('passes an Anthropic URL image source through as the URL string, unfetched', () => {
+    const req = {
+      model: 'm',
+      max_tokens: 1,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } },
+        ],
+      }],
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToOpenAIRequest(req, 'gpt');
+    assert.deepEqual(out.messages[0].content, [
+      { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+    ]);
+  });
+
+  it('throws rather than emitting an empty image_url when a url source has no url', () => {
+    const req = {
+      model: 'm',
+      max_tokens: 1,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'url' } },
+        ],
+      }],
+    } as unknown as ClaudeMessagesRequest;
+
+    assert.throws(
+      () => convertClaudeToOpenAIRequest(req, 'gpt'),
+      /image block with source\.type "url" has no source\.url/,
+    );
+  });
+
   it('carries a §5.4 ref through as a re-prefixed ref instead of stringifying it', () => {
     // §5.3 shape 3: the converted position has to hold something the serializer
     // recognizes. The ref's own `prefix` is `''` (a Claude `source.data` is bare

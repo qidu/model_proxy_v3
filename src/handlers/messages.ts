@@ -178,7 +178,14 @@ function completionsMessagesToResponsesInput(messages: unknown[]): unknown[] {
         if (pType === 'text') {
           parts.push({ type: textType, text: part.text ?? '' });
         } else if (pType === 'image_url') {
-          parts.push({ type: 'input_image', image_url: part.image_url });
+          // Responses wants `image_url` as a plain string — a fully qualified URL
+          // or a base64 data URL — with `detail` as a *sibling*, the opposite of
+          // the Chat Completions shape this comes from. Unwrap, matching
+          // converters/completions-to-responses.ts.
+          const img = part.image_url as { url?: unknown; detail?: unknown } | undefined;
+          const imagePart: Record<string, unknown> = { type: 'input_image', image_url: img?.url };
+          if (img?.detail !== undefined) imagePart.detail = img.detail;
+          parts.push(imagePart);
         } else if (pType === 'thinking') {
           // Thinking-mode content parts: emit a Responses `reasoning` item
           // carrying a single `reasoning_text` part so the prior reasoning
