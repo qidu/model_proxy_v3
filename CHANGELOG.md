@@ -5,6 +5,76 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### docs(semantic-routing): the plan's routing config surface settles on keyed sub-sections
+
+`docs/plan-semantic-routing-decision.md` and `docs/architecture/todos-of-semantic-route.md` were
+carrying three forms of the same `[routing]` surface: `[[routing.decisions]]` array-of-tables prose
+(§5.6, §6), inline tables under `[routing.decisions]` (§6.2, §6.4), and a nested
+`outcome = { route = "…" }` wrapper. All three are now one form — **`[routing.decisions.<name>]`**,
+**`[routing.signals.<name>]`**, **`[routing.projections.<name>]`**, the same section depth
+`[models.<category>]` already uses; the suffix is the name (no `name` key, no `.` allowed in it,
+duplicates are load errors), and the outcome is a single bare key (`route` / `candidates` /
+`algorithm`) rather than a wrapper table, because the decision already has its own section.
+
+The constraint behind it is `parseSimpleToml` (`src/utils/config-loader.ts:3357`), which has no
+`array of tables` support and whose multi-line fold at `:3382` tracks only balanced `[…]` — so a
+member whose body fits one physical line may stay an inline table under the parent, while anything
+longer (a `rules` tree, a `choice` question with criteria) must be its own section. The plan now
+states this as the "Declaration form" rule in §6 rather than leaving it to be rediscovered at
+implementation time.
+
+Two plan bugs were fixed in the same pass: §6's `long_context` decision matched
+`context.beyond_window`, a signal the same example never declared (it declares `long_context`), so
+under the load-time validation §6 itself mandates that config could never have loaded; and
+`code_task`/`task`/`difficulty` were reflowed to a single physical line or promoted to sections,
+since a multi-line `{…}` cannot parse. In the TODO, D9 is marked settled as a consequence of the
+style ruling, D5 records the amendment, and the new **A11** finding preserves the undeclared-signal
+bug as the failure mode increment 3's validation exists to catch. No `src/` change — no code from the
+plan has landed, so the TODO's verification baseline is unchanged.
+
+
+### fix(converters): an Anthropic URL image source reaches an OpenAI upstream as a URL
+
+`convertClaudeContentToOpenAI` (`src/converters/claude-to-openai.ts:55`) built every Claude `image`
+block as a `data:` URI, reading only `source.media_type` and `source.data` — the fields a
+`source.type: 'base64'` block has. A `source.type: 'url'` block carries neither, so it interpolated
+`data:undefined;base64,undefined` and sent that to the upstream; a 200 from a lenient upstream then
+returned a plausible-looking answer to a request that never contained the image. The evidence was
+already in `tests/logs/results/test_results_at_2026-07-06_12_00_01.md:433`.
+
+The fix is passthrough, not a fetch: Chat Completions' `image_url.url` accepts "either a URL of the
+image or the base64 encoded image data", and Responses' `input_image.image_url` accepts "a fully
+qualified URL or base64 encoded image in a data URL" (`openai@7.19.0`,
+`resources/responses/responses.d.ts:3484-3501`), so `source.url` is emitted verbatim as
+`image_url: { url: <string> }` with nothing fetched and no SSRF surface added. `image-fetch.ts`
+keeps its existing role — the targets with **no** URL slot, Gemini's `inline_data`, which is why
+its only callers are the Chat→Gemini and Chat→Claude converters. A `url` source with no `url` value
+now throws rather than emitting an empty field.
+
+`completionsMessagesToResponsesInput` (`src/handlers/messages.ts:180`) was the second half: it
+pushed the Chat part straight through as `input_image: { image_url: { url, detail } }`, the Chat
+object shape, where Responses declares `image_url` as a plain string with `detail` as a **sibling** —
+the shape `converters/completions-to-responses.ts:139` already produces. It now unwraps and hoists
+`detail`, which also repairs the already-OpenAI branch (`messages.ts:377`), where a client's own
+Chat body can carry `detail` nested in a position Responses does not have. Verified end to end for
+the reported request: both egresses now send
+`{"type":"input_image","image_url":"https://…/python-logo.png"}` and
+`{"type":"image_url","image_url":{"url":"https://…/python-logo.png"}}`.
+
+Three pin updates, all of them positions rather than behaviour: `tests/unit/messages-ref-streaming.test.ts`
+asserts the spooled ref at `input[1].content[1].image_url` instead of `.image_url.url` (one level
+shallower, because the field is now a string), and `tests/unit/thinking-roundtrip.test.ts:86`'s
+hand-kept replica of the function was updated to match so it stops pinning the old shape. New
+coverage: the pure converter's URL passthrough and its missing-`url` throw
+(`tests/unit/claude-to-openai.test.ts`), plus both egresses' wire bodies and the `detail` hoist
+through the real handler (`tests/unit/messages-ref-streaming.test.ts`). Unit suite 2650/2650.
+
+Two divergences remain, reported rather than changed: `completionsToResponsesBody`
+(`src/handlers/openai.ts`) has the same object-form `image_url` for the `/v1/chat/completions`
+front door and is pinned that way by three tests in `tests/unit/handlers.test.ts:404-451`; and
+`convertClaudeToGeminiRequest` (`src/converters/claude-to-gemini.ts:30`) reads only `source.data`,
+so a URL image sent to a `gemini-interactions` upstream still leaves `inline_data` with no payload.
+
 ### docs(spool): the README's 216-line `[spool]` bullet moves to `docs/getting-started/spool-guide.md`
 
 The `[spool]` bullet under README's *Configuration Reference* had absorbed every increment of the

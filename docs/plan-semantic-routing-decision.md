@@ -661,9 +661,13 @@ this request go to that model" without re-running anything.
 
 ### 5.4 Signals
 
-All signals produce the same triple, and all are keyed `"<type>:<name>"` (plus
-`":label"` where a signal has labels), so `signalConfidences` /
-`signalValues` / `signalErrors` are one flat namespace.
+All signals produce the same triple, and all are keyed `"<type>.<name>"` (plus
+`":<label>"` where a signal has labels), so `signalConfidences` /
+`signalValues` / `signalErrors` are one flat namespace. The dot mirrors the
+declaration path: `[routing.signals.long_context]` with `type = "context"` is
+`context.long_context`; a `choice` signal named `task` contributes
+`decision.task` plus `decision.task:<label>` per option; a projection band that
+emits `effort_high` contributes `projection.effort_high`.
 
 **Variant A signals (no embedding model required):**
 
@@ -777,7 +781,10 @@ wildcard / composite / catch-all model resolution, unchanged.
 
 ## 6. Config surface
 
-A new top-level `[routing]` block, inline-table style to match `[composite]`:
+A new top-level `[routing]` block. Signals and projections keep `[composite]`'s
+inline-table style wherever a body fits on one physical line; decisions — and any
+collection member too long for one line — are keyed sub-sections, the same depth
+`[models.<category>]` already uses:
 
 ```toml
 [routing]
@@ -785,42 +792,41 @@ strategy = "priority"        # "priority" | "confidence"
 apply_to = "composite"       # "composite" (default) | "all"
 
 [routing.signals]
-"brief_request"  = { type = "keyword", keywords = ["tl;dr", "briefly", "one sentence"], mode = "any" }
-"code_task"      = { type = "embedding", threshold = 0.62, aggregation = "mean",
-                     candidates = ["write a function", "fix this bug", "refactor the module"],
-                     negative_candidates = ["write a poem", "summarize this email"] }
-"task"           = { type = "decision",
-                     question = { type = "choice", instructions = "Classify the request.",
-                                  criteria = { chat = "…", code = "…", analysis = "…" } },
-                     timeout_ms = 800 }
-"difficulty"     = { type = "decision",
-                     question = { type = "score", instructions = "How hard is this?",
-                                  criteria = ["trivial", "easy", "moderate", "hard", "research-grade"] },
-                     predicate = { gte = 2 } }
+"brief_request" = { type = "keyword", keywords = ["tl;dr", "briefly", "one sentence"], mode = "any" }
+"long_context"  = { type = "context", min_tokens = 32000 }
+"code_task"     = { type = "embedding", threshold = 0.62, aggregation = "mean", candidates = ["write a function", "fix this bug", "refactor the module"], negative_candidates = ["write a poem", "summarize this email"] }
+
+# A longer body gets its own keyed section — see "Declaration form" below.
+[routing.signals.task]
+type       = "decision"
+timeout_ms = 800
+question   = { type = "choice", instructions = "Classify the request.", criteria = { chat = "…", code = "…", analysis = "…" } }
+
+[routing.signals.difficulty]
+type      = "decision"
+question  = { type = "score", instructions = "How hard is this?", criteria = ["trivial", "easy", "moderate", "hard", "research-grade"] }
+predicate = { gte = 2 }
 
 [routing.projections]
 "effort" = { method = "weighted_sum", terms = [...], bands = [...] }
 
-[[routing.decisions]]
-name = "long_context"
+[routing.decisions.long_context]
 priority = 900
-rules = { signal = "context.beyond_window" }
-outcome = { route = "glm-5.3-flash" }
+rules    = { signal = "context.long_context" }
+route    = "glm-5.3-flash"
 
-[[routing.decisions]]
-name = "code"
-priority = 450
+[routing.decisions.code]
+priority   = 450
+on_unknown = "no_match"
 rules = { and = [ { signal = "projection.effort_medium" },
                   { or = [ { signal = "decision.task:code" },
                            { signal = "embedding.code_task" } ] } ] }
-on_unknown = "no_match"
-outcome = { candidates = ["qwen3.8-flash-next", "glm-5.3-flash"] }
+candidates = ["qwen3.8-flash-next", "glm-5.3-flash"]
 
-[[routing.decisions]]
-name = "fallback"
+[routing.decisions.fallback]
 priority = 100
-rules = { }                  # catch-all — always ranks last
-outcome = { route = "qwen3.8-27b" }
+rules    = { }                  # catch-all — always ranks last
+route    = "qwen3.8-27b"
 ```
 
 Rules of the surface:
@@ -828,8 +834,20 @@ Rules of the surface:
 - `[routing.signals.*]` are declared once and referenced by name; ids are
   `[A-Za-z0-9_.-]+`. A `decision` signal names its own `deployment` optionally,
   defaulting to `[models.decision]`.
-- `[[routing.decisions]]` is an array of tables so declaration order is visible,
-  though priority (not order) is what ranks. `rules = { }` is the catch-all.
+- **Declaration form: keyed sub-sections.** Decisions are `[routing.decisions.<name>]`,
+  projections `[routing.projections.<name>]`, signals `[routing.signals.<name>]` —
+  the same depth as `[models.<category>]`, so the existing section dispatch reads
+  them. A member whose body fits on one physical line may instead be an inline table
+  under the parent section (`[routing.signals] "has_tools" = { … }`); a member that
+  needs more than one line must be its own section, because a reader that folds only
+  balanced `[…]` across lines cannot fold a multi-line `{…}`. The section suffix is
+  the name: it may not contain `.` and may not be repeated as a `name` key inside the
+  section — both are load errors, not last-one-wins.
+- Priority, not declaration order, is what ranks; order in the file is for readers
+  only, so nothing may depend on it. `rules = { }` is the catch-all.
+- Each decision declares **exactly one outcome as a bare key** — `route` or
+  `candidates` or `algorithm` — because the decision already has its own section
+  (§5.6). Zero or two outcome keys is a load error.
 - `on_unknown` is per-decision, values `match | no_match | fail_request`, with
   `fail_request` explicitly documented as opt-in and not the default (§9).
 - **Validation at load time** (`validateProxyConfig`): unknown signal references
@@ -887,38 +905,33 @@ budget_ms = 1000
 "difficulty" = {type = "decision", question = {type = "score", instructions = "How difficult is this request?", criteria = ["trivial", "easy", "moderate", "hard", "research-grade"]}, predicate = {gte = 3}, timeout_ms = 800}
 "needs_verification" = {type = "decision", question = {type = "noul", instructions = "Does this request require explicit verification of facts or code behavior?"}, predicate = {gte = 0.7}, timeout_ms = 800}
 
-[[routing.decisions]]
-name = "long_context"
+[routing.decisions.long_context]
 priority = 900
-rules = {signal = "context.long_context"}
-outcome = {route = "deepseek-v4-pro"}
+rules    = {signal = "context.long_context"}
+route    = "deepseek-v4-pro"
 
-[[routing.decisions]]
-name = "agentic_code"
-priority = 800
-rules = {and = [{signal = "structure.has_tools"}, {signal = "decision.task:code"}]}
+[routing.decisions.agentic_code]
+priority   = 800
 on_unknown = "no_match"
-outcome = {candidates = ["deepseek-v4-pro", "deepseek-v4-flash"]}
+rules      = {and = [{signal = "structure.has_tools"}, {signal = "decision.task:code"}]}
+candidates = ["deepseek-v4-pro", "deepseek-v4-flash"]
 
-[[routing.decisions]]
-name = "difficult_analysis"
-priority = 700
-rules = {and = [{signal = "decision.difficulty"}, {signal = "decision.task:analysis"}]}
+[routing.decisions.difficult_analysis]
+priority   = 700
 on_unknown = "no_match"
-outcome = {route = "deepseek-v4-pro"}
+rules      = {and = [{signal = "decision.difficulty"}, {signal = "decision.task:analysis"}]}
+route      = "deepseek-v4-pro"
 
-[[routing.decisions]]
-name = "brief_chat"
-priority = 400
-rules = {and = [{signal = "keyword.brief_request"}, {signal = "decision.task:chat"}]}
+[routing.decisions.brief_chat]
+priority   = 400
 on_unknown = "no_match"
-outcome = {route = "deepseek-v4-flash"}
+rules      = {and = [{signal = "keyword.brief_request"}, {signal = "decision.task:chat"}]}
+route      = "deepseek-v4-flash"
 
-[[routing.decisions]]
-name = "fallback"
+[routing.decisions.fallback]
 priority = 100
-rules = {}
-outcome = {route = "max-m3"}
+rules    = {}
+route    = "max-m3"
 ```
 
 ### 6.3 Variant A projection — derive an effort band
@@ -942,12 +955,11 @@ bands = [
   {gte = 0.75, emit = "effort_high"}
 ]
 
-[[routing.decisions]]
-name = "high_effort_analysis"
-priority = 750
-rules = {and = [{signal = "projection.effort_high"}, {signal = "decision.task:analysis"}]}
+[routing.decisions.high_effort_analysis]
+priority   = 750
 on_unknown = "no_match"
-outcome = {route = "deepseek-v4-pro"}
+rules      = {and = [{signal = "projection.effort_high"}, {signal = "decision.task:analysis"}]}
+route      = "deepseek-v4-pro"
 ```
 
 ### 6.4 Variant B — optional embedding signal
@@ -974,18 +986,16 @@ cache_size = 512
 [routing.signals]
 "code_task" = {type = "embedding", threshold = 0.62, aggregation = "mean", candidates = ["write a function", "fix this bug", "refactor the module"], negative_candidates = ["write a poem", "summarize this email"]}
 
-[[routing.decisions]]
-name = "embedding_code"
-priority = 500
-rules = {signal = "embedding.code_task"}
+[routing.decisions.embedding_code]
+priority   = 500
 on_unknown = "no_match"
-outcome = {candidates = ["deepseek-v4-pro", "deepseek-v4-flash"]}
+rules      = {signal = "embedding.code_task"}
+candidates = ["deepseek-v4-pro", "deepseek-v4-flash"]
 
-[[routing.decisions]]
-name = "fallback"
+[routing.decisions.fallback]
 priority = 100
-rules = {}
-outcome = {route = "max-m3"}
+rules    = {}
+route    = "max-m3"
 ```
 
 ---
@@ -1369,12 +1379,17 @@ intended trigger for migrating a hot signal from A to B.
 | A ≪ B on fuzzy intent categories | the judge's semantic reading is worth its RTT; B stays a pre-filter |
 | nothing beats the cheap↔best line | the pool's price/quality spread is the problem, not the router |
 
-**Sequencing** (matches §15.3): run **D vs. C first** — zero new code
-(`resolveCompositeWithDecision` and `share` both exist) and it answers the
-most important question, whether judge-based selection beats random at all.
-Add **A** once phase 0's evaluator exists, replayed offline against the same
-matrix. Build **B** only if A's *measured* overhead shows the per-request
-judge call dominating, or a taxonomy outgrows one `choice` question (§7.1).
+**Sequencing** (matches §15.3; amended 2026-11-10): these benchmarks are
+long-running online experiments, not development tests — they need the shipped
+router and live traffic (step 4's shadow validation, the 3× judge-drift runs,
+real-hardware judge latency per the honesty constraint below), so they follow
+building rather than gate it. **D vs. C** still costs zero new code
+(`resolveCompositeWithDecision` and `share` both exist) and still answers the
+most important question — whether judge-based selection beats random at all —
+but it runs once phases 0–2 ship, not before them. Add **A** once phase 0's
+evaluator exists, replayed offline against the same matrix. Build **B** only if
+A's *measured* overhead shows the per-request judge call dominating, or a
+taxonomy outgrows one `choice` question (§7.1).
 
 **Honesty constraint (§8.4).** Judge latency for the cost model must be
 measured on real hardware with the laya sidecar running — MLX is
