@@ -47,6 +47,10 @@ interface StreamingState {
     accumulatedText: string;
     hasStarted: boolean;
     hasEnded: boolean;
+    /** A text block is open at `contentIndex` and needs its content_block_stop. */
+    textBlockOpen: boolean;
+    /** At least one functionCall part was emitted — the turn stops for tool_use. */
+    hasToolUse: boolean;
 }
 
 /**
@@ -105,6 +109,8 @@ export function createGeminiStreamTransformer(
         accumulatedText: '',
         hasStarted: false,
         hasEnded: false,
+        textBlockOpen: false,
+        hasToolUse: false,
     };
 
     const parseMessage = (message: string, controller: TransformStreamDefaultController<Uint8Array>) => {
@@ -192,19 +198,56 @@ function handleNativeGeminiChunk(
     const candidate = candidates?.[0];
     const parts = candidate?.content?.parts as Array<Record<string, unknown>> | undefined;
     if (parts?.length) {
-        if (state.contentIndex === 0 && !state.accumulatedText) {
-            sendClaudeEvent(controller, 'content_block_start', {
-                type: 'content_block_start',
-                index: 0,
-                content_block: { type: 'text', text: '' },
-            });
-        }
         for (const part of parts) {
-            if (typeof part.text === 'string' && part.text) {
+            const functionCall = part.functionCall as Record<string, unknown> | undefined;
+            if (functionCall) {
+                // A functionCall cannot share a block with text — close the
+                // text block first, then emit a complete tool_use block of its own.
+                if (state.textBlockOpen) {
+                    sendClaudeEvent(controller, 'content_block_stop', {
+                        type: 'content_block_stop',
+                        index: state.contentIndex,
+                    });
+                    state.textBlockOpen = false;
+                    state.contentIndex += 1;
+                }
+                const toolIndex = state.contentIndex;
+                // generateContent carries no call id — mint one so the client can
+                // echo it back in the matching tool_result.
+                sendClaudeEvent(controller, 'content_block_start', {
+                    type: 'content_block_start',
+                    index: toolIndex,
+                    content_block: {
+                        type: 'tool_use',
+                        id: `tool_${Date.now()}_${toolIndex}`,
+                        name: functionCall.name,
+                        input: {},
+                    },
+                });
+                sendClaudeEvent(controller, 'content_block_delta', {
+                    type: 'content_block_delta',
+                    index: toolIndex,
+                    delta: { type: 'input_json_delta', partial_json: stringify(functionCall.args ?? {}) },
+                });
+                sendClaudeEvent(controller, 'content_block_stop', {
+                    type: 'content_block_stop',
+                    index: toolIndex,
+                });
+                state.contentIndex += 1;
+                state.hasToolUse = true;
+            } else if (typeof part.text === 'string' && part.text) {
+                if (!state.textBlockOpen) {
+                    sendClaudeEvent(controller, 'content_block_start', {
+                        type: 'content_block_start',
+                        index: state.contentIndex,
+                        content_block: { type: 'text', text: '' },
+                    });
+                    state.textBlockOpen = true;
+                }
                 state.accumulatedText += part.text;
                 sendClaudeEvent(controller, 'content_block_delta', {
                     type: 'content_block_delta',
-                    index: 0,
+                    index: state.contentIndex,
                     delta: { type: 'text_delta', text: part.text },
                 });
             }
@@ -213,10 +256,17 @@ function handleNativeGeminiChunk(
 
     const usage = convertGeminiUsageToClaudeUsage(chunk.usageMetadata as Record<string, unknown> | undefined);
     if (candidate?.finishReason || usage) {
-        sendClaudeEvent(controller, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+        if (state.textBlockOpen) {
+            sendClaudeEvent(controller, 'content_block_stop', { type: 'content_block_stop', index: state.contentIndex });
+            state.textBlockOpen = false;
+        }
         sendClaudeEvent(controller, 'message_delta', {
             type: 'message_delta',
-            delta: { stop_reason: candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn' },
+            delta: {
+                stop_reason: state.hasToolUse
+                    ? 'tool_use'
+                    : candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn',
+            },
             ...(usage ? { usage } : {}),
         });
         sendClaudeEvent(controller, 'message_stop', { type: 'message_stop' });

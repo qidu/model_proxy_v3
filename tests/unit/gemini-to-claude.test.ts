@@ -270,4 +270,64 @@ describe('convertGeminiGenerateContentToClaude', () => {
     );
     assert.equal(resp.stop_reason, null);
   });
+
+  it('maps a functionCall part to a tool_use block and stop_reason tool_use', () => {
+    const resp = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{
+          content: { parts: [{ functionCall: { name: 'get_weather', args: { city: '杭州' } } }] },
+          finishReason: 'STOP',
+        }],
+        usageMetadata: { promptTokenCount: 20, candidatesTokenCount: 8 },
+      },
+      'gemini-2',
+      'reqid-abcdef12',
+    );
+
+    assert.equal(resp.content.length, 1);
+    const block = resp.content[0] as any;
+    assert.equal(block.type, 'tool_use');
+    assert.equal(block.name, 'get_weather');
+    assert.deepEqual(block.input, { city: '杭州' });
+    assert.match(block.id, /^tool_\d+_0$/, 'a call id is minted because generateContent has none');
+    // Gemini reports a tool call as finishReason STOP — the block must win.
+    assert.equal(resp.stop_reason, 'tool_use');
+  });
+
+  it('keeps text and emits one tool_use block per functionCall, minting distinct ids', () => {
+    const resp = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{
+          content: {
+            parts: [
+              { text: 'checking' },
+              { functionCall: { name: 'a', args: { x: 1 } } },
+              { functionCall: { name: 'b', args: {} } },
+            ],
+          },
+          finishReason: 'STOP',
+        }],
+      },
+      'm',
+      'r',
+    );
+
+    assert.deepEqual(resp.content.map((b: any) => b.type), ['text', 'tool_use', 'tool_use']);
+    assert.deepEqual((resp.content[0] as any).text, 'checking');
+    assert.deepEqual((resp.content[1] as any).input, { x: 1 });
+    assert.deepEqual((resp.content[2] as any).input, {}, 'a missing args object becomes {}');
+    assert.notEqual((resp.content[1] as any).id, (resp.content[2] as any).id);
+    assert.equal(resp.stop_reason, 'tool_use');
+  });
+
+  it('defaults a functionCall without args to an empty input object', () => {
+    const resp = convertGeminiGenerateContentToClaude(
+      { candidates: [{ content: { parts: [{ functionCall: { name: 'noargs' } }] }, finishReason: 'STOP' }] },
+      'm',
+      'r',
+    );
+    assert.equal(resp.content.length, 1);
+    assert.deepEqual((resp.content[0] as any).input, {});
+    assert.equal(resp.stop_reason, 'tool_use');
+  });
 });

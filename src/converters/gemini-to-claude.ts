@@ -179,30 +179,46 @@ export function convertGeminiGenerateContentToClaude(
     
     let content: ClaudeContentBlock[] = [];
     let stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence' | 'timeout' | null = null;
-    
+    let hasToolUse = false;
+
     if (candidates && candidates.length > 0) {
         const firstCandidate = candidates[0];
         const candidateContent = firstCandidate.content as Record<string, unknown> | undefined;
         const finishReason = firstCandidate.finishReason as string | undefined;
-        
+
         if (candidateContent) {
             const parts = candidateContent.parts as Array<Record<string, unknown>> | undefined;
             if (parts && parts.length > 0) {
                 const textParts: string[] = [];
+                const toolUseBlocks: ClaudeToolUseBlock[] = [];
                 for (const part of parts) {
-                    if (part.text) {
+                    const functionCall = part.functionCall as Record<string, unknown> | undefined;
+                    if (functionCall) {
+                        // generateContent carries no call id — mint one so the
+                        // client can echo it back in the matching tool_result.
+                        toolUseBlocks.push({
+                            type: 'tool_use',
+                            id: `tool_${Date.now()}_${toolUseBlocks.length}`,
+                            name: functionCall.name as string,
+                            input: functionCall.args ?? {},
+                        });
+                    } else if (part.text) {
                         textParts.push(part.text as string);
                     }
                 }
+                const blocks: ClaudeContentBlock[] = [];
                 if (textParts.length > 0) {
-                    content = [{
+                    blocks.push({
                         type: 'text',
                         text: textParts.join('')
-                    }];
+                    });
                 }
+                blocks.push(...toolUseBlocks);
+                content = blocks;
+                hasToolUse = toolUseBlocks.length > 0;
             }
         }
-        
+
         // Map finish reason
         switch (finishReason) {
             case 'STOP':
@@ -215,6 +231,12 @@ export function convertGeminiGenerateContentToClaude(
             case 'RECITATION':
                 stopReason = 'stop_sequence';
                 break;
+        }
+
+        // Gemini reports a tool call as finishReason STOP; the block itself
+        // is what makes this turn a tool turn.
+        if (hasToolUse) {
+            stopReason = 'tool_use';
         }
     }
     

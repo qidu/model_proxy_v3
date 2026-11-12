@@ -64,14 +64,14 @@ describe('convertClaudeToGeminiRequest', () => {
     const req = {
       model: 'gemini',
       messages: [
-        { role: 'user', content: [{ type: 'tool_use', id: 't', name: 'n', input: {} }] },
+        { role: 'assistant', content: [{ type: 'thinking', thinking: 'hmm' }] },
         { role: 'user', content: 'kept' },
       ],
       max_tokens: 10,
     } as unknown as ClaudeMessagesRequest;
 
     const out = convertClaudeToGeminiRequest(req) as any;
-    assert.equal(out.contents.length, 1, 'the tool_use-only message is skipped');
+    assert.equal(out.contents.length, 1, 'the thinking-only message is skipped');
     assert.deepEqual(out.contents[0], { role: 'user', parts: [{ text: 'kept' }] });
   });
 
@@ -122,5 +122,195 @@ describe('convertClaudeToGeminiRequest', () => {
 
     const out = convertClaudeToGeminiRequest(req) as any;
     assert.equal(out.cachedContent, 'cache-key');
+  });
+});
+
+describe('convertClaudeToGeminiRequest — tools', () => {
+  const weatherTool = {
+    name: 'get_weather',
+    description: '查询天气',
+    input_schema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: { city: { type: 'string', format: 'uri' } },
+      required: ['city'],
+    },
+  };
+
+  it('maps Claude tools into one functionDeclarations group with a Gemini-clean schema', () => {
+    const req = {
+      model: 'gemini',
+      tools: [weatherTool],
+      messages: [{ role: 'user', content: '杭州今天天气如何' }],
+      max_tokens: 512,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.tools, [{
+      functionDeclarations: [{
+        name: 'get_weather',
+        description: '查询天气',
+        parameters: {
+          type: 'object',
+          // $schema and the unsupported string `format` are stripped.
+          properties: { city: { type: 'string' } },
+          required: ['city'],
+        },
+      }],
+    }]);
+  });
+
+  it('omits tools entirely when the request has none', () => {
+    const req = {
+      model: 'gemini',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToGeminiRequest(req) as any;
+    assert.equal(out.tools, undefined);
+    assert.equal(out.toolConfig, undefined);
+  });
+
+  it('defaults a missing description to an empty string and a missing schema to an empty object schema', () => {
+    const req = {
+      model: 'gemini',
+      tools: [{ name: 'ping' }],
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.tools[0].functionDeclarations[0], {
+      name: 'ping',
+      description: '',
+      parameters: { type: 'object', properties: {} },
+    });
+  });
+
+  it('throws rather than dropping a tool that has no name', () => {
+    const req = {
+      model: 'gemini',
+      tools: [{ description: 'nameless' }],
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    assert.throws(
+      () => convertClaudeToGeminiRequest(req),
+      /missing "name"/,
+      'Rule #8 — a silently dropped tool leaves the model unable to call it',
+    );
+  });
+
+  it('maps tool_choice auto/any/none to AUTO/ANY/NONE and tool to ANY + allowedFunctionNames', () => {
+    const cases: Array<[unknown, unknown]> = [
+      [{ type: 'auto' }, { mode: 'AUTO' }],
+      [{ type: 'any' }, { mode: 'ANY' }],
+      [{ type: 'none' }, { mode: 'NONE' }],
+      [{ type: 'tool', name: 'get_weather' }, { mode: 'ANY', allowedFunctionNames: ['get_weather'] }],
+    ];
+
+    for (const [toolChoice, expected] of cases) {
+      const req = {
+        model: 'gemini',
+        tools: [weatherTool],
+        tool_choice: toolChoice,
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 10,
+      } as unknown as ClaudeMessagesRequest;
+
+      const out = convertClaudeToGeminiRequest(req) as any;
+      assert.deepEqual(out.toolConfig, { functionCallingConfig: expected });
+    }
+  });
+
+  it('maps an assistant tool_use block to a functionCall part', () => {
+    const req = {
+      model: 'gemini',
+      messages: [
+        { role: 'user', content: '杭州今天天气如何' },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: { city: '杭州' } }],
+        },
+      ],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.contents[1], {
+      role: 'model',
+      parts: [{ functionCall: { name: 'get_weather', args: { city: '杭州' } } }],
+    });
+  });
+
+  it('maps a user tool_result block to a functionResponse carrying the tool name from the matching tool_use', () => {
+    const req = {
+      model: 'gemini',
+      messages: [
+        { role: 'user', content: '杭州今天天气如何' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'let me check' },
+            { type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: { city: '杭州' } },
+          ],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '晴，26°C' }],
+        },
+      ],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.contents[2], {
+      role: 'user',
+      parts: [{ functionResponse: { name: 'get_weather', response: { content: '晴，26°C' } } }],
+    });
+  });
+
+  it('stringifies a structured tool_result content array into the functionResponse text', () => {
+    const req = {
+      model: 'gemini',
+      messages: [
+        { role: 'user', content: 'x' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tid', name: 'f', input: {} }] },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tid',
+            content: [{ type: 'text', text: 'part-a' }, { type: 'text', text: 'part-b' }],
+          }],
+        },
+      ],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToGeminiRequest(req) as any;
+    assert.equal(
+      out.contents[2].parts[0].functionResponse.response.content,
+      JSON.stringify([{ type: 'text', text: 'part-a' }, { type: 'text', text: 'part-b' }]),
+    );
+  });
+
+  it('throws on a tool_result whose tool_use_id is unknown', () => {
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'ghost', content: 'x' }],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    assert.throws(
+      () => convertClaudeToGeminiRequest(req),
+      /no preceding tool_use block carries that id/,
+      'Rule #8 — Gemini rejects a nameless functionResponse anyway',
+    );
   });
 });

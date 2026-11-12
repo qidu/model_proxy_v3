@@ -3,9 +3,11 @@
  * Converts Claude API requests to Gemini Interactions API format
  */
 
-import { ClaudeMessagesRequest, ClaudeTextBlock, ClaudeImageBlock } from '../types/claude.js';
+import { ClaudeMessagesRequest, ClaudeTextBlock, ClaudeImageBlock, ClaudeToolUseBlock, ClaudeToolResultBlock } from '../types/claude.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
+import { recursivelyCleanSchema } from './claude-to-openai.js';
+import { stringify } from '../utils/stringify.js';
 
 /**
  * Convert Claude request to Gemini generateContent format
@@ -15,10 +17,13 @@ export function convertClaudeToGeminiRequest(
     modelId?: string
 ): Record<string, unknown> {
     const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [];
+    // Gemini's functionResponse carries a tool *name*, Claude's tool_result only
+    // a tool_use_id — so remember the name of every tool_use seen so far.
+    const toolNamesById = new Map<string, string>();
 
     for (const msg of claudeRequest.messages) {
         const parts: Array<Record<string, unknown>> = [];
-        
+
         if (typeof msg.content === 'string') {
             parts.push({ text: msg.content });
         } else if (Array.isArray(msg.content)) {
@@ -35,6 +40,31 @@ export function convertClaudeToGeminiRequest(
                             mime_type: imgBlock.source.media_type || 'image/jpeg',
                             data: isBlobRef(data) ? rebindBlobRef(data, 'gemini-inline-data', '') : data
                         }
+                    });
+                } else if (block.type === 'tool_use') {
+                    const toolUse = block as ClaudeToolUseBlock;
+                    toolNamesById.set(toolUse.id, toolUse.name);
+                    parts.push({ functionCall: { name: toolUse.name, args: toolUse.input ?? {} } });
+                } else if (block.type === 'tool_result') {
+                    const toolResult = block as ClaudeToolResultBlock;
+                    const name = toolNamesById.get(toolResult.tool_use_id);
+                    // Fail Loud (Rule #8): an unresolvable result would otherwise
+                    // reach Gemini as a nameless functionResponse and be rejected there.
+                    if (!name) {
+                        throw new Error(
+                            `Cannot convert tool_result "${toolResult.tool_use_id}" to a Gemini functionResponse: ` +
+                            `no preceding tool_use block carries that id`
+                        );
+                    }
+                    parts.push({
+                        functionResponse: {
+                            name,
+                            response: {
+                                content: typeof toolResult.content === 'string'
+                                    ? toolResult.content
+                                    : stringify(toolResult.content),
+                            },
+                        },
                     });
                 }
                 // Skip other block types for now
@@ -66,6 +96,44 @@ export function convertClaudeToGeminiRequest(
         if (claudeRequest.temperature !== undefined) config.temperature = claudeRequest.temperature;
         if (claudeRequest.max_tokens !== undefined) config.max_output_tokens = claudeRequest.max_tokens;
         request.generation_config = config;
+    }
+
+    // Add tools
+    if (Array.isArray(claudeRequest.tools) && claudeRequest.tools.length > 0) {
+        const nameless = claudeRequest.tools.filter(t => typeof t?.name !== 'string' || t.name === '');
+        // Fail Loud (Rule #8): Gemini would reject the declaration anyway, and a
+        // silently dropped tool leaves the model unable to call it.
+        if (nameless.length > 0) {
+            throw new Error(
+                `Cannot convert ${nameless.length} Claude tool(s) to Gemini functionDeclarations: missing "name"`
+            );
+        }
+        request.tools = [{
+            functionDeclarations: claudeRequest.tools.map(tool => ({
+                name: tool.name,
+                description: tool.description ?? '',
+                parameters: recursivelyCleanSchema(tool.input_schema ?? { type: 'object', properties: {} }),
+            })),
+        }];
+    }
+
+    // Add tool choice
+    const toolChoice = claudeRequest.tool_choice;
+    if (toolChoice) {
+        const functionCallingConfig: Record<string, unknown> = {};
+        if (toolChoice.type === 'auto') {
+            functionCallingConfig.mode = 'AUTO';
+        } else if (toolChoice.type === 'any') {
+            functionCallingConfig.mode = 'ANY';
+        } else if (toolChoice.type === 'none') {
+            functionCallingConfig.mode = 'NONE';
+        } else if (toolChoice.type === 'tool') {
+            functionCallingConfig.mode = 'ANY';
+            if (toolChoice.name) functionCallingConfig.allowedFunctionNames = [toolChoice.name];
+        }
+        if (functionCallingConfig.mode) {
+            request.toolConfig = { functionCallingConfig };
+        }
     }
 
     // Add cached content

@@ -5,6 +5,63 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): tools survive the Claude Messages ↔ Gemini generateContent pair
+
+`/v1/messages` routed to an `upstream_mode = "gemini-generatecontent"` target answered every
+tool-bearing request as if it had no tools. Three separate drops, measured by running the real
+converters on the request that reported it (`model: gemini-3.8-flash`, one `get_weather` tool):
+
+- `convertClaudeToGeminiRequest` (`src/converters/claude-to-gemini.ts`) never read
+  `claudeRequest.tools` / `tool_choice`, so the upstream body carried neither `tools` nor
+  `toolConfig` — the model was never told a function existed.
+- The same function's message walk handled only `text` and `image` blocks (`// Skip other block
+  types for now`), so an assistant `tool_use` block produced zero parts and the message was
+  dropped, as was the following `tool_result` turn: a tool loop lost its entire history on turn 2.
+- `convertGeminiGenerateContentToClaude` (`src/converters/gemini-to-claude.ts`) collected only
+  `part.text` and `createGeminiStreamTransformer`'s native-chunk handler only `part.text`, so a
+  `functionCall` part converted to `{"content": [], "stop_reason": "end_turn"}` — or streamed as an
+  empty text block — and the call vanished.
+
+The request side now emits `tools: [{ functionDeclarations: [{ name, description, parameters }] }]`
+(schemas run through the existing `recursivelyCleanSchema`, whose docstring already names Gemini as
+its target, so `$schema` and unsupported string `format`s are stripped), maps `tool_choice`
+`auto`/`any`/`none` to `AUTO`/`ANY`/`NONE` and `tool` to `ANY` + `allowedFunctionNames: [name]`,
+and maps the message blocks: `tool_use` → `{functionCall: {name, args}}`, `tool_result` →
+`{functionResponse: {name, response: {content}}}`. `tool_result` carries a `tool_use_id` where
+Gemini needs a **name**, so the walk records every `tool_use` id it has seen; an id with no
+matching block, or a tool with no `name`, throws (Rule #8) instead of reaching the upstream as a
+malformed declaration. Both additions go beyond a literal `tools`/`tool_choice` mapping — without
+them the feature is inert, because nothing ever tells the model what the previous turn returned.
+
+The response side emits one `tool_use` block per `functionCall` part (after any joined text block),
+mints an id (`tool_<ts>_<n>`) because generateContent has none, and forces
+`stop_reason: "tool_use"` — Gemini reports a tool call as `finishReason: "STOP"`, so the block, not
+the finish reason, decides the turn. Streaming does the same in block form: it closes an open text
+block, then emits `content_block_start {type: "tool_use", input: {}}` → `content_block_delta
+{type: "input_json_delta", partial_json}` → `content_block_stop` at its own index, and reports
+`stop_reason: "tool_use"`. Two incidental stream fixes came with it: a tool-only chunk no longer
+opens a spurious empty text block, and `content_block_stop` is only emitted for a block that was
+actually started (the old code sent one for index 0 unconditionally).
+
+A downstream consequence, not a goal: the chat-completions front door on the non-streaming
+gemini-generatecontent path converts through `claudeJsonToSyntheticCompletions`, which already maps
+`tool_use` → `tool_calls`, so those tool calls now reach the client too. That path's **streaming**
+half is a separate hand-rolled mapping (`src/handlers/chat-completions.ts:381`) and still drops
+`functionCall` parts — reported, not fixed here.
+
+Not fixed, flagged: `handleGeminiEvent` (the Interactions SSE branch of
+`src/converters/gemini-streaming.ts`) still emits `content_block_delta {delta: {type:
+"tool_use"}}`, which is not a valid Anthropic stream delta type — it should be a
+`content_block_start` + `input_json_delta` pair. The native generateContent path never reaches it.
+
+Verified: `npm run typecheck` clean; `npm run test:unit` 2667/2667. New coverage —
+`tests/unit/claude-to-gemini.test.ts` (schema cleaning, tool_choice matrix, `tool_use` →
+`functionCall`, `tool_result` → named `functionResponse`, structured-content stringification, the
+two throw paths), `tests/unit/gemini-to-claude.test.ts` (single and multiple `functionCall` parts,
+minted ids, `stop_reason` override, missing `args`), and the new
+`tests/unit/gemini-stream-tools.test.ts` (block ordering and indices, `input_json_delta` payload,
+one stop per block, `tool_use`/`end_turn`/`max_tokens` stop reasons, the plain-text regression).
+
 ### docs(semantic-routing): the plan's routing config surface settles on keyed sub-sections
 
 `docs/plan-semantic-routing-decision.md` and `docs/architecture/todos-of-semantic-route.md` were
