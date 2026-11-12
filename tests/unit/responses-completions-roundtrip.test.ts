@@ -2,7 +2,11 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../../src/converters/completions-to-responses.js';
-import { convertResponsesToChatCompletions, convertInputItemsToMessages, getNamespaceMap, extractAllowedTools } from '../../src/converters/responses-to-completions.js';
+import {
+  convertResponsesToChatCompletions, convertInputItemsToMessages, getNamespaceMap, extractAllowedTools,
+  convertResponsesToChatCompletionsAnswer, responsesUsageToChatCompletions,
+  createResponsesChatStreamState, responsesStreamEventToChatChunks,
+} from '../../src/converters/responses-to-completions.js';
 import { completionsToClaudeBody } from '../../src/handlers/openai.js';
 import type { OpenAIResponse } from '../../src/types/openai.js';
 
@@ -988,3 +992,218 @@ describe('unknown input item types (spec item 12)', () => {
     assert.deepEqual(msgs.map(m => m.role), ['user', 'assistant', 'tool']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Answer direction: Responses object → chat.completion
+// ---------------------------------------------------------------------------
+
+function responsesAnswer(output: Array<Record<string, unknown>>, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'resp_abc',
+    object: 'response',
+    created_at: 1700000000,
+    model: 'gpt-upstream',
+    status: 'completed',
+    output,
+    usage: { input_tokens: 11, output_tokens: 5, total_tokens: 16 },
+    ...overrides,
+  };
+}
+
+describe('convertResponsesToChatCompletionsAnswer', () => {
+  it('carries the envelope across and joins text split over several message items', () => {
+    const { completions, dropped } = convertResponsesToChatCompletionsAnswer(responsesAnswer([
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hello ', annotations: [] }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'world', annotations: [] }] },
+    ]), 'client-model');
+
+    assert.equal(completions.id, 'resp_abc');
+    assert.equal(completions.object, 'chat.completion');
+    assert.equal(completions.created, 1700000000);
+    assert.equal(completions.model, 'gpt-upstream', "the upstream's model, not the client's");
+    assert.deepEqual(completions.choices, [{
+      index: 0,
+      message: { role: 'assistant', content: 'hello world' },
+      finish_reason: 'stop',
+      logprobs: null,
+    }]);
+    assert.deepEqual(completions.usage, { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 });
+    assert.deepEqual(dropped, {});
+  });
+
+  it('keeps a refusal out of content and reasoning in reasoning_content', () => {
+    const { completions } = convertResponsesToChatCompletionsAnswer(responsesAnswer([
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'thought ' }], content: [{ type: 'reasoning_text', text: 'hard' }] },
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          { type: 'output_text', text: 'done' },
+          { type: 'refusal', refusal: 'cannot help with that' },
+        ],
+      },
+    ]), 'm');
+
+    const message = (completions as any).choices[0].message;
+    assert.equal(message.content, 'done');
+    assert.equal(message.refusal, 'cannot help with that', 'a refusal is its own field, not folded into content');
+    assert.equal(message.reasoning_content, 'thought hard', 'summary_text and reasoning_text both collected');
+  });
+
+  it('maps function_call items to tool_calls and nulls content when there is no text', () => {
+    const { completions } = convertResponsesToChatCompletionsAnswer(responsesAnswer([
+      { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"SF"}' },
+      { type: 'function_call', id: 'fc_2', name: 'get_time', arguments: '{}' },
+    ]), 'm');
+
+    const choice = (completions as any).choices[0];
+    assert.deepEqual(choice.message.tool_calls, [
+      { id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"SF"}' } },
+      { id: 'fc_2', type: 'function', function: { name: 'get_time', arguments: '{}' } },
+    ]);
+    assert.equal(choice.message.content, null, 'tool calls with no text: null, not empty string');
+    assert.equal(choice.finish_reason, 'tool_calls');
+  });
+
+  it('reports finish_reason from incomplete_details, and tool calls still win', () => {
+    const truncated = convertResponsesToChatCompletionsAnswer(
+      responsesAnswer([], { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }), 'm',
+    );
+    assert.equal((truncated.completions as any).choices[0].finish_reason, 'length');
+
+    const filtered = convertResponsesToChatCompletionsAnswer(
+      responsesAnswer([], { status: 'incomplete', incomplete_details: { reason: 'content_filter' } }), 'm',
+    );
+    assert.equal((filtered.completions as any).choices[0].finish_reason, 'content_filter');
+
+    const both = convertResponsesToChatCompletionsAnswer(responsesAnswer(
+      [{ type: 'function_call', call_id: 'c1', name: 'fn', arguments: '{}' }],
+      { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } },
+    ), 'm');
+    assert.equal((both.completions as any).choices[0].finish_reason, 'tool_calls');
+  });
+
+  it('counts output items and content parts it had no place for, instead of dropping them silently', () => {
+    const { completions, dropped } = convertResponsesToChatCompletionsAnswer(responsesAnswer([
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'see image' }, { type: 'input_image', image_url: 'http://x/i.png' }] },
+      { type: 'image_generation_call', result: 'aGk=' },
+      { type: 'web_search_call', query: 'x' },
+    ]), 'm');
+
+    assert.equal((completions as any).choices[0].message.content, 'see image');
+    assert.deepEqual(dropped, { 'content_part:input_image': 1, image_generation_call: 1, web_search_call: 1 });
+  });
+});
+
+describe('responsesUsageToChatCompletions', () => {
+  it('falls back to in+out for a missing total and carries cached_tokens across', () => {
+    assert.deepEqual(responsesUsageToChatCompletions({
+      input_tokens: 20, output_tokens: 4, input_tokens_details: { cached_tokens: 12 },
+    }), {
+      prompt_tokens: 20, completion_tokens: 4, total_tokens: 24, prompt_tokens_details: { cached_tokens: 12 },
+    });
+  });
+
+  it('omits prompt_tokens_details when the upstream reported no cache detail', () => {
+    const usage = responsesUsageToChatCompletions({ input_tokens: 1, output_tokens: 2, total_tokens: 3 });
+    assert.deepEqual(usage, { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 });
+    assert.equal('prompt_tokens_details' in (usage as object), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Answer direction, streaming: Responses SSE → chat.completion.chunk
+// ---------------------------------------------------------------------------
+
+describe('responsesStreamEventToChatChunks', () => {
+  function run(events: Array<Record<string, unknown>>): { chunks: any[]; state: ReturnType<typeof createResponsesChatStreamState> } {
+    const state = createResponsesChatStreamState('client-model');
+    const chunks: any[] = [];
+    for (const event of events) chunks.push(...responsesStreamEventToChatChunks(state, event));
+    return { chunks, state };
+  }
+
+  it('adopts the id and created time response.created carries, and emits no chunk for it', () => {
+    const { chunks, state } = run([
+      { type: 'response.created', response: { id: 'resp_stream', created_at: 1700000123, model: 'gpt-upstream' } },
+      { type: 'response.output_text.delta', delta: 'hi' },
+    ]);
+
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].id, 'resp_stream');
+    assert.equal(chunks[0].created, 1700000123);
+    assert.equal(chunks[0].model, 'gpt-upstream');
+    assert.equal(chunks[0].object, 'chat.completion.chunk');
+    assert.deepEqual(chunks[0].choices, [{ index: 0, delta: { role: 'assistant', content: 'hi' }, finish_reason: null }]);
+    assert.equal(state.finished, false);
+  });
+
+  it('routes reasoning deltas to reasoning_content', () => {
+    const { chunks } = run([
+      { type: 'response.reasoning_summary_text.delta', delta: 'a' },
+      { type: 'response.reasoning_text.delta', delta: 'b' },
+    ]);
+    assert.deepEqual(chunks.map(c => c.choices[0].delta), [{ reasoning_content: 'a' }, { reasoning_content: 'b' }]);
+  });
+
+  it('gives tool calls dense indexes even when output_index counts other items', () => {
+    const { chunks } = run([
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning' } },
+      { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'c1', name: 'first' } },
+      { type: 'response.output_item.added', output_index: 2, item: { type: 'function_call', call_id: 'c2', name: 'second' } },
+      { type: 'response.function_call_arguments.delta', output_index: 2, delta: '{"a":1}' },
+      { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{}' },
+    ]);
+
+    assert.deepEqual(chunks[0].choices[0].delta.tool_calls[0], {
+      index: 0, id: 'c1', type: 'function', function: { name: 'first', arguments: '' },
+    });
+    assert.deepEqual(chunks[1].choices[0].delta.tool_calls[0], {
+      index: 1, id: 'c2', type: 'function', function: { name: 'second', arguments: '' },
+    });
+    // Arguments follow their own call, not arrival order.
+    assert.deepEqual(chunks[2].choices[0].delta.tool_calls[0], { index: 1, function: { arguments: '{"a":1}' } });
+    assert.deepEqual(chunks[3].choices[0].delta.tool_calls[0], { index: 0, function: { arguments: '{}' } });
+  });
+
+  it('allocates a tool index from arguments alone when output_item.added never arrived', () => {
+    const { chunks } = run([
+      { type: 'response.function_call_arguments.delta', output_index: 7, delta: '{"x":' },
+      { type: 'response.function_call_arguments.delta', output_index: 7, delta: '2}' },
+    ]);
+    assert.deepEqual(chunks.map(c => c.choices[0].delta.tool_calls[0].index), [0, 0]);
+  });
+
+  it('closes on the terminal event with finish_reason and usage, and counts unrepresentable items', () => {
+    const { chunks, state } = run([
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'image_generation_call' } },
+      { type: 'response.output_text.delta', delta: 'ok' },
+      {
+        type: 'response.completed',
+        response: { usage: { input_tokens: 7, output_tokens: 2, input_tokens_details: { cached_tokens: 3 } } },
+      },
+    ]);
+
+    assert.deepEqual(chunks[1].choices[0], { index: 0, delta: {}, finish_reason: 'stop' });
+    assert.equal(state.finished, true);
+    assert.deepEqual(state.usage, {
+      prompt_tokens: 7, completion_tokens: 2, total_tokens: 9, prompt_tokens_details: { cached_tokens: 3 },
+    });
+    assert.deepEqual(state.dropped, { image_generation_call: 1 });
+  });
+
+  it('finishes a tool-calling stream with tool_calls, and response.incomplete reports length', () => {
+    const tool = run([
+      { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'c1', name: 'fn' } },
+      { type: 'response.completed', response: {} },
+    ]);
+    assert.equal(tool.chunks[tool.chunks.length - 1].choices[0].finish_reason, 'tool_calls');
+
+    const cut = run([
+      { type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } },
+    ]);
+    assert.equal(cut.chunks[0].choices[0].finish_reason, 'length');
+    assert.equal(cut.state.finished, true);
+  });
+});
+

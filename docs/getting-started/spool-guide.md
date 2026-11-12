@@ -177,9 +177,9 @@ Each of these receives a bounded body instead of calling `response.text()` or
 - the native `anthropic-messages` egress beside them, where the upstream bytes
   are the client's bytes, so the body is relayed from its spill and read again
   only when tracing is on;
-- the `/v1/chat/completions` handler's two converted non-streaming readers (the
-  `anthropic-messages` and `gemini-generatecontent` upstreams) and its
-  `openai-responses` passthrough, which forwards the spool unparsed;
+- the `/v1/chat/completions` handler's three converted non-streaming readers (the
+  `anthropic-messages`, `gemini-generatecontent` and `openai-responses`
+  upstreams), each converted after one bounded receive;
 - the three cross-mode readers `openai.ts` answers a Gemini-shaped client with
   (`/v1/interactions` and `:generateContent`, from an `anthropic-messages`,
   `openai-responses` or `openai-completions` upstream), converted after one

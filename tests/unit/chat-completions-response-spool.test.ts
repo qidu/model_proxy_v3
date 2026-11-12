@@ -6,15 +6,16 @@
  *
  * `/v1/chat/completions` (and its `/v1/completions` alias) answers from three
  * upstream modes without streaming, and all three read the body unbounded
- * before this change: the two converted branches — an `anthropic-messages`
+ * before the spool work: the two converted branches — an `anthropic-messages`
  * upstream, converted Claude JSON → Completions JSON, and a
  * `gemini-generatecontent` upstream, converted Gemini → Claude → Completions —
  * called `response.text()` and parsed it, and the `openai-responses` branch
  * piped the upstream body straight through with an `observeStream` transform but
  * no bound at all. The converted pair now goes through the same
- * `receiveJsonResponse` as `/v1/messages`; the identity branch receives into a
- * spool and forwards that spool's stream (§5.7's identity shape, as in
- * `passthrough.ts` and `responses.ts`).
+ * `receiveJsonResponse` as `/v1/messages`; the `openai-responses` branch
+ * receives into a spool and converts what it received (Responses `output[]` →
+ * Completions `choices[]`), so it is bounded by the same cap while no longer
+ * relaying upstream bytes.
  *
  * What these tests pin, and why each assertion is worth its space:
  *  - the converted body every client receives is unchanged, both under the
@@ -32,9 +33,9 @@
  *    assumed so that a future change of that rule fails here loudly;
  *  - `Response.prototype.clone()` is never called: the whole point of the
  *    bounded receive is that no second copy of the body exists;
- *  - §5.9 admission is charged the received byte count on the converted path,
- *    and on the identity path the trace read is charged and nothing else is; a
- *    refusal releases the spill and holds no reservation;
+ *  - §5.9 admission is charged the received byte count on the converted paths,
+ *    the `openai-responses` one included; a refusal releases the spill and holds
+ *    no reservation;
  *  - the gemini branch still drops a response's `inline_data` part. That drop is
  *    pre-existing (`convertGeminiGenerateContentToClaude` keeps only text
  *    parts) and it is why this egress extracts no payloads: there is no
@@ -463,7 +464,7 @@ describe('chat-completions.ts non-SSE response (§5.7)', () => {
     assert.equal(getLiveSpillBytes(), 0);
   });
 
-  it('forwards an openai-responses body byte-identically from its spool, and frees it when the client is done', async () => {
+  it('converts an openai-responses body out of its spool, and frees the spill once the answer is built', async () => {
     const config = configureSpool();
     const payload = JSON.stringify(responsesBody('q'.repeat(400)));
     const chunks = twoChunks(payload);
@@ -481,20 +482,23 @@ describe('chat-completions.ts non-SSE response (§5.7)', () => {
 
     const { result: response, clones } = await countClones(() => post('openai-responses'));
 
-    assert.equal(response.status, 200, 'the upstream status is forwarded');
+    assert.equal(response.status, 200, 'the converted answer replaces the upstream status');
     assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the received prefix must be on disk, charged');
-    // Identity forwarding: the client gets the upstream bytes themselves. (This
-    // branch is the pre-existing passthrough — a `/v1/chat/completions` client on
-    // an `openai-responses` route is answered in the Responses shape; that is not
-    // this change's business, the bounded receive is.)
-    assert.equal(await response.text(), payload, 'the forwarded body must be byte-identical');
-    // The client's read is what releases the spool: no second copy is kept.
-    assert.deepEqual(spillFiles(config), [], 'the spill must be released once the body has been sent');
+    // Converted, not relayed: the client gets a `chat.completion` carrying the
+    // upstream's answer, not the Responses object the upstream sent. The body
+    // above `threshold_bytes` proves the conversion read the spill, not a buffer.
+    const answer = JSON.parse(await response.text());
+    assert.equal(answer.object, 'chat.completion');
+    assert.equal(answer.choices[0].message.content, 'q'.repeat(400));
+    assert.equal(answer.choices[0].finish_reason, 'stop');
+    assert.deepEqual(answer.usage, { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 });
+    // The converted read releases the spill itself, before the answer is serialized.
+    assert.deepEqual(spillFiles(config), [], 'the spill must be released once the body has been read');
     assert.equal(getLiveSpillBytes(), 0);
     assert.equal(clones, 0);
   });
 
-  it('bounds the openai-responses passthrough at max_response_bytes with spooling off', async () => {
+  it('bounds the openai-responses conversion at max_response_bytes with spooling off', async () => {
     const config = configureSpool({ enabled: false, maxResponseBytes: 256 });
     const payload = JSON.stringify(responsesBody('r'.repeat(400)));
     assert.ok(new TextEncoder().encode(payload).byteLength > config.maxResponseBytes);
@@ -516,13 +520,13 @@ describe('chat-completions.ts non-SSE response (§5.7)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §5.9: byte admission around the trace read
+// §5.9: byte admission around the converted read
 // ---------------------------------------------------------------------------
 
-describe('chat-completions.ts openai-responses passthrough, trace admission (§5.9)', () => {
+describe('chat-completions.ts openai-responses conversion, admission (§5.9)', () => {
   const TRACE = createLogger({ LOG_LEVEL: 'trace' });
 
-  it('refuses the trace read one nominal byte past the budget, leaving no spill and no reservation', async () => {
+  it('refuses the converted read one nominal byte past the budget, leaving no spill and no reservation', async () => {
     const payload = JSON.stringify(responsesBody('b'.repeat(400)));
     const bodyBytes = new TextEncoder().encode(payload).byteLength;
     const config = configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) - 1 });
@@ -546,7 +550,7 @@ describe('chat-completions.ts openai-responses passthrough, trace admission (§5
     assert.equal(getAdmittedBytes(), 0, 'a refusal must not keep its queue slot');
   });
 
-  it('admits the trace read that fits and forwards the bytes unchanged', async () => {
+  it('admits the converted read that fits and answers with the converted body', async () => {
     const payload = JSON.stringify(responsesBody('f'.repeat(400)));
     const bodyBytes = new TextEncoder().encode(payload).byteLength;
     configureSpool({ maxMaterializedBodyBytes: Math.ceil(bodyBytes * 2) });
@@ -554,8 +558,10 @@ describe('chat-completions.ts openai-responses passthrough, trace admission (§5
 
     const response = await post('openai-responses', TRACE);
 
-    assert.equal(await response.text(), payload);
-    assert.equal(getAdmittedBytes(), 0, 'the lease is given back once the trace line is built');
+    const converted = JSON.parse(await response.text());
+    assert.equal(converted.object, 'chat.completion');
+    assert.equal(converted.choices[0].message.content, 'f'.repeat(400));
+    assert.equal(getAdmittedBytes(), 0, 'the lease is given back once the body is materialized');
   });
 });
 

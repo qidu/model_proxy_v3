@@ -5,6 +5,75 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(chat-completions): an `openai-responses` upstream's answer is converted, not relayed
+
+`/v1/chat/completions` routed to an `upstream_mode = "openai-responses"` target converted the
+**request** (`completionsToResponsesBody`) and then handed the upstream's answer back untouched. A
+Chat Completions client therefore received a Responses object — `{object: "response", output: [...]}`,
+no `choices`, no `usage.prompt_tokens` — or, when streaming, the upstream's own Responses SSE
+(`response.output_text.delta` … `response.completed`), which has no `chat.completion.chunk` frames
+and no `data: [DONE]`. An OpenAI SDK pointed at that route parsed nothing.
+
+The answer direction now exists in `src/converters/responses-to-completions.ts` (the direction-named
+file, next to the request converter) and the branch in `src/handlers/chat-completions.ts` uses it:
+
+- `convertResponsesToChatCompletionsAnswer` builds the `chat.completion` object. `message` items'
+  `output_text` parts are concatenated in output order; `refusal` parts go to
+  `choices[0].message.refusal` rather than into `content` (a refusal is not an ordinary answer);
+  `reasoning` items become `message.reasoning_content` (`summary[].summary_text` and
+  `content[].reasoning_text` both collected — the field this repository's converters read back);
+  `function_call` items become `tool_calls` with `call_id` as the id; `content` is `null`, not `""`,
+  when the answer is tool calls without text. `finish_reason` is `tool_calls` when there is a call,
+  `length`/`content_filter` from `incomplete_details.reason`, else `stop`. `usage` is remapped by
+  `responsesUsageToChatCompletions` — `input_tokens`/`output_tokens`/`total_tokens` (falling back to
+  their sum) plus `input_tokens_details.cached_tokens` → `prompt_tokens_details.cached_tokens`.
+- `responsesStreamEventToChatChunks` maps one Responses SSE event to zero or more chunks:
+  `response.created` adopts the upstream's `id`/`created_at`/`model` for every later frame,
+  `response.output_text.delta` → `delta.content`, the two reasoning deltas →
+  `delta.reasoning_content`, `output_item.added` (function_call) →
+  `delta.tool_calls[{index, id, name, arguments: ""}]`, `function_call_arguments.delta` →
+  `delta.tool_calls[{index, arguments}]`, and `response.completed`/`response.incomplete` →
+  an empty delta carrying `finish_reason` plus the usage. The `tool_calls[].index` is **dense** and
+  drawn from a separate space than `output_index`: `output_index` counts reasoning and message items
+  too, so a naive pass-through would emit `index: 1` for the first call and clients would drop it.
+  Arguments are routed by their `output_index`, and a call whose `output_item.added` never arrived
+  still gets an index allocated from its first argument delta.
+
+The handler now frames the converted chunks itself, terminates with `data: [DONE]`, and emits the
+spec's empty-`choices` usage chunk only when the client set `stream_options.include_usage` — the
+Responses terminal event always carries usage, so the gate is the client's, as in the two branches
+above. A broken stream is not closed as a success: unparseable JSON, a `response.failed` event, and
+a stream that ends before its terminal event each log and abort the client stream, so a truncated
+answer arrives without a `finish_reason` frame or `[DONE]`.
+
+Output items with no Chat Completions position (`image_generation_call`, `web_search_call`,
+`program`, and unknown content parts such as `input_image`) are **dropped and counted**, and the
+handler logs one `warn` per type with its count (Rule #8). This is a behaviour change for those
+answers: previously they reached the client inside the relayed Responses object; there is nowhere
+to put them in a `choices[]` message, and silently emitting an answer without them would be worse
+than saying so.
+
+What did *not* change: an upstream error answer (`!response.ok`) is still relayed byte-for-byte under
+its own status, because it is not a Responses object to convert — still received through the §5.7
+bounded spool, still with the §5.9 trace-read lease. The `!ok` tests in
+`chat-completions-response-spool.test.ts` pin that, and the successful-answer tests in the same file
+were rewritten from "the body is forwarded unchanged" to "the body is converted", keeping their
+§5.7/§5.9 intent (spill created, read from the spill, released; `max_response_bytes` applies with
+`enabled = false`; zero `Response.clone()` calls).
+
+Verified: `npm run typecheck` clean; `npm run test:unit` 2687/2687. New coverage —
+`responses-completions-roundtrip.test.ts` (the answer converters: multi-item text joining, refusal
+and reasoning fields, dense vs `output_index` tool indexes, the lazy-index fallback, the
+`finish_reason` matrix, usage-with-cache remap and its omitted-details case, dropped-item counts) and
+`tests/unit/chat-completions-responses-streaming.test.ts` (the wiring: chunk framing, a frame split
+across two reads, the `include_usage` gate, `[DONE]` last, abort on `response.failed` and on
+truncation, and the unchanged error-body relay).
+
+Known duplication, left alone deliberately: `src/handlers/messages.ts` and `src/handlers/openai.ts`
+each carry their own inline Responses→Completions mapping. They are not on this route and were not
+touched; consolidating them onto the new converter is a follow-up that changes those routes'
+behaviour, not this one's.
+
 ### fix(converters): tools survive the Claude Messages ↔ Gemini generateContent pair
 
 `/v1/messages` routed to an `upstream_mode = "gemini-generatecontent"` target answered every

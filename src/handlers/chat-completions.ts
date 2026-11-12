@@ -14,6 +14,11 @@ import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { validateOpenAICompletionsRequest } from '../utils/validation.js';
 import { ValidationError } from '../utils/errors.js';
 import { completionsToResponsesBody, completionsToClaudeBody, claudeJsonToSyntheticCompletions } from './openai.js';
+import {
+  convertResponsesToChatCompletionsAnswer,
+  createResponsesChatStreamState,
+  responsesStreamEventToChatChunks,
+} from '../converters/responses-to-completions.js';
 import { convertCompletionsToGeminiGenerateContentBody } from '../converters/claude-to-gemini.js';
 import { convertGeminiGenerateContentToClaude } from '../converters/gemini-to-claude.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
@@ -284,37 +289,133 @@ export async function handleChatCompletionsPassthrough(
     const responseHeaders = new Headers(responsesUpstreamResponse.headers);
     responseHeaders.set('x-request-id', requestId);
 
-    // Pure passthrough of the (already converted) upstream response. §5.7: the
-    // body is received with bounded memory — `max_response_bytes` enforced, the
-    // upstream cancelled on breach — and forwarded from that spool unparsed.
-    // Identity forwarding never parses: the trace line reads the same spool
-    // rather than teeing a second reader that would pull the body through
-    // beside the client's. No payload extraction here either: this is the
-    // identity shape, which relays whatever bytes the upstream sent, including
-    // an `image_generation_call` result the client asked for as-is.
-    const received = await receiveResponseBody(responsesUpstreamResponse.body);
-    if (logger.traceEnabled) {
-      // §5.9: the trace line is this shape's only materialization, so it is the
-      // only thing charged, and the lease is given back as soon as it is read.
-      let lease: AdmissionLease;
-      try {
-        lease = await admitResponseMaterialization(received.size, request.signal);
-      } catch (error) {
-        await received.release();
-        throw error;
+    // An error answer is not a Responses object to convert — it is relayed as
+    // bytes under the upstream's own status. §5.7: the body is received with
+    // bounded memory — `max_response_bytes` enforced, the upstream cancelled on
+    // breach — and forwarded from that spool unparsed. Identity forwarding never
+    // parses: the trace line reads the same spool rather than teeing a second
+    // reader that would pull the body through beside the client's.
+    if (!responsesUpstreamResponse.ok) {
+      const received = await receiveResponseBody(responsesUpstreamResponse.body);
+      if (logger.traceEnabled) {
+        // §5.9: the trace line is this shape's only materialization, so it is
+        // the only thing charged, and the lease is given back as soon as it is read.
+        let lease: AdmissionLease;
+        try {
+          lease = await admitResponseMaterialization(received.size, request.signal);
+        } catch (error) {
+          await received.release();
+          throw error;
+        }
+        try {
+          logPipelineStage(logger, requestId, 'upstream-response', responsesUpstreamResponse.url || targetUrl, await received.readText());
+        } finally {
+          lease.release();
+        }
       }
-      try {
-        logPipelineStage(logger, requestId, 'upstream-response', responsesUpstreamResponse.url || targetUrl, await received.readText());
-      } finally {
-        lease.release();
-      }
+      logPipelineHeaders(logger, requestId, 'outbound', path, responseHeaders);
+      return new Response(received.readStream(), {
+        status: responsesUpstreamResponse.status,
+        statusText: responsesUpstreamResponse.statusText,
+        headers: responseHeaders,
+      });
     }
-    logPipelineHeaders(logger, requestId, 'outbound', path, responseHeaders);
-    return new Response(received.readStream(), {
-      status: responsesUpstreamResponse.status,
-      statusText: responsesUpstreamResponse.statusText,
-      headers: responseHeaders,
-    });
+
+    if (isStreaming) {
+      // The upstream answers a streamed Responses request in Responses SSE
+      // events; the client asked for `chat.completion.chunk` frames. Each event
+      // is mapped by the converter and re-framed here, following the two
+      // converted branches above.
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      const encoder = new TextEncoder();
+      // Per OpenAI spec, streaming usage is only emitted when the client asks
+      // for it via stream_options.include_usage, as a final chunk with an empty
+      // choices array just before [DONE]. The Responses stream always reports
+      // usage on its terminal event, so the source is there when it is wanted.
+      const includeUsage = ((parsedBody.stream_options as Record<string, unknown> | undefined)?.include_usage === true);
+      (async () => {
+        try {
+          const state = createResponsesChatStreamState(model);
+          const reader = responsesUpstreamResponse.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const rawChunk = decoder.decode(value, { stream: true });
+            logPipelineStage(logger, requestId, 'upstream-response', responsesUpstreamResponse.url || targetUrl, rawChunk);
+            buffer += rawChunk;
+            const events = buffer.split('\n\n');
+            buffer = events.pop() || '';
+            for (const event of events) {
+              if (!event.trim()) continue;
+              const dataLine = event.split('\n').find(l => l.startsWith('data: '));
+              if (!dataLine) continue;
+              const data = dataLine.slice(6).trim();
+              if (!data || data === '[DONE]') continue;
+              let parsed: Record<string, unknown>;
+              try {
+                parsed = JSON.parse(data) as Record<string, unknown>;
+              } catch {
+                // An unparseable frame is a broken stream, not a frame to skip:
+                // silently dropping it would truncate the answer the client sees
+                // while the upstream believes it delivered everything.
+                throw new Error(`Invalid JSON in Responses SSE data (request ${requestId})`);
+              }
+              if (parsed.type === 'response.failed') {
+                throw new Error(`Responses stream failed (request ${requestId})`);
+              }
+              for (const chunk of responsesStreamEventToChatChunks(state, parsed)) {
+                logPipelineStage(logger, requestId, 'outbound', path, chunk);
+                await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              }
+              if (state.finished) break;
+            }
+            if (state.finished) break;
+          }
+          // A stream that stops before the terminal event leaves the client with
+          // a truncated answer and no finish_reason. `handleResponsesStreamAsClaude`
+          // refuses the same way.
+          if (!state.finished) {
+            throw new Error(`Responses stream ended before response.completed (request ${requestId})`);
+          }
+          warnDroppedOutputItems(logger, requestId, path, state.dropped);
+          if (includeUsage && state.usage) {
+            const usageChunk = {
+              id: state.id, object: 'chat.completion.chunk', created: state.created, model: state.model,
+              choices: [], usage: state.usage,
+            };
+            logPipelineStage(logger, requestId, 'outbound', path, usageChunk);
+            await writer.write(encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`));
+          }
+          await writer.write(encoder.encode('data: [DONE]\n\n'));
+          await writer.close();
+        } catch (e) {
+          logger.error(requestId, `${path} openai-responses streaming error: ${(e as Error).message}`);
+          await writer.abort();
+        }
+      })();
+      const responsesStreamOutHeaders = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'x-request-id': requestId };
+      logPipelineHeaders(logger, requestId, 'outbound', path, responsesStreamOutHeaders);
+      return new Response(readable, { headers: responsesStreamOutHeaders });
+    }
+
+    // Non-streaming: convert the Responses answer into a `chat.completion`
+    // object. §5.7: received with bounded memory and `max_response_bytes`
+    // enforced, then parsed once — the conversion needs the value, so the spill
+    // is released before this returns. No payload extraction: a Responses
+    // `image_generation_call` result has no Chat Completions position, so it is
+    // dropped and reported rather than kept for nobody (see the converter).
+    const responsesJson = await receiveJsonResponse<Record<string, unknown>>(
+      responsesUpstreamResponse, requestId, logger, responsesUpstreamResponse.url || targetUrl, request.signal,
+    );
+    const answer = convertResponsesToChatCompletionsAnswer(responsesJson, model);
+    warnDroppedOutputItems(logger, requestId, path, answer.dropped);
+    logPipelineStage(logger, requestId, 'outbound', path, answer.completions);
+    const responsesOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+    logPipelineHeaders(logger, requestId, 'outbound', path, responsesOutHeaders);
+    return new Response(JSON.stringify(answer.completions), { status: 200, headers: responsesOutHeaders });
   }
 
   // When the upstream is gemini-generatecontent, convert the OpenAI completions
@@ -538,4 +639,21 @@ export async function handleChatCompletionsPassthrough(
     statusText: upstreamResponse.statusText,
     headers: responseHeaders,
   });
+}
+
+/**
+ * Report Responses output items the conversion had no Chat Completions position
+ * for. Called on both the JSON and the SSE egress; a silent drop is forbidden
+ * (rule #8) — an `image_generation_call` result or a `web_search_call` vanishes
+ * from the client's answer, and the log is the only place that can say so.
+ */
+function warnDroppedOutputItems(
+  logger: Logger,
+  requestId: string,
+  path: string,
+  dropped: Record<string, number>,
+): void {
+  for (const [type, count] of Object.entries(dropped)) {
+    logger.warn(requestId, `${path} openai-responses → chat.completion: dropped ${count} output item(s) of type '${type}' (no Chat Completions representation)`);
+  }
 }

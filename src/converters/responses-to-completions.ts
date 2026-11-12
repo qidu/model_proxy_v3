@@ -722,3 +722,369 @@ function convertResponsesContentToCompletions(content: unknown): OpenAIContent {
   }
   return parts;
 }
+
+// ---------------------------------------------------------------------------
+// Answer direction: a Responses API answer → a Chat Completions answer
+// ---------------------------------------------------------------------------
+
+/**
+ * Chat Completions `usage`, the shape both the JSON answer and the stream's
+ * final usage chunk report.
+ *
+ * `input_tokens_details.cached_tokens` is carried across as
+ * `prompt_tokens_details.cached_tokens`, the field this repository's downstream
+ * converters read back (`convertOpenAIToClaudeResponse`, the streaming
+ * converter). Dropping it here would make a cached prompt look uncached on the
+ * next front door.
+ */
+export interface ChatCompletionsUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details?: { cached_tokens: number };
+}
+
+/** Map a Responses `usage` object onto Chat Completions usage. */
+export function responsesUsageToChatCompletions(usage: unknown): ChatCompletionsUsage | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const u = usage as Record<string, unknown>;
+  const input = typeof u.input_tokens === 'number' ? u.input_tokens : 0;
+  const output = typeof u.output_tokens === 'number' ? u.output_tokens : 0;
+  const mapped: ChatCompletionsUsage = {
+    prompt_tokens: input,
+    completion_tokens: output,
+    total_tokens: typeof u.total_tokens === 'number' ? u.total_tokens : input + output,
+  };
+  const details = u.input_tokens_details;
+  if (details && typeof details === 'object') {
+    const cached = (details as Record<string, unknown>).cached_tokens;
+    if (typeof cached === 'number') mapped.prompt_tokens_details = { cached_tokens: cached };
+  }
+  return mapped;
+}
+
+/**
+ * The Chat Completions `finish_reason` for a Responses answer.
+ *
+ * Tool calls win over everything else (a tool-calling turn is a `tool_calls`
+ * turn even when it also produced text — same order the two existing inline
+ * Responses→Completions mappings in `handlers/messages.ts` and
+ * `handlers/openai.ts` use). A truncated answer (`status: "incomplete"`) is
+ * `length` or `content_filter` depending on `incomplete_details.reason`;
+ * anything else, including a still-running response, is `stop`, because
+ * `finish_reason` has no "in progress" value.
+ */
+function responsesFinishReason(responsesJson: Record<string, unknown>, hasToolCalls: boolean): string {
+  if (hasToolCalls) return 'tool_calls';
+  const details = responsesJson.incomplete_details;
+  if (details && typeof details === 'object') {
+    const reason = (details as Record<string, unknown>).reason;
+    if (reason === 'max_output_tokens') return 'length';
+    if (reason === 'content_filter') return 'content_filter';
+  }
+  return 'stop';
+}
+
+/**
+ * Reasoning text of a Responses `reasoning` output item.
+ *
+ * An upstream may report it as `summary[].summary_text` (what OpenAI itself
+ * sends) or as `content[].reasoning_text` (`completions-to-responses.ts` emits
+ * this pair on the outbound side, so a proxy-to-proxy chain can produce it).
+ * Both are collected and joined in item order.
+ */
+function responsesReasoningText(item: Record<string, unknown>): string {
+  let text = '';
+  const summary = item.summary;
+  if (Array.isArray(summary)) {
+    for (const part of summary) {
+      if (part && typeof part === 'object' && (part as Record<string, unknown>).type === 'summary_text') {
+        const t = (part as Record<string, unknown>).text;
+        if (typeof t === 'string') text += t;
+      }
+    }
+  }
+  const content = item.content;
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (part && typeof part === 'object' && (part as Record<string, unknown>).type === 'reasoning_text') {
+        const t = (part as Record<string, unknown>).text;
+        if (typeof t === 'string') text += t;
+      }
+    }
+  }
+  return text;
+}
+
+/** What a Responses answer converted for a Chat Completions client. */
+export interface ResponsesChatCompletionsAnswer {
+  /** A `chat.completion` object, ready to serialize. */
+  completions: Record<string, unknown>;
+  /**
+   * Output item types that have no Chat Completions position, with a count
+   * each. They are dropped — a `choices[].message` has nowhere to put an
+   * `image_generation_call` result or a `web_search_call`. The caller reports
+   * these (rule #8: a conversion that skips data says what it skipped).
+   */
+  dropped: Record<string, number>;
+}
+
+/**
+ * Convert a Responses API answer (`/v1/responses` object) into a Chat
+ * Completions answer (`chat.completion` object).
+ *
+ * Mapping:
+ *  - `output[type=message].content[type=output_text]` → `choices[0].message.content`
+ *    (every message item, concatenated in output order — an answer may be split
+ *    across items with `phase` values);
+ *  - `output[type=message].content[type=refusal]` → `choices[0].message.refusal`
+ *    (kept separate: a refusal is the only content some answers carry, and
+ *    folding it into `content` would present it as an ordinary answer);
+ *  - `output[type=reasoning]` → `choices[0].message.reasoning_content` (this
+ *    repository's field for it — `convertOpenAIToClaudeResponse` and the
+ *    streaming converter read it back);
+ *  - `output[type=function_call]` → `choices[0].message.tool_calls`;
+ *  - `usage` → `responsesUsageToChatCompletions`;
+ *  - `status`/`incomplete_details` → `finish_reason` via
+ *    `responsesFinishReason`.
+ *
+ * `content` is `null`, not `''`, when the answer is tool calls without text —
+ * matching `claudeJsonToSyntheticCompletions` and what upstreams such as
+ * DeepSeek accept on a replayed turn.
+ */
+export function convertResponsesToChatCompletionsAnswer(
+  responsesJson: Record<string, unknown>,
+  model: string,
+): ResponsesChatCompletionsAnswer {
+  const output = Array.isArray(responsesJson.output)
+    ? responsesJson.output as Array<Record<string, unknown>>
+    : [];
+
+  let text = '';
+  let refusal = '';
+  let reasoning = '';
+  const toolCalls: Array<Record<string, unknown>> = [];
+  const dropped: Record<string, number> = {};
+
+  for (const item of output) {
+    if (!item || typeof item !== 'object') {
+      dropped['(malformed item)'] = (dropped['(malformed item)'] ?? 0) + 1;
+      continue;
+    }
+    const type = item.type as string | undefined;
+    if (type === 'message') {
+      const content = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
+      for (const part of content) {
+        if (!part || typeof part !== 'object') continue;
+        if (part.type === 'output_text') {
+          if (typeof part.text === 'string') text += part.text;
+          if (typeof part.refusal === 'string') refusal += part.refusal;
+        } else if (part.type === 'refusal') {
+          if (typeof part.refusal === 'string') refusal += part.refusal;
+        } else {
+          const key = `content_part:${String(part.type ?? '(missing type)')}`;
+          dropped[key] = (dropped[key] ?? 0) + 1;
+        }
+      }
+      // A message item with no content array (status "in_progress", or an empty
+      // answer) contributes nothing and is not a drop.
+    } else if (type === 'reasoning') {
+      reasoning += responsesReasoningText(item);
+    } else if (type === 'function_call') {
+      toolCalls.push({
+        id: (item.call_id as string) ?? (item.id as string) ?? `call_${toolCalls.length}`,
+        type: 'function',
+        function: {
+          name: (item.name as string) ?? '',
+          arguments: (item.arguments as string) ?? '',
+        },
+      });
+    } else {
+      const key = type ?? '(missing type)';
+      dropped[key] = (dropped[key] ?? 0) + 1;
+    }
+  }
+
+  const message: Record<string, unknown> = { role: 'assistant', content: text };
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+    if (text === '') message.content = null;
+  }
+  if (refusal) message.refusal = refusal;
+  if (reasoning) message.reasoning_content = reasoning;
+
+  const completions: Record<string, unknown> = {
+    // The upstream's own id. Both existing Responses→Completions mappings in
+    // this repository do the same, so a `resp_…` id on a `chat.completion`
+    // object is the established shape here, and it keeps the answer traceable
+    // to the upstream response it came from.
+    id: (responsesJson.id as string) ?? `chatcmpl_${Date.now()}`,
+    object: 'chat.completion',
+    created: (responsesJson.created_at as number) ?? Math.floor(Date.now() / 1000),
+    model: (responsesJson.model as string) ?? model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: responsesFinishReason(responsesJson, toolCalls.length > 0),
+      logprobs: null,
+    }],
+  };
+  const usage = responsesUsageToChatCompletions(responsesJson.usage);
+  if (usage) completions.usage = usage;
+
+  return { completions, dropped };
+}
+
+/** State a Responses SSE stream needs to become a Chat Completions chunk stream. */
+export interface ResponsesChatStreamState {
+  id: string;
+  created: number;
+  model: string;
+  /**
+   * Responses `output_index` → Chat Completions `tool_calls[].index`. The two
+   * index spaces differ once an answer mixes tool calls with anything else:
+   * `output_index` counts message and reasoning items too, while `tool_calls[]`
+   * is a dense list of just the calls.
+   */
+  toolIndexByOutput: Map<number, number>;
+  nextToolIndex: number;
+  sawToolCall: boolean;
+  /** Usage reported by the terminal event, in Chat Completions shape. */
+  usage?: ChatCompletionsUsage;
+  /** The upstream said the response ended; the client stream can be closed. */
+  finished: boolean;
+  /** Output item types the stream had no place for, with a count each. */
+  dropped: Record<string, number>;
+}
+
+/** Start the state for one streamed Responses answer. */
+export function createResponsesChatStreamState(model: string): ResponsesChatStreamState {
+  return {
+    id: `chatcmpl_${Date.now()}`,
+    created: Math.floor(Date.now() / 1000),
+    model,
+    toolIndexByOutput: new Map(),
+    nextToolIndex: 0,
+    sawToolCall: false,
+    finished: false,
+    dropped: {},
+  };
+}
+
+function responsesChatChunk(
+  state: ResponsesChatStreamState,
+  delta: Record<string, unknown>,
+  finishReason: string | null,
+): Record<string, unknown> {
+  return {
+    id: state.id,
+    object: 'chat.completion.chunk',
+    created: state.created,
+    model: state.model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+}
+
+/**
+ * Map one Responses SSE event to zero or more `chat.completion.chunk` objects.
+ *
+ *   response.created                          → adopt the response id/created time
+ *   response.output_text.delta                → delta.content
+ *   response.reasoning_summary_text.delta
+ *   response.reasoning_text.delta             → delta.reasoning_content
+ *   response.output_item.added (function_call)→ delta.tool_calls (id, name, "")
+ *   response.function_call_arguments.delta    → delta.tool_calls (arguments)
+ *   response.completed / response.incomplete  → finish_reason + usage, `finished`
+ *
+ * Events carrying nothing a chunk can express (`response.content_part.added`,
+ * `response.output_text.done`, `response.output_item.done`,
+ * `response.reasoning_summary_part.*`, …) map to no chunk. An output item type
+ * with no Chat Completions position is counted in `state.dropped` so the caller
+ * can report it — the non-streaming converter reports the same set.
+ *
+ * `response.failed` is not handled here: the caller aborts the client stream on
+ * it, as `handleResponsesStreamAsClaude` does.
+ */
+export function responsesStreamEventToChatChunks(
+  state: ResponsesChatStreamState,
+  event: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  const type = event.type as string | undefined;
+
+  if (type === 'response.created') {
+    const response = event.response as Record<string, unknown> | undefined;
+    if (response) {
+      if (typeof response.id === 'string') state.id = response.id;
+      if (typeof response.created_at === 'number') state.created = response.created_at;
+      if (typeof response.model === 'string') state.model = response.model;
+    }
+    return [];
+  }
+
+  if (type === 'response.output_text.delta') {
+    const delta = event.delta;
+    if (typeof delta !== 'string' || delta === '') return [];
+    return [responsesChatChunk(state, { role: 'assistant', content: delta }, null)];
+  }
+
+  if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') {
+    const delta = event.delta;
+    if (typeof delta !== 'string' || delta === '') return [];
+    return [responsesChatChunk(state, { reasoning_content: delta }, null)];
+  }
+
+  if (type === 'response.output_item.added') {
+    const item = event.item as Record<string, unknown> | undefined;
+    const itemType = item?.type as string | undefined;
+    if (itemType === 'function_call' && item) {
+      const outputIndex = typeof event.output_index === 'number' ? event.output_index : state.nextToolIndex;
+      const index = state.nextToolIndex++;
+      state.toolIndexByOutput.set(outputIndex, index);
+      state.sawToolCall = true;
+      return [responsesChatChunk(state, {
+        tool_calls: [{
+          index,
+          id: (item.call_id as string) ?? (item.id as string) ?? `call_${index}`,
+          type: 'function',
+          function: { name: (item.name as string) ?? '', arguments: '' },
+        }],
+      }, null)];
+    }
+    // message items are announced here and their text arrives as deltas;
+    // anything else has no Chat Completions position.
+    if (itemType !== 'message' && itemType !== 'reasoning') {
+      const key = itemType ?? '(missing type)';
+      state.dropped[key] = (state.dropped[key] ?? 0) + 1;
+    }
+    return [];
+  }
+
+  if (type === 'response.function_call_arguments.delta') {
+    const delta = event.delta;
+    if (typeof delta !== 'string' || delta === '') return [];
+    const outputIndex = typeof event.output_index === 'number' ? event.output_index : 0;
+    let index = state.toolIndexByOutput.get(outputIndex);
+    if (index === undefined) {
+      // An upstream that skipped `output_item.added` still gets its arguments
+      // through: a chunk with an index but no id/name is merged by the client
+      // into the call it already has at that index.
+      index = state.nextToolIndex++;
+      state.toolIndexByOutput.set(outputIndex, index);
+      state.sawToolCall = true;
+    }
+    return [responsesChatChunk(state, {
+      tool_calls: [{ index, function: { arguments: delta } }],
+    }, null)];
+  }
+
+  if (type === 'response.completed' || type === 'response.incomplete') {
+    const response = event.response as Record<string, unknown> | undefined;
+    if (response) {
+      state.usage = responsesUsageToChatCompletions(response.usage) ?? state.usage;
+    }
+    state.finished = true;
+    return [responsesChatChunk(state, {}, responsesFinishReason(response ?? {}, state.sawToolCall))];
+  }
+
+  return [];
+}

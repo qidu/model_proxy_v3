@@ -37,7 +37,7 @@ npm run test:unit           # runs tsx --test tests/unit/**/*.test.ts
 | `converters/claude-to-gemini.ts` | `claude-to-gemini` (role mapping, text/image blocks, system_instruction, generation_config, cached_content) |
 | `converters/openai-to-gemini.ts` | `openai-to-gemini` (text/tool_calls/thinking/reasoning_content, schema-aware arg coercion, empty-chunk handling) |
 | `converters/completions-to-responses.ts` | `responses-completions-roundtrip` (text/tool_calls/reasoning, compacted shape) |
-| `converters/responses-to-completions.ts` | `responses-completions-roundtrip` (input→messages, tool format flattening, tool_choice mapping, reasoning threading) |
+| `converters/responses-to-completions.ts` | `responses-completions-roundtrip` (input→messages, tool format flattening, tool_choice mapping, reasoning threading; the answer direction: `output[]`→`choices[]` with refusal/reasoning/tool_calls, usage+cache remap, `finish_reason` from `incomplete_details`, dropped-item counts, and the Responses-SSE→`chat.completion.chunk` event mapping), `chat-completions-responses-streaming` (via handler: framing, `include_usage` gate, `[DONE]`, abort on `response.failed`/truncation) |
 | `utils/request-transform.ts` | `request-transform` (hook plumbing, ops, builtins incl. `filter_anthropic_beta`) |
 | `utils/config-loader.ts` | `transforms-config`, `coordinator`, `request-transform`, `config-loader` (incl. `validateProxyConfig` model-entry lengths 1/3/4/5/6 with `max_tokens` number/digit-string/non-numeric), plus in-process `tests/integration/15_config_parse` and `16_security/config_loader_pollution` |
 | `utils/coordinator.ts` | `coordinator` |
