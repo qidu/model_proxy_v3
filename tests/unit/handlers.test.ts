@@ -6,7 +6,7 @@
  * by ./tests/integration (integration). Here we cover the exported pure functions
  * that contain the testable conversion/decision logic:
  *   - openai.ts: completionsToClaudeBody, completionsToResponsesBody,
- *                claudeJsonToSyntheticCompletions
+ *                claudeJsonToSyntheticCompletions, convertGeminiGenerateContentToOpenAI
  *   - gemini.ts: isGeminiRequest
  *
  * Run with: npx tsx --test tests/unit/handlers.test.ts
@@ -19,6 +19,7 @@ import {
   completionsToClaudeBody,
   completionsToResponsesBody,
   claudeJsonToSyntheticCompletions,
+  convertGeminiGenerateContentToOpenAI,
 } from '../../src/handlers/openai.js';
 import { isGeminiRequest } from '../../src/handlers/gemini.js';
 
@@ -536,6 +537,153 @@ describe('claudeJsonToSyntheticCompletions', () => {
     const msg = (out.choices as any[])[0].message;
     assert.equal(msg.content, 'calling tool');
     assert.ok(msg.tool_calls?.length === 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// convertGeminiGenerateContentToOpenAI — toolConfig.functionCallingConfig
+// ---------------------------------------------------------------------------
+
+describe('convertGeminiGenerateContentToOpenAI — toolConfig', () => {
+  const weatherTool = { functionDeclarations: [{ name: 'get_weather', parameters: { type: 'OBJECT', properties: {} } }] };
+
+  function geminiRequest(toolConfig: Record<string, unknown>, tools: unknown[] = [weatherTool]): Record<string, unknown> {
+    return {
+      model: 'gpt-target',
+      contents: [{ role: 'user', parts: [{ text: 'count to 10' }] }],
+      tools,
+      toolConfig,
+    };
+  }
+
+  it('maps a single-name ANY allow-list to the forced function form', () => {
+    const out = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather'] } }),
+    );
+    assert.deepEqual(out.tool_choice, { type: 'function', function: { name: 'get_weather' } });
+  });
+
+  // Pinned, not fixed: Gemini's "must call some function" has no faithful
+  // Completions string, so ANY without an allow-list goes out as 'auto'.
+  it("maps ANY with no allow-list to 'auto'", () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ functionCallingConfig: { mode: 'ANY' } }));
+    assert.equal(out.tool_choice, 'auto');
+  });
+
+  it("maps NONE to 'none' and AUTO to 'auto'", () => {
+    assert.equal(
+      convertGeminiGenerateContentToOpenAI(geminiRequest({ functionCallingConfig: { mode: 'NONE' } })).tool_choice,
+      'none',
+    );
+    assert.equal(
+      convertGeminiGenerateContentToOpenAI(geminiRequest({ functionCallingConfig: { mode: 'AUTO' } })).tool_choice,
+      'auto',
+    );
+  });
+
+  // Pinned, not fixed: Completions cannot express "one of these two, and no
+  // other tool", so a 2+ name allow-list collapses to the looser 'required'.
+  it("collapses a multi-name allow-list to 'required' (looser)", () => {
+    const out = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather', 'get_time'] } }),
+    );
+    assert.equal(out.tool_choice, 'required');
+  });
+
+  it('omits tool_choice when toolConfig is absent or unrecognized', () => {
+    assert.equal('tool_choice' in convertGeminiGenerateContentToOpenAI({ ...geminiRequest({}), toolConfig: undefined }), false);
+    assert.equal(
+      'tool_choice' in convertGeminiGenerateContentToOpenAI(geminiRequest({ functionCallingConfig: { mode: 'WHATEVER' } })),
+      false,
+    );
+  });
+
+  it('omits tool_choice when no functionDeclaration survived the conversion', () => {
+    const out = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ functionCallingConfig: { mode: 'ANY' } }, [{ google_search: {} }]),
+    );
+    assert.equal('tools' in out, false);
+    assert.equal('tool_choice' in out, false);
+  });
+
+  it('carries a forced function to both cross-mode upstreams', async () => {
+    const completions = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather'] } }),
+    );
+    const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
+    const responsesBody = completionsToResponsesBody(completions as any, 'gpt-target');
+
+    assert.deepEqual(claudeBody.tool_choice, { type: 'tool', name: 'get_weather' });
+    assert.deepEqual(responsesBody.tool_choice, { type: 'function', name: 'get_weather' });
+  });
+
+  it("carries a multi-name allow-list to both cross-mode upstreams as 'required' / {type:'any'}", async () => {
+    const completions = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather', 'get_time'] } }),
+    );
+    const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
+    const responsesBody = completionsToResponsesBody(completions as any, 'gpt-target');
+
+    assert.deepEqual(claudeBody.tool_choice, { type: 'any' });
+    assert.equal(responsesBody.tool_choice, 'required');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// convertGeminiGenerateContentToOpenAI — generationConfig.stopSequences
+// ---------------------------------------------------------------------------
+
+describe('convertGeminiGenerateContentToOpenAI — stopSequences', () => {
+  function geminiRequest(generationConfig: Record<string, unknown>): Record<string, unknown> {
+    return {
+      model: 'gpt-target',
+      contents: [{ role: 'user', parts: [{ text: 'count to 10' }] }],
+      generationConfig,
+    };
+  }
+
+  it('maps generationConfig.stopSequences to the Completions stop array', () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ stopSequences: ['5.', 'END'] }));
+    assert.deepEqual(out.stop, ['5.', 'END']);
+    // The rest of the conversion is unchanged.
+    assert.equal(out.model, 'gpt-target');
+    assert.deepEqual(out.messages, [{ role: 'user', content: 'count to 10' }]);
+  });
+
+  it('normalizes a bare-string stopSequences to a one-element array', () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ stopSequences: 'END' }));
+    assert.deepEqual(out.stop, ['END']);
+  });
+
+  it('omits stop when stopSequences is absent', () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ temperature: 0.3 }));
+    assert.equal('stop' in out, false);
+  });
+
+  it('omits stop for an empty stopSequences list', () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ stopSequences: [] }));
+    assert.equal('stop' in out, false);
+  });
+
+  it('carries the sequences to an anthropic-messages upstream as stop_sequences', async () => {
+    const completions = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ stopSequences: ['5.', 'END'] }),
+    );
+    const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
+    assert.deepEqual(claudeBody.stop_sequences, ['5.', 'END']);
+  });
+
+  // Pinned, not fixed: the Responses API has no stop-sequence field, so the
+  // openai-responses hop drops what the Completions body carries. This test
+  // exists so that drop stays visible instead of being silently assumed.
+  it('still drops the sequences at the openai-responses hop', () => {
+    const completions = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ stopSequences: ['5.', 'END'] }),
+    );
+    const responsesBody = completionsToResponsesBody(completions as any, 'gpt-target');
+    assert.equal('stop' in responsesBody, false);
+    assert.equal('stop_sequences' in responsesBody, false);
   });
 });
 

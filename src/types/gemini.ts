@@ -150,9 +150,15 @@ export interface GeminiGenerationConfig {
     top_p?: number;
     seed?: number;
     stop_sequences?: string[];
-    tool_choice?: {
-        type: 'auto' | 'any' | 'none' | 'function' | 'dynamic';
+    // Either the bare enum or the ToolChoiceConfig object form. `function` and
+    // `dynamic` are not in the documented enum, but bodies carrying them reach
+    // this proxy and are accepted (see geminiToolChoiceToOpenAI in
+    // src/handlers/openai.ts).
+    tool_choice?: 'auto' | 'any' | 'none' | 'validated' | 'dynamic' | 'function' | {
+        type?: 'auto' | 'any' | 'none' | 'validated' | 'dynamic' | 'function';
+        mode?: 'auto' | 'any' | 'none' | 'validated';
         function?: { name: string };
+        tools?: string[];
     };
     thinking_level?: 'minimal' | 'low' | 'medium' | 'high';
     thinking_summaries?: 'auto' | 'none';

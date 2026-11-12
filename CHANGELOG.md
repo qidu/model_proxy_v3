@@ -5,6 +5,108 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(route): both Gemini front doors carry `tool_choice` to non-Gemini upstreams
+
+`tool_choice` was in the dropped set of both Gemini→Completions converters
+(`convertGeminiInteractionsToOpenAI`, `convertGeminiGenerateContentToOpenAI` in
+`src/handlers/openai.ts`), so a client that forced a function — `toolConfig.functionCallingConfig`
+on generateContent, `generation_config.tool_choice` on Interactions — reached the upstream
+indistinguishable from "auto" and could answer in prose instead. The shared
+`geminiToolChoiceToOpenAI` normalizer now maps every spelling onto the Completions vocabulary:
+
+| Gemini | Completions |
+| --- | --- |
+| `auto`, `dynamic` (undocumented), `any` | `'auto'` |
+| `none` | `'none'` |
+| `validated` | `'required'` |
+| `{function:{name}}`, single-name allow-list | `{type:'function', function:{name}}` |
+| allow-list of 2+ names | `'required'` |
+| absent / unrecognized | key omitted |
+
+- **`OpenAIRequest['tool_choice']` gained `'required'`** (`src/types/openai.ts`). The union was
+  missing a value the Responses→Completions converter already produced, which is why the
+  multi-name and `validated` rows could not be expressed before.
+- **Second hop.** `completionsToClaudeBody` maps `'auto'`/`'none'`/`'required'` →
+  `{type:'auto'|'none'|'any'}` and the forced form → `{type:'tool', name}`;
+  `completionsToResponsesBody` passes the three strings through and flattens the forced form to
+  `{type:'function', name}`. Both are gated on `tools` being non-empty at *both* hops — a
+  `tool_choice` naming no declared function is an upstream error, and one emitted for a request
+  whose tools were all non-function would be a new wire value for nothing.
+- **Documented losses.** `any` ("must call some function") goes out as `'auto'`, not
+  `'required'`: the upstream vocabularies disagree on which one means "a tool call and no
+  prose". A 2+ name allow-list collapses to the looser `'required'` (any declared tool, not
+  only the listed ones) — Completions cannot express the set. `dynamic` is not in the
+  documented enum but is still read as "auto". All three are pinned by test.
+- **`src/types/gemini.ts`'s `tool_choice` corrected** to the documented shape (`ToolChoiceConfig
+  | string enum`, adding `validated` and the `{mode, tools}` object form) while keeping the
+  `function`/`dynamic` spellings this proxy still accepts.
+
+Tests: 19 new cases in `tests/unit/gemini-interactions-to-openai.test.ts` (each table row, the
+forced form, both allow-list sizes, the `toolConfig` spelling, unrecognized/absent values, the
+no-tools gate, and five second-hop carry-throughs) and 8 in `tests/unit/handlers.test.ts` (the
+same rows on the generateContent path, including both cross-mode ends). Full unit suite
+2752/2752.
+
+### fix(interactions): `convertGeminiInteractionsToOpenAI` carries system prompt, tools and stop sequences
+
+`/v1/interactions` bodies routed to an `openai-completions`, `anthropic-messages` or
+`openai-responses` upstream go through a conversion to a Completions body first, and that
+conversion (`src/handlers/openai.ts`) emitted only `{model, messages, stream}` in every
+branch — so an Interactions client lost four request-level fields on any non-Gemini route:
+`system_instruction`, `tools`, `generation_config.stop_sequences`, and (unchanged below) the
+rest of `generation_config`. The function now assembles its four input shapes' messages
+first and then carries the three fields that have a Completions equivalent:
+
+- **`system_instruction` → leading `role: "system"` message.** Both spellings are read — the
+  Interactions top-level string and generateContent's `{parts:[{text}]}` wrapper — matching
+  what `convertGeminiGenerateContentToOpenAI` does with `systemInstruction`.
+- **`tools` → Completions `tools[]`.** Both shapes are read: the flat Interactions
+  `{type:'function', name, description, parameters}` entry and the native
+  `{functionDeclarations:[...]}` wrapper. Parameters go through `normalizeGeminiSchema`, so
+  Gemini's uppercase type names are lowercased for the upstream. Non-function Gemini tools
+  (`google_search`, `code_execution`, …) still have no Completions equivalent and are
+  dropped, as on the generateContent path — the one remaining silent loss on this route.
+- **`generation_config.stop_sequences` → `stop`**, snake_case and camelCase both accepted,
+  bare string normalized to a one-element array, omitted when empty or absent. At the second
+  hop it lands as `stop_sequences` on an `anthropic-messages` upstream; the
+  `openai-responses` hop still drops it (no such field in the Responses API), pinned by test.
+
+**Still dropped, same as the generateContent path**: `temperature`, `top_p`,
+`max_output_tokens` (and `seed`, `response_mime_type`). `tool_choice` is carried as of the
+entry above. Not a new decision — it is the shared gap tracked under the entry below.
+
+Tests: `tests/unit/gemini-interactions-to-openai.test.ts` (15 cases — both system-prompt
+spellings, absence, the no-mutation guarantee on the caller's `input.messages`, both tool
+shapes, the non-function drop, both stop spellings, the empty list, both second-hop
+carry-throughs including the pinned `openai-responses` stop drop, the `input.messages`
+passthrough, and the invalid-body throw). Full unit suite 2727/2727.
+
+### fix(generate-content): `generationConfig.stopSequences` reaches the upstreams that can carry it
+
+A Gemini client's stop sequences were lost on every non-Gemini route:
+`convertGeminiGenerateContentToOpenAI` (`src/handlers/openai.ts`) read
+`generationConfig` for exactly one thing — the `stream` flag — and emitted only
+`{model, messages, stream, tools}`. Nothing downstream could recover them, so the
+second hop's own stop mapping (`completionsToClaudeBody`: `stop` → `stop_sequences`)
+never had anything to map.
+
+- **Hop 1 now maps `generationConfig.stopSequences` → `stop`**, the Completions
+  field, normalizing a bare string to a one-element array the way the surrounding
+  converters do. This covers both cross-mode targets that can carry it: an
+  `openai-completions` upstream takes `stop` natively, and an `anthropic-messages`
+  upstream receives `stop_sequences` via `completionsToClaudeBody`.
+- **The `openai-responses` hop still drops it, and that is not fixable here**: the
+  Responses API has no stop-sequence parameter, so `completionsToResponsesBody`
+  has nothing to map `stop` to. Pinned by test so the drop stays visible rather
+  than silently assumed.
+- **Out of scope, deliberately**: the other `generationConfig` knobs
+  (`temperature`, `topP`, `topK`, `maxOutputTokens`) are still dropped at hop 1 —
+  same loss, larger behaviour change, left for a decision of its own.
+
+Tests: `tests/unit/handlers.test.ts` (6 cases — the map, the string
+normalization, absence, an empty list, the `stop_sequences` carry-through, and
+the pinned `openai-responses` drop). Full unit suite 2712/2712.
+
 ### fix(chat-completions): the `gemini-generatecontent` route reports what it cannot carry
 
 The tools-and-streaming fixes below left three places where this route lost information without a

@@ -78,67 +78,197 @@ function geminiPartsToOpenAIContent(
   return out;
 }
 
+/** Map a Gemini guided-decoding mode/type onto the Completions vocabulary. */
+function geminiToolChoiceMode(value: unknown): 'auto' | 'none' | 'required' | undefined {
+  if (typeof value !== 'string') return undefined;
+  switch (value.toLowerCase()) {
+    case 'auto':
+    case 'any':
+    case 'dynamic':
+      return 'auto';
+    case 'none':
+      return 'none';
+    case 'validated':
+      return 'required';
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Map a Gemini tool-choice value onto the Completions `tool_choice` vocabulary.
+ *
+ * Three spellings reach this: the Interactions `generation_config.tool_choice`
+ * (bare enum, `{type, function}`, or `{mode, tools}`), generateContent's
+ * `toolConfig.functionCallingConfig` (`{mode: 'AUTO'|'ANY'|'NONE',
+ * allowedFunctionNames}`), and generateContent's own `tool_choice`. Completions
+ * only has `'auto'`, `'none'`, `'required'` and a forced single function:
+ *
+ *   'auto' | 'any' | 'dynamic'              → 'auto'
+ *   'none'                                  → 'none'
+ *   'validated'                             → 'required'
+ *   {function:{name}} / one-name allow-list → {type:'function', function:{name}}
+ *   allow-list of 2+ names                  → 'required'  (looser: the model may
+ *                                             call any declared tool, not only
+ *                                             one of the listed ones)
+ *   absent / unrecognized                   → undefined   (key omitted)
+ *
+ * `any` maps to `'auto'`, not to `'required'`: a client asking for "any tool"
+ * is not asking for "a tool call and no prose", and the upstream vocabularies
+ * disagree on which one they mean. Both losses are documented in CHANGELOG.md.
+ */
+function geminiToolChoiceToOpenAI(toolChoice: unknown): unknown {
+  if (typeof toolChoice === 'string') return geminiToolChoiceMode(toolChoice);
+  if (!toolChoice || typeof toolChoice !== 'object') return undefined;
+  const cfg = toolChoice as Record<string, unknown>;
+
+  const fnName = (cfg.function as Record<string, unknown> | undefined)?.name;
+  if (typeof fnName === 'string' && fnName !== '') {
+    return { type: 'function', function: { name: fnName } };
+  }
+
+  // `allowedFunctionNames` is the generateContent spelling, `tools` the
+  // Interactions one. An empty or absent list constrains nothing.
+  const rawNames = Array.isArray(cfg.allowedFunctionNames) ? cfg.allowedFunctionNames : cfg.tools;
+  const names = Array.isArray(rawNames) ? rawNames.filter(n => typeof n === 'string' && n !== '') : [];
+  if (names.length === 1) return { type: 'function', function: { name: names[0] } };
+  if (names.length > 1) return 'required';
+
+  return geminiToolChoiceMode(cfg.type ?? cfg.mode);
+}
+
 /**
  * Convert Gemini Interactions request to OpenAI format
+ *
+ * Carries the same three request-level things `convertGeminiGenerateContentToOpenAI`
+ * does — the system prompt, the tool declarations and `stop_sequences` — because
+ * an Interactions client's body is re-targeted to the same upstream families
+ * (openai-completions natively, anthropic-messages via `completionsToClaudeBody`,
+ * openai-responses via `completionsToResponsesBody`). The rest of
+ * `generation_config` (`temperature`, `top_p`, `max_output_tokens`) is dropped
+ * here exactly as it is on the generateContent path.
  */
 export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, unknown>): Record<string, unknown> {
   const model = (geminiRequest.model as string) || 'gemini-no-id-at-proxy';
+  let messages: unknown[] | undefined;
 
   // Handle input.messages format (Interactions API)
   if (geminiRequest.input && typeof geminiRequest.input === 'object') {
     const input = geminiRequest.input as Record<string, unknown>;
     if (Array.isArray(input.messages)) {
-      return {
-        model,
-        messages: input.messages,
-        stream: geminiRequest.stream || false,
-      };
+      messages = input.messages;
     }
   }
 
   // Handle input as array-of-turns (TC203: [{role, content}, ...]).
   // String content is preserved; array content (Gemini parts shape) is
   // routed through geminiPartsToOpenAIContent so inline_data images survive.
-  if (Array.isArray(geminiRequest.input)) {
-    return {
-      model,
-      messages: (geminiRequest.input as any[]).map((turn: any) => ({
-        role: turn.role === 'model' ? 'assistant' : turn.role,
-        content: typeof turn.content === 'string'
-          ? turn.content
-          : Array.isArray(turn.content)
-            ? geminiPartsToOpenAIContent(turn.content)
-            : String(turn.content ?? ''),
-      })),
-      stream: geminiRequest.stream || false,
-    };
+  if (!messages && Array.isArray(geminiRequest.input)) {
+    messages = (geminiRequest.input as any[]).map((turn: any) => ({
+      role: turn.role === 'model' ? 'assistant' : turn.role,
+      content: typeof turn.content === 'string'
+        ? turn.content
+        : Array.isArray(turn.content)
+          ? geminiPartsToOpenAIContent(turn.content)
+          : String(turn.content ?? ''),
+    }));
   }
 
   // Handle simple input format
-  if (typeof geminiRequest.input === 'string') {
-    return {
-      model,
-      messages: [{ role: 'user', content: geminiRequest.input }],
-      stream: geminiRequest.stream || false,
-    };
+  if (!messages && typeof geminiRequest.input === 'string') {
+    messages = [{ role: 'user', content: geminiRequest.input }];
   }
 
   // Handle contents format (Gemini generateContent shape).
   // Each content's parts → OpenAI content via geminiPartsToOpenAIContent.
-  if (Array.isArray(geminiRequest.contents)) {
-    const messages = (geminiRequest.contents as any[]).map((content: any) => ({
+  if (!messages && Array.isArray(geminiRequest.contents)) {
+    messages = (geminiRequest.contents as any[]).map((content: any) => ({
       role: content.role === 'model' ? 'assistant' : content.role,
       content: geminiPartsToOpenAIContent(content.parts),
     }));
-
-    return {
-      model,
-      messages,
-      stream: geminiRequest.stream || false,
-    };
   }
 
-  throw new Error('Invalid Gemini Interactions request format');
+  if (!messages) {
+    throw new Error('Invalid Gemini Interactions request format');
+  }
+
+  // `system_instruction` is a top-level string on the Interactions API, while
+  // generateContent wraps it as `{parts:[{text}]}`; both forms become the
+  // leading OpenAI system message (mirroring convertGeminiGenerateContentToOpenAI).
+  const sysInstr = (geminiRequest.system_instruction ?? geminiRequest.systemInstruction) as
+    string | Record<string, unknown> | undefined;
+  if (sysInstr) {
+    const parts = typeof sysInstr === 'object' ? sysInstr.parts as Array<Record<string, unknown>> | undefined : undefined;
+    const systemText = Array.isArray(parts)
+      ? parts.map(p => (typeof p.text === 'string' ? p.text : '')).join('')
+      : typeof sysInstr === 'string' ? sysInstr : typeof sysInstr.text === 'string' ? sysInstr.text : '';
+    if (systemText) {
+      // New array, not unshift: `messages` may be the caller's own
+      // `input.messages` array, which must not be mutated.
+      messages = [{ role: 'system', content: systemText }, ...messages];
+    }
+  }
+
+  const result: Record<string, unknown> = {
+    model,
+    messages,
+    stream: geminiRequest.stream || false,
+  };
+
+  // Convert Gemini tools to OpenAI tools[]. The Interactions API declares a flat
+  // `{type:'function', name, description, parameters}` entry; a body that came
+  // from the generateContent shape (or went through before_conversion) carries
+  // `functionDeclarations`. Accept both. Non-function Gemini tools
+  // (google_search, code_execution, …) have no Completions equivalent and are
+  // still dropped, as on the generateContent path.
+  const tools: unknown[] = [];
+  if (Array.isArray(geminiRequest.tools)) {
+    for (const tool of geminiRequest.tools as any[]) {
+      const decls: any[] = Array.isArray(tool?.functionDeclarations)
+        ? tool.functionDeclarations
+        : typeof tool?.name === 'string' && tool.name !== '' ? [tool] : [];
+      for (const fd of decls) {
+        tools.push({
+          type: 'function',
+          function: {
+            name: fd.name,
+            description: fd.description,
+            parameters: normalizeGeminiSchema(fd.parameters ?? { type: 'object', properties: {} }),
+          },
+        });
+      }
+    }
+  }
+  if (tools.length > 0) result.tools = tools;
+
+  // `generation_config.stop_sequences` is the one generation knob with a
+  // Completions equivalent here too. Snake_case is the Interactions spelling,
+  // camelCase the generateContent one; both are read. Same trade-off as the
+  // generateContent path: an openai-completions upstream takes `stop` natively
+  // and anthropic-messages receives it as `stop_sequences`, while the
+  // openai-responses hop still drops it (the Responses API has no such field).
+  const config = (geminiRequest.generation_config ?? geminiRequest.generationConfig) as
+    Record<string, unknown> | undefined;
+  const stopSequences = config?.stop_sequences ?? config?.stopSequences;
+  const stop = Array.isArray(stopSequences)
+    ? stopSequences
+    : typeof stopSequences === 'string' ? [stopSequences] : [];
+  // An empty list means "no stop sequences"; emitting `stop: []` would be a new
+  // wire value for an upstream that never saw the field.
+  if (stop.length > 0) result.stop = stop;
+
+  // `tool_choice` (Interactions) / `toolConfig.functionCallingConfig`
+  // (generateContent shape). Only emitted when a tool survived the conversion:
+  // a tool_choice naming no declared function is an upstream error, and one
+  // sent alongside an empty tools list would be a new wire value for nothing.
+  const toolChoice = geminiToolChoiceToOpenAI(
+    config?.tool_choice
+      ?? config?.toolChoice
+      ?? (geminiRequest.toolConfig as Record<string, unknown> | undefined)?.functionCallingConfig,
+  );
+  if (tools.length > 0 && toolChoice !== undefined) result.tool_choice = toolChoice;
+
+  return result;
 }
 
 /**
@@ -297,6 +427,28 @@ export function convertGeminiGenerateContentToOpenAI(geminiRequest: Record<strin
 
     const result: Record<string, unknown> = { model, messages, stream };
     if (tools.length > 0) result.tools = tools;
+
+    // `generationConfig.stopSequences` is the one generation knob with a
+    // Completions equivalent, and the two cross-mode targets this body gets
+    // re-targeted to can carry it: an openai-completions upstream takes `stop`
+    // natively, and an anthropic-messages upstream receives it as `stop_sequences`
+    // via `completionsToClaudeBody`. The openai-responses hop still drops it — the
+    // Responses API has no stop-sequence field (`completionsToResponsesBody`).
+    const stopSequences = config?.stopSequences;
+    const stop = Array.isArray(stopSequences)
+      ? stopSequences
+      : typeof stopSequences === 'string' ? [stopSequences] : [];
+    // An empty list means "no stop sequences"; emitting `stop: []` would be a new
+    // wire value for an upstream that never saw the field.
+    if (stop.length > 0) result.stop = stop;
+
+    // `toolConfig.functionCallingConfig` (native spelling) or `tool_choice`.
+    // Same gate as the Interactions path: no surviving tool, no tool_choice.
+    const toolChoice = geminiToolChoiceToOpenAI(
+      (geminiRequest.toolConfig as Record<string, unknown> | undefined)?.functionCallingConfig
+        ?? config?.tool_choice,
+    );
+    if (tools.length > 0 && toolChoice !== undefined) result.tool_choice = toolChoice;
     return result;
   }
 
@@ -644,6 +796,30 @@ async function openAIContentToClaudeStringOrBlocks(
   return blocks;
 }
 
+/** The forced function name of a Completions `{type:'function', function:{name}}` tool_choice. */
+function completionsForcedToolName(toolChoice: unknown): string | undefined {
+  if (!toolChoice || typeof toolChoice !== 'object') return undefined;
+  const name = ((toolChoice as Record<string, unknown>).function as Record<string, unknown> | undefined)?.name;
+  return typeof name === 'string' && name !== '' ? name : undefined;
+}
+
+/** Map a Completions `tool_choice` onto the Claude Messages vocabulary. */
+function completionsToolChoiceToClaude(toolChoice: unknown): Record<string, unknown> | undefined {
+  if (toolChoice === 'auto') return { type: 'auto' };
+  if (toolChoice === 'none') return { type: 'none' };
+  // Completions' "a tool call and no prose" is Claude's `any`.
+  if (toolChoice === 'required') return { type: 'any' };
+  const name = completionsForcedToolName(toolChoice);
+  return name === undefined ? undefined : { type: 'tool', name };
+}
+
+/** Map a Completions `tool_choice` onto the Responses vocabulary. */
+function completionsToolChoiceToResponses(toolChoice: unknown): unknown {
+  if (toolChoice === 'auto' || toolChoice === 'none' || toolChoice === 'required') return toolChoice;
+  const name = completionsForcedToolName(toolChoice);
+  return name === undefined ? undefined : { type: 'function', name };
+}
+
 /**
  * Convert an OpenAI Chat Completions body (model, messages, max_tokens, ...) to a
  * Claude Messages body. Used to route Gemini endpoints (interactions/generateContent)
@@ -724,6 +900,10 @@ export async function completionsToClaudeBody(completions: Record<string, unknow
       description: t.function.description,
       input_schema: t.function.parameters ?? { type: 'object', properties: {} },
     }));
+
+    // Gated on the tools above: Claude rejects a tool_choice with no tools.
+    const toolChoice = completionsToolChoiceToClaude(completions.tool_choice);
+    if (toolChoice !== undefined) claudeBody.tool_choice = toolChoice;
   }
 
   return claudeBody;
@@ -806,6 +986,10 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
       description: t.function.description,
       parameters: t.function.parameters,
     }));
+
+    // Gated on the tools above: a tool_choice with no tools is rejected upstream.
+    const toolChoice = completionsToolChoiceToResponses(completions.tool_choice);
+    if (toolChoice !== undefined) responsesBody.tool_choice = toolChoice;
   }
 
   return responsesBody;
