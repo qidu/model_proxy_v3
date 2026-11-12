@@ -59,6 +59,68 @@ function geminiStreamResponse(textChunks: string[]): Response {
   });
 }
 
+/**
+ * A Gemini SSE stream whose turn ends in a function call: one text chunk, then
+ * a chunk carrying the complete functionCall together with finishReason STOP
+ * and the turn's usageMetadata (the shape a real :streamGenerateContent emits).
+ */
+function geminiToolCallStreamResponse(): Response {
+  const encoder = new TextEncoder();
+  const events = [
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'Checking.' }] }, finishReason: null }] },
+    {
+      candidates: [{
+        content: { role: 'model', parts: [{ functionCall: { name: 'get_weather', args: { city: 'sf' } } }] },
+        finishReason: 'STOP',
+      }],
+      usageMetadata: { promptTokenCount: 31, candidatesTokenCount: 17, totalTokenCount: 48 },
+    },
+  ].map(e => `data: ${JSON.stringify(e)}\n\n`);
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const p of events) controller.enqueue(encoder.encode(p));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
+function parseSSE(text: string): { chunks: any[]; raw: string[] } {
+  const raw = text.split('\n\n').filter(s => s.startsWith('data: ')).map(s => s.slice(6));
+  return { chunks: raw.filter(s => s !== '[DONE]').map(s => JSON.parse(s)), raw };
+}
+
+/** A Gemini SSE stream with a thought part and a finishReason OpenAI has no name for. */
+function geminiThoughtAndUnknownFinishStreamResponse(): Response {
+  const encoder = new TextEncoder();
+  const events = [
+    { candidates: [{ content: { role: 'model', parts: [{ thought: true, text: 'thinking' }] }, finishReason: null }] },
+    { candidates: [{ content: { role: 'model', parts: [] }, finishReason: 'MALFORMED_FUNCTION_CALL' }] },
+  ].map(e => `data: ${JSON.stringify(e)}\n\n`);
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const p of events) controller.enqueue(encoder.encode(p));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
+/** Collects the handler's warnings so the fail-loud (Rule #8) path can be asserted. */
+function recordingLogger(): { logger: any; warnings: string[] } {
+  const warnings: string[] = [];
+  const noop = () => {};
+  return {
+    warnings,
+    logger: {
+      traceEnabled: false,
+      trace: noop, debug: noop, info: noop,
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+      error: (_requestId: string, message: string) => { warnings.push(message); },
+    },
+  };
+}
+
 describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode', () => {
   const realFetch = globalThis.fetch;
   after(() => { globalThis.fetch = realFetch; });
@@ -144,6 +206,111 @@ describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode
     const lastChunk = parsed[parsed.length - 1];
     assert.equal(lastChunk.choices[0].finish_reason, 'stop');
     assert.equal(chunks[chunks.length - 1], '[DONE]');
+  });
+
+  it('streaming: a functionCall becomes an OpenAI tool_calls delta with finish_reason tool_calls', async () => {
+    globalThis.fetch = (async () => geminiToolCallStreamResponse()) as typeof fetch;
+
+    const req = makeRequest({
+      model: 'g', messages: [{ role: 'user', content: 'weather in sf?' }],
+    }, true);
+    const res = await handleChatCompletionsPassthrough(
+      req, 'https://upstream/v1beta/models/g:generateContent',
+      { Authorization: 'Bearer k' }, 'rid-5', testLogger, env, 'g', 'gemini-generatecontent',
+    );
+
+    const { chunks, raw } = parseSSE(await res.text());
+
+    // The text part still streams as content, ahead of the call.
+    assert.equal(chunks[0].choices[0].delta.content, 'Checking.');
+
+    const toolChunk = chunks.find(c => c.choices[0]?.delta?.tool_calls);
+    assert.ok(toolChunk, 'expected a chunk carrying delta.tool_calls');
+    const call = toolChunk.choices[0].delta.tool_calls[0];
+    assert.equal(call.index, 0);
+    assert.match(call.id, /^tool_\d+_0$/);
+    assert.equal(call.type, 'function');
+    assert.equal(call.function.name, 'get_weather');
+    // arguments is the JSON string form of functionCall.args, not the object.
+    assert.deepEqual(JSON.parse(call.function.arguments), { city: 'sf' });
+
+    // Gemini says STOP here; the call is what makes this a tool turn.
+    const finish = chunks.find(c => c.choices[0]?.finish_reason);
+    assert.equal(finish.choices[0].finish_reason, 'tool_calls');
+    assert.equal(raw[raw.length - 1], '[DONE]');
+  });
+
+  it('streaming: emits the usage chunk when stream_options.include_usage is set', async () => {
+    globalThis.fetch = (async () => geminiToolCallStreamResponse()) as typeof fetch;
+
+    const req = makeRequest({
+      model: 'g', messages: [{ role: 'user', content: 'hi' }],
+      stream_options: { include_usage: true },
+    }, true);
+    const res = await handleChatCompletionsPassthrough(
+      req, 'https://upstream/v1beta/models/g:generateContent',
+      { Authorization: 'Bearer k' }, 'rid-6', testLogger, env, 'g', 'gemini-generatecontent',
+    );
+
+    const { chunks, raw } = parseSSE(await res.text());
+
+    const usageChunk = chunks.find(c => c.usage);
+    assert.ok(usageChunk, 'expected a final usage chunk');
+    assert.deepEqual(usageChunk.choices, []);
+    assert.deepEqual(usageChunk.usage, { prompt_tokens: 31, completion_tokens: 17, total_tokens: 48 });
+    // Usage comes last, before the sentinel.
+    assert.equal(chunks[chunks.length - 1], usageChunk);
+    assert.equal(raw[raw.length - 1], '[DONE]');
+  });
+
+  it('streaming: no usage chunk when the client did not ask for one', async () => {
+    globalThis.fetch = (async () => geminiToolCallStreamResponse()) as typeof fetch;
+
+    const req = makeRequest({
+      model: 'g', messages: [{ role: 'user', content: 'hi' }],
+    }, true);
+    const res = await handleChatCompletionsPassthrough(
+      req, 'https://upstream/v1beta/models/g:generateContent',
+      { Authorization: 'Bearer k' }, 'rid-7', testLogger, env, 'g', 'gemini-generatecontent',
+    );
+
+    const { chunks } = parseSSE(await res.text());
+    assert.equal(chunks.filter(c => c.usage).length, 0);
+    // The finish chunk still reaches the client.
+    assert.equal(chunks.find(c => c.choices[0]?.finish_reason).choices[0].finish_reason, 'tool_calls');
+  });
+
+  it('streaming: warns with the dropped part kind and the raw unmapped finishReason', async () => {
+    globalThis.fetch = (async () => geminiThoughtAndUnknownFinishStreamResponse()) as typeof fetch;
+    const { logger, warnings } = recordingLogger();
+
+    const req = makeRequest({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }, true);
+    const res = await handleChatCompletionsPassthrough(
+      req, 'https://upstream/v1beta/models/g:generateContent',
+      { Authorization: 'Bearer k' }, 'rid-8', logger, env, 'g', 'gemini-generatecontent',
+    );
+
+    const { chunks } = parseSSE(await res.text());
+    // The thought text is not answered as content, so its kind is what must be reported.
+    assert.equal(chunks.filter(c => c.choices[0]?.delta?.content).length, 0);
+    const log = warnings.join('\n');
+    assert.match(log, /dropped thought reply part\(s\)/);
+    assert.match(log, /unmapped finishReason "MALFORMED_FUNCTION_CALL", reported as "stop"/);
+    // The turn still closes with a finish_reason, so the client is not left hanging.
+    assert.equal(chunks.find(c => c.choices[0]?.finish_reason).choices[0].finish_reason, 'stop');
+  });
+
+  it('streaming: warns about nothing on a clean text stream', async () => {
+    globalThis.fetch = (async () => geminiStreamResponse(['ok'])) as typeof fetch;
+    const { logger, warnings } = recordingLogger();
+
+    const req = makeRequest({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }, true);
+    await handleChatCompletionsPassthrough(
+      req, 'https://upstream/v1beta/models/g:generateContent',
+      { Authorization: 'Bearer k' }, 'rid-9', logger, env, 'g', 'gemini-generatecontent',
+    );
+
+    assert.deepEqual(warnings, []);
   });
 
   it('propagates upstream error status unchanged', async () => {

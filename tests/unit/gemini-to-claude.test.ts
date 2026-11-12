@@ -7,6 +7,17 @@ import {
 } from '../../src/converters/gemini-to-claude.js';
 import type { GeminiInteractionResponse } from '../../src/types/gemini.js';
 
+/** Collects the converter's warnings so the fail-loud (Rule #8) path can be asserted. */
+function recordingLogger(): { logger: any; warnings: string[] } {
+  const warnings: string[] = [];
+  return {
+    warnings,
+    logger: {
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    },
+  };
+}
+
 /**
  * Direct field-level coverage for the Gemini -> Claude response converters.
  * Previously these were only exercised indirectly through the HTTP
@@ -329,5 +340,78 @@ describe('convertGeminiGenerateContentToClaude', () => {
     assert.equal(resp.content.length, 1);
     assert.deepEqual((resp.content[0] as any).input, {});
     assert.equal(resp.stop_reason, 'tool_use');
+  });
+
+  it('warns with the raw finishReason it cannot map, and still leaves stop_reason null', () => {
+    const { logger, warnings } = recordingLogger();
+    const resp = convertGeminiGenerateContentToClaude(
+      { candidates: [{ content: { parts: [{ text: 'x' }] }, finishReason: 'MALFORMED_FUNCTION_CALL' }] },
+      'm',
+      'rid',
+      { logger },
+    );
+
+    assert.equal(resp.stop_reason, null);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /unmapped Gemini finishReason "MALFORMED_FUNCTION_CALL"/);
+  });
+
+  it('reports each dropped reply-part kind instead of shortening the answer silently', () => {
+    const { logger, warnings } = recordingLogger();
+    const resp = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{
+          content: {
+            parts: [
+              { text: 'here' },
+              { inlineData: { mimeType: 'image/png', data: 'AAA' } },
+              { inline_data: { mime_type: 'image/png', data: 'BBB' } },
+            ],
+          },
+          finishReason: 'STOP',
+        }],
+      },
+      'm',
+      'rid',
+      { logger },
+    );
+
+    assert.deepEqual(resp.content, [{ type: 'text', text: 'here' }]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /no Claude Messages projection: inline_data×2$/);
+  });
+
+  it('reports thought parts, which this path folds into the answer text', () => {
+    const { logger, warnings } = recordingLogger();
+    const resp = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{
+          content: { parts: [{ thought: true, text: 'considering' }, { text: 'answer' }] },
+          finishReason: 'STOP',
+        }],
+      },
+      'm',
+      'rid',
+      { logger },
+    );
+
+    // Current behaviour, now reported rather than silent: both parts land in one
+    // text block, because this path has no thinking projection.
+    assert.deepEqual(resp.content, [{ type: 'text', text: 'consideringanswer' }]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /folded 1 thought part\(s\) into the answer text/);
+  });
+
+  it('warns about nothing on a clean text response with a mapped finishReason', () => {
+    const { logger, warnings } = recordingLogger();
+    const resp = convertGeminiGenerateContentToClaude(
+      { candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] },
+      'm',
+      'rid',
+      { logger },
+    );
+
+    assert.deepEqual(resp.content, [{ type: 'text', text: 'ok' }]);
+    assert.deepEqual(warnings, []);
   });
 });

@@ -6,6 +6,7 @@
 import { ClaudeMessagesResponse, ClaudeContentBlock, ClaudeTextBlock, ClaudeToolUseBlock, ClaudeToolResultBlock } from '../types/claude.js';
 import { GeminiInteractionResponse, GeminiContent, GeminiUsage } from '../types/gemini.js';
 import { stringify } from '../utils/stringify.js';
+import { Logger } from '../utils/logger.js';
 
 /**
  * Convert Gemini interaction response to Claude format
@@ -167,12 +168,17 @@ function mapGeminiStatusToStopReason(
 }
 
 /**
- * Convert Gemini generateContent response to Claude format
+ * Convert Gemini generateContent response to Claude format.
+ *
+ * `options.logger` is optional and carries warnings only: Rule #8 requires a
+ * reply part this converter cannot project, and any `finishReason` it does not
+ * map, to be reported rather than vanish into an answer that looks complete.
  */
 export function convertGeminiGenerateContentToClaude(
     geminiResponse: Record<string, unknown>,
     model: string,
-    requestId: string
+    requestId: string,
+    options?: { logger?: Logger },
 ): ClaudeMessagesResponse {
     const candidates = geminiResponse.candidates as Array<Record<string, unknown>> | undefined;
     const usageMetadata = geminiResponse.usageMetadata as Record<string, number> | undefined;
@@ -191,6 +197,10 @@ export function convertGeminiGenerateContentToClaude(
             if (parts && parts.length > 0) {
                 const textParts: string[] = [];
                 const toolUseBlocks: ClaudeToolUseBlock[] = [];
+                // Rule #8: a part this converter cannot project must be counted by
+                // kind and reported, not dropped into a shorter, clean-looking answer.
+                const droppedKinds = new Map<string, number>();
+                let thoughtParts = 0;
                 for (const part of parts) {
                     const functionCall = part.functionCall as Record<string, unknown> | undefined;
                     if (functionCall) {
@@ -202,9 +212,35 @@ export function convertGeminiGenerateContentToClaude(
                             name: functionCall.name as string,
                             input: functionCall.args ?? {},
                         });
-                    } else if (part.text) {
-                        textParts.push(part.text as string);
+                    } else if (typeof part.text === 'string') {
+                        // A thought part carries the same `text` field, so it lands
+                        // here and is answered as ordinary text: this path has no
+                        // thinking projection, which the warning below states.
+                        if (part.thought === true) thoughtParts++;
+                        textParts.push(part.text);
+                    } else {
+                        const kind = part.inline_data || part.inlineData ? 'inline_data'
+                            : part.functionResponse ? 'functionResponse'
+                            : part.executableCode ? 'executableCode'
+                            : part.codeExecutionResult ? 'codeExecutionResult'
+                            : part.file_data || part.fileData ? 'file_data'
+                            : Object.keys(part).join('+') || '<empty>';
+                        droppedKinds.set(kind, (droppedKinds.get(kind) ?? 0) + 1);
                     }
+                }
+                if (droppedKinds.size > 0) {
+                    options?.logger?.warn(
+                        requestId,
+                        `[gemini->claude] dropped generateContent reply part(s) with no Claude Messages projection: ` +
+                        [...droppedKinds].map(([kind, n]) => `${kind}×${n}`).join(', ')
+                    );
+                }
+                if (thoughtParts > 0) {
+                    options?.logger?.warn(
+                        requestId,
+                        `[gemini->claude] folded ${thoughtParts} thought part(s) into the answer text ` +
+                        `(this path has no thinking/reasoning projection)`
+                    );
                 }
                 const blocks: ClaudeContentBlock[] = [];
                 if (textParts.length > 0) {
@@ -231,6 +267,17 @@ export function convertGeminiGenerateContentToClaude(
             case 'RECITATION':
                 stopReason = 'stop_sequence';
                 break;
+            default:
+                // Rule #8: an unmapped raw value must not read as a clean stop when
+                // it reaches the client. `undefined`/`null`/`FINISH_REASON_UNSPECIFIED`
+                // mean "no reason given", which is nothing to report.
+                if (finishReason && finishReason !== 'FINISH_REASON_UNSPECIFIED') {
+                    options?.logger?.warn(
+                        requestId,
+                        `[gemini->claude] unmapped Gemini finishReason ${JSON.stringify(finishReason)}; ` +
+                        `stop_reason left null (an OpenAI client sees "stop")`
+                    );
+                }
         }
 
         // Gemini reports a tool call as finishReason STOP; the block itself

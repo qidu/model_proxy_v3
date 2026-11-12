@@ -276,17 +276,68 @@ export async function convertCompletionsToGeminiGenerateContentBody(
 
     const tools = completions.tools as Array<Record<string, unknown>> | undefined;
     if (Array.isArray(tools) && tools.length > 0) {
-        const fds = tools
-            .map(t => {
+        // Fail Loud (Rule #8): Gemini rejects a nameless declaration anyway, and a
+        // silently dropped tool leaves the model unable to call one the client
+        // asked for. Name the tool kinds, so a non-`function` tool (which this
+        // route has no Gemini equivalent for) is not reported as a missing name.
+        const nameless = tools.filter(t => {
+            const name = (t.function as Record<string, unknown> | undefined)?.name;
+            return typeof name !== 'string' || name === '';
+        });
+        if (nameless.length > 0) {
+            const kinds = [...new Set(nameless.map(t =>
+                typeof t.type === 'string' && t.type !== '' ? t.type : 'untyped'))];
+            throw new Error(
+                `Cannot convert ${nameless.length} OpenAI tool(s) to Gemini functionDeclarations: ` +
+                `no "function.name" (tool type(s): ${kinds.join(', ')})`
+            );
+        }
+        geminiBody.tools = [{
+            functionDeclarations: tools.map(t => {
                 const fn = (t.function ?? {}) as Record<string, unknown>;
                 return {
                     name: fn.name,
                     description: fn.description ?? '',
-                    parameters: fn.parameters ?? { type: 'object', properties: {} },
+                    // Gemini's Schema is an OpenAPI subset, so clean it exactly as
+                    // the Claude path above does: OpenAI tool parameters commonly
+                    // carry '$schema', 'additionalProperties' and a 'format' the
+                    // upstream rejects.
+                    parameters: recursivelyCleanSchema(fn.parameters ?? { type: 'object', properties: {} }),
                 };
-            })
-            .filter(fd => typeof fd.name === 'string');
-        if (fds.length > 0) geminiBody.tools = [{ functionDeclarations: fds }];
+            }),
+        }];
+    }
+
+    // Add tool choice — the same functionCallingConfig the Claude path above
+    // builds. Without it a request that forces one function reaches Gemini
+    // indistinguishable from "auto", so the model may answer in prose instead.
+    const toolChoice = completions.tool_choice;
+    if (toolChoice !== undefined && toolChoice !== null) {
+        const functionCallingConfig: Record<string, unknown> = {};
+        if (toolChoice === 'auto') {
+            functionCallingConfig.mode = 'AUTO';
+        } else if (toolChoice === 'none') {
+            functionCallingConfig.mode = 'NONE';
+        } else if (toolChoice === 'required') {
+            // OpenAI's "required" (any tool) == Gemini's ANY with no allow-list.
+            functionCallingConfig.mode = 'ANY';
+        } else if (typeof toolChoice === 'object') {
+            const name = ((toolChoice as Record<string, unknown>).function as Record<string, unknown> | undefined)?.name;
+            // Fail Loud (Rule #8): named intent we cannot honour must not downgrade
+            // to ANY, which would let the model call a different tool.
+            if (typeof name !== 'string' || name === '') {
+                throw new Error(
+                    'Cannot convert tool_choice to a Gemini functionCallingConfig: the forced-function form has no "function.name"'
+                );
+            }
+            functionCallingConfig.mode = 'ANY';
+            functionCallingConfig.allowedFunctionNames = [name];
+        } else {
+            throw new Error(
+                `Cannot convert tool_choice value ${stringify(toolChoice)} to a Gemini functionCallingConfig`
+            );
+        }
+        geminiBody.toolConfig = { functionCallingConfig };
     }
 
     if (completions.stream === true) geminiBody.stream = true;

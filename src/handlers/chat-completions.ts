@@ -482,15 +482,29 @@ export async function handleChatCompletionsPassthrough(
     if (isStreaming) {
       // Gemini SSE -> OpenAI chat.completion.chunk SSE. Each Gemini chunk is a
       // complete generateContent-style object with candidates[].content.parts[];
-      // we extract the text delta per chunk.
+      // we extract the text delta and any complete functionCall per chunk.
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
       const encoder = new TextEncoder();
+      // Same gate and chunk shape as the anthropic-messages branch above: usage
+      // only when the client asks via stream_options.include_usage, emitted as
+      // an empty-choices chunk just before [DONE].
+      const includeUsage = ((parsedBody.stream_options as Record<string, unknown> | undefined)?.include_usage === true);
+      let usagePromptTokens: number | undefined;
+      let usageCompletionTokens: number | undefined;
       (async () => {
         try {
           const reader = geminiUpstreamResponse.body!.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
+          // Gemini streams a functionCall whole, never split across chunks, so
+          // each one becomes a complete OpenAI tool_calls delta whose index
+          // counts the calls emitted so far.
+          let toolCallIndex = 0;
+          let sawToolCall = false;
+          // Rule #8: a part this mapper cannot project is reported once per kind
+          // per response, instead of leaving a shorter answer with no trace.
+          const droppedKindsWarned = new Set<string>();
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -509,6 +523,11 @@ export async function handleChatCompletionsPassthrough(
                 const parsed = JSON.parse(data) as Record<string, unknown>;
                 const candidates = parsed.candidates as Array<Record<string, unknown>> | undefined;
                 const parts = (candidates?.[0]?.content as Record<string, unknown> | undefined)?.parts as Array<Record<string, unknown>> | undefined;
+                const usageMetadata = parsed.usageMetadata as Record<string, unknown> | undefined;
+                if (usageMetadata) {
+                  if (typeof usageMetadata.promptTokenCount === 'number') usagePromptTokens = usageMetadata.promptTokenCount;
+                  if (typeof usageMetadata.candidatesTokenCount === 'number') usageCompletionTokens = usageMetadata.candidatesTokenCount;
+                }
                 const text = (parts ?? []).filter(p => typeof p.text === 'string' && !(p.thought === true)).map(p => p.text).join('');
                 if (text) {
                   const chunk = {
@@ -519,12 +538,60 @@ export async function handleChatCompletionsPassthrough(
                   logPipelineStage(logger, requestId, 'outbound', path, chunk);
                   await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 }
+                for (const part of parts ?? []) {
+                  const functionCall = part.functionCall as Record<string, unknown> | undefined;
+                  if (!functionCall) continue;
+                  sawToolCall = true;
+                  const index = toolCallIndex++;
+                  const chunk = {
+                    id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000), model,
+                    choices: [{
+                      index: 0,
+                      delta: {
+                        tool_calls: [{
+                          index,
+                          // generateContent carries no call id — mint one in the
+                          // shape the non-streaming converter uses, so a client
+                          // echoing it back keeps working either way.
+                          id: `tool_${Date.now()}_${index}`,
+                          type: 'function',
+                          function: { name: functionCall.name, arguments: JSON.stringify(functionCall.args ?? {}) },
+                        }],
+                      },
+                      finish_reason: null,
+                    }],
+                  };
+                  logPipelineStage(logger, requestId, 'outbound', path, chunk);
+                  await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                }
                 const finishReason = candidates?.[0]?.finishReason as string | undefined;
+                for (const part of parts ?? []) {
+                  if (part.functionCall) continue;
+                  // `thought` parts carry `text` too but are filtered out of the
+                  // answer above, so they are exactly a kind this mapper drops.
+                  if (typeof part.text === 'string' && part.thought !== true) continue;
+                  const kind = part.thought === true ? 'thought'
+                    : part.inline_data || part.inlineData ? 'inline_data'
+                    : part.functionResponse ? 'functionResponse'
+                    : Object.keys(part).join('+') || '<empty>';
+                  if (droppedKindsWarned.has(kind)) continue;
+                  droppedKindsWarned.add(kind);
+                  logger.warn(requestId, `${path} gemini-generatecontent stream: dropped ${kind} reply part(s) with no OpenAI chat.completion.chunk projection`);
+                }
                 if (finishReason && finishReason !== 'FINISH_REASON_UNSPECIFIED') {
-                  const mapped = finishReason === 'STOP' ? 'stop'
-                    : finishReason === 'MAX_TOKENS' ? 'length'
-                    : finishReason === 'SAFETY' || finishReason === 'RECITATION' ? 'content_filter'
-                    : 'stop';
+                  // Gemini reports a tool call as finishReason STOP; the call
+                  // itself is what makes this turn a tool turn.
+                  let mapped: string;
+                  if (sawToolCall) mapped = 'tool_calls';
+                  else if (finishReason === 'STOP') mapped = 'stop';
+                  else if (finishReason === 'MAX_TOKENS') mapped = 'length';
+                  else if (finishReason === 'SAFETY' || finishReason === 'RECITATION') mapped = 'content_filter';
+                  else {
+                    // Rule #8: report the raw value rather than let it read as a clean stop.
+                    logger.warn(requestId, `${path} gemini-generatecontent stream: unmapped finishReason ${JSON.stringify(finishReason)}, reported as "stop"`);
+                    mapped = 'stop';
+                  }
                   const chunk = {
                     id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk',
                     created: Math.floor(Date.now() / 1000), model,
@@ -535,6 +602,11 @@ export async function handleChatCompletionsPassthrough(
                 }
               } catch { /* skip unparseable events */ }
             }
+          }
+          if (includeUsage && usagePromptTokens !== undefined && usageCompletionTokens !== undefined) {
+            const usageChunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [], usage: { prompt_tokens: usagePromptTokens, completion_tokens: usageCompletionTokens, total_tokens: usagePromptTokens + usageCompletionTokens } };
+            logPipelineStage(logger, requestId, 'outbound', path, usageChunk);
+            await writer.write(encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`));
           }
           await writer.write(encoder.encode('data: [DONE]\n\n'));
           await writer.close();
@@ -558,7 +630,7 @@ export async function handleChatCompletionsPassthrough(
     const geminiJson = await receiveJsonResponse<Record<string, unknown>>(
       geminiUpstreamResponse, requestId, logger, geminiUpstreamResponse.url || geminiTargetUrl, request.signal,
     );
-    const claudeJson = convertGeminiGenerateContentToClaude(geminiJson, model, requestId) as unknown as Record<string, unknown>;
+    const claudeJson = convertGeminiGenerateContentToClaude(geminiJson, model, requestId, { logger }) as unknown as Record<string, unknown>;
     const completions = claudeJsonToSyntheticCompletions(claudeJson, model);
     logPipelineStage(logger, requestId, 'outbound', path, completions);
     const geminiOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };

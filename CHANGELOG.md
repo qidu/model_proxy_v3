@@ -5,6 +5,76 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(chat-completions): the `gemini-generatecontent` route reports what it cannot carry
+
+The tools-and-streaming fixes below left three places where this route lost information without a
+word, so a client could not tell a real answer from a silently shortened one. All three now speak up
+(Rule #8).
+
+- **A nameless tool is rejected, not filtered** (`src/converters/claude-to-gemini.ts`,
+  `convertCompletionsToGeminiGenerateContentBody`). The old `tools.filter(t => typeof
+  t.function?.name === 'string')` dropped such an entry and converted the rest, so the model could be
+  asked to use a tool it was never given. It now throws, naming the count and the offending tool
+  `type`(s) — a `type: "function"` tool with no name and a `type: "web_search"` tool with no Gemini
+  equivalent are different mistakes and are reported as such. An empty-string name throws too, where
+  the old filter let it through and sent `name: ""` upstream. This is what the Claude path in the
+  same file already did.
+- **The response converter reports dropped parts and unmapped finish reasons**
+  (`src/converters/gemini-to-claude.ts`, `convertGeminiGenerateContentToClaude`). It takes an
+  optional `options?: { logger }` (warnings only — the returned message is unchanged). It counts
+  every reply part it cannot project *by kind* (`inline_data`, `functionResponse`,
+  `executableCode`, `codeExecutionResult`, `file_data`, else its own key names) and warns once with
+  the counts; it counts thought parts separately, because this path has no thinking projection and
+  folds their `text` into the answer; and the `finishReason` switch gained a `default` arm that
+  warns with the raw value. `undefined` / `null` / `FINISH_REASON_UNSPECIFIED` mean "no reason
+  given" and stay quiet.
+- **The streaming mapper reports the same two classes** (`src/handlers/chat-completions.ts`, the
+  Gemini-SSE → `chat.completion.chunk` mapper). A part it skips is named by kind — once per kind per
+  response, so a long stream does not repeat itself — and an unmapped `finishReason` is warned with
+  its raw value *and* the `finish_reason` the client is actually handed (`stop`).
+
+Behaviour is otherwise unchanged, deliberately: an unmapped `finishReason` still leaves
+`stop_reason` null on the non-streaming path (an OpenAI client sees `"stop"`), and a thought part's
+text is still answered as ordinary text there. Both are now observable rather than hidden, and the
+tests pin the current shapes so a future fix surfaces as a test change.
+
+`src/handlers/gemini.ts` calls the same converter without a logger, so its warnings remain silent —
+that is a different front door and was left alone.
+
+### fix(chat-completions): `gemini-generatecontent` carries tool choice, cleaned schemas, and streamed calls
+
+Three gaps on the `/v1/chat/completions` → `upstream_mode = "gemini-generatecontent"` route made a
+tool-using client see a prose answer instead of a call. A live request with `tools` +
+`tool_choice: "auto"` came back as `content: ""`, `finish_reason: "stop"`, real `usage` — the model
+had answered in text that the route then dropped.
+
+- **`tool_choice` → `toolConfig.functionCallingConfig`** (`src/converters/claude-to-gemini.ts`,
+  `convertCompletionsToGeminiGenerateContentBody`). The converter never read `tool_choice`, so a
+  forced function reached Gemini indistinguishable from auto. Now `"auto"`→`AUTO`, `"none"`→`NONE`,
+  `"required"`→`ANY` (OpenAI's any-tool form), and `{type:"function",function:{name}}`→`ANY` plus
+  `allowedFunctionNames:[name]` — the same config the Claude path in the same file already built.
+  A forced-function form with no `function.name`, or any unrecognised `tool_choice` value, now
+  **throws** (Rule #8) instead of silently dropping the constraint: a downgrade to `ANY` would let
+  the model call a *different* tool, and a downgrade to nothing is what caused this bug.
+- **Tool parameters are cleaned for Gemini's OpenAPI subset.** `parameters` went through raw;
+  OpenAI function schemas routinely carry `$schema`, `additionalProperties` and `format` values the
+  upstream rejects. It now uses the same `recursivelyCleanSchema` the Claude path calls.
+- **Streaming `functionCall` and `usageMetadata`** (`src/handlers/chat-completions.ts`, the
+  Gemini-SSE → `chat.completion.chunk` mapper). The loop read only `parts[].text`, so a streamed call
+  vanished. Each `functionCall` part is now a complete `delta.tool_calls` entry — dense `index`
+  counted per response, a minted `id` (`tool_<ms>_<index>`, generateContent carries none),
+  `type: "function"`, `arguments` as the JSON-string form of `args` — and the turn ends with
+  `finish_reason: "tool_calls"` when any call was emitted (Gemini reports a call as `STOP`; the call
+  is what makes it a tool turn). `usageMetadata.promptTokenCount` /
+  `candidatesTokenCount` are captured and emitted as the empty-`choices` usage chunk before
+  `data: [DONE]`, gated on `stream_options.include_usage` exactly like the `anthropic-messages`
+  branch above it.
+
+Still not fixed on this route, and worth knowing before trusting a round-trip: the request converter
+emits `role: "tool"` for tool-result turns, where Gemini accepts only `user` and `model` — so a tool
+round-trip needs that fixed before it will work end to end. (The nameless-tool filter and the silent
+response-side drops noted here were fixed separately; see the entry above.)
+
 ### fix(chat-completions): an `openai-responses` upstream's answer is converted, not relayed
 
 `/v1/chat/completions` routed to an `upstream_mode = "openai-responses"` target converted the

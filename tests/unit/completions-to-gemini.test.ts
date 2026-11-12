@@ -128,4 +128,161 @@ describe('convertCompletionsToGeminiGenerateContentBody', () => {
       }],
     }]);
   });
+
+  it('cleans tool parameters the way Gemini requires (no $schema/additionalProperties/unsupported format)', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'lookup',
+            parameters: {
+              $schema: 'http://json-schema.org/draft-07/schema#',
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                email: { type: 'string', format: 'email' },
+                at: { type: 'string', format: 'date-time' },
+                filter: { type: 'object', properties: {}, additionalProperties: { type: 'string' } },
+              },
+              required: ['email'],
+            },
+          },
+        }],
+      },
+      'g',
+    );
+    const declarations = (out.tools as any[])[0].functionDeclarations;
+    assert.deepEqual(declarations[0].parameters, {
+      type: 'object',
+      properties: {
+        email: { type: 'string' },
+        at: { type: 'string', format: 'date-time' },
+        filter: { type: 'object', properties: {} },
+      },
+      required: ['email'],
+    });
+  });
+
+  it('maps tool_choice "auto" to functionCallingConfig mode AUTO', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g', messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+        tool_choice: 'auto',
+      },
+      'g',
+    );
+    assert.deepEqual(out.toolConfig, { functionCallingConfig: { mode: 'AUTO' } });
+  });
+
+  it('maps tool_choice "none" to functionCallingConfig mode NONE', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g', messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+        tool_choice: 'none',
+      },
+      'g',
+    );
+    assert.deepEqual(out.toolConfig, { functionCallingConfig: { mode: 'NONE' } });
+  });
+
+  it('maps tool_choice "required" to mode ANY with no allow-list', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g', messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+        tool_choice: 'required',
+      },
+      'g',
+    );
+    assert.deepEqual(out.toolConfig, { functionCallingConfig: { mode: 'ANY' } });
+  });
+
+  it('maps a forced function to mode ANY + allowedFunctionNames', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g', messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+        tool_choice: { type: 'function', function: { name: 'get_weather' } },
+      },
+      'g',
+    );
+    assert.deepEqual(out.toolConfig, {
+      functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather'] },
+    });
+  });
+
+  it('rejects a forced function_choice without a name rather than downgrading to ANY', async () => {
+    await assert.rejects(
+      () => convertCompletionsToGeminiGenerateContentBody(
+        {
+          model: 'g', messages: [{ role: 'user', content: 'hi' }],
+          tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+          tool_choice: { type: 'function', function: {} },
+        },
+        'g',
+      ),
+      (err: Error) => /tool_choice.*function\.name/.test(err.message),
+    );
+  });
+
+  it('rejects an unrecognised tool_choice value instead of silently sending none', async () => {
+    await assert.rejects(
+      () => convertCompletionsToGeminiGenerateContentBody(
+        { model: 'g', messages: [{ role: 'user', content: 'hi' }], tool_choice: 'sometimes' },
+        'g',
+      ),
+      (err: Error) => /Cannot convert tool_choice value "sometimes"/.test(err.message),
+    );
+  });
+
+  it('rejects a nameless tool instead of silently dropping it', async () => {
+    await assert.rejects(
+      () => convertCompletionsToGeminiGenerateContentBody(
+        {
+          model: 'g',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [
+            { type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } },
+            { type: 'function', function: { description: 'no name here' } },
+          ],
+        },
+        'g',
+      ),
+      (err: Error) => /1 OpenAI tool\(s\).*no "function\.name".*\(tool type\(s\): function\)/.test(err.message),
+    );
+  });
+
+  it('names the tool type when a non-function tool has no Gemini equivalent', async () => {
+    await assert.rejects(
+      () => convertCompletionsToGeminiGenerateContentBody(
+        {
+          model: 'g',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [
+            { type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } },
+            { type: 'web_search' },
+          ],
+        },
+        'g',
+      ),
+      (err: Error) => /1 OpenAI tool\(s\).*\(tool type\(s\): web_search\)/.test(err.message),
+    );
+  });
+
+  it('omits toolConfig when the client sends no tool_choice', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g', messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+      },
+      'g',
+    );
+    assert.equal(out.toolConfig, undefined);
+    assert.equal((out.tools as any[]).length, 1);
+  });
 });
