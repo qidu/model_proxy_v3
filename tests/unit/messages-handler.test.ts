@@ -136,6 +136,7 @@ describe('handleMessagesRequest', () => {
       model: 'gpt-test',
       content: [{ type: 'text', text: 'ok' }],
       stop_reason: 'end_turn',
+      stop_sequence: null,
       usage: { input_tokens: 3, output_tokens: 1 },
     });
   });
@@ -162,6 +163,7 @@ describe('handleMessagesRequest', () => {
       model: 'gpt-test',
       content: [{ type: 'text', text: 'ok' }],
       stop_reason: 'end_turn',
+      stop_sequence: null,
       usage: { input_tokens: 3, output_tokens: 1 },
     });
   });
@@ -230,6 +232,7 @@ describe('handleMessagesRequest', () => {
         },
       ],
       stop_reason: 'tool_use',
+      stop_sequence: null,
       usage: {
         input_tokens: 12,
         output_tokens: 7,

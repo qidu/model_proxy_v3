@@ -5,6 +5,36 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): the non-streaming converted answer carries `stop_sequence: null`
+
+`convertOpenAIToClaudeResponse` (`src/converters/openai-to-claude.ts`) built its
+`ClaudeMessagesResponse` without a `stop_sequence` key, so `JSON.stringify` dropped the field from
+every `/v1/messages` → `openai-completions` answer. The streaming path next door has always sent it
+(`src/converters/streaming.ts`, the terminal `message_delta`), and Anthropic always includes it, so
+the two egresses for one hop disagreed on the response shape. Both response construction sites now
+emit `stop_sequence: null` — the main object and the empty-`choices` early return — and
+`ClaudeMessagesResponse.stop_sequence` is widened to `string | null`
+(`src/types/claude.ts`), matching the `stop_reason: string | null` beside it and the spec.
+
+**The value is always `null`, and deliberately so.** It is not a placeholder awaiting a mapping: the
+Chat Completions protocol cannot supply one. `finish_reason: "stop"` covers both a natural end of
+turn and a matched stop sequence, an upstream never reports *which* sequence matched, and the matched
+sequence is stripped from the returned text — so there is no field to read and no inference that
+would not mislabel every ordinary end-of-turn as `stop_sequence`. `convertFinishReasonToStopReason`
+likewise never yields `"stop_sequence"`. A comment at the construction site records this, so the
+`null` is not later mistaken for a bug and "fixed" with a guess. The Gemini path is unaffected: it
+*can* report a matched sequence, because Gemini's own status enum distinguishes the two
+(`src/converters/gemini-to-claude.ts`), and it still does.
+
+Tests: `tests/unit/openai-to-claude.test.ts` (+1 — the field is a strict `null` and present, asserted
+with `node:assert/strict` so a dropped field fails rather than passing as `undefined == null`, and a
+defensive upstream reporting `finish_reason: "stop_sequence"` by name still gets no sequence).
+Four whole-body `deepStrictEqual` fixtures gained the field:
+`tests/unit/messages-handler.test.ts` (×3) and `tests/unit/messages-response-spool.test.ts` (×1).
+The `spills above threshold_bytes` case needed no change — it compares a spilled run against a
+baseline captured from the same code, so the field is present on both sides. Full unit suite
+2809/2809.
+
 ### fix(handlers): a truncated `openai-responses` stream ends with `max_tokens` instead of aborting
 
 `handleResponsesStreamAsClaude` (`src/handlers/messages.ts`) terminated the client stream only on

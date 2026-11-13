@@ -154,7 +154,7 @@ export interface ClaudeMessagesResponse {
     content: ClaudeContentBlock[];
     model: string;
     stop_reason: string | null;
-    stop_sequence?: string;
+    stop_sequence?: string | null;
     usage: {
         input_tokens: number;
         output_tokens: number;

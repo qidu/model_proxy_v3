@@ -3,8 +3,8 @@
  *
  * Covers: extractTokenCounts (standard/QNAIGC/cache fields), the response
  * converter (text, <think> extraction, reasoning_content, tool_calls,
- * stop_reason fixups, empty choices, synthetic signature), and the models /
- * token-count converters.
+ * stop_reason fixups, stop_sequence parity, empty choices, synthetic
+ * signature), and the models / token-count converters.
  *
  * Run with: npx tsx --test tests/unit/openai-to-claude.test.ts
  */
@@ -83,6 +83,7 @@ describe('convertOpenAIToClaudeResponse', () => {
     );
     assert.deepEqual(out.content, []);
     assert.equal(out.stop_reason, null);
+    assert.equal(out.stop_sequence, null);
     assert.equal(out.id, 'x');
     assert.equal(out.usage.input_tokens, 2);
   });
@@ -95,6 +96,28 @@ describe('convertOpenAIToClaudeResponse', () => {
     assert.deepEqual(out.content, [{ type: 'text', text: 'hello' }]);
     assert.equal(out.stop_reason, 'end_turn');
     assert.equal(out.role, 'assistant');
+  });
+
+  it('always emits a null stop_sequence, including when a stop sequence was sent', async () => {
+    // Chat Completions cannot report which stop sequence matched (finish_reason
+    // "stop" covers a natural end of turn too, and the matched sequence is
+    // stripped from the text), so the field is present-and-null rather than
+    // carrying a value. A null here is the contract, not an omission: it is a
+    // strict (`===`) null, so a dropped field would fail this test.
+    const out = await convertOpenAIToClaudeResponse(
+      resp({ message: { role: 'assistant', content: 'one\ntwo' }, finish_reason: 'stop' }),
+      'model-a', 'req-1',
+    );
+    assert.equal(out.stop_sequence, null);
+    assert.ok('stop_sequence' in out);
+    // Even a defensive upstream that reports the reason by name gets no
+    // sequence: there is no field on the OpenAI response to read one from.
+    const named = await convertOpenAIToClaudeResponse(
+      resp({ message: { role: 'assistant', content: 'x' }, finish_reason: 'stop_sequence' } as any),
+      'model-a', 'req-1',
+    );
+    assert.equal(named.stop_sequence, null);
+    assert.equal(named.stop_reason, 'end_turn');
   });
 
   it('extracts <think> markers into a thinking block and strips them from text', async () => {

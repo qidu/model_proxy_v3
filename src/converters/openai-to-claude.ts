@@ -133,6 +133,7 @@ export async function convertOpenAIToClaudeResponse(
             model: model,
             content: [],
             stop_reason: null,
+            stop_sequence: null,
             usage: await extractTokenCounts(openaiResponse.usage, requestBody, config),
         };
     }
@@ -283,6 +284,14 @@ export async function convertOpenAIToClaudeResponse(
         model: model,
         content: contentBlocks,
         stop_reason: stopReason,
+        // Always null, and deliberately so: Chat Completions `finish_reason:
+        // "stop"` covers both a natural end of turn and a matched stop sequence,
+        // never reports which sequence matched, and strips it from the returned
+        // text. Emitting the field for spec parity is all that is available —
+        // see `convertFinishReasonToStopReason`, which likewise never yields
+        // "stop_sequence". Anthropic always includes the field; omitting it
+        // would only differ from what the streaming path sends.
+        stop_sequence: null,
         usage: await extractTokenCounts(openaiResponse.usage, requestBody, config),
     };
 

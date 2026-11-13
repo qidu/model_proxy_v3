@@ -346,6 +346,7 @@ describe('messages.ts non-SSE response (§5.7)', () => {
       model: 'gpt-test',
       content: [{ type: 'text', text: 'ok' }],
       stop_reason: 'end_turn',
+      stop_sequence: null,
       usage: { input_tokens: 3, output_tokens: 1 },
     });
     assert.deepEqual(spillFiles(config), [], 'a body under the threshold leaves no spill');
