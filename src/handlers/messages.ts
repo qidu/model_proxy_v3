@@ -33,6 +33,9 @@ import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
 import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
 import { getSpoolConfig } from '../utils/spool.js';
 import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
+// The one Completions→Responses request converter, shared with the /v1/interactions and
+// /v1/chat/completions hops. No import cycle: openai.ts does not import this module.
+import { completionsToResponsesBody } from './openai.js';
 
 /**
  * Get token counting configuration from environment
@@ -75,140 +78,18 @@ function normalizeOpenAICompletionsBody(requestBody: Record<string, unknown>): R
 }
 
 /**
- * Convert OpenAI Chat Completions tools ({type:"function", function:{name, ...}})
- * into the Responses API flat tool form ({type:"function", name, ...}).
+ * The `/v1/messages` → `openai-responses` hop used to carry private copies of the three
+ * Completions→Responses request conversions that live here. They had drifted from the
+ * shared `completionsToResponsesBody` (`src/handlers/openai.ts`), which the
+ * `/v1/interactions` and `/v1/chat/completions` hops use, in four ways: the system
+ * prompt was emitted as a `system` item in `input[]` instead of the canonical
+ * `instructions`; `input_image.image_url` was built from the client's object rather than
+ * the string the Responses API declares; the assistant reasoning round-trip
+ * (`reasoning_content`, `thinking` parts) existed here and not there; and
+ * `store` / `response_format` / `reasoning_effort` / `prompt_cache_key` were carried
+ * there and not here. Both hops now call the one converter, so a fix to either lands on
+ * both. See `docs/api/review-interactions-to-openai-responses-hops.md`.
  */
-function completionsToolsToResponsesTools(tools: unknown[] | undefined): unknown[] | undefined {
-  if (!tools || !Array.isArray(tools)) return tools;
-  return tools.map((t) => {
-    const tool = t as Record<string, unknown>;
-    if (tool.type !== 'function') return tool;
-    const fn = tool.function as Record<string, unknown> | undefined;
-    if (!fn) return tool;
-    const flat: Record<string, unknown> = { type: 'function' };
-    if (fn.name !== undefined) flat.name = fn.name;
-    if (fn.description !== undefined) flat.description = fn.description;
-    if (fn.parameters !== undefined) flat.parameters = fn.parameters;
-    return flat;
-  });
-}
-
-/**
- * Convert OpenAI Chat Completions tool_choice to Responses API form.
- * Completions: {type:"function", function:{name:"..."}} or "auto"/"none"/"required"
- * Responses:   {type:"function", name:"..."} or "auto"/"none"/"required"
- */
-function completionsToolChoiceToResponsesToolChoice(tc: unknown): unknown {
-  if (typeof tc !== 'object' || tc === null) return tc;
-  const obj = tc as Record<string, unknown>;
-  if (obj.type !== 'function') return obj;
-  const fn = obj.function as Record<string, unknown> | undefined;
-  if (!fn) return obj;
-  const flat: Record<string, unknown> = { type: 'function' };
-  if (fn.name !== undefined) flat.name = fn.name;
-  return flat;
-}
-
-/**
- * Convert OpenAI Chat Completions `messages` array into a Responses API
- * `input` array.
- *
- * The Responses API uses a different content part vocabulary:
- *   - `text` (Completions) → `input_text` (user/system) or `output_text` (assistant)
- *   - `image_url`         → `input_image`
- * Tool calls on assistant messages become standalone `function_call` items;
- * `tool` role messages become `function_call_output` items.
- */
-function completionsMessagesToResponsesInput(messages: unknown[]): unknown[] {
-  const input: unknown[] = [];
-  for (const raw of messages) {
-    if (!raw || typeof raw !== 'object') continue;
-    const msg = raw as Record<string, unknown>;
-    const role = msg.role as string | undefined;
-    const content = msg.content;
-
-    // Extract reasoning carried on the message itself (OpenAI wire-format
-    // `reasoning_content` is a per-message field set by thinking-mode upstreams
-    // such as DeepSeek). Emit a Responses-side `reasoning` item so the prior
-    // turn's reasoning round-trips and DeepSeek doesn't reject the next turn
-    // with "reasoning_content must be passed back".
-    const inlineReasoning = msg.reasoning_content;
-    if (role === 'assistant' && typeof inlineReasoning === 'string' && inlineReasoning) {
-      input.push({
-        type: 'reasoning',
-        content: [{ type: 'reasoning_text', text: inlineReasoning }],
-      });
-    }
-
-    // assistant message with tool_calls → emit function_call items (no message item)
-    if (role === 'assistant' && Array.isArray(msg.tool_calls)) {
-      for (const tc of msg.tool_calls as Array<Record<string, unknown>>) {
-        const fn = tc.function as Record<string, unknown> | undefined;
-        input.push({
-          type: 'function_call',
-          call_id: tc.id ?? `call_${Date.now()}`,
-          name: fn?.name ?? '',
-          arguments: fn?.arguments ?? '',
-        });
-      }
-      // If the assistant message also has text content, fall through to emit a message item too
-      if (content === undefined || content === null || content === '') continue;
-    }
-
-    // tool role → function_call_output item
-    if (role === 'tool') {
-      const text = typeof content === 'string' ? content : JSON.stringify(content ?? '');
-      input.push({
-        type: 'function_call_output',
-        call_id: msg.tool_call_id ?? '',
-        output: text,
-      });
-      continue;
-    }
-
-    // Regular message → map content parts to Responses vocabulary
-    const textType = role === 'assistant' ? 'output_text' : 'input_text';
-    let contentParts: unknown[];
-    if (typeof content === 'string') {
-      contentParts = [{ type: textType, text: content }];
-    } else if (Array.isArray(content)) {
-      const parts: unknown[] = [];
-      for (const part of content as Array<Record<string, unknown>>) {
-        const pType = part.type as string;
-        if (pType === 'text') {
-          parts.push({ type: textType, text: part.text ?? '' });
-        } else if (pType === 'image_url') {
-          // Responses wants `image_url` as a plain string — a fully qualified URL
-          // or a base64 data URL — with `detail` as a *sibling*, the opposite of
-          // the Chat Completions shape this comes from. Unwrap, matching
-          // converters/completions-to-responses.ts.
-          const img = part.image_url as { url?: unknown; detail?: unknown } | undefined;
-          const imagePart: Record<string, unknown> = { type: 'input_image', image_url: img?.url };
-          if (img?.detail !== undefined) imagePart.detail = img.detail;
-          parts.push(imagePart);
-        } else if (pType === 'thinking') {
-          // Thinking-mode content parts: emit a Responses `reasoning` item
-          // carrying a single `reasoning_text` part so the prior reasoning
-          // round-trips to thinking-mode upstreams (DeepSeek requires it).
-          input.push({
-            type: 'reasoning',
-            content: [{ type: 'reasoning_text', text: part.thinking ?? '' }],
-          });
-        }
-        // unknown part types are dropped (intentional; narrower than silent swallow)
-      }
-      contentParts = parts;
-    } else {
-      contentParts = [{ type: textType, text: JSON.stringify(content ?? '') }];
-    }
-
-    input.push({
-      role: role ?? 'user',
-      content: contentParts,
-    });
-  }
-  return input;
-}
 
 /**
  * Handle messages API request
@@ -379,16 +260,35 @@ export async function handleMessagesRequest(
     // OpenAI Responses API upstream: body has `messages` (Completions format), must be
     // converted to Responses format (`input`) before forwarding.
     if (upstreamMode === 'openai-responses') {
-      const responsesBody: Record<string, unknown> = {
-        model: openaiRequestBody.model ?? model,
-        input: completionsMessagesToResponsesInput(openaiRequestBody.messages as unknown[]),
-        stream: isStreaming,
-      };
-      if (openaiRequestBody.temperature !== undefined) responsesBody.temperature = openaiRequestBody.temperature;
-      if (openaiRequestBody.top_p !== undefined) responsesBody.top_p = openaiRequestBody.top_p;
-      if (openaiRequestBody.max_tokens !== undefined) responsesBody.max_output_tokens = openaiRequestBody.max_tokens;
-      if (openaiRequestBody.tools !== undefined) responsesBody.tools = completionsToolsToResponsesTools(openaiRequestBody.tools as unknown[]);
-      if (openaiRequestBody.tool_choice !== undefined) responsesBody.tool_choice = completionsToolChoiceToResponsesToolChoice(openaiRequestBody.tool_choice);
+      // The shared converter (see the note above the tombstone comment) is a superset
+      // of what this branch built by hand: it also emits `instructions`, `store`,
+      // `response_format`, `reasoning_effort`, `prompt_cache_key` and the assistant
+      // reasoning items.
+      let responsesBody: Record<string, unknown> = completionsToResponsesBody(
+        openaiRequestBody as unknown as Record<string, unknown>,
+        (openaiRequestBody.model as string | undefined) ?? model,
+      );
+      // Re-asserted rather than taken from the converter: `stream` here is the proxy's
+      // own decision (`?alt=sse` and the streaming doorways can force it), not a field
+      // the client is trusted to have set.
+      responsesBody.stream = isStreaming;
+
+      // Declared transforms and the per-entry maxTokens cap both live in this hook
+      // (`applyMaxTokensCap`, src/utils/request-transform.ts). Without it this
+      // egress was the one that put `max_output_tokens` on the body and then never
+      // gave the cap a chance to clamp it.
+      if (route) {
+        const hookCtxResponses: HookContext = {
+          hook: 'before_upstream',
+          route,
+          upstreamMode: 'openai-responses',
+          clientModel: (requestBody.model as string) || modelId || 'unknown',
+          requestId,
+          streaming: isStreaming,
+          logger: activeLogger,
+        };
+        ({ body: responsesBody, headers: authHeaders } = runHook('before_upstream', { body: responsesBody, headers: authHeaders }, hookCtxResponses));
+      }
 
       logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, responsesBody);
       const responsesFetchHeaders1 = { 'Content-Type': 'application/json', ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request) };
@@ -647,26 +547,37 @@ export async function handleMessagesRequest(
 
     // Build Responses API request body from the converted Completions request.
     // The Responses API uses `input` (array of message items) instead of `messages`.
-    const responsesBody: Record<string, unknown> = {
-      model: openaiRequest.model,
-      input: completionsMessagesToResponsesInput(openaiRequest.messages),
-      stream: isStreaming,
-    };
-    if (openaiRequest.temperature !== undefined) responsesBody.temperature = openaiRequest.temperature;
-    if (openaiRequest.top_p !== undefined) responsesBody.top_p = openaiRequest.top_p;
-    if (openaiRequest.max_tokens !== undefined) responsesBody.max_output_tokens = openaiRequest.max_tokens;
-    if (openaiRequest.tools !== undefined) responsesBody.tools = completionsToolsToResponsesTools(openaiRequest.tools);
-    if (openaiRequest.tool_choice !== undefined) responsesBody.tool_choice = completionsToolChoiceToResponsesToolChoice(openaiRequest.tool_choice);
+    const responsesBody: Record<string, unknown> = completionsToResponsesBody(
+      openaiRequest as unknown as Record<string, unknown>,
+      openaiRequest.model,
+    );
+    responsesBody.stream = isStreaming;
 
-    logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, responsesBody);
+    // Same hook, same reason as the OpenAI-Responses egress above: the per-entry
+    // maxTokens cap only runs inside `runHook('before_upstream')`.
+    let upstreamBodyResponses: Record<string, unknown> = responsesBody;
+    if (route) {
+      const hookCtxResponses: HookContext = {
+        hook: 'before_upstream',
+        route,
+        upstreamMode: 'openai-responses',
+        clientModel: (requestBody.model as string) || modelId || 'unknown',
+        requestId,
+        streaming: isStreaming,
+        logger: activeLogger,
+      };
+      ({ body: upstreamBodyResponses, headers: authHeaders } = runHook('before_upstream', { body: upstreamBodyResponses, headers: authHeaders }, hookCtxResponses));
+    }
+
+    logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, upstreamBodyResponses);
     // §5.3 shape 3 (claude.ts:154 precedent): a body that still carries refs is
     // sent as a stream — skeleton plus one blob chunk at a time — with the exact
     // length the serializer measured and `duplex: 'half'`. A ref-free body sends
     // the expanded string exactly as before.
-    const responsesStreamed = streamRefs ? createRefAwareJsonBody(responsesBody) : undefined;
+    const responsesStreamed = streamRefs ? createRefAwareJsonBody(upstreamBodyResponses) : undefined;
     const responsesEgress = responsesStreamed
       ? { body: responsesStreamed.body, contentLength: responsesStreamed.contentLength, spilled: true }
-      : await createJsonEgressBody(responsesBody, 'att-');
+      : await createJsonEgressBody(upstreamBodyResponses, 'att-');
     const responsesFetchHeaders2 = {
       'Content-Type': 'application/json',
       ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),

@@ -262,15 +262,17 @@ describe('messages.ts ref-aware converted egress (§5.3 shape 3)', () => {
   it('streams the converted Responses body, where the ref survives a second conversion', async () => {
     const call = await assertStreamsWhatTheStringPathSends('openai-responses');
 
-    // The Responses body is built by `completionsMessagesToResponsesInput`, which
+    // The Responses body is built by the shared `completionsToResponsesBody`, which
     // relays the Chat image part by reference — so this position is where the
     // converter's re-prefixed ref ends up, not where the client's ref started.
     // Responses spells `image_url` as a string (not the Chat `{url}` object), so
     // the ref lands one level shallower than on the Chat egress above.
-    // (Item 0 is the system message the converter emits first.)
+    // (`system` becomes the top-level `instructions`, not an `input` item, so the user
+    // turn is item 0.)
     const sent = JSON.parse(call.text);
-    assert.equal(sent.input[1].content[1].type, 'input_image');
-    assert.equal(sent.input[1].content[1].image_url, DATA_URL);
+    assert.equal(sent.instructions, 'be brief');
+    assert.equal(sent.input[0].content[1].type, 'input_image');
+    assert.equal(sent.input[0].content[1].image_url, DATA_URL);
   });
 
   it('places each payload where its ref ended up, in order, with two refs in one body', async () => {
@@ -346,7 +348,10 @@ describe('messages.ts ref-aware converted egress (§5.3 shape 3)', () => {
     assert.deepEqual(chat.messages[1].content[1], { type: 'image_url', image_url: { url } });
 
     const responses = JSON.parse((await send(structuredClone(body), 'openai-responses')).text);
-    assert.deepEqual(responses.input[1].content[1], { type: 'input_image', image_url: url });
+    // `system: 'be brief'` becomes the top-level `instructions`, so the user turn is
+    // item 0 rather than item 1.
+    assert.equal(responses.instructions, 'be brief');
+    assert.deepEqual(responses.input[0].content[1], { type: 'input_image', image_url: url });
     assert.ok(!JSON.stringify(responses).includes('data:undefined'), 'no placeholder data URL may reach the upstream');
   });
 

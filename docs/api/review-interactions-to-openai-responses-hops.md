@@ -102,32 +102,60 @@ safety-relevant change rather than mere data loss. The same argument applies to 
 Responses spells `web_search`, `file_search`, `code_interpreter`, `computer_use` and `mcp` natively,
 while Completions `tools[]` only spells functions.
 
-## The two-hop is already two divergent implementations
+## The two-hop *was* two divergent implementations — now unified
 
-This is the finding to settle before anyone writes a third.
+**Status: settled.** At the time of this review, two implementations existed:
 
-- `/v1/interactions` → openai-responses uses `completionsToResponsesBody` (`src/handlers/openai.ts:957`).
-- `/v1/messages` → openai-responses uses private helpers in `src/handlers/messages.ts:81-211`
+- `/v1/interactions` → openai-responses used `completionsToResponsesBody` (`src/handlers/openai.ts`).
+- `/v1/messages` → openai-responses used private helpers in `src/handlers/messages.ts`
   (`completionsMessagesToResponsesInput`, `completionsToolsToResponsesTools`,
   `completionsToolChoiceToResponsesToolChoice`).
 
-Same logical request (one system prompt, one user turn, one function tool) through both front doors,
-captured at the fetch mock:
+Same logical request (one system prompt, one user turn) through both front doors, captured at the
+fetch mock — measured **before** the unification:
 
 | | `/v1/interactions` | `/v1/messages` |
 |---|---|---|
 | system prompt | `instructions: "be terse"` | input message `{role:'system'}` — **no `instructions`** |
 | input item envelope | `{type:'message', role, content}` | `{role, content}` — **no `type`** |
-| `max_output_tokens` | absent | `64` |
 | `store` | `false` | absent |
 | `reasoning_content` | dropped | → `reasoning` item |
 | `prompt_cache_key` | carried | absent |
 
-Both emit valid Responses shapes, so nothing is broken — but the same logical request produces
-different bytes depending on which front door it arrives at. `instructions` is the canonical
-system-prompt field, so the `messages.ts` shape is expected to be the riskier of the two on a strict
-Responses-compatible upstream; that has **not** been tested against a live upstream, so this is
-reported as a divergence, not as a break.
+Both emitted valid Responses shapes, so nothing was broken — but the same logical request produced
+different bytes depending on which front door carried it.
+
+Both hops now call `completionsToResponsesBody` and the private copies are deleted. Measured
+**after**: `instructions` and the `input[0]` envelope are byte-identical across the two doors; the
+only key difference is `max_output_tokens`, driven by the input (`max_tokens` present on the
+`/v1/messages` side), not by the converter.
+
+Each divergence was resolved as follows:
+
+| divergence | resolution |
+|---|---|
+| system prompt | top-level `instructions` — the canonical field, accepted by every upstream |
+| item envelope | `{type:'message', …}` — the spec's explicit item type |
+| assistant reasoning | the `reasoning` item is kept, and is now emitted on all three front doors |
+| `store` / `response_format` / `reasoning_effort` / `prompt_cache_key` | carried on all three front doors |
+
+Behaviour change: `/v1/messages` → `openai-responses` puts its system prompt in `instructions`
+instead of `input[]`, so its `input[]` indices shift down one. Pinned in
+`tests/unit/messages-ref-streaming.test.ts`.
+
+### Two defects the merge surfaced
+
+- **`input_image.image_url` was non-conformant on the `openai.ts` side.** It relayed the client's
+  Chat-shaped `{url, detail}` object into the Responses body verbatim. The spec says
+  `image_url: optional string or null` with `detail` a *sibling* on the item
+  (`docs/api/openai-response-methods-create.md`) — the form `messages.ts` already emitted. Fixed by
+  unwrapping, while still accepting a client that sends the string form. Three cases in
+  `tests/unit/handlers.test.ts` had pinned the object shape and were rewritten; the comment claiming
+  they mirrored `messages.ts` was backwards.
+- **A tool result sent as an object was being dropped.** The shared `openAIContentToText` returns
+  `''` for any non-array, non-string content, so `content: {answer: 42}` became `output: ''` where
+  `messages.ts` had serialized it. The merged converter keeps the serialize branch. Caught by
+  `tests/unit/messages-handler.test.ts` failing, and fixed rather than re-pinned.
 
 ## Trade-off
 
@@ -150,12 +178,14 @@ and `completionsToResponsesBody` already carries `temperature`/`top_p`/`max_toke
 
 Therefore, in order:
 
-1. **Fix hop 1** (in progress). Recovers the bottom row for this route and
-   `/v1/chat/completions` simultaneously, with no architectural change.
-2. **Unify the two Completions→Responses implementations** before adding a third.
-3. **Consider a direct converter** only if `tool_choice` fidelity and the non-function tool families
-   are wanted — that is the entire remaining margin, and `stop_sequences` / `seed` /
-   `response_modalities` / `cached_content` are unrecoverable at a Responses target under either design.
+1. ✅ **Fix hop 1** — done. The bottom row now rides the intermediate for `/v1/interactions` and
+   `/v1/chat/completions` alike, with no architectural change.
+2. ✅ **Unify the two Completions→Responses implementations** — done, before anything else was built
+   on top of them. See the section above.
+3. ⬜ **Consider a direct converter** only if `tool_choice` fidelity and the non-function tool
+   families are wanted — that is the entire remaining margin, and `stop_sequences` / `seed` /
+   `response_modalities` / `cached_content` are unrecoverable at a Responses target under either
+   design. Not started; nothing in the repo depends on it.
 
 ## How the numbers were produced
 

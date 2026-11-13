@@ -5,6 +5,122 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): `max_completion_tokens` reaches a Responses upstream, and the reasoning item order is restored
+
+Two follow-ups from reviewing the merge below.
+
+- **`completionsToResponsesBody` carried only the legacy `max_tokens` name.** A client that sent the
+  newer `max_completion_tokens` — the only spelling some clients send, as `completionsToClaudeBody`
+  already notes — reached an `openai-responses` upstream with **no output bound at all**, and the
+  per-entry `maxTokens` cap had no field to clamp. It is now
+  `max_tokens ?? max_completion_tokens`, the precedence `completionsToClaudeBody` already uses when
+  both are present. Measured: `max_completion_tokens: 32000` through `/v1/messages` →
+  `openai-responses` now arrives as `max_output_tokens: 4096` against a 4096 cap; before the
+  mapping, `max_output_tokens` was absent from the body entirely.
+- **The merged converter emitted `thinking`-part reasoning ahead of the tool calls.** The
+  `/v1/messages` converter it replaced emitted it after them, because it pushed the item from inside
+  its content-part loop, which ran after the `function_call` items. The previous order is restored
+  via `pushThinkingReasoning`, called at the point the message item is pushed:
+  `reasoning_content` (the turn's preamble) → `function_call` items → `reasoning` from `content[]` →
+  the message. `reasoning_content` keeps the position it always had.
+
+Tests: `tests/unit/handlers.test.ts` (+2 — the item order of a `tool_calls` turn carrying both
+reasoning sources, and both spellings of the output bound with legacy precedence). Full unit suite
+2804/2804.
+
+### refactor(handlers): one Completions→Responses request converter, not two
+
+`/v1/messages` → `openai-responses` built its request body with three private helpers in
+`src/handlers/messages.ts` (`completionsToolsToResponsesTools`,
+`completionsToolChoiceToResponsesToolChoice`, `completionsMessagesToResponsesInput`), while
+`/v1/interactions` and `/v1/chat/completions` → `openai-responses` used
+`completionsToResponsesBody` (`src/handlers/openai.ts`). The two had drifted in four ways, so the
+same logical request produced different bytes depending on which front door carried it. Both hops
+now call `completionsToResponsesBody`; the private copies are deleted. Verified: the same logical
+request through `/v1/interactions` and `/v1/messages` now yields identical `instructions` and an
+identical `input[0]` envelope.
+
+How each divergence resolved:
+
+| divergence | `/v1/messages` (old) | shared converter (now) |
+|---|---|---|
+| system prompt | a `system` item in `input[]` | top-level `instructions` |
+| message item envelope | `{role, content}` | `{type:'message', role, content}` |
+| assistant reasoning | `reasoning_content` / `thinking` → a `reasoning` item | same — this was **missing** on the `openai.ts` side |
+| `store`, `response_format`, `reasoning_effort`, `prompt_cache_key` | not carried | carried — also previously missing on the `messages.ts` side |
+
+`instructions` was chosen deliberately (the canonical Responses field, accepted by every upstream),
+which makes the three front doors agree. **Behaviour change for `/v1/messages` →
+`openai-responses`**: its system prompt moves out of `input[]` into `instructions`, so the `input[]`
+items shift down one index. Pinned in `tests/unit/messages-ref-streaming.test.ts`.
+
+**Three defects surfaced by the merge, all previously untested:**
+
+- **`input_image.image_url` was non-conformant.** `openai.ts` relayed the client's Chat-shaped
+  `{url, detail}` object straight into the Responses body. The Responses API declares
+  `image_url: optional string or null` with `detail` a *sibling* on the item
+  (`docs/api/openai-response-methods-create.md`) — which is what `messages.ts` already emitted — so
+  `/v1/interactions` and `/v1/chat/completions` were sending an object where the spec has a string.
+  The converter now unwraps, and still accepts a client that sends the string form already. Three
+  cases in `tests/unit/handlers.test.ts` pinned the old object shape; they are rewritten to the
+  conforming shape (and the comment claiming they mirrored `messages.ts` was backwards — they were
+  the opposite of it).
+- **A tool result sent as an object was being dropped.** Merging onto `openai.ts`'s
+  `openAIContentToText` would have turned `content: {answer: 42}` into `output: ''`, because that
+  extractor returns `''` for any non-array, non-string content, while `messages.ts` serialized it.
+  The merged converter keeps the serialize branch, so the value survives as `'{"answer":42}'`. This
+  was caught by `tests/unit/messages-handler.test.ts` failing and fixed, not re-pinned.
+- **Assistant images accompanying tool calls were being dropped.** The shared tool-call branch used
+  the same text-only extractor, where the deleted converter preserved every content part. It now
+  uses the full content-part conversion, so the assistant message retains its `input_image` parts
+  alongside the `function_call` items. Pinned in `tests/unit/messages-handler.test.ts`.
+
+Tests: `tests/unit/messages-handler.test.ts` (4 cases updated for `type: 'message'`, plus 1 new
+assistant image/tool-call regression), `tests/unit/messages-ref-streaming.test.ts` (2 updated for
+the `instructions` move, now also asserting `instructions`), `tests/unit/handlers.test.ts` (3
+rewritten for the conforming image shape plus 1 new case for the string input form). Full unit
+suite 2802/2802.
+
+### fix(handlers): the per-entry `maxTokens` cap fires on every egress
+
+The cap is applied inside `runHook('before_upstream')` (`applyMaxTokensCap`,
+`src/utils/request-transform.ts`), so an egress that builds a body and posts it without
+calling that hook accepts the route's `max_tokens` and silently ignores it. Three did:
+
+- `forwardCompletionsAsAnthropicMessages` (`src/handlers/openai.ts`) called **no hook at
+  all** — neither `before_upstream` nor `after_upstream` — though its sibling
+  `forwardCompletionsAsOpenAIResponses` calls both, and every other egress in the repo
+  calls `before_upstream`.
+- both `openai-responses` branches of `handleMessagesRequest` (`src/handlers/messages.ts`)
+  called `applyAfterUpstream` but not `runHook('before_upstream')`.
+
+All three now call the hook, placed after their body is fully built — including the
+Anthropic thinking-block fixup — so a declared transform sees exactly what will be sent.
+Measured, client asking 32000 against a 4096 cap:
+
+| egress | before | after |
+|---|---|---|
+| `/v1/interactions` → openai-responses | 4096 | 4096 (already hooked) |
+| `/v1/interactions` → anthropic-messages | **32000 sent** | 4096 |
+| `/v1/messages` → openai-responses | **32000 sent** | 4096 |
+| `/v1/messages` → anthropic-messages | 4096 | 4096 (already hooked) |
+
+This also restores declared `before_upstream` transforms on those three hops, which were
+ignored for the same reason — a behaviour change for any route that declares them.
+
+The preceding entry claimed the cap "now has something to clamp on an `openai-responses`
+route". That was true for `/v1/interactions` → openai-responses and **false** for the other
+two, which put `max_output_tokens` on the body and still never clamped it. Corrected here.
+
+Still unhooked on that egress: `applyAfterUpstream`. `forwardCompletionsAsAnthropicMessages`
+does not apply `after_upstream` transforms either, so an `after_upstream` op declared on a
+route is still ignored on that hop. Reported rather than changed — it is response-side and
+outside this fix's scope.
+
+Tests: `tests/unit/max-tokens-cap-egress.test.ts` (6 cases — the clamp on all four egresses,
+a below-cap value passing untouched on each, and no cap declared). Full unit suite
+2800/2800.
+
 ### fix(interactions): the `generation_config` knobs, `store` and structured output reach the upstream
 
 Seven request-level fields the Gemini Interactions API declares were dropped by

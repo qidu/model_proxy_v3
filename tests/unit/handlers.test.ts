@@ -389,6 +389,46 @@ describe('completionsToResponsesBody', () => {
     assert.equal(body.prompt_cache_key, 'cache-1');
   });
 
+  it('maps a tool_calls turn in the order the /v1/messages converter used', () => {
+    // `reasoning_content` is the turn's preamble and comes before the tool calls; a
+    // `thinking` content part travels with the message, so it comes after them.
+    const body = completionsToResponsesBody({
+      messages: [{
+        role: 'assistant',
+        reasoning_content: 'preamble',
+        content: [
+          { type: 'thinking', thinking: 'inner' },
+          { type: 'text', text: 'the answer' },
+        ],
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'do', arguments: '{}' },
+        }],
+      }],
+    } as any, 'm');
+    const input = body.input as any[];
+    assert.deepEqual(input.map(i => i.type), ['reasoning', 'function_call', 'reasoning', 'message']);
+    assert.equal(input[0].content[0].text, 'preamble');
+    assert.equal(input[2].content[0].text, 'inner');
+    // The thinking text must not also appear as message text.
+    assert.deepEqual(input[3].content, [{ type: 'output_text', text: 'the answer' }]);
+  });
+
+  it('maps max_completion_tokens to max_output_tokens, preferring legacy max_tokens', () => {
+    const newer = completionsToResponsesBody({
+      messages: [{ role: 'user', content: 'x' }],
+      max_completion_tokens: 700,
+    } as any, 'm');
+    assert.equal(newer.max_output_tokens, 700);
+
+    const both = completionsToResponsesBody({
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 500,
+      max_completion_tokens: 700,
+    } as any, 'm');
+    assert.equal(both.max_output_tokens, 500);
+  });
+
   it('maps tools array to responses-style function tools', () => {
     const body = completionsToResponsesBody({
       messages: [{ role: 'user', content: 'x' }],
@@ -420,7 +460,7 @@ describe('completionsToResponsesBody', () => {
     assert.equal(input[1].content[0].type, 'output_text');
   });
 
-  it('forwards image_url parts as input_image with URL passthrough', () => {
+  it('unwraps a Chat image_url object into the string the Responses API declares', () => {
     const body = completionsToResponsesBody({
       messages: [{
         role: 'user',
@@ -433,13 +473,16 @@ describe('completionsToResponsesBody', () => {
     const input = body.input as any[];
     assert.equal(input.length, 1);
     assert.equal(input[0].type, 'message');
+    // `docs/api/openai-response-methods-create.md`: "image_url: optional string or null",
+    // with `detail` a sibling on the item — not the Chat Completions `{url, detail}`
+    // object this arrives as.
     assert.deepEqual(input[0].content, [
       { type: 'input_text', text: 'look' },
-      { type: 'input_image', image_url: { url: 'https://example.com/cat.png', detail: 'high' } },
+      { type: 'input_image', image_url: 'https://example.com/cat.png', detail: 'high' },
     ]);
   });
 
-  it('forwards a data: URI image_url as input_image unchanged', () => {
+  it('carries a data: URI image_url through as a string', () => {
     const body = completionsToResponsesBody({
       messages: [{
         role: 'user',
@@ -448,13 +491,26 @@ describe('completionsToResponsesBody', () => {
     } as any, 'm');
     const input = body.input as any[];
     assert.deepEqual(input[0].content, [
-      { type: 'input_image', image_url: { url: 'data:image/png;base64,QUJD' } },
+      { type: 'input_image', image_url: 'data:image/png;base64,QUJD' },
+    ]);
+  });
+
+  it('passes an image_url already in the Responses string form through unchanged', () => {
+    const body = completionsToResponsesBody({
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image_url', image_url: 'https://example.com/plain.png' }],
+      }],
+    } as any, 'm');
+    const input = body.input as any[];
+    assert.deepEqual(input[0].content, [
+      { type: 'input_image', image_url: 'https://example.com/plain.png' },
     ]);
   });
 
   it('assistant with image content emits output_text + input_image parts', () => {
-    // Mirrors messages.ts behavior: image_url is always forwarded as input_image
-    // regardless of role; text uses the role-appropriate type.
+    // image_url always becomes an input_image regardless of role; text uses the
+    // role-appropriate type.
     const body = completionsToResponsesBody({
       messages: [{
         role: 'assistant',
@@ -467,7 +523,7 @@ describe('completionsToResponsesBody', () => {
     const input = body.input as any[];
     assert.deepEqual(input[0].content, [
       { type: 'output_text', text: 'note' },
-      { type: 'input_image', image_url: { url: 'https://example.com/x.jpg' } },
+      { type: 'input_image', image_url: 'https://example.com/x.jpg' },
     ]);
   });
 });

@@ -184,6 +184,7 @@ describe('handleMessagesRequest', () => {
     assertUpstreamBody({
       model: 'gpt-test',
       input: [{
+        type: 'message',
         role: 'user',
         content: [{ type: 'input_text', text: 'What is the weather in Paris?' }],
       }],
@@ -237,10 +238,39 @@ describe('handleMessagesRequest', () => {
     assert.equal(response.status, 200);
     assert.equal(upstreamCalls.length, 1);
     assert.deepEqual(upstreamCalls[0].body.input, [
-      { role: 'user', content: [{ type: 'input_text', text: 'Check Paris' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Check Paris' }] },
       { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'I need the weather tool.' }] },
       { type: 'function_call', call_id: 'call-weather', name: 'get_weather', arguments: '{"city":"Paris"}' },
       { type: 'function_call_output', call_id: 'call-weather', output: 'sunny' },
+    ]);
+  });
+
+  it('preserves assistant image content alongside tool calls in Responses history', async () => {
+    const response = await postMessages({
+      model: 'gpt-test',
+      messages: [{
+        role: 'assistant',
+        content: [{
+          type: 'image_url',
+          image_url: { url: 'https://example.com/cat.png', detail: 'high' },
+        }],
+        tool_calls: [{
+          id: 'call-lookup',
+          type: 'function',
+          function: { name: 'lookup', arguments: '{"q":"cat"}' },
+        }],
+      }],
+    }, 'openai-responses');
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamCalls.length, 1);
+    assert.deepEqual(upstreamCalls[0].body.input, [
+      { type: 'function_call', call_id: 'call-lookup', name: 'lookup', arguments: '{"q":"cat"}' },
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'input_image', image_url: 'https://example.com/cat.png', detail: 'high' }],
+      },
     ]);
   });
 
@@ -387,7 +417,7 @@ describe('handleMessagesRequest', () => {
     assert.equal(response.status, 200);
     assert.deepEqual(upstreamCalls[0].body, {
       model: 'gpt-test',
-      input: [{ role: 'user', content: [{ type: 'input_text', text: 'Use a tool' }] }],
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Use a tool' }] }],
       stream: false,
       temperature: 0.2,
       top_p: 0.8,
@@ -509,7 +539,7 @@ describe('handleMessagesRequest', () => {
         { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'Use the lookup tool.' }] },
         { type: 'function_call', call_id: 'call-lookup', name: 'lookup', arguments: '{"q":"answer"}' },
         { type: 'function_call_output', call_id: 'call-lookup', output: '{"answer":42}' },
-        { role: 'user', content: [{ type: 'input_text', text: 'What did you find?' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'What did you find?' }] },
       ],
       stream: false,
     });

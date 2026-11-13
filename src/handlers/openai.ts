@@ -567,10 +567,10 @@ function openAIContentToText(content: OpenAIContent | null | undefined): string 
  * `completionsToResponsesBody` to route Completions clients through an
  * `openai-responses` upstream.
  *
- * `image_url` parts are forwarded as `input_image` with the URL object passed
- * through unchanged (the Responses upstream performs its own fetch — no
- * in-proxy SSRF-guarded fetch is needed). Matches the pattern used in
- * `src/handlers/messages.ts:151` for Claude → Responses image forwarding.
+ * `image_url` parts are forwarded as `input_image`; the Chat Completions
+ * `{url, detail}` object is unwrapped into the Responses API's string `image_url`
+ * with `detail` as a sibling. The Responses upstream performs its own fetch — no
+ * in-proxy SSRF-guarded fetch is needed.
  */
 function openAIContentToResponsesParts(
   content: OpenAIContent | null | undefined,
@@ -586,11 +586,44 @@ function openAIContentToResponsesParts(
     if (part.type === 'text') {
       parts.push({ type: textType, text: part.text });
     } else if (part.type === 'image_url') {
-      parts.push({ type: 'input_image', image_url: part.image_url });
+      // The Responses API wants `image_url` as a plain string — a fully qualified URL
+      // or a base64 data URL — with `detail` as a *sibling* on the item
+      // (`docs/api/openai-response-methods-create.md`: "image_url: optional string or
+      // null"). That is the opposite of the Chat Completions shape arriving here, where
+      // `image_url` is an object, so it is unwrapped; a client that already sent the
+      // string form is passed through unchanged.
+      const image = part.image_url as { url?: unknown; detail?: unknown } | string | undefined;
+      if (typeof image === 'string') {
+        parts.push({ type: 'input_image', image_url: image });
+      } else {
+        const imagePart: Record<string, unknown> = { type: 'input_image', image_url: image?.url };
+        if (image?.detail !== undefined) imagePart.detail = image.detail;
+        parts.push(imagePart);
+      }
     }
     // Unknown part types (e.g. thinking) are skipped here.
   }
   return parts;
+}
+
+/**
+ * Emit a Responses `reasoning` item for each `thinking` content part on an assistant
+ * message. Called where the message item is pushed rather than up front, so the item
+ * order matches the `/v1/messages` converter this one replaced: `reasoning_content`
+ * first as the turn's preamble, then the `function_call` items, then this reasoning,
+ * then the message. `openAIContentToResponsesParts` skips `thinking` parts, so the
+ * text does not also appear as `input_text`/`output_text`.
+ */
+function pushThinkingReasoning(msg: OpenAIMessage, input: unknown[]): void {
+  if (msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
+  for (const part of msg.content as unknown as Array<Record<string, unknown>>) {
+    if (part.type === 'thinking') {
+      input.push({
+        type: 'reasoning',
+        content: [{ type: 'reasoning_text', text: (part.thinking as string) ?? '' }],
+      });
+    }
+  }
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> {
@@ -1019,6 +1052,25 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
       continue;
     }
 
+    // Reasoning round-trip. An OpenAI thinking-mode upstream (DeepSeek) sets
+    // `reasoning_content` on the assistant message, and a `thinking` content part
+    // carries the same text; either must come back as a Responses `reasoning` item on
+    // the next turn or the upstream rejects it with "reasoning_content must be passed
+    // back". Taken from the `/v1/messages` converter, which had this and this one did
+    // not — the same body shape reaches both.
+    //
+    // Only the `reasoning_content` half is emitted here. A `thinking` content part is
+    // emitted by `pushThinkingReasoning` where the message item is pushed, which keeps
+    // the item order this converter inherited: the preamble reasoning first, then the
+    // turn's `function_call` items, then the reasoning carried inside `content[]`, then
+    // the message.
+    if (msg.role === 'assistant') {
+      const inlineReasoning = (msg as unknown as Record<string, unknown>).reasoning_content;
+      if (typeof inlineReasoning === 'string' && inlineReasoning) {
+        input.push({ type: 'reasoning', content: [{ type: 'reasoning_text', text: inlineReasoning }] });
+      }
+    }
+
     if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
       for (const tc of msg.tool_calls) {
         input.push({
@@ -1028,22 +1080,34 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
           arguments: tc.function.arguments,
         });
       }
-      const text = openAIContentToText(msg.content);
-      if (text !== '') {
+      pushThinkingReasoning(msg, input);
+      const contentParts = openAIContentToResponsesParts(msg.content, 'output_text');
+      if (msg.content !== '' && contentParts.length > 0) {
         input.push({
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text }],
+          content: contentParts,
         });
       }
       continue;
     }
 
     if (msg.role === 'tool') {
+      // `output` must be a string. A string passes through unchanged and an array of
+      // parts is text-extracted as before; anything else is serialized, because a client
+      // may send the tool result as an object and the text extractor yields '' for it —
+      // that silently dropped the whole result. The serialize branch is the
+      // `/v1/messages` converter's rule, kept when the two merged
+      // (`tests/unit/messages-handler.test.ts`).
+      const toolContent = msg.content;
       input.push({
         type: 'function_call_output',
         call_id: msg.tool_call_id,
-        output: openAIContentToText(msg.content),
+        output: typeof toolContent === 'string'
+          ? toolContent
+          : Array.isArray(toolContent)
+            ? openAIContentToText(toolContent)
+            : JSON.stringify(toolContent ?? ''),
       });
       continue;
     }
@@ -1052,6 +1116,7 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
     // the upstream originally emitted); user turns use `input_text`.
     const textType = msg.role === 'assistant' ? 'output_text' : 'input_text';
     const contentParts = openAIContentToResponsesParts(msg.content, textType);
+    pushThinkingReasoning(msg, input);
     input.push({
       type: 'message',
       role: msg.role,
@@ -1068,7 +1133,13 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
 
   if (completions.temperature !== undefined) responsesBody.temperature = completions.temperature;
   if (completions.top_p !== undefined) responsesBody.top_p = completions.top_p;
-  if (completions.max_tokens !== undefined) responsesBody.max_output_tokens = completions.max_tokens;
+  // Legacy `max_tokens` wins when both names are present; `max_completion_tokens` is the
+  // newer OpenAI spelling and is the only one some clients send. Same precedence as
+  // `completionsToClaudeBody`. Carrying only the legacy name left a client that used the
+  // newer one with no output bound at all on a Responses upstream.
+  const maxOutputTokens = (completions.max_tokens as number | undefined)
+    ?? (completions.max_completion_tokens as number | undefined);
+  if (maxOutputTokens !== undefined) responsesBody.max_output_tokens = maxOutputTokens;
   if (completions.prompt_cache_key !== undefined) responsesBody.prompt_cache_key = completions.prompt_cache_key;
   // Retention and reasoning: same field name on both sides for `store`; the
   // Completions scalar `reasoning_effort` is the Responses nested `reasoning.effort`.
@@ -1135,7 +1206,7 @@ async function forwardCompletionsAsAnthropicMessages(
   env?: Env,
   route?: ModelRouteConfig,
 ): Promise<Response> {
-  const claudeBody = await completionsToClaudeBody(openaiRequest, model);
+  let claudeBody = await completionsToClaudeBody(openaiRequest, model);
 
   // DeepSeek's anthropic-compatible endpoint REQUIRES a `content[].thinking`
   // block on any assistant turn that carried tool_use in thinking mode — a turn
@@ -1153,6 +1224,21 @@ async function forwardCompletionsAsAnthropicMessages(
         blocks.unshift({ type: 'thinking', thinking: '' });
       }
     }
+  }
+  // Declared transforms and the per-entry maxTokens cap both run inside this hook
+  // (`applyMaxTokensCap`, src/utils/request-transform.ts). Every other egress in the
+  // repo runs it — including this function's sibling
+  // `forwardCompletionsAsOpenAIResponses` — but this one did not, so an
+  // anthropic-messages route reached from /v1/interactions or :generateContent
+  // silently ignored both. Placed after the thinking-block fixup above so a
+  // transform sees the body as it will actually be sent.
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_upstream', route,
+      upstreamMode: 'anthropic-messages',
+      clientModel: model, requestId, streaming: claudeBody.stream === true, logger,
+    };
+    ({ body: claudeBody, headers: authHeaders } = runHook('before_upstream', { body: claudeBody, headers: authHeaders }, hookCtx));
   }
   logger.debug(requestId, `Interactions/generateContent -> anthropic-messages body: ${JSON.stringify(claudeBody).substring(0, 500)}`);
   logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
