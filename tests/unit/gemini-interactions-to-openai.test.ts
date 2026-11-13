@@ -9,12 +9,17 @@ import {
 
 /**
  * Request-level fields of the Gemini Interactions body (`system_instruction`,
- * `tools`, `generation_config.stop_sequences`, `generation_config.tool_choice`)
- * must survive the conversion to an OpenAI Completions body, because that body
- * is then re-targeted to an openai-completions / anthropic-messages /
- * openai-responses upstream. Each case pins the field at the Completions hop,
- * and the cross-mode cases pin where it lands (or is still lost) at the second
- * hop.
+ * `tools`, `generation_config.stop_sequences`, `generation_config.tool_choice`,
+ * the `generation_config` sampling knobs, `store`, `response_format` /
+ * `response_mime_type`) must survive the conversion to an OpenAI Completions
+ * body, because that body is then re-targeted to an openai-completions /
+ * anthropic-messages / openai-responses upstream. Each case pins the field at
+ * the Completions hop, and the cross-mode cases pin where it lands (or is still
+ * lost) at the second hop.
+ *
+ * The end-to-end half of the same claim — that these survive the whole handler
+ * and reach the bytes the upstream receives — is in
+ * `tests/unit/interactions-request-field-carry.test.ts`.
  */
 
 const userTurn = { input: [{ role: 'user', content: 'hi' }] };
@@ -370,5 +375,137 @@ describe('convertGeminiInteractionsToOpenAI — input shapes', () => {
       () => convertGeminiInteractionsToOpenAI({ model: 'm' }),
       (err: Error) => err instanceof Error && err.message === 'Invalid Gemini Interactions request format',
     );
+  });
+});
+
+describe('convertGeminiInteractionsToOpenAI — sampling knobs, retention and structured output', () => {
+  const body = (extra: Record<string, unknown> = {}) => ({ model: 'm', input: 'hi', ...extra });
+
+  it('maps the generation_config sampling knobs to their Completions spellings', () => {
+    const out = convertGeminiInteractionsToOpenAI(body({
+      generation_config: { temperature: 0.3, top_p: 0.9, max_output_tokens: 1234 },
+    })) as any;
+
+    assert.equal(out.temperature, 0.3);
+    assert.equal(out.top_p, 0.9);
+    // Renamed across the hop: `max_output_tokens` is the Interactions spelling,
+    // `max_tokens` the one the route cap and the Responses hop both read.
+    assert.equal(out.max_tokens, 1234);
+    assert.equal('max_output_tokens' in out, false);
+  });
+
+  it('maps thinking_level to reasoning_effort for all four levels', () => {
+    // All four survive because the Responses effort enum carries `minimal` too, so
+    // this is a rename rather than a clamp.
+    for (const level of ['minimal', 'low', 'medium', 'high']) {
+      const out = convertGeminiInteractionsToOpenAI(body({
+        generation_config: { thinking_level: level },
+      })) as any;
+
+      assert.equal(out.reasoning_effort, level);
+    }
+  });
+
+  it('accepts the camelCase thinkingLevel spelling', () => {
+    const out = convertGeminiInteractionsToOpenAI(body({
+      generation_config: { thinkingLevel: 'high' },
+    })) as any;
+
+    assert.equal(out.reasoning_effort, 'high');
+  });
+
+  it('carries store in both directions, and omits it when absent', () => {
+    assert.equal((convertGeminiInteractionsToOpenAI(body({ store: false })) as any).store, false);
+    assert.equal((convertGeminiInteractionsToOpenAI(body({ store: true })) as any).store, true);
+    assert.equal('store' in (convertGeminiInteractionsToOpenAI(body()) as any), false);
+  });
+
+  it('ignores a non-boolean store', () => {
+    const out = convertGeminiInteractionsToOpenAI(body({ store: 'yes' })) as any;
+
+    assert.equal('store' in out, false);
+  });
+
+  it('wraps a JSON-schema response_format in the named Completions json_schema', () => {
+    const schema = { type: 'object', properties: { a: { type: 'string' } } };
+    const out = convertGeminiInteractionsToOpenAI(body({ response_format: schema })) as any;
+
+    assert.deepEqual(out.response_format, {
+      type: 'json_schema',
+      json_schema: { name: 'response', schema },
+    });
+  });
+
+  it('maps response_mime_type application/json to the schema-less JSON mode', () => {
+    const out = convertGeminiInteractionsToOpenAI(body({ response_mime_type: 'application/json' })) as any;
+
+    assert.deepEqual(out.response_format, { type: 'json_object' });
+  });
+
+  it('prefers a response_format schema over response_mime_type', () => {
+    const out = convertGeminiInteractionsToOpenAI(body({
+      response_format: { type: 'object' },
+      response_mime_type: 'application/json',
+    })) as any;
+
+    assert.equal(out.response_format.type, 'json_schema');
+  });
+
+  it('leaves a mime type with no Completions equivalent alone', () => {
+    const out = convertGeminiInteractionsToOpenAI(body({ response_mime_type: 'text/plain' })) as any;
+
+    assert.equal('response_format' in out, false);
+  });
+
+  it('invents no key when the client sent none of them', () => {
+    const out = convertGeminiInteractionsToOpenAI(body()) as any;
+
+    for (const key of ['temperature', 'top_p', 'max_tokens', 'reasoning_effort', 'store', 'response_format']) {
+      assert.equal(key in out, false, `${key} must not be invented`);
+    }
+  });
+});
+
+describe('convertGeminiInteractionsToOpenAI — the sampling knobs at the second hop', () => {
+  const body = {
+    model: 'm',
+    input: [{ role: 'user', content: 'hi' }],
+    store: false,
+    response_mime_type: 'application/json',
+    generation_config: { temperature: 0.3, top_p: 0.9, max_output_tokens: 1234, thinking_level: 'minimal' },
+  };
+
+  it('reaches an openai-responses upstream as the Responses spellings', () => {
+    const responses = completionsToResponsesBody(
+      convertGeminiInteractionsToOpenAI(body), 'responses-target',
+    ) as any;
+
+    assert.equal(responses.temperature, 0.3);
+    assert.equal(responses.top_p, 0.9);
+    assert.equal(responses.max_output_tokens, 1234);
+    assert.equal(responses.store, false);
+    // The Completions scalar becomes the Responses nested object.
+    assert.deepEqual(responses.reasoning, { effort: 'minimal' });
+    assert.deepEqual(responses.text, { format: { type: 'json_object' } });
+  });
+
+  it('unwraps a json_schema response_format into the Responses text.format', () => {
+    const schema = { type: 'object', properties: { a: { type: 'string' } } };
+    const responses = completionsToResponsesBody(
+      convertGeminiInteractionsToOpenAI({ model: 'm', input: 'hi', response_format: schema }),
+      'responses-target',
+    ) as any;
+
+    assert.deepEqual(responses.text, { format: { type: 'json_schema', name: 'response', schema } });
+  });
+
+  it('reaches an anthropic-messages upstream as temperature, top_p and max_tokens', async () => {
+    const claude = await completionsToClaudeBody(
+      convertGeminiInteractionsToOpenAI(body), 'claude-target',
+    ) as any;
+
+    assert.equal(claude.temperature, 0.3);
+    assert.equal(claude.top_p, 0.9);
+    assert.equal(claude.max_tokens, 1234);
   });
 });

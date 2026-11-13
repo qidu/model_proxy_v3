@@ -5,6 +5,74 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(interactions): the `generation_config` knobs, `store` and structured output reach the upstream
+
+Seven request-level fields the Gemini Interactions API declares were dropped by
+`convertGeminiInteractionsToOpenAI` (`src/handlers/openai.ts`) before any upstream saw them:
+`generation_config.temperature`, `.top_p`, `.max_output_tokens` and `.thinking_level`, plus
+`store`, `response_format` and `response_mime_type`. Because that one hop feeds all three
+cross-mode targets — openai-completions natively, and anthropic-messages / openai-responses
+through `completionsToClaudeBody` / `completionsToResponsesBody` — the loss applied to every
+non-Gemini route. Each field has a Completions spelling, so each now rides the intermediate and
+the second hop re-targets it:
+
+| Interactions | Completions (hop 1) | Responses (hop 2) |
+|---|---|---|
+| `generation_config.temperature` / `.top_p` | `temperature` / `top_p` | same names |
+| `generation_config.max_output_tokens` | `max_tokens` | `max_output_tokens` |
+| `generation_config.thinking_level` | `reasoning_effort` | `reasoning.effort` |
+| `store` | `store` | `store` |
+| `response_format` (the schema itself) | `{type:'json_schema', json_schema:{name:'response', schema}}` | `text.format` |
+| `response_mime_type: 'application/json'` | `{type:'json_object'}` | `text.format` |
+
+All four `thinking_level` values (`minimal`, `low`, `medium`, `high`) survive as reasoning effort:
+the Responses `ReasoningEffort` enum carries `minimal`
+(`docs/api/openai-response-methods-create.md:3325-3343`), so this is a rename rather than a clamp.
+The `text.format` mapping is the exact inverse of `responses-to-completions.ts:197-213`, including
+that converter's `'response'` default schema name, so the two directions stay symmetrical.
+
+**A correction recorded.** An earlier entry in this file — and the code comment it introduced —
+claimed `store` could **not** ride the intermediate, on the grounds that a Completions upstream
+"has no such field", and threaded it to the openai-responses hop out of band through a new
+function parameter. That was wrong: `docs/api/list_of_api_and_schema.md:203` declares `store?` on
+`OpenAIRequest`. What misled it is that the **TS type under-declares** — `store` is absent from
+`src/types/openai.ts:59-95`, so `grep -c store src/types/openai.ts` returns 0 while the repo's own
+schema dump lists it. The side channel is removed and `store` now rides the intermediate like every
+other field here. The same type-vs-dump gap also covers `seed`, `modalities`, `n`, `user`,
+`prediction`, `audio` and `prompt_cache_options`.
+
+Consequences worth knowing:
+
+- An `openai-completions` upstream now receives `store` / `temperature` / `max_tokens` / … from an
+  Interactions client. That is intended — these are real `OpenAIRequest` fields, not new wire
+  values — and is pinned by test.
+- A per-route `maxTokens` cap now has something to clamp on an `openai-responses` route: the body
+  carries `max_output_tokens` by the time `MAX_OUTPUT_TOKENS_PATHS` runs
+  (`src/utils/request-transform.ts`), where previously the field never arrived. The documented
+  silent no-op is gone.
+- `/v1/chat/completions` → `openai-responses` gains `store`, `response_format` and
+  `reasoning_effort` for free, since it shares `completionsToResponsesBody`.
+- A `response_format.type` outside the three the mapping knows is still left unmapped rather than
+  throwing, as it was before this entry — a deliberate choice for a converter two front doors
+  share.
+
+**Still dropped, unchanged**: `seed` and `stop_sequences` (the Responses API has no top-level
+`seed` or `stop`, so no design can carry them to a Responses target), `thinking_summaries`,
+`background`, `previous_interaction_id`, `response_modalities`, `cached_content`,
+`agent` / `agent_config`, and the non-function tool families. The `:generateContent` front door
+has the identical gap in its own converter and is pinned as still-unmapped rather than fixed here.
+
+The architecture comparison behind this scope — a direct Interactions→Responses conversion versus
+going over the Completions intermediate, with the measured per-hop losses and the `tool_choice`
+fidelity that only the direct design could recover — is written up in
+`docs/api/review-interactions-to-openai-responses-hops.md`.
+
+Tests: `tests/unit/gemini-interactions-to-openai.test.ts` (47 cases; extended with hop-1 pins for
+all seven fields and their landings at both second hops, including all four `thinking_level`
+values and the `response_format`-beats-`response_mime_type` precedence) and
+`tests/unit/interactions-request-field-carry.test.ts` (8 cases driving the real handler and
+asserting on the bytes the upstream fetch received). Full unit suite 2794/2794.
+
 ### fix(handlers): Interactions `input` steps keep their own roles on the way to the upstream
 
 A `/v1/interactions` client may send `input` as an array of Turns (`role`), an array of Content (a

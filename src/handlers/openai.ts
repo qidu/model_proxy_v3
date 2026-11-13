@@ -140,13 +140,23 @@ function geminiToolChoiceToOpenAI(toolChoice: unknown): unknown {
 /**
  * Convert Gemini Interactions request to OpenAI format
  *
- * Carries the same three request-level things `convertGeminiGenerateContentToOpenAI`
- * does — the system prompt, the tool declarations and `stop_sequences` — because
- * an Interactions client's body is re-targeted to the same upstream families
- * (openai-completions natively, anthropic-messages via `completionsToClaudeBody`,
- * openai-responses via `completionsToResponsesBody`). The rest of
- * `generation_config` (`temperature`, `top_p`, `max_output_tokens`) is dropped
- * here exactly as it is on the generateContent path.
+ * Carries every request-level field the Interactions body declares that has a
+ * Completions spelling: the system prompt, the tool declarations, `stop_sequences`,
+ * `tool_choice`, the `generation_config` sampling knobs (`temperature`, `top_p`,
+ * `max_output_tokens`, `thinking_level`), `store`, and `response_format` /
+ * `response_mime_type`. This matters because the body is re-targeted to three
+ * upstream families — openai-completions natively, anthropic-messages via
+ * `completionsToClaudeBody`, openai-responses via `completionsToResponsesBody` — and
+ * whatever this hop drops is unreachable at every one of them.
+ *
+ * Still dropped here, as on the generateContent path: `seed` and the rest of
+ * `generation_config` (`thinking_summaries`, `speech_config`), `background`,
+ * `previous_interaction_id`, `response_modalities`, `cached_content`, `agent` /
+ * `agent_config`, and the non-function tool families. `thinking_summaries` and the
+ * tool families are expressible in the Responses API but have no Completions
+ * spelling, so only a direct Interactions→Responses converter could reach them;
+ * `seed` and `stop_sequences` are unreachable at a Responses target under either
+ * design. See `docs/api/review-interactions-to-openai-responses-hops.md`.
  */
 export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, unknown>): Record<string, unknown> {
   const model = (geminiRequest.model as string) || 'gemini-no-id-at-proxy';
@@ -272,6 +282,47 @@ export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, 
       ?? (geminiRequest.toolConfig as Record<string, unknown> | undefined)?.functionCallingConfig,
   );
   if (tools.length > 0 && toolChoice !== undefined) result.tool_choice = toolChoice;
+
+  // Sampling and budget knobs. Unlike `stop_sequences`, each of these has a
+  // Completions spelling, so they ride the intermediate and the openai-responses
+  // hop re-targets them (`completionsToResponsesBody`).
+  if (typeof config?.temperature === 'number') result.temperature = config.temperature;
+  if (typeof config?.top_p === 'number') result.top_p = config.top_p;
+  // `max_tokens` is the spelling `convertClaudeToOpenAIRequest` already emits, and
+  // the one both the per-route cap and the openai-responses hop read.
+  if (typeof config?.max_output_tokens === 'number') result.max_tokens = config.max_output_tokens;
+
+  // `thinking_level` (`minimal` | `low` | `medium` | `high`) is the same four values
+  // as the Responses `reasoning.effort` enum, and a subset of what a Completions
+  // upstream accepts as `reasoning_effort`, so it passes through verbatim. The
+  // `OpenAIRequest` union under-declares it (`low` | `medium` | `high` | `max`) —
+  // as it does `store` below — so the schema dump, not the TS type, is the authority.
+  const thinkingLevel = config?.thinking_level ?? config?.thinkingLevel;
+  if (typeof thinkingLevel === 'string') result.reasoning_effort = thinkingLevel;
+
+  // `store` is the Interactions input-only retention flag ("whether to store the
+  // response and request for later retrieval"). Chat Completions spells it the same
+  // way (`docs/api/list_of_api_and_schema.md:203`), so it needs no side channel: an
+  // openai-completions upstream receives a field it already has, and the
+  // openai-responses hop re-emits it under the same name. Omitted when the client
+  // did not send it, so an upstream's own default still applies.
+  if (typeof geminiRequest.store === 'boolean') result.store = geminiRequest.store;
+
+  // Structured output. The Interactions field carries the JSON schema itself, while
+  // the Completions spelling wraps it in a named `json_schema` — the shape
+  // `completionsToResponsesBody` unwraps back into the Responses `text.format`,
+  // using the same default name `responses-to-completions.ts:203` uses in reverse.
+  // `response_mime_type: 'application/json'` without a schema is the schema-less JSON
+  // mode; any other mime type has no Completions equivalent and is left alone.
+  const responseFormat = geminiRequest.response_format;
+  if (responseFormat && typeof responseFormat === 'object' && !Array.isArray(responseFormat)) {
+    result.response_format = {
+      type: 'json_schema',
+      json_schema: { name: 'response', schema: responseFormat },
+    };
+  } else if (geminiRequest.response_mime_type === 'application/json') {
+    result.response_format = { type: 'json_object' };
+  }
 
   return result;
 }
@@ -1019,6 +1070,34 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
   if (completions.top_p !== undefined) responsesBody.top_p = completions.top_p;
   if (completions.max_tokens !== undefined) responsesBody.max_output_tokens = completions.max_tokens;
   if (completions.prompt_cache_key !== undefined) responsesBody.prompt_cache_key = completions.prompt_cache_key;
+  // Retention and reasoning: same field name on both sides for `store`; the
+  // Completions scalar `reasoning_effort` is the Responses nested `reasoning.effort`.
+  // Both are set by `convertGeminiInteractionsToOpenAI` for an Interactions client,
+  // and either may already be on the body from a Completions client.
+  if (completions.store !== undefined) responsesBody.store = completions.store;
+  if (completions.reasoning_effort !== undefined) {
+    responsesBody.reasoning = { effort: completions.reasoning_effort };
+  }
+  // Structured output: Chat Completions spells it `response_format`, the Responses
+  // API `text.format`. The inverse of `responses-to-completions.ts:197-213`, which is
+  // the shape unwrapped here. A `type` outside the three it accepts is left unmapped,
+  // as it was before this mapping existed rather than throwing on a shared converter.
+  const responseFormat = completions.response_format as Record<string, unknown> | undefined;
+  if (responseFormat && typeof responseFormat === 'object') {
+    if (responseFormat.type === 'json_schema') {
+      const jsonSchema = responseFormat.json_schema as Record<string, unknown> | undefined;
+      responsesBody.text = {
+        format: {
+          type: 'json_schema',
+          name: (jsonSchema?.name as string) ?? 'response',
+          schema: jsonSchema?.schema,
+          ...(jsonSchema?.strict !== undefined ? { strict: jsonSchema.strict } : {}),
+        },
+      };
+    } else if (responseFormat.type === 'json_object' || responseFormat.type === 'text') {
+      responsesBody.text = { format: { type: responseFormat.type } };
+    }
+  }
   if (completions.tools && Array.isArray(completions.tools) && (completions.tools as unknown[]).length > 0) {
     responsesBody.tools = (completions.tools as Array<{ type: string; function: { name: string; description?: string; parameters?: unknown } }>).map(t => ({
       type: 'function',
