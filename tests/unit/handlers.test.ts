@@ -22,6 +22,7 @@ import {
   convertGeminiGenerateContentToOpenAI,
 } from '../../src/handlers/openai.js';
 import { isGeminiRequest } from '../../src/handlers/gemini.js';
+import type { Logger } from '../../src/types/shared.js';
 
 // ---------------------------------------------------------------------------
 // completionsToClaudeBody
@@ -643,6 +644,122 @@ describe('convertGeminiGenerateContentToOpenAI — toolConfig', () => {
 
     assert.deepEqual(claudeBody.tool_choice, { type: 'any' });
     assert.equal(responsesBody.tool_choice, 'required');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// convertGeminiGenerateContentToOpenAI — functionCall / functionResponse ids
+// ---------------------------------------------------------------------------
+
+describe('convertGeminiGenerateContentToOpenAI — tool-call ids', () => {
+  /** One user turn, a model turn with two calls, then the client's results. */
+  function withResponses(responseParts: unknown[]): Record<string, unknown> {
+    return {
+      model: 'gpt-target',
+      contents: [
+        { role: 'user', parts: [{ text: 'go' }] },
+        {
+          role: 'model',
+          parts: [
+            { functionCall: { id: 'gid_A', name: 'read_file', args: { path: 'a.ts' } } },
+            { functionCall: { id: 'gid_B', name: 'read_file', args: { path: 'b.ts' } } },
+          ],
+        },
+        { role: 'user', parts: responseParts },
+      ],
+    };
+  }
+
+  it("carries the client's functionCall.id onto the assistant tool_calls", () => {
+    const out = convertGeminiGenerateContentToOpenAI(withResponses([
+      { functionResponse: { id: 'gid_A', name: 'read_file', response: { output: 'A' } } },
+      { functionResponse: { id: 'gid_B', name: 'read_file', response: { output: 'B' } } },
+    ]) as any);
+
+    const asst = (out.messages as any[])[1];
+    assert.deepEqual(asst.tool_calls.map((tc: any) => tc.id), ['gid_A', 'gid_B']);
+  });
+
+  // Parallel tool results arrive in completion order, which need not match call
+  // order — the id is the only thing that pairs them correctly.
+  it('pairs out-of-order functionResponses by id, not by position', () => {
+    const out = convertGeminiGenerateContentToOpenAI(withResponses([
+      { functionResponse: { id: 'gid_B', name: 'read_file', response: { output: 'B' } } },
+      { functionResponse: { id: 'gid_A', name: 'read_file', response: { output: 'A' } } },
+    ]) as any);
+
+    const toolMsgs = (out.messages as any[]).filter(m => m.role === 'tool');
+    assert.deepEqual(
+      toolMsgs.map(m => [m.tool_call_id, JSON.parse(m.content).output]),
+      [['gid_B', 'B'], ['gid_A', 'A']],
+    );
+  });
+
+  it('mints the positional id when the client carries none', () => {
+    const out = convertGeminiGenerateContentToOpenAI({
+      model: 'gpt-target',
+      contents: [
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: {} } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'A' } } }] },
+      ],
+    } as any);
+
+    const asst = (out.messages as any[])[0];
+    const toolMsgs = (out.messages as any[]).filter(m => m.role === 'tool');
+    assert.equal(asst.tool_calls[0].id, 'call_read_file_0');
+    assert.equal(toolMsgs[0].tool_call_id, 'call_read_file_0');
+  });
+
+  /** Collects `logger.warn` messages — the only level this converter emits. */
+  function capturingLogger(warnings: string[]): Logger {
+    return {
+      traceEnabled: false,
+      trace() { },
+      debug() { },
+      info() { },
+      error() { },
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    };
+  }
+
+  // Rule #8: an id the client supplied that matches no call is evidence position
+  // is not the pairing. It must be reported, not applied in silence.
+  it('warns — naming the id and the candidates — when a supplied id matches no call', () => {
+    const warnings: string[] = [];
+    const out = convertGeminiGenerateContentToOpenAI(withResponses([
+      { functionResponse: { id: 'UNKNOWN', name: 'read_file', response: { output: 'R' } } },
+    ]) as any, { requestId: 'rid-unmatched', logger: capturingLogger(warnings) });
+
+    assert.equal(warnings.length, 1, 'exactly one warning for the one unmatched id');
+    assert.match(warnings[0], /UNKNOWN/, 'names the id the client supplied');
+    assert.match(warnings[0], /gid_A, gid_B/, 'names the calls it could have belonged to');
+    // Positional pairing is deliberately retained — the warning is what makes it
+    // honest, and this pins that the fallback still happened.
+    const toolMsgs = (out.messages as any[]).filter(m => m.role === 'tool');
+    assert.equal(toolMsgs[0].tool_call_id, 'gid_A');
+  });
+
+  it('stays silent when every supplied id matches, and when no id is supplied', () => {
+    const warnings: string[] = [];
+    const logger = capturingLogger(warnings);
+
+    const matched = convertGeminiGenerateContentToOpenAI(withResponses([
+      { functionResponse: { id: 'gid_B', name: 'read_file', response: { output: 'B' } } },
+      { functionResponse: { id: 'gid_A', name: 'read_file', response: { output: 'A' } } },
+    ]) as any, { requestId: 'rid-matched', logger });
+
+    const idless = convertGeminiGenerateContentToOpenAI({
+      model: 'gpt-target',
+      contents: [
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: {} } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'A' } } }] },
+      ],
+    } as any, { requestId: 'rid-idless', logger });
+
+    assert.deepEqual(warnings, [], 'no warning when the id matches, or when none was supplied');
+    // Both of those requests still pair correctly, so silence is the right answer.
+    assert.equal(((matched.messages as any[])[2]).tool_call_id, 'gid_B');
+    assert.equal(((idless.messages as any[])[1]).tool_call_id, 'call_read_file_0');
   });
 });
 

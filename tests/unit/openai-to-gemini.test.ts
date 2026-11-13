@@ -151,7 +151,7 @@ describe('convertOpenAIToGeminiGenerateContent', () => {
     assert.equal(parts[1].text, 'answer');
   });
 
-  it('converts tool_calls into functionCall parts', () => {
+  it('converts tool_calls into functionCall parts, carrying the call id', () => {
     const out = convertOpenAIToGeminiGenerateContent(
       {
         choices: [
@@ -172,7 +172,32 @@ describe('convertOpenAIToGeminiGenerateContent', () => {
     ) as any;
 
     const fnPart = out.candidates[0].content.parts[0];
+    assert.deepEqual(fnPart.functionCall, { id: 'tc_1', name: 'search', args: { q: 'test' } });
+  });
+
+  it('omits functionCall.id entirely when the upstream tool_call carries none', () => {
+    const out = convertOpenAIToGeminiGenerateContent(
+      {
+        choices: [
+          {
+            message: {
+              content: '',
+              tool_calls: [
+                { type: 'function', function: { name: 'search', arguments: '{"q":"test"}' } },
+              ],
+            },
+            finish_reason: 'tool_calls',
+            index: 0,
+          },
+        ],
+      },
+      'm',
+      'r',
+    ) as any;
+
+    const fnPart = out.candidates[0].content.parts[0];
     assert.deepEqual(fnPart.functionCall, { name: 'search', args: { q: 'test' } });
+    assert.equal('id' in fnPart.functionCall, false, 'absent id must not be emitted as null/undefined');
   });
 
   it('handles an empty choices array gracefully', () => {

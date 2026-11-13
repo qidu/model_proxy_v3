@@ -179,6 +179,11 @@ export function convertOpenAIToGeminiGenerateContent(
             const args = parseToolArguments(fn.arguments);
             parts.push({
                 functionCall: {
+                    // Gemini's `FunctionCall.id` is optional but the client is
+                    // expected to echo it in the matching `FunctionResponse.id`,
+                    // so an upstream tool_call id travels through when it exists
+                    // and is omitted (never `null`) when it does not.
+                    ...(typeof toolCall.id === 'string' && toolCall.id !== '' ? { id: toolCall.id } : {}),
                     name,
                     args: coerceArgsToSchema(args, schemasByName?.get(name)),
                 }

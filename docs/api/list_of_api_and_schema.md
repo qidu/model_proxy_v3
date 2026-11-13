@@ -226,8 +226,8 @@ is selected by the route's `defaultMode` / model config.
 | `GeminiAudioContent` | `{inlineData: {mimeType: "audio/...", data}}` | Inline audio |
 | `GeminiVideoContent` | `{inlineData: {mimeType: "video/...", data}}` or `{fileData}` | Inline video |
 | `GeminiDocumentContent` | `{inlineData: {mimeType: "application/pdf", data}}` or `{fileData}` | PDF / file |
-| `GeminiFunctionCallContent` | `{functionCall: {name, args}}` or `{function_call: ...}` | Tool call |
-| `GeminiFunctionResultContent` | `{functionResponse: {name, response}}` or `{function_response: ...}` | Tool result |
+| `GeminiFunctionCallContent` | `{functionCall: {name, args, id?}}` or `{function_call: ...}` | Tool call; `id` is carried through when the upstream supplies one |
+| `GeminiFunctionResultContent` | `{functionResponse: {name, response, id?}}` or `{function_response: ...}` | Tool result; `id` matches the call when present |
 | `GeminiThoughtContent` | `{thought: true, text}` | Thinking part |
 | `GeminiCodeExecutionCallContent` | `{executableCode: {language, code}}` | Code execution |
 | `GeminiCodeExecutionResultContent` | `{codeExecutionResult: {outcome, output}}` | Code execution result |

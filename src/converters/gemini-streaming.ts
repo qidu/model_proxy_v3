@@ -212,14 +212,17 @@ function handleNativeGeminiChunk(
                     state.contentIndex += 1;
                 }
                 const toolIndex = state.contentIndex;
-                // generateContent carries no call id — mint one so the client can
-                // echo it back in the matching tool_result.
+                // Carry the upstream's own call id when it has one so the client
+                // can echo it back in the matching tool_result; mint one when the
+                // upstream omitted it (`FunctionCall.id` is optional).
                 sendClaudeEvent(controller, 'content_block_start', {
                     type: 'content_block_start',
                     index: toolIndex,
                     content_block: {
                         type: 'tool_use',
-                        id: `tool_${Date.now()}_${toolIndex}`,
+                        id: typeof functionCall.id === 'string' && functionCall.id !== ''
+                            ? functionCall.id
+                            : `tool_${Date.now()}_${toolIndex}`,
                         name: functionCall.name,
                         input: {},
                     },

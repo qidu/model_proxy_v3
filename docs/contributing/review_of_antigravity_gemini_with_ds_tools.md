@@ -717,26 +717,44 @@ concept. The failures fall into two classes:
 
 The only place `functionCall` parts are built for the `:generateContent`
 response is `convertOpenAIToGeminiGenerateContent`
-(`src/converters/openai-to-gemini.ts:73-81`):
+(`src/converters/openai-to-gemini.ts:175-191`):
 
 ```ts
+const schemasByName = geminiToolSchemas.get(requestId);
 for (const toolCall of toolCalls) {
     const fn = toolCall.function || {};
+    const name = fn.name || '';
+    const args = parseToolArguments(fn.arguments);
     parts.push({
         functionCall: {
-            name: fn.name || '',
-            args: parseToolArguments(fn.arguments),   // JSON.parse, verbatim
+            ...(typeof toolCall.id === 'string' && toolCall.id !== '' ? { id: toolCall.id } : {}),
+            name,
+            args: coerceArgsToSchema(args, schemasByName?.get(name)),
         }
     });
 }
 ```
 
-`parseToolArguments` (`:23-32`) just `JSON.parse`s the model's raw argument
-string. The args are relayed **verbatim** through the whole chain
+> **Status update — 2026-11-04.** The coercion pass this doc recommends below
+> has since landed: `coerceArgsToSchema` (`:99`) plus the per-request schema map
+> (`registerGeminiToolSchemas`, `:43`), populated by the handler at inbound and
+> consulted here. It is **coercion-only, no drop-unknown**, exactly as proposed.
+> The `id` spread above arrived the same week and is unrelated to this review.
+> The log excerpts and the "hard limit" analysis below still hold; the
+> Recommendation and implementation-plan sections describe work that is now
+> shipped, so read them as history rather than as a to-do — and treat the
+> `openai-to-gemini.ts` line numbers inside those two sections as of the review
+> date (the cited `:73-81` is now `:175-191`).
+
+`parseToolArguments` (`:23-32`) `JSON.parse`s the model's raw argument string,
+and the args are **no longer relayed verbatim** end to end
 (`processAnthropicSSEBuffer` accumulates `input_json_delta` →
-`geminiToolCallBuffer` re-accumulates at `openai.ts:1318-1334` → this
-converter). Nothing corrupts them; the model itself produces the
-non-conforming args.
+`geminiToolCallBuffers` re-accumulates at `openai.ts:1762-1775` → this
+converter): `coerceArgsToSchema` now repairs declared-type mismatches against
+the inbound `functionDeclarations` — scalar→array, →string, →`number`/`boolean`
+— and returns anything it cannot safely coerce **unchanged**, so the upstream
+still rejects it honestly instead of receiving a fabricated value. The model
+itself still produces the non-conforming args this review is about.
 
 ### What an egress rewrite could fix — and its hard limit
 

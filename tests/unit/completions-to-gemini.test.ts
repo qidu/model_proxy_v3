@@ -63,7 +63,7 @@ describe('convertCompletionsToGeminiGenerateContentBody', () => {
     );
   });
 
-  it('converts assistant tool_calls to functionCall parts', async () => {
+  it('converts assistant tool_calls to functionCall parts, carrying the call id', async () => {
     const out = await convertCompletionsToGeminiGenerateContentBody(
       {
         model: 'g',
@@ -80,11 +80,11 @@ describe('convertCompletionsToGeminiGenerateContentBody', () => {
     );
     assert.equal(out.contents[0].role, 'model');
     assert.deepEqual(out.contents[0].parts, [{
-      functionCall: { name: 'get_weather', args: { city: 'sf' } },
+      functionCall: { id: 'call_1', name: 'get_weather', args: { city: 'sf' } },
     }]);
   });
 
-  it('converts role:tool messages to functionResponse parts', async () => {
+  it('converts role:tool messages to functionResponse parts, carrying the call id', async () => {
     const out = await convertCompletionsToGeminiGenerateContentBody(
       {
         model: 'g',
@@ -95,8 +95,29 @@ describe('convertCompletionsToGeminiGenerateContentBody', () => {
       'g',
     );
     assert.deepEqual(out.contents[0].parts, [{
-      functionResponse: { name: 'get_weather', response: { content: 'sunny' } },
+      functionResponse: { id: 'call_1', name: 'get_weather', response: { content: 'sunny' } },
     }]);
+  });
+
+  it('omits ids when tool calls and results carry none or an empty id', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g',
+        messages: [
+          {
+            role: 'assistant', content: '',
+            tool_calls: [{ type: 'function', function: { name: 'get_weather', arguments: '{}' } }],
+          },
+          { role: 'tool', tool_call_id: '', name: 'get_weather', content: 'sunny' },
+        ],
+      },
+      'g',
+    );
+
+    const functionCall = out.contents[0].parts[0].functionCall;
+    const functionResponse = out.contents[1].parts[0].functionResponse;
+    assert.equal('id' in functionCall, false);
+    assert.equal('id' in functionResponse, false);
   });
 
   it('maps generation params into generationConfig', async () => {

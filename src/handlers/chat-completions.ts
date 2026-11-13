@@ -551,10 +551,13 @@ export async function handleChatCompletionsPassthrough(
                       delta: {
                         tool_calls: [{
                           index,
-                          // generateContent carries no call id — mint one in the
-                          // shape the non-streaming converter uses, so a client
-                          // echoing it back keeps working either way.
-                          id: `tool_${Date.now()}_${index}`,
+                          // Carry the upstream's own call id when it has one, so a
+                          // client echoing it back keeps working either way; mint
+                          // one in the shape the non-streaming converter uses when
+                          // the upstream omitted it (`FunctionCall.id` is optional).
+                          id: typeof functionCall.id === 'string' && functionCall.id !== ''
+                            ? functionCall.id
+                            : `tool_${Date.now()}_${index}`,
                           type: 'function',
                           function: { name: functionCall.name, arguments: JSON.stringify(functionCall.args ?? {}) },
                         }],

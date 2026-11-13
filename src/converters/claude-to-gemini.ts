@@ -44,7 +44,13 @@ export function convertClaudeToGeminiRequest(
                 } else if (block.type === 'tool_use') {
                     const toolUse = block as ClaudeToolUseBlock;
                     toolNamesById.set(toolUse.id, toolUse.name);
-                    parts.push({ functionCall: { name: toolUse.name, args: toolUse.input ?? {} } });
+                    parts.push({
+                        functionCall: {
+                            ...(typeof toolUse.id === 'string' && toolUse.id !== '' ? { id: toolUse.id } : {}),
+                            name: toolUse.name,
+                            args: toolUse.input ?? {},
+                        },
+                    });
                 } else if (block.type === 'tool_result') {
                     const toolResult = block as ClaudeToolResultBlock;
                     const name = toolNamesById.get(toolResult.tool_use_id);
@@ -58,6 +64,7 @@ export function convertClaudeToGeminiRequest(
                     }
                     parts.push({
                         functionResponse: {
+                            ...(typeof toolResult.tool_use_id === 'string' && toolResult.tool_use_id !== '' ? { id: toolResult.tool_use_id } : {}),
                             name,
                             response: {
                                 content: typeof toolResult.content === 'string'
@@ -212,7 +219,13 @@ export async function convertCompletionsToGeminiGenerateContentBody(
                 } else if (typeof args === 'string') {
                     args = {};
                 }
-                parts.push({ functionCall: { name: fn?.name ?? '', args } });
+                parts.push({
+                    functionCall: {
+                        ...(typeof tc.id === 'string' && tc.id !== '' ? { id: tc.id } : {}),
+                        name: fn?.name ?? '',
+                        args,
+                    },
+                });
             }
         }
 
@@ -221,6 +234,7 @@ export async function convertCompletionsToGeminiGenerateContentBody(
             parts.length = 0;
             parts.push({
                 functionResponse: {
+                    ...(typeof m.tool_call_id === 'string' && m.tool_call_id !== '' ? { id: m.tool_call_id } : {}),
                     name: (m.name as string) || '',
                     response: { content: m.content ?? '' },
                 },

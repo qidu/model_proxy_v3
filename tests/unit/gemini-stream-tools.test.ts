@@ -97,6 +97,21 @@ describe('createGeminiStreamTransformer — native functionCall', () => {
     assert.deepEqual(startTypes, ['tool_use']);
   });
 
+  it("carries the upstream functionCall.id instead of minting one", async () => {
+    const events = await convert([
+      {
+        candidates: [{
+          content: { role: 'model', parts: [{ functionCall: { id: 'gemini-call-7', name: 'get_weather', args: { city: 'sf' } } }] },
+          finishReason: 'STOP',
+        }],
+      },
+    ]);
+
+    const start = events.find(e => e.event === 'content_block_start')!;
+    assert.equal(start.data.content_block.type, 'tool_use');
+    assert.equal(start.data.content_block.id, 'gemini-call-7', "the upstream's own id wins over the minted one");
+  });
+
   it('closes the open text block, then places the tool block at the next index', async () => {
     const events = await convert([
       {

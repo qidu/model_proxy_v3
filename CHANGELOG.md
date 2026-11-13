@@ -5,6 +5,90 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): `functionCall` / `functionResponse` ids survive the Gemini `generateContent` round trip
+
+The codebase's stated convention was that the `generateContent` shape carries no tool-call id, so
+the proxy minted one wherever a downstream schema needed it (`tool_${Date.now()}_${n}`,
+`call_${name}_${i}`). That convention is now reversed: **an id that exists is carried through, and
+one is minted only when the upstream or client supplied none.** Gemini's `FunctionCall.id` is a
+real optional field — the SDK documents it as *"the unique id of the function call. If populated,
+the client to execute the `function_call` and return the response with the matching `id`"*
+(`@google/genai` `FunctionCall.id`, with `FunctionResponse.id` as its counterpart) — and the
+sibling Interactions egress (`convertOpenAIToGeminiInteractions`) already passed `id`/`call_id`
+through, so the two Gemini output shapes disagreed. Three code comments, two API-doc claims and
+two pinned assertions asserted the old convention and were updated with it.
+
+**Egress** (`src/converters/openai-to-gemini.ts`) — the `functionCall` part now carries
+`toolCall.id` inside a conditional spread, so an id-less upstream omits the key entirely rather
+than emitting `"id": null`. Both the non-streaming path and the streaming flush reach this one
+converter, so a fragmented streamed `tool_call` is covered by the same change.
+
+**Ingress** (`src/handlers/openai.ts`) — `convertGeminiGenerateContentToOpenAI` keeps the client's
+own `functionCall.id` on the assistant `tool_calls`, and pairs each `functionResponse` to its call
+**by id when the client carried one**, falling back to the previous positional match otherwise.
+
+**Request-side cross-mode conversion** (`src/converters/claude-to-gemini.ts`) follows the same rule:
+Claude `tool_use.id` / `tool_result.tool_use_id` and OpenAI `tool_calls[].id` / `tool_call_id` now
+reach the corresponding Gemini `functionCall` / `functionResponse`, with absent or empty ids omitted.
+
+That second half fixes a real mispairing, not just a lost identifier: parallel tool results return
+in completion order, which need not match call order, and position alone attached each result to
+the wrong call. Measured through `handler.fetch` with a stubbed upstream — two `read_file` calls
+(`a.ts`, `b.ts`), responses returned in reverse order, each tagged with its own id:
+
+| upstream `tool_call_id` | before | after |
+| --- | --- | --- |
+| `call_read_file_0` (a.ts) | `CONTENT_OF_B` | `CONTENT_OF_A` |
+| `call_read_file_1` (b.ts) | `CONTENT_OF_A` | `CONTENT_OF_B` |
+
+Egress, same harness (`openai-completions` upstream → `:generateContent` front door):
+
+| leg | before | after |
+| --- | --- | --- |
+| non-streaming, upstream `id: 'call_A'` | `{"name":"run","args":{"cmd":"ls"}}` | `{"id":"call_A","name":"run","args":{"cmd":"ls"}}` |
+| streaming, `id` in chunk 1 and args split across chunks 2 | no `id` | `{"id":"call_B","name":"run","args":{"cmd":"ls"}}` |
+
+**An unmatched id warns instead of misfiling in silence.** That pairing falls back to position in
+two different situations: the client carried no ids at all (a truncated history, or a client with
+its own id scheme), and the client carried an id that matches no call in the same body. Only the
+second is anomalous — it is evidence that position is *not* the pairing — so it now reports
+itself via `logger.warn`:
+
+```
+[gemini->openai] functionResponse id "UNKNOWN" matches no functionCall in this request
+(calls: gid_A, gid_B); pairing by position instead, which may attach this result to the wrong call
+```
+
+`convertGeminiGenerateContentToOpenAI` gained an optional `options: { logger?, requestId? }` for
+this, following the `options.logger`-carries-warnings-only convention already used by the sibling
+`convertGeminiGenerateContentToClaude`. Positional pairing is deliberately **retained**: rejecting
+an unmatched id would emit a tool message whose `tool_call_id` matches no assistant tool call,
+which an OpenAI-compatible upstream answers with a 400 — trading a silent mispair for a hard
+failure on every client that mints its own response ids. The id-less path stays silent, so no
+existing client starts emitting warnings. Found by review rather than by a failing request; the
+reviewer's proposed remedy (drop the positional fallback for an unmatched id) is what the 400
+above rules out.
+
+**The three mint sites now prefer the upstream's id too** — `convertGeminiGenerateContentToClaude`
+and `createGeminiStreamTransformer` (`src/converters/gemini-streaming.ts`) for the Claude front
+doors, and the `gemini-generatecontent` streaming branch of `/v1/chat/completions`
+(`src/handlers/chat-completions.ts`). All three keep the existing minted-id shape as the fallback,
+so they stay consistent with each other and with the non-streaming converter they mirror.
+
+**Compatibility.** A client that never sends or reads the field is unaffected (the field is
+optional and omitted, never null). A client whose parser rejects unknown fields would see `id` on
+a `functionCall` part where it previously saw none — Gemini's own schema defines the field, so
+only a client pinned to an older proto is at risk.
+
+Docs updated with the convention: `docs/api/list_of_api_and_schema.md` (both content-part rows)
+and `docs/api/api-endpoints.md`. Also refreshed:
+`docs/contributing/review_of_antigravity_gemini_with_ds_tools.md`, whose "single egress site"
+section quoted this converter's pre-change body and cited line numbers that had rotted several
+increments earlier (`:73-81` → `:175-191`); the quote now matches the code, its "the args are
+relayed verbatim" paragraph is corrected to describe `coerceArgsToSchema` (the very pass that doc
+recommends — landed since it was written), and a dated status note marks its Recommendation and
+implementation-plan sections as shipped history rather than a to-do.
+
 ### fix(route): `max_completion_tokens` reaches an `anthropic-messages` upstream
 
 `/v1/chat/completions` routed to an `anthropic-messages` upstream converts through

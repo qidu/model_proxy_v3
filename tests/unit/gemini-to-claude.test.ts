@@ -300,9 +300,29 @@ describe('convertGeminiGenerateContentToClaude', () => {
     assert.equal(block.type, 'tool_use');
     assert.equal(block.name, 'get_weather');
     assert.deepEqual(block.input, { city: '杭州' });
-    assert.match(block.id, /^tool_\d+_0$/, 'a call id is minted because generateContent has none');
+    assert.match(block.id, /^tool_\d+_0$/, 'a call id is minted because this functionCall carries none');
     // Gemini reports a tool call as finishReason STOP — the block must win.
     assert.equal(resp.stop_reason, 'tool_use');
+  });
+
+  it("carries the upstream functionCall.id instead of minting one", () => {
+    const resp = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{
+          content: { parts: [{ functionCall: { id: 'gemini-call-7', name: 'get_weather', args: { city: '杭州' } } }] },
+          finishReason: 'STOP',
+        }],
+        usageMetadata: { promptTokenCount: 20, candidatesTokenCount: 8 },
+      },
+      'gemini-2',
+      'reqid-abcdef12',
+    );
+
+    assert.equal(resp.content.length, 1);
+    const block = resp.content[0] as any;
+    assert.equal(block.type, 'tool_use');
+    assert.equal(block.id, 'gemini-call-7', "the upstream's own id wins over the minted one");
+    assert.equal(block.name, 'get_weather');
   });
 
   it('keeps text and emits one tool_use block per functionCall, minting distinct ids', () => {

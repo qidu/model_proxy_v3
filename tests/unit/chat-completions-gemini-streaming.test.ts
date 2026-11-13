@@ -64,13 +64,16 @@ function geminiStreamResponse(textChunks: string[]): Response {
  * a chunk carrying the complete functionCall together with finishReason STOP
  * and the turn's usageMetadata (the shape a real :streamGenerateContent emits).
  */
-function geminiToolCallStreamResponse(): Response {
+function geminiToolCallStreamResponse(callId?: string): Response {
   const encoder = new TextEncoder();
   const events = [
     { candidates: [{ content: { role: 'model', parts: [{ text: 'Checking.' }] }, finishReason: null }] },
     {
       candidates: [{
-        content: { role: 'model', parts: [{ functionCall: { name: 'get_weather', args: { city: 'sf' } } }] },
+        content: {
+          role: 'model',
+          parts: [{ functionCall: { ...(callId ? { id: callId } : {}), name: 'get_weather', args: { city: 'sf' } } }],
+        },
         finishReason: 'STOP',
       }],
       usageMetadata: { promptTokenCount: 31, candidatesTokenCount: 17, totalTokenCount: 48 },
@@ -238,6 +241,25 @@ describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode
     const finish = chunks.find(c => c.choices[0]?.finish_reason);
     assert.equal(finish.choices[0].finish_reason, 'tool_calls');
     assert.equal(raw[raw.length - 1], '[DONE]');
+  });
+
+  it("streaming: carries the upstream functionCall.id instead of minting one", async () => {
+    globalThis.fetch = (async () => geminiToolCallStreamResponse('gemini-call-7')) as typeof fetch;
+
+    const req = makeRequest({
+      model: 'g', messages: [{ role: 'user', content: 'weather in sf?' }],
+    }, true);
+    const res = await handleChatCompletionsPassthrough(
+      req, 'https://upstream/v1beta/models/g:generateContent',
+      { Authorization: 'Bearer k' }, 'rid-5b', testLogger, env, 'g', 'gemini-generatecontent',
+    );
+
+    const { chunks } = parseSSE(await res.text());
+    const toolChunk = chunks.find(c => c.choices[0]?.delta?.tool_calls);
+    assert.ok(toolChunk, 'expected a chunk carrying delta.tool_calls');
+    const call = toolChunk.choices[0].delta.tool_calls[0];
+    assert.equal(call.id, 'gemini-call-7', "the upstream's own id wins over the minted one");
+    assert.equal(call.function.name, 'get_weather');
   });
 
   it('streaming: emits the usage chunk when stream_options.include_usage is set', async () => {

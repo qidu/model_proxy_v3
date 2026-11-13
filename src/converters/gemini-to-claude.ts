@@ -204,11 +204,15 @@ export function convertGeminiGenerateContentToClaude(
                 for (const part of parts) {
                     const functionCall = part.functionCall as Record<string, unknown> | undefined;
                     if (functionCall) {
-                        // generateContent carries no call id — mint one so the
-                        // client can echo it back in the matching tool_result.
+                        // Gemini's `FunctionCall.id` is optional: carry the
+                        // upstream's own id when it has one so the client can
+                        // echo it back in the matching tool_result, and mint one
+                        // when the upstream omitted it.
                         toolUseBlocks.push({
                             type: 'tool_use',
-                            id: `tool_${Date.now()}_${toolUseBlocks.length}`,
+                            id: typeof functionCall.id === 'string' && functionCall.id !== ''
+                                ? functionCall.id
+                                : `tool_${Date.now()}_${toolUseBlocks.length}`,
                             name: functionCall.name as string,
                             input: functionCall.args ?? {},
                         });

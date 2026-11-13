@@ -292,8 +292,15 @@ function normalizeGeminiSchema(schema: any): any {
 
 /**
  * Convert Gemini generateContent request to OpenAI format
+ *
+ * `options.logger` is optional and carries warnings only: Rule #8 requires a
+ * `functionResponse` whose supplied `id` matches no `functionCall` in the same
+ * body to be reported rather than paired by position in silence.
  */
-export function convertGeminiGenerateContentToOpenAI(geminiRequest: Record<string, unknown>): Record<string, unknown> {
+export function convertGeminiGenerateContentToOpenAI(
+  geminiRequest: Record<string, unknown>,
+  options?: { logger?: Logger; requestId?: string },
+): Record<string, unknown> {
   const model = (geminiRequest.model as string) || 'gemini-no-id-at-proxy';
 
   // Handle contents format
@@ -312,7 +319,8 @@ export function convertGeminiGenerateContentToOpenAI(geminiRequest: Record<strin
       }
     }
 
-    // Track the last emitted tool_calls so tool results can recover the correct id+name.
+    // Track the last emitted tool_calls so tool results can recover the correct
+    // id+name — by the client's own id when it carried one, by position otherwise.
     let lastToolCalls: Array<{ id: string; name: string }> = [];
 
     for (const content of geminiRequest.contents as any[]) {
@@ -330,9 +338,14 @@ export function convertGeminiGenerateContentToOpenAI(geminiRequest: Record<strin
       const textContent = parts.filter((p: any) => p.text && !p.thought).map((p: any) => p.text as string).join('');
 
       if (funcCallParts.length > 0) {
-        // Model turn: convert functionCall parts to OpenAI tool_calls
+        // Model turn: convert functionCall parts to OpenAI tool_calls. A client
+        // that tagged its call with an `id` keeps it, so the matching
+        // functionResponse can be paired by id; the synthesized id stays the
+        // fallback for the (common) client that carries none.
         lastToolCalls = funcCallParts.map((p: any, i: number) => ({
-          id: `call_${p.functionCall.name}_${i}`,
+          id: typeof p.functionCall.id === 'string' && p.functionCall.id !== ''
+            ? p.functionCall.id
+            : `call_${p.functionCall.name}_${i}`,
           name: p.functionCall.name,
         }));
         const msg: Record<string, unknown> = {
@@ -351,10 +364,28 @@ export function convertGeminiGenerateContentToOpenAI(geminiRequest: Record<strin
         messages.push(msg);
       } else if (funcRespParts.length > 0) {
         // User turn: convert functionResponse parts to OpenAI tool messages.
-        // Match by position to the preceding lastToolCalls so id and name agree.
+        // Prefer the id the client carried on the response: parallel tool calls
+        // complete in whatever order they finish, which need not match call
+        // order, and position alone would attach each result to the wrong call.
         for (let i = 0; i < funcRespParts.length; i++) {
           const p = funcRespParts[i];
-          const matched = lastToolCalls[i];
+          const respId = typeof p.functionResponse.id === 'string' ? p.functionResponse.id : '';
+          const byId = respId ? lastToolCalls.find(tc => tc.id === respId) : undefined;
+          // Rule #8: a supplied id that matches no call is evidence that position
+          // is NOT the pairing — report it rather than file the result silently
+          // under whichever call happens to sit at this index. Positional pairing
+          // stays the fallback (and remains the whole behavior when the client
+          // carries no ids): rejecting instead would turn a mispaired result into
+          // a hard upstream 400 for every client that mints its own response ids.
+          if (respId && !byId) {
+            options?.logger?.warn(
+              options?.requestId ?? 'unknown',
+              `[gemini->openai] functionResponse id ${JSON.stringify(respId)} matches no functionCall in this ` +
+              `request (calls: ${lastToolCalls.map(tc => tc.id).join(', ') || 'none'}); pairing by position ` +
+              `instead, which may attach this result to the wrong call`,
+            );
+          }
+          const matched = byId ?? lastToolCalls[i];
           messages.push({
             role: 'tool',
             tool_call_id: matched?.id ?? `call_${p.functionResponse.name}_${i}`,
@@ -1392,7 +1423,7 @@ export async function handleOpenAIRequest(
           }
           if (schemasByName.size > 0) registerGeminiToolSchemas(requestId, schemasByName);
         }
-        openaiRequest = convertGeminiGenerateContentToOpenAI(requestBody);
+        openaiRequest = convertGeminiGenerateContentToOpenAI(requestBody, { logger: activeLogger, requestId });
       } else {
         activeLogger.debug(requestId, 'Detected Interactions format with input field');
         openaiRequest = convertGeminiInteractionsToOpenAI(requestBody);

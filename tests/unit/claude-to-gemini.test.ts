@@ -225,7 +225,7 @@ describe('convertClaudeToGeminiRequest — tools', () => {
     }
   });
 
-  it('maps an assistant tool_use block to a functionCall part', () => {
+  it('maps an assistant tool_use block to a functionCall part, carrying the tool_use id', () => {
     const req = {
       model: 'gemini',
       messages: [
@@ -241,11 +241,11 @@ describe('convertClaudeToGeminiRequest — tools', () => {
     const out = convertClaudeToGeminiRequest(req) as any;
     assert.deepEqual(out.contents[1], {
       role: 'model',
-      parts: [{ functionCall: { name: 'get_weather', args: { city: '杭州' } } }],
+      parts: [{ functionCall: { id: 'toolu_1', name: 'get_weather', args: { city: '杭州' } } }],
     });
   });
 
-  it('maps a user tool_result block to a functionResponse carrying the tool name from the matching tool_use', () => {
+  it('maps a user tool_result block to a functionResponse carrying the matching tool_use id and name', () => {
     const req = {
       model: 'gemini',
       messages: [
@@ -268,8 +268,31 @@ describe('convertClaudeToGeminiRequest — tools', () => {
     const out = convertClaudeToGeminiRequest(req) as any;
     assert.deepEqual(out.contents[2], {
       role: 'user',
-      parts: [{ functionResponse: { name: 'get_weather', response: { content: '晴，26°C' } } }],
+      parts: [{ functionResponse: { id: 'toolu_1', name: 'get_weather', response: { content: '晴，26°C' } } }],
     });
+  });
+
+  it('omits empty tool_use and tool_result ids', () => {
+    const req = {
+      model: 'gemini',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: '', name: 'get_weather', input: {} }],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: '', content: 'sunny' }],
+        },
+      ],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToGeminiRequest(req) as any;
+    const functionCall = out.contents[0].parts[0].functionCall;
+    const functionResponse = out.contents[1].parts[0].functionResponse;
+    assert.equal('id' in functionCall, false);
+    assert.equal('id' in functionResponse, false);
   });
 
   it('stringifies a structured tool_result content array into the functionResponse text', () => {
