@@ -5,6 +5,39 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): a truncated `openai-responses` stream ends with `max_tokens` instead of aborting
+
+`handleResponsesStreamAsClaude` (`src/handlers/messages.ts`) terminated the client stream only on
+`response.completed`. An upstream that hit the output cap reports `response.incomplete` instead, which
+matched no branch — the pump read on to EOF, `completed` stayed false, and the client's SSE stream was
+**aborted** (`Responses stream ended before response.completed`) with no `message_delta` and no
+`message_stop`: a connection that just stops mid-message. Reproduced with `max_tokens: 256` against a
+300-word prompt, exactly the truncation path `/v1/messages` → `openai-responses` takes.
+
+`response.incomplete` now ends the message like `response.completed`, with `stop_reason: 'max_tokens'`
+and the incomplete event's own `usage`. `tool_use` deliberately does not win on this path (unlike
+`responsesFinishReason` in `src/converters/responses-to-completions.ts`): a `function_call` cut off
+mid-arguments is not runnable, so reporting it as `tool_use` would invite the client to execute a
+partial call. A terminal event also writes a `content_block_stop` for every block the upstream left
+open — a truncated turn never sends the item's `output_text.done` / `output_item.done`, and nothing may
+follow `message_stop` while a block is still open. Blocks upstream already closed are tracked in a
+`closedBlocks` set and never written twice. Finally, a terminal event stops the pump's line loop, so
+events that share its chunk can no longer be forwarded after `message_stop`.
+
+The same path now traces the upstream SSE (`observeStream(..., 'upstream-response', ..., 'sse-lines')`),
+which is what the Completions SSE path next door already did. Before this, at `LOG_LEVEL=trace` the
+`openai-responses` branch logged the request, the response headers and the outbound headers but not a
+single upstream event, so "upstream sent no text", "upstream sent text this converter dropped" and "the
+stream was truncated" were indistinguishable from the log. Still untraced on this path: the converted
+outbound events (the sibling path traces both ends); no report has needed them yet.
+
+Tests: `tests/unit/messages-handler.test.ts` (+4 — a truncated text turn forwards its deltas, ends
+`max_tokens` with the incomplete event's usage, and drops the event that follows; a truncated tool call
+reports `max_tokens`, not `tool_use`, with its block closed before the stop event; a block left open by
+the truncation gets exactly one synthesized `content_block_stop`; each upstream event is traced verbatim
+at TRACE, nothing is traced below it, and the trace does not consume the client's stream). Full unit
+suite 2808/2808.
+
 ### fix(handlers): `max_completion_tokens` reaches a Responses upstream, and the reasoning item order is restored
 
 Two follow-ups from reviewing the merge below.

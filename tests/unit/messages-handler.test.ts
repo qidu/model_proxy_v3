@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { handleMessagesRequest } from '../../src/handlers/messages.js';
 import { countClaudeRequestTokens } from '../../src/utils/token-counting.js';
 import { ClaudeProxyError } from '../../src/utils/errors.js';
+import type { Logger } from '../../src/utils/logger.js';
 
 const TARGET_URL = 'https://upstream.example/v1/chat/completions';
 const ENV = { LOG_LEVEL: 'error' } as any;
@@ -21,6 +22,23 @@ function jsonResponse(body: unknown): Record<string, unknown> {
   return body as Record<string, unknown>;
 }
 
+function recordingLogger(traceEnabled: boolean): Logger & { traces: string[] } {
+  const traces: string[] = [];
+  return {
+    traceEnabled,
+    traces,
+    // Gates like the real logger does, so a trace-off run records nothing even
+    // though `logPipelineHeaders` does not check `traceEnabled` itself.
+    trace(_requestId: string, message: string) {
+      if (traceEnabled) traces.push(message);
+    },
+    debug() {},
+    info() {},
+    warn() {},
+    error() {},
+  };
+}
+
 function messagesRequest(body: Record<string, unknown>): Request {
   return new Request('http://proxy/v1/messages', {
     method: 'POST',
@@ -29,7 +47,11 @@ function messagesRequest(body: Record<string, unknown>): Request {
   });
 }
 
-async function postMessages(body: Record<string, unknown>, upstreamMode = 'openai-completions'): Promise<Response> {
+async function postMessages(
+  body: Record<string, unknown>,
+  upstreamMode = 'openai-completions',
+  logger?: Logger,
+): Promise<Response> {
   return handleMessagesRequest(
     messagesRequest(body),
     TARGET_URL,
@@ -37,7 +59,7 @@ async function postMessages(body: Record<string, unknown>, upstreamMode = 'opena
     'req-messages',
     'gpt-test',
     ENV,
-    undefined,
+    logger,
     undefined,
     upstreamMode,
   );
@@ -330,6 +352,187 @@ describe('handleMessagesRequest', () => {
         usage: { input_tokens: 8, output_tokens: 4 },
       });
       assert.deepEqual(parsed[6], { type: 'message_stop' });
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('ends a truncated Responses stream with stop_reason max_tokens instead of aborting it', async () => {
+    const previousFetch = globalThis.fetch;
+    const events = [
+      { type: 'response.output_text.delta', delta: 'The sea ' },
+      { type: 'response.output_text.delta', delta: 'is vast' },
+      { type: 'response.output_text.done', text: 'The sea is vast' },
+      {
+        type: 'response.incomplete',
+        response: {
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          usage: { input_tokens: 37, output_tokens: 256 },
+        },
+      },
+      // After the terminal event: must not reach the client.
+      { type: 'response.output_text.delta', delta: 'never forwarded' },
+    ];
+    globalThis.fetch = (async () => new Response(
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )) as typeof fetch;
+
+    try {
+      const response = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'essay' }],
+      }, 'openai-responses');
+
+      // Resolves rather than rejecting: the client gets a terminated message.
+      const text = await response.text();
+      const parsed = text.split('\n\n').filter(Boolean).map((frame) => {
+        const data = frame.split('\n').find((line) => line.startsWith('data: '));
+        return JSON.parse(data!.slice(6));
+      });
+
+      assert.deepEqual(parsed.map((p: any) => p.type), [
+        'message_start',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_delta',
+        'content_block_stop',
+        'message_delta',
+        'message_stop',
+      ]);
+      assert.deepEqual(parsed[2].delta, { type: 'text_delta', text: 'The sea ' });
+      assert.deepEqual(parsed[5].delta, { stop_reason: 'max_tokens', stop_sequence: null });
+      // Usage comes from the incomplete event's response, not the pre-stream estimate.
+      assert.deepEqual(parsed[5].usage, { input_tokens: 37, output_tokens: 256 });
+      assert.equal(text.includes('never forwarded'), false);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('reports a truncated tool call as max_tokens, never as tool_use', async () => {
+    const previousFetch = globalThis.fetch;
+    const events = [
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call-weather', name: 'get_weather' } },
+      { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":' },
+      {
+        type: 'response.incomplete',
+        response: {
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          usage: { input_tokens: 8, output_tokens: 16 },
+        },
+      },
+    ];
+    globalThis.fetch = (async () => new Response(
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )) as typeof fetch;
+
+    try {
+      const response = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'Weather?' }],
+      }, 'openai-responses');
+      const text = await response.text();
+      const parsed = text.split('\n\n').filter(Boolean).map((frame) => {
+        const data = frame.split('\n').find((line) => line.startsWith('data: '));
+        return JSON.parse(data!.slice(6));
+      });
+
+      const messageDelta = parsed.find((p: any) => p.type === 'message_delta');
+      assert.deepEqual(messageDelta!.delta, { stop_reason: 'max_tokens', stop_sequence: null });
+      // The truncated tool block is closed before the stop event, not left open.
+      const stopIndex = parsed.findIndex((p: any) => p.type === 'content_block_stop');
+      assert.deepEqual(parsed[stopIndex], { type: 'content_block_stop', index: 0 });
+      assert.ok(stopIndex < parsed.indexOf(messageDelta!));
+      assert.deepEqual(parsed[parsed.length - 1], { type: 'message_stop' });
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('closes a content block the truncated stream left open, exactly once', async () => {
+    const previousFetch = globalThis.fetch;
+    // No `response.output_text.done`: upstream truncates with the block still open.
+    const events = [
+      { type: 'response.output_text.delta', delta: 'The sea ' },
+      {
+        type: 'response.incomplete',
+        response: {
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          usage: { input_tokens: 37, output_tokens: 256 },
+        },
+      },
+    ];
+    globalThis.fetch = (async () => new Response(
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )) as typeof fetch;
+
+    try {
+      const response = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'essay' }],
+      }, 'openai-responses');
+      const text = await response.text();
+      const parsed = text.split('\n\n').filter(Boolean).map((frame) => {
+        const data = frame.split('\n').find((line) => line.startsWith('data: '));
+        return JSON.parse(data!.slice(6));
+      });
+
+      assert.deepEqual(parsed.map((p: any) => p.type), [
+        'message_start',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_stop',
+        'message_delta',
+        'message_stop',
+      ]);
+      assert.deepEqual(parsed[3], { type: 'content_block_stop', index: 0 });
+      assert.deepEqual(parsed[4].delta, { stop_reason: 'max_tokens', stop_sequence: null });
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('traces the upstream Responses SSE at TRACE and stays silent below it', async () => {
+    const previousFetch = globalThis.fetch;
+    const events = [
+      { type: 'response.output_text.delta', delta: 'The sea ' },
+      { type: 'response.completed', response: { usage: { input_tokens: 5, output_tokens: 2 } } },
+    ];
+    globalThis.fetch = (async () => new Response(
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )) as typeof fetch;
+
+    try {
+      const traced = recordingLogger(true);
+      const response = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'essay' }],
+      }, 'openai-responses', traced);
+      // The trace must not consume the stream the client reads.
+      const text = await response.text();
+      assert.equal(text.includes('"type":"message_stop"'), true);
+
+      const upstream = traced.traces.filter((line) => line.startsWith('[UPSTREAM-RESP]'));
+      assert.equal(upstream.length, 2);
+      // Each line carries one upstream event, verbatim.
+      assert.deepEqual(
+        JSON.parse(upstream[0].slice(upstream[0].indexOf(': ') + 2)),
+        events[0],
+      );
+      assert.deepEqual(
+        JSON.parse(upstream[1].slice(upstream[1].indexOf(': ') + 2)),
+        events[1],
+      );
+
+      const quiet = recordingLogger(false);
+      const quietResponse = await postMessages({
+        model: 'gpt-test', stream: true, messages: [{ role: 'user', content: 'essay' }],
+      }, 'openai-responses', quiet);
+      await quietResponse.text();
+      assert.deepEqual(quiet.traces, []);
     } finally {
       globalThis.fetch = previousFetch;
     }

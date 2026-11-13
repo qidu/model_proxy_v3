@@ -964,6 +964,11 @@ async function handleStreamingResponse(
  *   response.output_text.delta          → emit content_block_delta
  *   response.output_text.done           → emit content_block_stop
  *   response.completed                  → emit message_delta (stop) + message_stop
+ *   response.incomplete                 → emit message_delta (stop_reason
+ *                                         `max_tokens`) + message_stop
+ *
+ * A terminal event also writes a `content_block_stop` for every block the
+ * upstream left open (a truncated turn never sends the item's `done` event).
  *
  * Tool-call events (response.output_item.added with function_call type) are
  * mapped to Claude tool_use content blocks.
@@ -1021,12 +1026,29 @@ function handleResponsesStreamAsClaude(
       let textBlockIndex = -1;
       // Map from function_call output_index → Claude content block index
       const toolBlockIndex = new Map<number, number>();
+      /** Blocks a `content_block_stop` was already written for. */
+      const closedBlocks = new Set<number>();
       let nextBlockIndex = 0;
       let buffer = '';
       let outputTokens = 0;
       let completed = false;
 
-      const reader = upstreamResponse.body!.getReader();
+      const closeBlock = async (index: number): Promise<void> => {
+        if (closedBlocks.has(index)) return;
+        closedBlocks.add(index);
+        await writer.write(claudeEvent('content_block_stop', {
+          type: 'content_block_stop',
+          index,
+        }));
+      };
+
+      // Same trace the Completions SSE path carries (`handleStreamingResponse`):
+      // the upstream event is the only record of what this converter was given,
+      // and a stream that closes with no visible answer cannot be diagnosed
+      // without it.
+      const reader = upstreamResponse.body!
+        .pipeThrough(observeStream(logger, requestId, 'upstream-response', upstreamResponse.url || '(upstream SSE)', 'sse-lines'))
+        .getReader();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1093,10 +1115,7 @@ function handleResponsesStreamAsClaude(
             }
           } else if (type === 'response.output_text.done') {
             if (textBlockIndex !== -1) {
-              await writer.write(claudeEvent('content_block_stop', {
-                type: 'content_block_stop',
-                index: textBlockIndex,
-              }));
+              await closeBlock(textBlockIndex);
             }
           } else if (type === 'response.output_item.done') {
             const item = evt.item as Record<string, unknown> | undefined;
@@ -1104,15 +1123,12 @@ function handleResponsesStreamAsClaude(
               const outputIndex = evt.output_index as number ?? 0;
               const blockIdx = toolBlockIndex.get(outputIndex);
               if (blockIdx !== undefined) {
-                await writer.write(claudeEvent('content_block_stop', {
-                  type: 'content_block_stop',
-                  index: blockIdx,
-                }));
+                await closeBlock(blockIdx);
               }
             }
           } else if (type === 'response.failed') {
             throw new Error(`Responses stream failed before response.completed (request ${requestId})`);
-          } else if (type === 'response.completed') {
+          } else if (type === 'response.completed' || type === 'response.incomplete') {
             const resp = evt.response as Record<string, unknown> | undefined;
             const usage = resp?.usage as Record<string, unknown> | undefined;
             if (usage) {
@@ -1120,10 +1136,30 @@ function handleResponsesStreamAsClaude(
               outputTokens = (usage.output_tokens as number) ?? 0;
             }
             const hasToolUse = toolBlockIndex.size > 0;
+            // An answer truncated at the output cap (`response.incomplete`) still
+            // ends with a terminated message: `stop_reason: 'max_tokens'` tells the
+            // client the answer was cut, where reading on would abort the stream at
+            // EOF with no `message_delta`/`message_stop` at all.
+            // `tool_use` does not win here — a tool call cut off mid-arguments is
+            // not runnable, so a truncated turn must never report it as such.
+            const stopReason = type === 'response.incomplete'
+              ? 'max_tokens'
+              : (hasToolUse ? 'tool_use' : 'end_turn');
+            // A stream that ends without the item's `output_text.done` /
+            // `output_item.done` leaves blocks open — the normal case for a
+            // truncated turn, whose items upstream never finalizes. Nothing may
+            // follow `message_stop` and every block stops before `message_delta`,
+            // so the blocks left open are closed here, in block order. A block
+            // upstream already closed is not written twice.
+            const openBlocks = [
+              ...(textBlockIndex !== -1 ? [textBlockIndex] : []),
+              ...toolBlockIndex.values(),
+            ].filter((index) => !closedBlocks.has(index)).sort((a, b) => a - b);
+            for (const index of openBlocks) await closeBlock(index);
             await writer.write(claudeEvent('message_delta', {
               type: 'message_delta',
               delta: {
-                stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
+                stop_reason: stopReason,
                 stop_sequence: null,
               },
               usage: { input_tokens: inputTokens, output_tokens: outputTokens },
@@ -1131,6 +1167,10 @@ function handleResponsesStreamAsClaude(
             await writer.write(claudeEvent('message_stop', { type: 'message_stop' }));
             completed = true;
           }
+
+          // A terminal event ends the message for the events that share its
+          // chunk too: nothing may follow `message_stop` on the client stream.
+          if (completed) break;
         }
         if (completed) break;
       }
