@@ -654,11 +654,14 @@ export function formatTransformsDebug(transforms: TransformSet[]): string {
 /**
  * Per-entry `max_tokens` cap paths per upstream mode, checked in order.
  * openai-completions checks both names because the `max_tokens_rename`
- * transform may have renamed the field at this hook; gemini bodies may carry
- * the snake_case converted form or a camelCase native-client form.
+ * transform may have renamed the field at this hook; anthropic-messages checks
+ * both because its Chat Completions front door hands this hook a
+ * still-Completions-shaped body, whose `max_completion_tokens`
+ * `completionsToClaudeBody` honours; gemini bodies may carry the snake_case
+ * converted form or a camelCase native-client form.
  */
 const MAX_OUTPUT_TOKENS_PATHS: Record<string, string[]> = {
-  'anthropic-messages': ['max_tokens'],
+  'anthropic-messages': ['max_tokens', 'max_completion_tokens'],
   'openai-completions': ['max_completion_tokens', 'max_tokens'],
   'openai-responses': ['max_output_tokens'],
   'gemini': ['generation_config.max_output_tokens', 'generationConfig.maxOutputTokens'],

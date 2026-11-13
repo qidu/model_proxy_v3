@@ -1761,6 +1761,13 @@ describe('per-entry max_tokens cap', () => {
     assert.equal(result.body.max_tokens, 8192);
   });
 
+  it('clamps anthropic-messages max_completion_tokens (Chat Completions front door)', () => {
+    // The chat-completions handler runs this hook before `completionsToClaudeBody`,
+    // so the body is still Completions-shaped and may carry the newer field name.
+    const result = runHook('before_upstream', payload({ max_completion_tokens: 50000 }), capCtx('anthropic-messages', 8192));
+    assert.equal(result.body.max_completion_tokens, 8192);
+  });
+
   it('leaves smaller client values unchanged (anthropic-messages)', () => {
     const result = runHook('before_upstream', payload({ max_tokens: 1024 }), capCtx('anthropic-messages', 8192));
     assert.equal(result.body.max_tokens, 1024);

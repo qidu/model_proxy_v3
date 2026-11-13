@@ -5,6 +5,44 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(route): `max_completion_tokens` reaches an `anthropic-messages` upstream
+
+`/v1/chat/completions` routed to an `anthropic-messages` upstream converts through
+`completionsToClaudeBody`, which read only `completions.max_tokens` and fell back to `4096`
+(`src/handlers/openai.ts:888`). A client speaking the newer OpenAI vocabulary — sending
+`max_completion_tokens` alone — therefore had its limit **silently replaced by 4096**: no log
+line, no client-visible signal, and the upstream's `stop_reason: max_tokens` as the only hint.
+
+- **The converter now reads both names**: `max_tokens ?? max_completion_tokens ?? 4096`. The
+  legacy name still wins when both are present, so no existing caller changes.
+- **Companion, required by the above**: `MAX_OUTPUT_TOKENS_PATHS['anthropic-messages']` gained
+  `max_completion_tokens` (`src/utils/request-transform.ts`). The chat-completions handler runs
+  `before_upstream` *before* the conversion, so the hook sees a still-Completions-shaped body —
+  without this the per-entry `route.maxTokens` cap would have become bypassable by the very
+  field the converter had just started honouring. Same reason `openai-completions` already
+  listed both names.
+
+Measured on the wire (handler driven with a stubbed upstream, body captured):
+
+| client body | `max_tokens` sent upstream |
+| --- | --- |
+| `max_completion_tokens: 1234` only | 1234 (was 4096) |
+| `max_tokens: 777` only | 777 |
+| both | 777 |
+| neither | 4096 |
+| `max_completion_tokens: 50000`, entry cap 8192 | 8192 |
+| `max_completion_tokens: 1024`, entry cap 8192 | 1024 |
+
+**Reported, not fixed.** The same gap exists on the sibling `openai-responses` path:
+`completionsToResponsesBody` reads only `max_tokens` (`src/handlers/openai.ts:980`), and on that
+branch `before_upstream` runs *after* the conversion, so no transform can rescue the field
+either. `validateOpenAICompletionsRequest` likewise never validates `max_completion_tokens`, so
+a malformed value (`0`, `"abc"`) passes validation and is then dropped.
+
+Tests: 3 new cases — `tests/unit/handlers.test.ts` (the fallback, and `max_tokens` winning when
+both are present) and `tests/unit/request-transform.test.ts` (the cap clamping
+`max_completion_tokens` on the anthropic-messages path). Full unit suite 2755/2755.
+
 ### fix(route): both Gemini front doors carry `tool_choice` to non-Gemini upstreams
 
 `tool_choice` was in the dropped set of both Gemini→Completions converters

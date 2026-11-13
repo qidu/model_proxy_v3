@@ -47,6 +47,23 @@ describe('completionsToClaudeBody', () => {
     assert.equal(body.max_tokens, 4096);
   });
 
+  it('reads max_completion_tokens when max_tokens is absent', async () => {
+    const body = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'hi' }],
+      max_completion_tokens: 1234,
+    } as any, 'm');
+    assert.equal(body.max_tokens, 1234);
+  });
+
+  it('prefers max_tokens over max_completion_tokens when both are present', async () => {
+    const body = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 777,
+      max_completion_tokens: 1234,
+    } as any, 'm');
+    assert.equal(body.max_tokens, 777);
+  });
+
   it('extracts the system message into top-level system field', async () => {
     const body = await completionsToClaudeBody({
       messages: [
