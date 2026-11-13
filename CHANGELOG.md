@@ -5,6 +5,44 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): Interactions `input` steps keep their own roles on the way to the upstream
+
+A `/v1/interactions` client may send `input` as an array of Turns (`role`), an array of Content (a
+part list) — or as an array of *steps* discriminated by `type`, `user_input` and `model_output`,
+where the step's `type` stands in for a Turn's `role`. Neither conversion site recognized that
+third shape. On the native Gemini route (`src/handlers/gemini.ts`) such an array fell through to
+the array-of-Content branch, which flattens every item into **one** `role: 'user'` content — so the
+model's earlier turns were replayed to the upstream as client input and the turn boundaries were
+lost. On the cross-mode route (`src/handlers/openai.ts`) `convertGeminiInteractionsToOpenAI` read
+`turn.role` off a step, got `undefined`, and `defaultMissingOpenAIMessageRoles` silently defaulted
+it to `user` one hop later — the same loss, without even the flattening to show for it.
+
+Both sites now resolve the role from the step's own `type`: `user_input` → `user`; `model_output` →
+`model` on the native route (`generateContent`'s spelling) or `assistant` at the Completions hop
+that the `anthropic-messages` / `openai-responses` routes pass through. Roles are resolved per
+item, so a mixed history keeps its turn order, and a step's `content` is extracted by the same rule
+the neighbouring Turn branch already used (bare string, parts array, otherwise stringified). The
+array-of-Turn and array-of-Content shapes are untouched and pinned alongside, as is an empty
+`input: []`, which must not throw.
+
+Two limits are **pinned, not fixed**:
+
+- Only these two step types are mapped. An unrecognized one (`function_call`, `thought`,
+  `code_execution_call`, …) still carries no role of its own: on the cross-mode route it keeps
+  `role: undefined` for `defaultMissingOpenAIMessageRoles` to call `user`, and on the native route
+  it depends on position — the array's *first* item selects the branch, so an unrecognized step
+  inside a step array is mapped to `user` like its neighbours, while an array that *starts* with
+  one is not recognized as a step array at all and flattens into a single user content.
+- The step's payload field is taken to be `content`, the same field the Turn shape uses. The
+  bundled wire snapshot (`docs/api/interactions.md`) does not document step types at all, so this
+  shape comes from the client, not from the spec in-tree; a step whose payload lives under another
+  key would reach the parts extraction as `undefined` and be stringified.
+
+Verified: `npm run typecheck` clean; `npm run test:unit` 2773/2773, of which the 5 cases in
+`tests/unit/gemini-interactions-input.test.ts` and 2 in `tests/unit/gemini-interactions-to-openai.test.ts`
+are new — the step cases fail on the old mapping (checked by reverting each `src/` file alone), the
+shape guards pass either way.
+
 ### fix(converters): `functionCall` / `functionResponse` ids survive the Gemini `generateContent` round trip
 
 The codebase's stated convention was that the `generateContent` shape carries no tool-call id, so

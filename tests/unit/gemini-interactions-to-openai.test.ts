@@ -335,6 +335,36 @@ describe('convertGeminiInteractionsToOpenAI — input shapes', () => {
     assert.deepEqual(out, { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true });
   });
 
+  const stepBody = {
+    model: 'm',
+    input: [
+      { type: 'user_input', content: [{ type: 'text', text: 'hi' }] },
+      { type: 'model_output', content: [{ type: 'text', text: 'hello' }] },
+      { type: 'user_input', content: [{ type: 'text', text: 'again' }] },
+    ],
+  };
+
+  it('resolves each input step role from its own type', () => {
+    // A step carries `type` where a Turn carries `role`, and the role of every
+    // item is decided by that item — not by the array's first entry.
+    const out = convertGeminiInteractionsToOpenAI(stepBody) as any;
+
+    assert.deepEqual(out.messages, [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+      { role: 'user', content: 'again' },
+    ]);
+  });
+
+  it('carries a model_output step to an anthropic-messages upstream as assistant', async () => {
+    const claude = await completionsToClaudeBody(
+      convertGeminiInteractionsToOpenAI(stepBody),
+      'claude-target',
+    ) as any;
+
+    assert.deepEqual(claude.messages.map((m: any) => m.role), ['user', 'assistant', 'user']);
+  });
+
   it('throws on a body with no recognizable input', () => {
     assert.throws(
       () => convertGeminiInteractionsToOpenAI({ model: 'm' }),

@@ -160,12 +160,17 @@ export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, 
     }
   }
 
-  // Handle input as array-of-turns (TC203: [{role, content}, ...]).
+  // Handle input as array-of-turns (TC203: [{role, content}, ...]) or as
+  // array-of-steps (Interactions steps: [{type: 'user_input'|'model_output',
+  // content}, ...], where the step's `type` stands in for a Turn's `role` and
+  // `model_output` is the model's own earlier turn).
   // String content is preserved; array content (Gemini parts shape) is
   // routed through geminiPartsToOpenAIContent so inline_data images survive.
   if (!messages && Array.isArray(geminiRequest.input)) {
     messages = (geminiRequest.input as any[]).map((turn: any) => ({
-      role: turn.role === 'model' ? 'assistant' : turn.role,
+      role: turn.role === 'model' || turn.type === 'model_output'
+        ? 'assistant'
+        : turn.role === 'user' || turn.type === 'user_input' ? 'user' : turn.role,
       content: typeof turn.content === 'string'
         ? turn.content
         : Array.isArray(turn.content)

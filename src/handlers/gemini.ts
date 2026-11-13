@@ -185,7 +185,8 @@ async function handleGeminiInteractionsRequest(
             }));
         }
     } else if (Array.isArray(requestBody.input)) {
-        // Check if it's array of Turn (has role field) or array of Content
+        // Check if it's array of Turn (has role field), array of input steps
+        // (has type field), or array of Content
         const firstItem = requestBody.input[0] as any;
         if (firstItem && 'role' in firstItem) {
             // Array of Turn format
@@ -196,6 +197,18 @@ async function handleGeminiInteractionsRequest(
                     : Array.isArray(turn.content)
                         ? turn.content.map((c: any) => c.type === 'text' ? { text: c.text } : c)
                         : [{ text: String(turn.content) }]
+            }));
+        } else if (firstItem && (firstItem.type === 'user_input' || firstItem.type === 'model_output')) {
+            // Array of input steps: a step's `type` stands in for a Turn's
+            // `role`. `user_input` is the client's turn; `model_output` is the
+            // model's own earlier turn, which generateContent spells 'model'.
+            geminiRequest.contents = requestBody.input.map((step: any) => ({
+                role: step.type === 'model_output' ? 'model' : 'user',
+                parts: typeof step.content === 'string'
+                    ? [{ text: step.content }]
+                    : Array.isArray(step.content)
+                        ? step.content.map((c: any) => c.type === 'text' ? { text: c.text } : c)
+                        : [{ text: String(step.content) }]
             }));
         } else {
             // Array of Content format
