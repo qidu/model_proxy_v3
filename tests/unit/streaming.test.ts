@@ -95,10 +95,9 @@ function oaFinal(finishReason: string | null, usage?: any): string {
 const DONE = 'data: [DONE]\n\n';
 
 /**
- * The transformer's stop-reason / usage extraction scans backward through the
- * lines of the SAME transform() call that carries [DONE]. A real upstream
- * flushes the final finish_reason chunk and [DONE] together, so emit them as
- * one combined write to reproduce that framing.
+ * Convenience: the finish chunk and [DONE] in one write. The transformer no
+ * longer depends on that framing — it records `finish_reason` as the chunks
+ * stream by — so the tests below that matter emit them as separate writes.
  */
 function finalThenDone(finishReason: string | null, usage?: any): string {
   return oaFinal(finishReason, usage) + DONE;
@@ -140,6 +139,33 @@ describe('createStreamTransformer — text content', () => {
 
   it('maps finish_reason=length to max_tokens', async () => {
     const events = await runTransformer([oa({ content: 'x' }), finalThenDone('length')]);
+    const md = events.find(e => e.event === 'message_delta');
+    assert.equal(md!.data.delta.stop_reason, 'max_tokens');
+  });
+
+  // The frame layout a real upstream produces for a streaming request: the
+  // finish chunk, then the `choices: []` usage chunk that
+  // `stream_options.include_usage` (set by the handlers) forces, then [DONE] —
+  // each flushed as its own network chunk.
+  it('keeps finish_reason=length across chunk boundaries and a trailing usage chunk', async () => {
+    const usageChunk = `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 11, completion_tokens: 3 } })}\n\n`;
+    const events = await runTransformer([oa({ content: 'x' }), oaFinal('length'), usageChunk, DONE]);
+    const md = events.find(e => e.event === 'message_delta');
+    assert.equal(md!.data.delta.stop_reason, 'max_tokens');
+    assert.equal(md!.data.usage.input_tokens, 11);
+    assert.equal(md!.data.usage.output_tokens, 3);
+  });
+
+  it('keeps finish_reason when writes split the finish chunk and [DONE] mid-line', async () => {
+    const combined = oaFinal('length') + DONE;
+    const cut = combined.indexOf('"finish_reason"') + 3;
+    const doneCut = combined.indexOf('[DONE]') + 3;
+    const events = await runTransformer([
+      oa({ content: 'x' }),
+      combined.slice(0, cut),
+      combined.slice(cut, doneCut),
+      combined.slice(doneCut),
+    ]);
     const md = events.find(e => e.event === 'message_delta');
     assert.equal(md!.data.delta.stop_reason, 'max_tokens');
   });

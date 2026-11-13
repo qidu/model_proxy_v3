@@ -23,6 +23,11 @@ export function createStreamTransformer(
     let initialized = false;
     let buffer = "";
     let hasToolCalls = false;
+    // The last `finish_reason` the upstream reported, recorded as it arrives.
+    // It cannot be recovered from the frame that precedes [DONE]: that frame may
+    // be in an earlier network chunk, or the `choices: []` usage chunk that
+    // stream_options.include_usage makes upstream emit after the finish chunk.
+    let upstreamFinishReason: string | null = null;
     let hasThinking = false;
     let thinkingStarted = false;
     const messageMutex = requestId || `msg_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
@@ -288,46 +293,13 @@ export function createStreamTransformer(
                         }
                     });
 
-                    // Determine final stop reason
+                    // Determine final stop reason from the reason recorded as the
+                    // chunks streamed by, not from the frame before [DONE].
                     let finalStopReason = "end_turn";
-                    try {
-                        // Find the last data chunk before [DONE]
-                        let lastDataChunk: any = null;
-                        // We need to look backward from the current line (which is [DONE])
-                        // The lines array includes all lines from buffer.split("\n"), including empty lines
-                        // We need to find the last non-empty data line before [DONE]
-
-                        // Iterate backward through lines to find the last data chunk
-                        for (let i = lines.length - 2; i >= 0; i--) {
-                            const line = lines[i];
-                            if (line.startsWith("data: ")) {
-                                const lineData = line.substring(6);
-                                if (lineData.trim() !== "[DONE]") {
-                                    try {
-                                        lastDataChunk = JSON.parse(lineData);
-                                        break;
-                                    } catch (e) {
-                                        // Skip invalid JSON lines
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-
-                        if (lastDataChunk) {
-                            const finishReason = lastDataChunk.choices?.[0]?.finish_reason;
-                            if (finishReason === 'tool_calls' || finishReason === 'tool_use') finalStopReason = 'tool_use';
-                            else if (finishReason === 'length') finalStopReason = 'max_tokens';
-                            else if (finishReason === 'content_filter') finalStopReason = 'content_filter';
-                            else if ((!finishReason || finishReason === 'stop') && hasToolCalls) finalStopReason = 'tool_use';
-
-                            // Extract upstream token usage from the final chunk
-                            captureUpstreamUsage(lastDataChunk.usage);
-                        } else if (hasToolCalls) {
-                            // If we can't find the last chunk but we have tool calls, default to tool_use
-                            finalStopReason = 'tool_use';
-                        }
-                    } catch (e) { }
+                    if (upstreamFinishReason === 'tool_calls' || upstreamFinishReason === 'tool_use') finalStopReason = 'tool_use';
+                    else if (upstreamFinishReason === 'length') finalStopReason = 'max_tokens';
+                    else if (upstreamFinishReason === 'content_filter') finalStopReason = 'content_filter';
+                    else if ((!upstreamFinishReason || upstreamFinishReason === 'stop') && hasToolCalls) finalStopReason = 'tool_use';
 
                     // Send message_delta with final token counts
                     sendEvent(controller, 'message_delta', {
@@ -351,6 +323,11 @@ export function createStreamTransformer(
                     // final chunk that has an empty choices array — capture it
                     // before skipping such chunks.
                     captureUpstreamUsage(openaiChunk.usage);
+                    // Record the terminal reason here, before the empty-choices
+                    // skip below: the usage chunk that follows the finish chunk
+                    // has `choices: []`, so a later reconstruction would miss it.
+                    const chunkFinishReason = openaiChunk.choices?.[0]?.finish_reason;
+                    if (typeof chunkFinishReason === 'string') upstreamFinishReason = chunkFinishReason;
                     if (!openaiChunk.choices || !Array.isArray(openaiChunk.choices) || openaiChunk.choices.length === 0) {
                         continue;
                     }

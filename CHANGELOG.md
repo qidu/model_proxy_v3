@@ -5,6 +5,51 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): a stream that ends on `length` reports `max_tokens`, not `end_turn`
+
+`createStreamTransformer`'s `[DONE]` branch (`src/converters/streaming.ts`) never recorded
+`finish_reason` as the chunks streamed by. It tried to reconstruct it at the end instead, scanning
+backwards for the last `data:` line **of the same `transform()` call** that carried `[DONE]`. That
+scan misses in two ways, and one of them is deterministic:
+
+- **Chunk boundaries.** SSE frames are not aligned to reads. When the finish chunk and `data: [DONE]`
+  land in different chunks, the scan sees only `[DONE]` and finds nothing.
+- **The usage chunk.** `handleMessagesRequest` forces `stream_options.include_usage = true`
+  (`src/handlers/messages.ts:226`; `src/converters/claude-to-openai.ts:486` does the same for the
+  converted path), so upstream sends a `choices: []` usage chunk *after* the finish chunk. It is the
+  last `data:` line before `[DONE]`, so `choices[0]` is `undefined` and the scan comes up empty even
+  when everything arrives in one read.
+
+On an empty scan `finalStopReason` kept its `"end_turn"` initializer, so a token-budget exhaustion was
+reported to the client as a natural end of turn — the one signal Claude Code uses to decide whether to
+continue, and the reason `max_tokens` appeared to work in tests and not in production.
+
+`finish_reason` is now recorded per chunk, **before** the empty-`choices` skip that the usage chunk
+falls through, and the `[DONE]` branch seeds the existing `if`/`else if` chain from it. The mapping
+itself is unchanged (`length` → `max_tokens`, `tool_calls`/`tool_use` → `tool_use`,
+`content_filter` → `content_filter`, `stop`/absent + tool calls → `tool_use`, otherwise `end_turn`).
+Two pieces of dead weight went with the scan: the `try { } catch { }` that swallowed JSON errors the
+normal branch already reports loudly, and a redundant `captureUpstreamUsage(lastDataChunk.usage)` —
+every chunk, usage chunk included, already passes through `captureUpstreamUsage` in the normal branch.
+
+Measured against the real transformer, before → after:
+
+| write shape | before | after |
+| --- | --- | --- |
+| finish + `[DONE]` in one write | `max_tokens` | `max_tokens` |
+| finish and `[DONE]` in separate writes | `end_turn` | `max_tokens` |
+| finish, usage chunk, `[DONE]` in separate writes | `end_turn` | `max_tokens` |
+
+`content_filter` is unaffected by this change and still passes through as the literal string, which is
+not one of Anthropic's documented `stop_reason` values (the spec's nearest value is `refusal`); that
+divergence is pre-existing and still open.
+
+Tests: `tests/unit/streaming.test.ts` +2, both verified to fail against the unfixed converter — the
+usage-chunk layout above, and a write that splits both the finish line and `[DONE]` mid-line. The
+`finalThenDone` helper's comment claimed a real upstream flushes the finish chunk and `[DONE]`
+together, which is what let the bug survive the original `length` test; corrected. Full unit suite
+2811/2811.
+
 ### fix(converters): the non-streaming converted answer carries `stop_sequence: null`
 
 `convertOpenAIToClaudeResponse` (`src/converters/openai-to-claude.ts`) built its
