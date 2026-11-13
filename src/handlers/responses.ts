@@ -10,7 +10,7 @@ import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStre
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
 import { handleResponsesApiError, createResponsesErrorResponse, ResponsesApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
-import { normalizeOpenAIAuthHeaders } from '../utils/auth-headers.js';
+import { normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader } from '../utils/auth-headers.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
@@ -688,6 +688,7 @@ async function handleAsAnthropicMessages(
     logger.debug(requestId, `Responses->anthropic-messages msg structure: ${JSON.stringify((claudeBody.messages as Array<Record<string, unknown>>).map(m => ({ role: m.role, content: Array.isArray(m.content) ? (m.content as Array<Record<string, unknown>>).map(b => b.type === 'tool_use' ? `tu:${b.id}` : b.type === 'tool_result' ? `tr:${b.tool_use_id}` : String(b.type)) : `str:${String(m.content).substring(0, 20)}` })))}`);
   }
   logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
+  ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
   const anthropicFetchHeaders = {
     'Content-Type': 'application/json',
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),

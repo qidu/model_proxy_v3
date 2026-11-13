@@ -224,8 +224,14 @@ describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode
 
     const { chunks, raw } = parseSSE(await res.text());
 
-    // The text part still streams as content, ahead of the call.
-    assert.equal(chunks[0].choices[0].delta.content, 'Checking.');
+    // The stream opens with the speaker chunk, then the text part streams as
+    // content, ahead of the call. Only the opening chunk names the role.
+    assert.deepEqual(chunks[0].choices[0].delta, { role: 'assistant', content: '' });
+    assert.equal(chunks[1].choices[0].delta.content, 'Checking.');
+    assert.equal('role' in chunks[1].choices[0].delta, false);
+    // Exactly one chunk in the whole stream names the role — the tool chunk that
+    // follows does not repeat it.
+    assert.equal(chunks.filter((c: any) => c.choices[0]?.delta?.role !== undefined).length, 1);
 
     const toolChunk = chunks.find(c => c.choices[0]?.delta?.tool_calls);
     assert.ok(toolChunk, 'expected a chunk carrying delta.tool_calls');

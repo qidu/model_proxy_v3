@@ -29,11 +29,13 @@ const AUTH = { Authorization: 'Bearer upstream-key' };
 const CAP = 4096;
 
 let upstreamBodies: string[] = [];
+let upstreamHeaders: Array<Record<string, string>> = [];
 const realFetch = globalThis.fetch;
 
 before(() => {
   globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const sent = init?.body;
+    upstreamHeaders.push(Object.fromEntries(new Headers(init?.headers).entries()));
     upstreamBodies.push(
       typeof sent === 'string' ? sent : await new Response(sent as ReadableStream).text(),
     );
@@ -125,5 +127,33 @@ describe('per-entry maxTokens cap fires on every egress', () => {
   it('leaves the client value alone when the route declares no cap', async () => {
     assert.equal(await sentMaxTokens('/v1/interactions', interactions(32000), 'openai-responses', undefined), 32000);
     assert.equal(await sentMaxTokens('/v1/messages', messages(32000), 'openai-responses', undefined), 32000);
+  });
+});
+
+describe('structured-output beta pairing', () => {
+  it('preserves existing beta entries on /v1/interactions → anthropic-messages', async () => {
+    upstreamBodies = [];
+    upstreamHeaders = [];
+    const schema = { type: 'object', properties: { answer: { type: 'string' } } };
+    const response = await handleOpenAIRequest(
+      requestFor('/v1/interactions', { model: 'm', input: 'hi', response_format: schema }),
+      TARGET,
+      { ...AUTH, 'anthropic-beta': 'existing-beta' },
+      'r-structured',
+      'm',
+      ENV,
+      LOGGER,
+      false,
+      undefined,
+      'anthropic-messages',
+      routeFor('anthropic-messages'),
+    );
+    await response.text();
+
+    assert.equal(upstreamBodies.length, 1);
+    assert.equal(upstreamHeaders[0]['anthropic-beta'], 'existing-beta,structured-outputs-2025-11-13');
+    assert.deepEqual(JSON.parse(upstreamBodies[0]).output_config, {
+      format: { type: 'json_schema', schema },
+    });
   });
 });

@@ -7,7 +7,7 @@
 import type { Env, Logger } from '../types/shared.js';
 import { logPipelineStage, logPipelineHeaders, observeStream } from '../utils/logger.js';
 import { addForwardedHeaders } from '../utils/routing.js';
-import { repackBearerCredential, normalizeOpenAIAuthHeaders } from '../utils/auth-headers.js';
+import { repackBearerCredential, normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader } from '../utils/auth-headers.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
@@ -104,6 +104,7 @@ export async function handleChatCompletionsPassthrough(
     logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
 
     const anthropicHeaders: Record<string, string> = { ...authHeaders };
+    ensureStructuredOutputsBetaHeader(anthropicHeaders, claudeBody);
     repackBearerCredential(anthropicHeaders, 'x-api-key');
 
     const anthropicFetchHeaders = {
@@ -151,6 +152,19 @@ export async function handleChatCompletionsPassthrough(
       // for it via stream_options.include_usage, as a final chunk with an
       // empty choices array just before [DONE].
       const includeUsage = ((parsedBody.stream_options as Record<string, unknown> | undefined)?.include_usage === true);
+      // OpenAI's stream identifies the speaker once, in an opening chunk whose
+      // delta is `{role, content: ''}`, and every later chunk carries only what
+      // changed. Emitted lazily before the first data chunk of any kind — text,
+      // tool_use or arguments — so a tool-call-only answer, which used to carry no
+      // role at all, is covered too. A stream with no data chunks sends none.
+      let roleSent = false;
+      const writeRoleChunk = async () => {
+        if (roleSent) return;
+        roleSent = true;
+        const roleChunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] };
+        logPipelineStage(logger, requestId, 'outbound', path, roleChunk);
+        await writer.write(encoder.encode(`data: ${JSON.stringify(roleChunk)}\n\n`));
+      };
       let usagePromptTokens: number | undefined;
       let usageCompletionTokens: number | undefined;
       (async () => {
@@ -178,11 +192,13 @@ export async function handleChatCompletionsPassthrough(
                 if (parsed.type === 'content_block_delta') {
                   const delta = parsed.delta as Record<string, unknown> | undefined;
                   if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-                    const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: 'assistant', content: delta.text }, finish_reason: null }] };
+                    await writeRoleChunk();
+                    const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta.text }, finish_reason: null }] };
                     logPipelineStage(logger, requestId, 'outbound', path, chunk);
                     await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                   } else if (delta?.type === 'input_json_delta') {
                     // tool call argument streaming — emit as function arguments delta
+                    await writeRoleChunk();
                     const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: delta.partial_json ?? '' } }] }, finish_reason: null }] };
                     logPipelineStage(logger, requestId, 'outbound', path, chunk);
                     await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
@@ -190,6 +206,7 @@ export async function handleChatCompletionsPassthrough(
                 } else if (parsed.type === 'content_block_start') {
                   const block = parsed.content_block as Record<string, unknown> | undefined;
                   if (block?.type === 'tool_use') {
+                    await writeRoleChunk();
                     const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: parsed.index ?? 0, id: block.id, type: 'function', function: { name: block.name, arguments: '' } }] }, finish_reason: null }] };
                     logPipelineStage(logger, requestId, 'outbound', path, chunk);
                     await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
@@ -490,6 +507,16 @@ export async function handleChatCompletionsPassthrough(
       // only when the client asks via stream_options.include_usage, emitted as
       // an empty-choices chunk just before [DONE].
       const includeUsage = ((parsedBody.stream_options as Record<string, unknown> | undefined)?.include_usage === true);
+      // Same opening role chunk as the anthropic-messages branch above, so a
+      // client sees one chunk shape whichever upstream mode answered.
+      let roleSent = false;
+      const writeRoleChunk = async () => {
+        if (roleSent) return;
+        roleSent = true;
+        const roleChunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] };
+        logPipelineStage(logger, requestId, 'outbound', path, roleChunk);
+        await writer.write(encoder.encode(`data: ${JSON.stringify(roleChunk)}\n\n`));
+      };
       let usagePromptTokens: number | undefined;
       let usageCompletionTokens: number | undefined;
       (async () => {
@@ -530,10 +557,11 @@ export async function handleChatCompletionsPassthrough(
                 }
                 const text = (parts ?? []).filter(p => typeof p.text === 'string' && !(p.thought === true)).map(p => p.text).join('');
                 if (text) {
+                  await writeRoleChunk();
                   const chunk = {
                     id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk',
                     created: Math.floor(Date.now() / 1000), model,
-                    choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }],
+                    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
                   };
                   logPipelineStage(logger, requestId, 'outbound', path, chunk);
                   await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
@@ -543,6 +571,7 @@ export async function handleChatCompletionsPassthrough(
                   if (!functionCall) continue;
                   sawToolCall = true;
                   const index = toolCallIndex++;
+                  await writeRoleChunk();
                   const chunk = {
                     id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk',
                     created: Math.floor(Date.now() / 1000), model,

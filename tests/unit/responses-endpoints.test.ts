@@ -83,6 +83,31 @@ describe('Responses endpoint handlers', () => {
     upstreamBody = {};
   });
 
+  it('pairs a converted structured-output body with its beta header', async () => {
+    upstreamBody = {
+      id: 'msg-structured',
+      type: 'message',
+      role: 'assistant',
+      model: 'resolved-model',
+      content: [{ type: 'text', text: '{}' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 3, output_tokens: 1 },
+    };
+
+    const response = await callHandler(handleResponsesRequest, '/v1/responses', {
+      model: 'client-model',
+      input: 'Return JSON',
+      text: { format: { type: 'json_object' } },
+    }, 'anthropic-messages');
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamCalls.length, 1);
+    assert.equal(upstreamCalls[0].headers['anthropic-beta'], 'structured-outputs-2025-11-13');
+    assert.deepEqual(upstreamCalls[0].body.output_config, {
+      format: { type: 'json_schema', schema: { type: 'object' } },
+    });
+  });
+
   it('converts input_tokens requests and returns upstream prompt usage', async () => {
     upstreamBody = {
       id: 'chatcmpl-count',

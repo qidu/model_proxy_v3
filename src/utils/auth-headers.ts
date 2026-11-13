@@ -69,3 +69,18 @@ export function normalizeOpenAIAuthHeaders(authHeaders: Record<string, string>, 
   delete normalized['x-api-key'];
   return normalized;
 }
+
+const STRUCTURED_OUTPUTS_BETA = 'structured-outputs-2025-11-13';
+
+// Pair converted structured-output bodies with the legacy beta capability for
+// gateways that still require the header/body pair.
+export function ensureStructuredOutputsBetaHeader(headers: Record<string, string>, body: Record<string, unknown>): void {
+  const outputConfig = body.output_config as Record<string, unknown> | undefined;
+  if (!outputConfig || typeof outputConfig !== 'object' || outputConfig.format == null) return;
+  const betas = (headers['anthropic-beta'] ?? '')
+    .split(',')
+    .map(beta => beta.trim())
+    .filter(beta => beta !== '');
+  if (!betas.includes(STRUCTURED_OUTPUTS_BETA)) betas.push(STRUCTURED_OUTPUTS_BETA);
+  headers['anthropic-beta'] = betas.join(',');
+}

@@ -8,6 +8,7 @@ import {
   resolveIncomingAuthorization,
   repackBearerCredential,
   normalizeOpenAIAuthHeaders,
+  ensureStructuredOutputsBetaHeader,
 } from '../../src/utils/auth-headers.js';
 
 /**
@@ -231,5 +232,21 @@ describe('normalizeOpenAIAuthHeaders', () => {
       'Content-Type': 'application/json',
       'api-key': 'x-api-key-val',
     });
+  });
+});
+
+describe('ensureStructuredOutputsBetaHeader', () => {
+  it('preserves existing beta entries and never duplicates the structured-outputs token', () => {
+    const headers = { 'anthropic-beta': 'existing-beta' };
+    const body = { output_config: { format: { type: 'json_schema', schema: {} } } };
+    ensureStructuredOutputsBetaHeader(headers, body);
+    ensureStructuredOutputsBetaHeader(headers, body);
+    assert.equal(headers['anthropic-beta'], 'existing-beta,structured-outputs-2025-11-13');
+  });
+
+  it('leaves headers untouched when the body has no output format', () => {
+    const headers = { 'anthropic-beta': 'existing-beta' };
+    ensureStructuredOutputsBetaHeader(headers, { output_config: { effort: 'high' } });
+    assert.deepEqual(headers, { 'anthropic-beta': 'existing-beta' });
   });
 });

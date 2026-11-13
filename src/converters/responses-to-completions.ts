@@ -949,6 +949,8 @@ export interface ResponsesChatStreamState {
   toolIndexByOutput: Map<number, number>;
   nextToolIndex: number;
   sawToolCall: boolean;
+  /** The opening `{role}` chunk has been emitted for this stream. */
+  roleSent: boolean;
   /** Usage reported by the terminal event, in Chat Completions shape. */
   usage?: ChatCompletionsUsage;
   /** The upstream said the response ended; the client stream can be closed. */
@@ -966,6 +968,7 @@ export function createResponsesChatStreamState(model: string): ResponsesChatStre
     toolIndexByOutput: new Map(),
     nextToolIndex: 0,
     sawToolCall: false,
+    roleSent: false,
     finished: false,
     dropped: {},
   };
@@ -1005,7 +1008,7 @@ function responsesChatChunk(
  * `response.failed` is not handled here: the caller aborts the client stream on
  * it, as `handleResponsesStreamAsClaude` does.
  */
-export function responsesStreamEventToChatChunks(
+function responsesEventToChatChunks(
   state: ResponsesChatStreamState,
   event: Record<string, unknown>,
 ): Array<Record<string, unknown>> {
@@ -1024,7 +1027,7 @@ export function responsesStreamEventToChatChunks(
   if (type === 'response.output_text.delta') {
     const delta = event.delta;
     if (typeof delta !== 'string' || delta === '') return [];
-    return [responsesChatChunk(state, { role: 'assistant', content: delta }, null)];
+    return [responsesChatChunk(state, { content: delta }, null)];
   }
 
   if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') {
@@ -1087,4 +1090,33 @@ export function responsesStreamEventToChatChunks(
   }
 
   return [];
+}
+
+/**
+ * Map one Responses SSE event to the chunks the client receives, adding the
+ * stream's opening speaker chunk exactly once.
+ *
+ * An OpenAI stream names the speaker in its first chunk — `delta: {role}` with no
+ * content — and every later chunk carries only what changed. This egress used to
+ * repeat `role` on every content chunk and omit it entirely from a
+ * tool-call-only answer, which `responsesEventToChatChunks` still does on its
+ * own. The role chunk is prepended to the first event that yields a data chunk
+ * (`finish_reason: null`); the terminal `response.completed` alone does not
+ * count, so an answer carrying no content still sends no role — the same rule
+ * the two Anthropic- and Gemini-shaped egresses in `handlers/chat-completions.ts`
+ * apply.
+ */
+export function responsesStreamEventToChatChunks(
+  state: ResponsesChatStreamState,
+  event: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  const chunks = responsesEventToChatChunks(state, event);
+  if (state.roleSent) return chunks;
+  const carriesData = chunks.some(chunk => {
+    const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
+    return choice !== undefined && choice.finish_reason === null;
+  });
+  if (!carriesData) return chunks;
+  state.roleSent = true;
+  return [responsesChatChunk(state, { role: 'assistant', content: '' }, null), ...chunks];
 }

@@ -6,13 +6,13 @@ import { createLogger, logPipelineStage, logPipelineHeaders } from '../utils/log
 import { isSdkUrl, handleSdkOpenAIRequest } from '../utils/sdk-handler.js';
 import type { Env, Logger } from '../types/shared.js';
 import { addForwardedHeaders } from '../utils/routing.js';
-import { resolveIncomingAuthorization, normalizeOpenAIAuthHeaders } from '../utils/auth-headers.js';
+import { resolveIncomingAuthorization, normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader } from '../utils/auth-headers.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
-import { handleTargetApiError } from '../utils/errors.js';
+import { handleTargetApiError, ValidationError } from '../utils/errors.js';
 import { OpenAIContent, OpenAIMessage } from '../types/openai.js';
 import { decodeDataUriOrRef } from '../converters/claude-to-gemini.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
@@ -951,8 +951,19 @@ function completionsToolChoiceToResponses(toolChoice: unknown): unknown {
  */
 export async function completionsToClaudeBody(completions: Record<string, unknown>, model: string): Promise<Record<string, unknown>> {
   const messages = (completions.messages as OpenAIMessage[]) || [];
-  const systemMsg = messages.find(m => m.role === 'system');
-  const otherMessages = messages.filter(m => m.role !== 'system');
+  // Claude carries one top-level `system`, not system turns inside `messages`, so
+  // every system-level message — OpenAI's `developer` included — is merged into it
+  // in document order, the same join `completionsToResponsesBody` applies to
+  // `instructions`. Taking only the first one dropped the others in silence, and
+  // two can arrive together: `convertResponsesToChatCompletions` prepends a system
+  // message from `instructions` and maps every `developer` input item to role
+  // `system`, so `/v1/responses` reaches this hop with a pair.
+  const systemText = messages
+    .filter(m => m.role === 'system' || m.role === 'developer')
+    .map(m => openAIContentToText(m.content))
+    .filter(text => text !== '')
+    .join('\n');
+  const otherMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Group consecutive tool-role messages into a single user message with multiple
   // tool_result blocks — Claude requires all results in one message immediately
@@ -1013,10 +1024,35 @@ export async function completionsToClaudeBody(completions: Record<string, unknow
     stream: completions.stream === true,
   };
 
-  if (systemMsg) claudeBody.system = systemMsg.content;
+  // Omitted entirely when every system message was empty or absent, as the
+  // sibling converter does with `if (instructions)`.
+  if (systemText) claudeBody.system = systemText;
   if (completions.temperature !== undefined) claudeBody.temperature = completions.temperature;
   if (completions.top_p !== undefined) claudeBody.top_p = completions.top_p;
   if (completions.stop !== undefined) claudeBody.stop_sequences = Array.isArray(completions.stop) ? completions.stop : [completions.stop as string];
+
+  // Structured output: Completions spells it `response_format`, the Messages API
+  // `output_config.format`. Anthropic has no schema-less JSON mode — the format's
+  // `type` is always `json_schema` and its `schema` is required — so a Completions
+  // `json_object` (a valid JSON object, no declared shape) becomes the permissive
+  // object schema, the closest expressible equivalent. `text` asks for the default
+  // and an unmapped `type` stays unmapped, as in `completionsToResponsesBody`.
+  const responseFormat = completions.response_format as Record<string, unknown> | undefined;
+  if (responseFormat && typeof responseFormat === 'object') {
+    if (responseFormat.type === 'json_object') {
+      claudeBody.output_config = { format: { type: 'json_schema', schema: { type: 'object' } } };
+    } else if (responseFormat.type === 'json_schema') {
+      const jsonSchema = responseFormat.json_schema as Record<string, unknown> | undefined;
+      const schema = jsonSchema?.schema;
+      // `format.schema` is required. Sending the request without one would only
+      // be rejected upstream with a less useful message, and dropping the field
+      // would lose the client's guarantee without saying so (repo rule #8).
+      if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+        throw new ValidationError("response_format json_schema requires a 'json_schema.schema' object");
+      }
+      claudeBody.output_config = { format: { type: 'json_schema', schema } };
+    }
+  }
 
   if (completions.tools && Array.isArray(completions.tools) && (completions.tools as unknown[]).length > 0) {
     claudeBody.tools = (completions.tools as Array<{ type: string; function: { name: string; description?: string; parameters?: unknown } }>).map(t => ({
@@ -1245,6 +1281,7 @@ async function forwardCompletionsAsAnthropicMessages(
 
   // anthropic-messages expects x-api-key (or Authorization). Normalize headers.
   const anthropicHeaders: Record<string, string> = { ...authHeaders };
+  ensureStructuredOutputsBetaHeader(anthropicHeaders, claudeBody);
   if (anthropicHeaders['x-api-key']) {
     delete anthropicHeaders['Authorization'];
   }

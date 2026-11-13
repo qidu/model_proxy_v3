@@ -22,6 +22,7 @@ import {
   convertGeminiGenerateContentToOpenAI,
 } from '../../src/handlers/openai.js';
 import { isGeminiRequest } from '../../src/handlers/gemini.js';
+import { ValidationError } from '../../src/utils/errors.js';
 import type { Logger } from '../../src/types/shared.js';
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,66 @@ describe('completionsToClaudeBody', () => {
     assert.equal(body.system, 'be brief');
     assert.equal((body.messages as any[]).length, 1);
     assert.equal((body.messages as any[])[0].role, 'user');
+  });
+
+  it('merges every system message into one, in document order', async () => {
+    const body = await completionsToClaudeBody({
+      messages: [
+        { role: 'system', content: '你是中文助手。' },
+        { role: 'system', content: '回答不超过20字。' },
+        { role: 'user', content: '你好' },
+      ],
+    } as any, 'm');
+    // Claude has one top-level `system` and no system turns inside `messages`;
+    // the join is `\n`, the same one `completionsToResponsesBody` uses.
+    assert.equal(body.system, '你是中文助手。\n回答不超过20字。');
+    // Neither system turn may survive as a message — Claude accepts only
+    // user/assistant there. Only the first used to be read; the second vanished.
+    assert.deepEqual(body.messages, [{ role: 'user', content: '你好' }]);
+  });
+
+  it('treats developer messages as system content', async () => {
+    const body = await completionsToClaudeBody({
+      messages: [
+        { role: 'developer', content: 'rule two' },
+        { role: 'user', content: 'q' },
+      ],
+    } as any, 'm');
+    assert.equal(body.system, 'rule two');
+    // Before, it passed through as `role: 'developer'` — a role the Messages API
+    // rejects, so every such request failed upstream.
+    assert.deepEqual(body.messages, [{ role: 'user', content: 'q' }]);
+  });
+
+  it('drops empty system messages and omits the field when none carry text', async () => {
+    const mixed = await completionsToClaudeBody({
+      messages: [
+        { role: 'system', content: '' },
+        { role: 'system', content: 'only real rule' },
+        { role: 'user', content: 'q' },
+      ],
+    } as any, 'm');
+    assert.equal(mixed.system, 'only real rule');
+
+    const blank = await completionsToClaudeBody({
+      messages: [
+        { role: 'system', content: '' },
+        { role: 'user', content: 'q' },
+      ],
+    } as any, 'm');
+    assert.equal('system' in blank, false);
+  });
+
+  it('extracts the text parts of array-form system content', async () => {
+    const body = await completionsToClaudeBody({
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: 'part one. ' }, { type: 'text', text: 'part two.' }] },
+        { role: 'user', content: 'q' },
+      ],
+    } as any, 'm');
+    // Array-form content used to be forwarded raw, which the Messages API
+    // rejects as a `system` value; the text parts are now joined.
+    assert.equal(body.system, 'part one. part two.');
   });
 
   it('maps tool_calls + tool results into Claude tool_use / tool_result blocks', async () => {
@@ -191,6 +252,53 @@ describe('completionsToClaudeBody', () => {
     } as any, 'm');
     // parseJsonObject returns {} on invalid JSON
     assert.deepEqual((body.messages as any[])[0].content[0].input, {});
+  });
+
+  it('maps response_format json_object to the permissive output_config schema', async () => {
+    const body = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }],
+      response_format: { type: 'json_object' },
+    } as any, 'm');
+    // Anthropic has no schema-less JSON mode: `format.type` is always
+    // `json_schema` and `format.schema` is required, so `json_object` becomes the
+    // permissive object schema rather than being dropped.
+    assert.deepEqual(body.output_config, {
+      format: { type: 'json_schema', schema: { type: 'object' } },
+    });
+  });
+
+  it('passes a response_format json_schema through verbatim', async () => {
+    const schema = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] };
+    const body = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }],
+      response_format: { type: 'json_schema', json_schema: { name: 'answer', schema } },
+    } as any, 'm');
+    assert.deepEqual(body.output_config, { format: { type: 'json_schema', schema } });
+    // The Completions-side `name` and `strict` have no Messages counterpart, and
+    // `output_config` may carry `effort`/`task_budget` — neither must leak in.
+    assert.deepEqual(Object.keys((body.output_config as any).format), ['type', 'schema']);
+  });
+
+  it('rejects a json_schema response_format carrying no schema', async () => {
+    await assert.rejects(
+      () => completionsToClaudeBody({
+        messages: [{ role: 'user', content: 'x' }],
+        response_format: { type: 'json_schema', json_schema: { name: 'answer' } },
+      } as any, 'm'),
+      (err: any) => err instanceof ValidationError && err.status === 400,
+    );
+  });
+
+  it('emits no output_config for response_format text or an unknown type', async () => {
+    const text = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }], response_format: { type: 'text' },
+    } as any, 'm');
+    assert.equal('output_config' in text, false);
+
+    const unknown = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }], response_format: { type: 'audio' },
+    } as any, 'm');
+    assert.equal('output_config' in unknown, false);
   });
 });
 

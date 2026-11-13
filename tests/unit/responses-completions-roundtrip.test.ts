@@ -1129,13 +1129,18 @@ describe('responsesStreamEventToChatChunks', () => {
       { type: 'response.output_text.delta', delta: 'hi' },
     ]);
 
-    assert.equal(chunks.length, 1);
+    // The stream opens with the speaker chunk, adopted from the same state, then
+    // the event's own chunk carries content without repeating the role.
+    assert.equal(chunks.length, 2);
     assert.equal(chunks[0].id, 'resp_stream');
-    assert.equal(chunks[0].created, 1700000123);
-    assert.equal(chunks[0].model, 'gpt-upstream');
-    assert.equal(chunks[0].object, 'chat.completion.chunk');
-    assert.deepEqual(chunks[0].choices, [{ index: 0, delta: { role: 'assistant', content: 'hi' }, finish_reason: null }]);
+    assert.deepEqual(chunks[0].choices, [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]);
+    assert.equal(chunks[1].id, 'resp_stream');
+    assert.equal(chunks[1].created, 1700000123);
+    assert.equal(chunks[1].model, 'gpt-upstream');
+    assert.equal(chunks[1].object, 'chat.completion.chunk');
+    assert.deepEqual(chunks[1].choices, [{ index: 0, delta: { content: 'hi' }, finish_reason: null }]);
     assert.equal(state.finished, false);
+    assert.equal(state.roleSent, true);
   });
 
   it('routes reasoning deltas to reasoning_content', () => {
@@ -1143,7 +1148,9 @@ describe('responsesStreamEventToChatChunks', () => {
       { type: 'response.reasoning_summary_text.delta', delta: 'a' },
       { type: 'response.reasoning_text.delta', delta: 'b' },
     ]);
-    assert.deepEqual(chunks.map(c => c.choices[0].delta), [{ reasoning_content: 'a' }, { reasoning_content: 'b' }]);
+    assert.deepEqual(chunks.map(c => c.choices[0].delta), [
+      { role: 'assistant', content: '' }, { reasoning_content: 'a' }, { reasoning_content: 'b' },
+    ]);
   });
 
   it('gives tool calls dense indexes even when output_index counts other items', () => {
@@ -1155,15 +1162,16 @@ describe('responsesStreamEventToChatChunks', () => {
       { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{}' },
     ]);
 
-    assert.deepEqual(chunks[0].choices[0].delta.tool_calls[0], {
+    assert.deepEqual(chunks[0].choices[0].delta, { role: 'assistant', content: '' });
+    assert.deepEqual(chunks[1].choices[0].delta.tool_calls[0], {
       index: 0, id: 'c1', type: 'function', function: { name: 'first', arguments: '' },
     });
-    assert.deepEqual(chunks[1].choices[0].delta.tool_calls[0], {
+    assert.deepEqual(chunks[2].choices[0].delta.tool_calls[0], {
       index: 1, id: 'c2', type: 'function', function: { name: 'second', arguments: '' },
     });
     // Arguments follow their own call, not arrival order.
-    assert.deepEqual(chunks[2].choices[0].delta.tool_calls[0], { index: 1, function: { arguments: '{"a":1}' } });
-    assert.deepEqual(chunks[3].choices[0].delta.tool_calls[0], { index: 0, function: { arguments: '{}' } });
+    assert.deepEqual(chunks[3].choices[0].delta.tool_calls[0], { index: 1, function: { arguments: '{"a":1}' } });
+    assert.deepEqual(chunks[4].choices[0].delta.tool_calls[0], { index: 0, function: { arguments: '{}' } });
   });
 
   it('allocates a tool index from arguments alone when output_item.added never arrived', () => {
@@ -1171,7 +1179,8 @@ describe('responsesStreamEventToChatChunks', () => {
       { type: 'response.function_call_arguments.delta', output_index: 7, delta: '{"x":' },
       { type: 'response.function_call_arguments.delta', output_index: 7, delta: '2}' },
     ]);
-    assert.deepEqual(chunks.map(c => c.choices[0].delta.tool_calls[0].index), [0, 0]);
+    assert.deepEqual(chunks[0].choices[0].delta, { role: 'assistant', content: '' });
+    assert.deepEqual(chunks.slice(1).map(c => c.choices[0].delta.tool_calls[0].index), [0, 0]);
   });
 
   it('closes on the terminal event with finish_reason and usage, and counts unrepresentable items', () => {
@@ -1184,7 +1193,8 @@ describe('responsesStreamEventToChatChunks', () => {
       },
     ]);
 
-    assert.deepEqual(chunks[1].choices[0], { index: 0, delta: {}, finish_reason: 'stop' });
+    assert.deepEqual(chunks[0].choices[0].delta, { role: 'assistant', content: '' });
+    assert.deepEqual(chunks[2].choices[0], { index: 0, delta: {}, finish_reason: 'stop' });
     assert.equal(state.finished, true);
     assert.deepEqual(state.usage, {
       prompt_tokens: 7, completion_tokens: 2, total_tokens: 9, prompt_tokens_details: { cached_tokens: 3 },

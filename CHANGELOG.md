@@ -5,6 +5,132 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): the chat-completions SSE egress names the speaker once
+
+An OpenAI stream identifies the speaker in its first chunk — `delta: {role: "assistant", content: ""}`
+— and every later chunk carries only what changed. Two of the three SSE egresses behind
+`/v1/chat/completions` repeated `role: "assistant"` on every text chunk instead
+(`src/handlers/chat-completions.ts:181` for anthropic-messages, `:536` for Gemini, and
+`responses-to-completions.ts:1027` for openai-responses), while a tool-call-only answer carried no
+role at all, because the tool branches never emitted one.
+
+Measured on the anthropic-messages branch, for an answer of three text deltas, before → after:
+
+| before | after |
+| --- | --- |
+| `{"role":"assistant","content":"你"}` | `{"role":"assistant","content":""}` |
+| `{"role":"assistant","content":"好"}` | `{"content":"hi"}` |
+| `{"role":"assistant","content":"！"}` | `{"content":"there"}` |
+| `{}` + `finish_reason: "stop"` | `{"content":"!"}` |
+| | `{}` + `finish_reason: "stop"` |
+
+All three egresses now emit the opening chunk lazily, immediately before the first chunk carrying
+data — text, `tool_calls` or reasoning — so a tool-only answer is named as well, and a stream that
+yields no data chunk at all (a terminal event and nothing else) still sends no role. The repeated
+role was idempotent and tolerant clients accepted it; the tool-only case, which left the client to
+infer the speaker, is the part that could genuinely confuse one.
+
+The Responses egress needed the role taken off the content chunk as well as the opening chunk added —
+the wrapper alone would have sent it twice, which the round-trip test caught.
+
+Tests: `tests/unit/chat-completions-anthropic-streaming.test.ts` +2 — exactly one chunk carries the
+role and it comes first, plus a tool-only stream that used to carry none. The Gemini and Responses
+pins (`chat-completions-gemini-streaming.test.ts`, `responses-completions-roundtrip.test.ts`) were
+re-indexed onto the new shape and now assert the opening chunk and the role's absence after it. Full
+unit suite 2821/2821.
+
+Still open, measured while writing this: every chunk in the two `chat-completions.ts` branches mints
+its own `` id: `chatcmpl_${Date.now()}` ``, so one stream can carry two ids — the probe run above
+produced `chatcmpl_1794564524184` for the role chunk and `chatcmpl_1794564524185` for the rest. The
+Responses egress has always used a single `state.id` per stream; the other two should follow.
+
+### fix(converters): every system message reaches an `anthropic-messages` upstream
+
+`completionsToClaudeBody` (`src/handlers/openai.ts`) read the system prompt with
+`messages.find(m => m.role === 'system')`, and filtered only that role out of the turns. The Messages
+API takes one top-level `system`, so a client sending two — the ordinary persona-plus-length-rule
+pair — had the second discarded in silence, and one sending `role: "developer"` (OpenAI's newer
+spelling, and a role this proxy's own validator accepts) had it forwarded as a `messages[]` turn with
+role `developer`, which the Messages API rejects outright.
+
+Both now merge into `system`, in document order, `\n`-joined with empty entries dropped — verbatim
+the join `completionsToResponsesBody` already applies to `instructions`, so the two converters in this
+file finally agree on what a system prompt is. This request:
+
+```json
+{"model":"claude-model","messages":[{"role":"system","content":"you are"},{"role":"system","content":"a nice assistant"},{"role":"user","content":"hello"}]}
+```
+
+now produces:
+
+```json
+{"model":"claude-model","messages":[{"role":"user","content":"hello"}],"max_tokens":4096,"stream":false,"system":"you are a nice assistant"}
+```
+
+Array-form system content is joined from its text parts (`openAIContentToText`) rather than forwarded
+raw, which the Messages API rejects as a `system` value; `system` is omitted altogether when no system
+message carries text. Position is not preserved — a system turn found mid-conversation is hoisted to
+the top-level field, the only place Claude has for it.
+
+Reachable beyond `/v1/chat/completions`: `convertResponsesToChatCompletions`
+(`src/converters/responses-to-completions.ts:130`) prepends a system message built from `instructions`
+and maps every `developer` input item to role `system`, so a `/v1/responses` request carrying both
+always arrived here with a pair and always lost one of them.
+
+Tests: `tests/unit/handlers.test.ts` +4 — the two-system-message join with neither surviving as a
+turn, `developer` merging (and no longer leaking as an invalid role), empty-entry dropping and
+omission, and array-form text extraction. Full unit suite 2819/2819.
+
+### fix(converters): `response_format` reaches an `anthropic-messages` upstream
+
+`completionsToClaudeBody` (`src/handlers/openai.ts`) built its Claude body from a whitelist and never
+read `response_format`, so a client's structured-output request was dropped in silence on every hop
+that uses it: the upstream was never told, the model answered in prose, and the client got a 200 with
+`finish_reason: "stop"` and no indication that its guarantee had gone. That covered four call sites —
+`/v1/chat/completions` (`src/handlers/chat-completions.ts:102`), `/v1/interactions` and
+`:generateContent` through `forwardCompletionsAsAnthropicMessages` (`src/handlers/openai.ts:1232`),
+and two `/v1/responses` paths (`src/handlers/responses.ts:667`, `:756`). It mattered most on the first
+two: `convertGeminiInteractionsToOpenAI` carries a Gemini `response_format` into the Completions body
+precisely so it survives the hop, and `convertResponsesToChatCompletions` copies it from the Responses
+`text.format` — both then lost it one hop later.
+
+Both forms now map to the Messages API's `output_config.format`:
+
+| `response_format` | `output_config.format` |
+| --- | --- |
+| `{type: 'json_object'}` | `{type: 'json_schema', schema: {type: 'object'}}` |
+| `{type: 'json_schema', json_schema: {schema}}` | `{type: 'json_schema', schema}` |
+| `{type: 'text'}`, unknown `type` | absent (unchanged) |
+
+`json_object` is an approximation, not a translation, and deliberately so: the Messages API has no
+schema-less JSON mode (`JSONOutputFormat` is `{type: 'json_schema', schema}`, with `schema` required
+and no `json_object` value for `type`), so "any JSON object" is expressed as the permissive object
+schema — the closest thing that exists. A `json_schema` request carrying no `json_schema.schema` is
+rejected with a 400 `ValidationError` rather than sent upstream for a worse error or dropped silently
+(rule #8). `output_config` is the GA spelling and the one this repo's own
+`docs/api/claude_api_docs/messages-create.md` documents; `output_format` is the deprecated alias it
+replaced.
+
+For gateways that still enforce the header/body pairing documented in
+`docs/api/llm-gateway-protocol-for-claude-code.md`, all three direct Anthropic egresses now add
+`anthropic-beta: structured-outputs-2025-11-13` whenever the final body carries
+`output_config.format`: `/v1/chat/completions`, `/v1/interactions`/`:generateContent`, and
+`/v1/responses`. Existing comma-separated beta capabilities are preserved and the token is not
+duplicated. This is additive compatibility — Anthropic's current GA API no longer requires a beta
+header for `output_config.format`.
+
+Caveat, unverified against a live upstream: the mapping assumes the target implements Anthropic
+structured outputs. Real Anthropic does, and reports it as the `structured_outputs` model capability;
+a third-party anthropic-compatible endpoint may reject the field or the legacy beta token. Emitting
+them is what makes the client's guarantee resolve or fail at the upstream instead of vanishing
+locally — the failure moves from silent to visible, not from broken to working.
+
+Tests: `tests/unit/handlers.test.ts` +4 — the exact mapped shape for both forms (including that the
+Completions-side `name`/`strict` do not leak and no `effort`/`task_budget` is invented), the 400 for a
+schema-less `json_schema`, and `text`/unknown emitting no `output_config`. Full unit suite 2815/2815.
+The header pairing has wire-level pins on all three front doors, plus merge/deduplication and
+no-format cases in `tests/unit/auth-headers.test.ts`. Full unit suite after those pins: 2826/2826.
+
 ### fix(converters): a stream that ends on `length` reports `max_tokens`, not `end_turn`
 
 `createStreamTransformer`'s `[DONE]` branch (`src/converters/streaming.ts`) never recorded

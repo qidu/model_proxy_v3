@@ -43,12 +43,37 @@ function anthropicStreamResponse(inputTokens: number, outputTokens: number, text
   });
 }
 
+function anthropicToolStreamResponse(): Response {
+  const encoder = new TextEncoder();
+  const events = [
+    { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 0 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'get_weather' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"city":"sf"}' } },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } },
+    { type: 'message_stop' },
+  ];
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const e of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(e)}\n\n`));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
 describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode streaming', () => {
   const realFetch = globalThis.fetch;
   after(() => { globalThis.fetch = realFetch; });
 
-  async function runStream(body: Record<string, unknown>): Promise<any[]> {
-    globalThis.fetch = (async () => anthropicStreamResponse(19, 7)) as typeof fetch;
+  async function runStream(
+    body: Record<string, unknown>,
+    responder: () => Response = () => anthropicStreamResponse(19, 7),
+    onUpstream?: (init?: RequestInit) => void,
+  ): Promise<any[]> {
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      onUpstream?.(init);
+      return responder();
+    }) as typeof fetch;
     const res = await handleChatCompletionsPassthrough(
       makeRequest({ model: 'a', messages: [{ role: 'user', content: 'hi' }], ...body }, true),
       'https://upstream/v1/messages',
@@ -77,5 +102,51 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
     assert.deepEqual(last.usage, { prompt_tokens: 19, completion_tokens: 7, total_tokens: 26 });
     // The finish_reason chunk comes right before the usage chunk.
     assert.equal(parsed[parsed.length - 2].choices[0].finish_reason, 'stop');
+  });
+
+  it('opens with one role chunk and never repeats it', async () => {
+    const parsed = await runStream({});
+
+    const withRole = parsed.filter((c: any) => c.choices[0]?.delta?.role !== undefined);
+    assert.equal(withRole.length, 1, 'role must appear on exactly one chunk');
+    assert.deepEqual(withRole[0].choices[0].delta, { role: 'assistant', content: '' });
+    // It is the first chunk on the wire, ahead of any content.
+    assert.equal(parsed[0], withRole[0]);
+    // Content chunks carry content only — the role no longer rides along on each.
+    const contentChunks = parsed.filter((c: any) => c.choices[0]?.delta?.content);
+    assert.equal(contentChunks.length, 1);
+    assert.deepEqual(contentChunks[0].choices[0].delta, { content: 'hi' });
+  });
+
+  it('names the speaker on a tool-call-only stream, which previously sent no role', async () => {
+    const parsed = await runStream({}, anthropicToolStreamResponse);
+
+    assert.deepEqual(parsed[0].choices[0].delta, { role: 'assistant', content: '' });
+    // Every chunk after the opening one must carry no role, tool calls included.
+    for (const chunk of parsed.slice(1)) {
+      assert.equal('role' in chunk.choices[0].delta, false);
+    }
+    const toolChunk = parsed.find((c: any) => c.choices[0]?.delta?.tool_calls);
+    assert.ok(toolChunk, 'expected a chunk carrying delta.tool_calls');
+    assert.equal(toolChunk.choices[0].delta.tool_calls[0].function.name, 'get_weather');
+    assert.equal(parsed[parsed.length - 1].choices[0].finish_reason, 'tool_calls');
+  });
+
+  it('pairs a converted structured-output body with its beta header', async () => {
+    let upstreamHeaders: Headers | undefined;
+    let upstreamBody: Record<string, any> | undefined;
+    await runStream(
+      { response_format: { type: 'json_object' } },
+      undefined,
+      (init) => {
+        upstreamHeaders = new Headers(init?.headers);
+        upstreamBody = JSON.parse(String(init?.body));
+      },
+    );
+
+    assert.equal(upstreamHeaders?.get('anthropic-beta'), 'structured-outputs-2025-11-13');
+    assert.deepEqual(upstreamBody?.output_config, {
+      format: { type: 'json_schema', schema: { type: 'object' } },
+    });
   });
 });
