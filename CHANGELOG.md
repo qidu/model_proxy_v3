@@ -5,6 +5,46 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): three streaming-egress defects on the converted routes
+
+Three silent failures at two seams, none of them covered by a test.
+
+**1. `tool_calls[].index` on `/v1/chat/completions` → `anthropic-messages`.** The
+announcement passed Claude's `content_block` index through, while every `input_json_delta`
+hardcoded `index: 0`. A turn that speaks before it calls a tool announces its first call at
+block 1, and two calls sit at blocks 1 and 2 — so each call's arguments were appended to an
+index no announcement ever named: the client received one call holding every argument
+concatenated (`{"city":"sf"}{"tz":"PST"}`, unparseable) and the announced calls with
+`arguments: ""`. The egress now keeps a `blockIndex → toolIndex` map and numbers the calls
+densely from 0, the rule `responses-to-completions.ts` already applies to the Responses
+`output_index`.
+
+**2. `/v1/interactions` over `anthropic-messages` never closed the interaction.**
+`message_stop` called `clearAnthropicSSEState`, which deletes the per-request Interactions
+state — and `finishInteractionsStream`, the only writer of `step.stop` +
+`interaction.completed` + the answer's usage, runs after the upstream is drained. A standard
+Anthropic turn therefore ended with `interaction.created` / `step.start` / `step.delta…` and a
+clean close: no terminal event, no usage. The sentinel frees nothing now; the driver's
+`finally` already frees that state on every exit.
+
+**3. A truncated Anthropic turn was announced as `completed`.** `interactionStreamEnded` — the
+sole input to the truncation guard — was driven by any usage-bearing frame, and this driver
+puts a running usage on every text chunk, so `ended` was true from the first delta onward.
+Whether a cut-off answer was reported complete depended on whether a frame happened to carry
+usage. Only the finish-reason frame records the end now; usage is still absorbed from whatever
+frame reports it, so the deferral that puts real counts on the terminal frames is unchanged,
+and a truncated turn aborts the client stream instead of claiming success (rule #8).
+
+**Verification**: the seam had no streaming test at all — `gemini-responses-cross-mode-stream`
+drives only the `openai-responses` source — so it gains
+`tests/unit/interactions-over-anthropic-stream.test.ts`: the terminal pair with usage, the
+answer frames ahead of it, a truncated turn *with* usage (aborts), and the same turn without
+usage (aborts). `chat-completions-anthropic-streaming.test.ts` gains two more: each call's
+arguments land on that call's dense index, and no unannounced index reaches the wire. Four of
+those six failed against the previous code; the other two pin behaviour that was already
+correct and must not regress. `npm run typecheck`, `npm run build`, and `npm run test:unit`
+pass (2992/2992).
+
 ### fix(types): align Gemini Interaction streaming with the current SDK vocabulary
 
 Corrected stale converter paths in the API references, added the six missing converters/stream helpers to

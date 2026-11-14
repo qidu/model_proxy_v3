@@ -168,6 +168,17 @@ export async function handleChatCompletionsPassthrough(
         logPipelineStage(logger, requestId, 'outbound', path, roleChunk);
         await writer.write(encoder.encode(`data: ${JSON.stringify(roleChunk)}\n\n`));
       };
+      // Claude's `content_block` index is not the Completions `tool_calls[].index`.
+      // It also counts text and thinking blocks, so a turn that speaks before it
+      // calls a tool opens its first call at block 1 — while `tool_calls[].index`
+      // is the call's position in the message's own list, dense from 0, and is the
+      // only number a client files an argument delta under. Assign it when the call
+      // is announced and reuse it for that block's deltas; passing the block index
+      // through (with the deltas hardcoded to 0) merged every call's arguments into
+      // an index no announcement named. `responses-to-completions.ts` keeps the same
+      // map for the same reason.
+      const toolIndexByBlock = new Map<number, number>();
+      let nextToolIndex = 0;
       let usagePromptTokens: number | undefined;
       let usageCompletionTokens: number | undefined;
       (async () => {
@@ -202,7 +213,17 @@ export async function handleChatCompletionsPassthrough(
                   } else if (delta?.type === 'input_json_delta') {
                     // tool call argument streaming — emit as function arguments delta
                     await writeRoleChunk();
-                    const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: delta.partial_json ?? '' } }] }, finish_reason: null }] };
+                    // Keyed on the block the delta names, so the arguments land under
+                    // the same `tool_calls[].index` the announcement used. An upstream
+                    // that never sent this block's `content_block_start` still gets its
+                    // arguments through, under a fresh index, rather than under 0.
+                    const blockIndex = typeof parsed.index === 'number' ? parsed.index : 0;
+                    let toolIndex = toolIndexByBlock.get(blockIndex);
+                    if (toolIndex === undefined) {
+                      toolIndex = nextToolIndex++;
+                      toolIndexByBlock.set(blockIndex, toolIndex);
+                    }
+                    const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: toolIndex, function: { arguments: delta.partial_json ?? '' } }] }, finish_reason: null }] };
                     logPipelineStage(logger, requestId, 'outbound', path, chunk);
                     await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                   }
@@ -210,7 +231,10 @@ export async function handleChatCompletionsPassthrough(
                   const block = parsed.content_block as Record<string, unknown> | undefined;
                   if (block?.type === 'tool_use') {
                     await writeRoleChunk();
-                    const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: parsed.index ?? 0, id: block.id, type: 'function', function: { name: block.name, arguments: '' } }] }, finish_reason: null }] };
+                    const blockIndex = typeof parsed.index === 'number' ? parsed.index : 0;
+                    const toolIndex = nextToolIndex++;
+                    toolIndexByBlock.set(blockIndex, toolIndex);
+                    const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: toolIndex, id: block.id, type: 'function', function: { name: block.name, arguments: '' } }] }, finish_reason: null }] };
                     logPipelineStage(logger, requestId, 'outbound', path, chunk);
                     await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                   }

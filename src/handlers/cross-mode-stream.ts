@@ -266,10 +266,15 @@ function processAnthropicSSEBuffer(
         };
         const { processed } = processSSEBuffer(`data: ${JSON.stringify(syntheticFinish)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
         result += processed;
-      } else if (parsed.type === 'message_stop') {
-        clearAnthropicSSEState(requestId);
-        // Gemini generateContent/interactions streams end naturally; no sentinel needed.
       }
+      // `message_stop` frees nothing. The Gemini dialects end naturally, and the
+      // Interactions dialect's terminal frames are written once the upstream has
+      // been drained (`finishInteractionsStream`) because the usage may ride a later
+      // frame. Freeing the per-request state here — as this branch used to, through
+      // `clearAnthropicSSEState` — deleted exactly the state those frames are built
+      // from, so a standard Anthropic stream ended with no `step.stop`, no
+      // `interaction.completed` and no usage. The driver's `finally` frees it on
+      // every exit, sentinel or not.
     } catch {
       // Skip invalid SSE data.
     }
@@ -552,8 +557,16 @@ function interactionsFramesForChunk(
   // Recorded whenever it arrives, which is not always the frame that ended the
   // answer: the openai-completions upstreams that gate usage behind
   // `stream_options.include_usage` report it on a later, choice-less frame.
+  //
+  // It does *not* mark the answer ended, though: a frame carrying counts is not
+  // evidence that the upstream stated a finish reason. Marking it did make
+  // `state.ended` true from the first usage-bearing delta onward (this driver puts
+  // a running usage on every text chunk), and `finishInteractionsStream`'s
+  // truncation guard reads that flag alone — so a stream cut off mid-text was
+  // announced as a completed interaction whenever its `message_start` happened to
+  // carry usage. The finish-reason branch above is what records the end.
   const usage = completionsUsageToInteractionUsage(parsed?.usage);
-  if (usage) interactionStreamEnded(state, usage);
+  if (usage) state.usage = usage;
 
   return interactionFrames(events);
 }

@@ -150,3 +150,109 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
     });
   });
 });
+
+/**
+ * `tool_calls[].index` is the call's position in the message's own list: dense
+ * from 0, and the *same* index on the announcement chunk and on every argument
+ * delta that belongs to it, because a client folds deltas into
+ * `message.tool_calls[index]` by that number alone.
+ *
+ * Claude's `content_block` index is a different number — it also counts text and
+ * thinking blocks, so a turn that speaks before it calls a tool opens its first
+ * call at block 1, and two calls sit at blocks 1 and 2.
+ *
+ * Pins finding #2 of `review_fixes.md`, which is unfixed at the time of writing:
+ * the announcement passed Claude's block index through while every
+ * `input_json_delta` hardcoded 0, so each call's arguments were appended to an
+ * index no announcement ever named — leaving one bogus call holding every
+ * argument concatenated, and the announced calls with `arguments: ""`.
+ */
+describe('handleChatCompletionsPassthrough — anthropic-messages tool_calls indices', () => {
+  const realFetch = globalThis.fetch;
+  after(() => { globalThis.fetch = realFetch; });
+
+  /** A turn that speaks first (block 0), then calls two tools in blocks 1 and 2. */
+  function anthropicTwoToolStream(): Response {
+    const encoder = new TextEncoder();
+    const events = [
+      { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Let me check.' } },
+      { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'get_weather' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"city":' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '"sf"}' } },
+      { type: 'content_block_start', index: 2, content_block: { type: 'tool_use', id: 'toolu_2', name: 'get_time' } },
+      { type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '{"tz":"PST"}' } },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 30 } },
+      { type: 'message_stop' },
+    ];
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const e of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(e)}\n\n`));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
+
+  async function runTwoToolStream(): Promise<any[]> {
+    globalThis.fetch = (async () => anthropicTwoToolStream()) as typeof fetch;
+    const res = await handleChatCompletionsPassthrough(
+      makeRequest({ model: 'a', messages: [{ role: 'user', content: 'hi' }] }, true),
+      'https://upstream/v1/messages', { Authorization: 'Bearer k' }, 'rid-two-tools',
+      testLogger, env, 'a', 'anthropic-messages',
+    );
+    const text = await res.text();
+    return text.split('\n\n').filter(s => s.startsWith('data: ')).map(s => s.slice(6))
+      .filter(s => s !== '[DONE]').map(s => JSON.parse(s));
+  }
+
+  /**
+   * Fold `delta.tool_calls` the way a client does: by index, appending argument
+   * fragments and taking id/name from whichever chunk carries them.
+   */
+  function foldToolCalls(chunks: any[]): Map<number, { id?: string; name?: string; arguments: string }> {
+    const calls = new Map<number, { id?: string; name?: string; arguments: string }>();
+    for (const chunk of chunks) {
+      for (const delta of chunk.choices[0]?.delta?.tool_calls ?? []) {
+        const call = calls.get(delta.index) ?? { arguments: '' };
+        if (delta.id !== undefined) call.id = delta.id;
+        if (delta.function?.name !== undefined) call.name = delta.function.name;
+        call.arguments += delta.function?.arguments ?? '';
+        calls.set(delta.index, call);
+      }
+    }
+    return calls;
+  }
+
+  it('keeps each call\'s arguments with its own index, numbered densely from 0', async () => {
+    const calls = foldToolCalls(await runTwoToolStream());
+
+    // Dense from 0: the client addresses `message.tool_calls[i]` by this number,
+    // so a gap makes it look for a call the message does not have.
+    assert.deepEqual([...calls.keys()].sort((a, b) => a - b), [0, 1],
+      'tool_calls indices must be dense from 0 — review_fixes.md #2 (Claude blocks 1 and 2 leaked through)');
+
+    assert.equal(calls.get(0)?.id, 'toolu_1');
+    assert.equal(calls.get(0)?.name, 'get_weather');
+    assert.equal(calls.get(1)?.id, 'toolu_2');
+    assert.equal(calls.get(1)?.name, 'get_time');
+
+    // The decisive property: each call's arguments are its own and parse.
+    assert.deepEqual(JSON.parse(calls.get(0)!.arguments), { city: 'sf' },
+      'the first call must hold its own arguments, not every delta merged at index 0');
+    assert.deepEqual(JSON.parse(calls.get(1)!.arguments), { tz: 'PST' },
+      'the second call must hold its own arguments');
+  });
+
+  it('never announces or feeds an index beyond the calls it announced', async () => {
+    const chunks = await runTwoToolStream();
+    const indices = chunks.flatMap(c => (c.choices[0]?.delta?.tool_calls ?? []).map((d: any) => d.index));
+
+    // Every index on the wire is one the stream announced, so the two calls above
+    // are the whole list: no phantom call, and no call left without arguments.
+    assert.equal(indices.every((index: number) => index === 0 || index === 1), true,
+      `an unannounced tool_calls index reached the client: ${JSON.stringify(indices)}`);
+    assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, 'tool_calls');
+  });
+});
