@@ -7,6 +7,7 @@ import { ClaudeMessagesResponse, ClaudeContentBlock, ClaudeTextBlock, ClaudeTool
 import { GeminiInteractionResponse, GeminiContent, GeminiUsage } from '../types/gemini.js';
 import { stringify } from '../utils/stringify.js';
 import { Logger } from '../utils/logger.js';
+import { SYNTHETIC_THINKING_SIGNATURE } from './openai-to-claude.js';
 
 /**
  * Convert Gemini interaction response to Claude format
@@ -178,7 +179,7 @@ export function convertGeminiGenerateContentToClaude(
     geminiResponse: Record<string, unknown>,
     model: string,
     requestId: string,
-    options?: { logger?: Logger },
+    options?: { logger?: Logger; stopSequences?: string[] },
 ): ClaudeMessagesResponse {
     const candidates = geminiResponse.candidates as Array<Record<string, unknown>> | undefined;
     const usageMetadata = geminiResponse.usageMetadata as Record<string, number> | undefined;
@@ -195,12 +196,13 @@ export function convertGeminiGenerateContentToClaude(
         if (candidateContent) {
             const parts = candidateContent.parts as Array<Record<string, unknown>> | undefined;
             if (parts && parts.length > 0) {
+                const thoughtTexts: string[] = [];
+                let thoughtSignature: string | undefined;
                 const textParts: string[] = [];
                 const toolUseBlocks: ClaudeToolUseBlock[] = [];
                 // Rule #8: a part this converter cannot project must be counted by
                 // kind and reported, not dropped into a shorter, clean-looking answer.
                 const droppedKinds = new Map<string, number>();
-                let thoughtParts = 0;
                 for (const part of parts) {
                     const functionCall = part.functionCall as Record<string, unknown> | undefined;
                     if (functionCall) {
@@ -217,11 +219,19 @@ export function convertGeminiGenerateContentToClaude(
                             input: functionCall.args ?? {},
                         });
                     } else if (typeof part.text === 'string') {
-                        // A thought part carries the same `text` field, so it lands
-                        // here and is answered as ordinary text: this path has no
-                        // thinking projection, which the warning below states.
-                        if (part.thought === true) thoughtParts++;
-                        textParts.push(part.text);
+                        // A thought part carries the same `text` field as the answer
+                        // and is told apart by `thought: true`. It becomes a Claude
+                        // thinking block below — ahead of the text block, where
+                        // Anthropic's spec puts it — rather than being folded into
+                        // what the client reads as the answer.
+                        if (part.thought === true) {
+                            thoughtTexts.push(part.text);
+                            if (typeof part.thoughtSignature === 'string' && part.thoughtSignature !== '') {
+                                thoughtSignature = part.thoughtSignature;
+                            }
+                        } else {
+                            textParts.push(part.text);
+                        }
                     } else {
                         const kind = part.inline_data || part.inlineData ? 'inline_data'
                             : part.functionResponse ? 'functionResponse'
@@ -239,14 +249,19 @@ export function convertGeminiGenerateContentToClaude(
                         [...droppedKinds].map(([kind, n]) => `${kind}×${n}`).join(', ')
                     );
                 }
-                if (thoughtParts > 0) {
-                    options?.logger?.warn(
-                        requestId,
-                        `[gemini->claude] folded ${thoughtParts} thought part(s) into the answer text ` +
-                        `(this path has no thinking/reasoning projection)`
-                    );
-                }
                 const blocks: ClaudeContentBlock[] = [];
+                if (thoughtTexts.length > 0) {
+                    // Anthropic's spec puts thinking ahead of the answer and marks
+                    // `signature` required: the part's own `thoughtSignature` when
+                    // Gemini sent one, the shared synthetic placeholder otherwise —
+                    // the same rule `openai-to-claude` applies, since a signature
+                    // only load-bears on Anthropic's own round-trip.
+                    blocks.push({
+                        type: 'thinking',
+                        thinking: thoughtTexts.join(''),
+                        signature: thoughtSignature ?? SYNTHETIC_THINKING_SIGNATURE,
+                    } as ClaudeContentBlock);
+                }
                 if (textParts.length > 0) {
                     blocks.push({
                         type: 'text',
@@ -262,6 +277,21 @@ export function convertGeminiGenerateContentToClaude(
         // Map finish reason
         switch (finishReason) {
             case 'STOP':
+                // Gemini reports "the model hit one of the request's
+                // `stopSequences`" as a plain STOP, and never says which sequence
+                // matched. So on this path a stop-sequence turn is
+                // indistinguishable from a natural one: `stop_sequence` (the
+                // matched string) is unknown, and reporting
+                // `stop_reason: 'stop_sequence'` on every STOP of a request that
+                // declared sequences would be a guess presented as a fact.
+                if (options?.stopSequences?.length && !hasToolUse) {
+                    options.logger?.warn(
+                        requestId,
+                        `[gemini->claude] Gemini STOP is ambiguous for a request with stop_sequences: ` +
+                        `a stop-sequence match cannot be distinguished from natural completion; ` +
+                        `returning stop_reason "end_turn" without stop_sequence`
+                    );
+                }
                 stopReason = 'end_turn';
                 break;
             case 'MAX_TOKENS':

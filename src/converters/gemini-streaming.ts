@@ -7,6 +7,7 @@ import { GeminiSSEEvent, GeminiContent } from '../types/gemini.js';
 import { stringify } from '../utils/stringify.js';
 import type { Logger } from '../utils/logger.js';
 import { convertGenerateContentToInteraction, blockedPromptReason } from './gemini-to-interactions.js';
+import { SYNTHETIC_THINKING_SIGNATURE } from './openai-to-claude.js';
 
 type ClaudeUsage = {
     input_tokens: number;
@@ -51,8 +52,18 @@ interface StreamingState {
     hasEnded: boolean;
     /** A text block is open at `contentIndex` and needs its content_block_stop. */
     textBlockOpen: boolean;
+    /**
+     * A thinking block is open at `contentIndex`. At most one of this and
+     * `textBlockOpen` is set: a thinking block is closed (signature + stop)
+     * before a text or tool block opens at the next index.
+     */
+    thinkingBlockOpen: boolean;
+    /** The `thoughtSignature` Gemini attached to the open thinking block, if any. */
+    thinkingSignature?: string;
     /** At least one functionCall part was emitted — the turn stops for tool_use. */
     hasToolUse: boolean;
+    logger?: Logger;
+    stopSequences?: string[];
 }
 
 /**
@@ -99,7 +110,8 @@ export function createNativeGeminiStreamTransformer(
  */
 export function createGeminiStreamTransformer(
     model: string,
-    requestId: string
+    requestId: string,
+    options?: { logger?: Logger; stopSequences?: string[] }
 ): TransformStream<Uint8Array, Uint8Array> {
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
@@ -112,7 +124,10 @@ export function createGeminiStreamTransformer(
         hasStarted: false,
         hasEnded: false,
         textBlockOpen: false,
+        thinkingBlockOpen: false,
         hasToolUse: false,
+        logger: options?.logger,
+        stopSequences: options?.stopSequences,
     };
 
     const parseMessage = (message: string, controller: TransformStreamDefaultController<Uint8Array>) => {
@@ -199,20 +214,50 @@ function handleNativeGeminiChunk(
     const candidates = chunk.candidates as Array<Record<string, any>> | undefined;
     const candidate = candidates?.[0];
     const parts = candidate?.content?.parts as Array<Record<string, unknown>> | undefined;
+
+    /**
+     * Close whichever block is open, so the next one starts at a fresh index.
+     * A thinking block gets its `signature_delta` first: Anthropic's spec marks
+     * `signature` required, and this converter cannot know whether the block will
+     * be replayed, so the shared synthetic placeholder stands in when Gemini sent
+     * no `thoughtSignature` (the same rule `streaming.ts` applies).
+     */
+    const closeOpenBlock = (): void => {
+        if (state.thinkingBlockOpen) {
+            sendClaudeEvent(controller, 'content_block_delta', {
+                type: 'content_block_delta',
+                index: state.contentIndex,
+                delta: {
+                    type: 'signature_delta',
+                    signature: state.thinkingSignature ?? SYNTHETIC_THINKING_SIGNATURE,
+                },
+            });
+            sendClaudeEvent(controller, 'content_block_stop', {
+                type: 'content_block_stop',
+                index: state.contentIndex,
+            });
+            state.thinkingBlockOpen = false;
+            state.thinkingSignature = undefined;
+            state.contentIndex += 1;
+            return;
+        }
+        if (state.textBlockOpen) {
+            sendClaudeEvent(controller, 'content_block_stop', {
+                type: 'content_block_stop',
+                index: state.contentIndex,
+            });
+            state.textBlockOpen = false;
+            state.contentIndex += 1;
+        }
+    };
+
     if (parts?.length) {
         for (const part of parts) {
             const functionCall = part.functionCall as Record<string, unknown> | undefined;
             if (functionCall) {
                 // A functionCall cannot share a block with text — close the
-                // text block first, then emit a complete tool_use block of its own.
-                if (state.textBlockOpen) {
-                    sendClaudeEvent(controller, 'content_block_stop', {
-                        type: 'content_block_stop',
-                        index: state.contentIndex,
-                    });
-                    state.textBlockOpen = false;
-                    state.contentIndex += 1;
-                }
+                // open block first, then emit a complete tool_use block of its own.
+                closeOpenBlock();
                 const toolIndex = state.contentIndex;
                 // Carry the upstream's own call id when it has one so the client
                 // can echo it back in the matching tool_result; mint one when the
@@ -241,7 +286,32 @@ function handleNativeGeminiChunk(
                 state.contentIndex += 1;
                 state.hasToolUse = true;
             } else if (typeof part.text === 'string' && part.text) {
+                // A thought part carries the same `text` field as the answer and
+                // is told apart by `thought: true`. It opens a thinking block —
+                // ahead of the answer, where Anthropic's spec puts it — instead of
+                // being streamed to the client as answer text.
+                if (part.thought === true) {
+                    if (!state.thinkingBlockOpen) {
+                        closeOpenBlock();
+                        sendClaudeEvent(controller, 'content_block_start', {
+                            type: 'content_block_start',
+                            index: state.contentIndex,
+                            content_block: { type: 'thinking', thinking: '' },
+                        });
+                        state.thinkingBlockOpen = true;
+                    }
+                    if (typeof part.thoughtSignature === 'string' && part.thoughtSignature !== '') {
+                        state.thinkingSignature = part.thoughtSignature;
+                    }
+                    sendClaudeEvent(controller, 'content_block_delta', {
+                        type: 'content_block_delta',
+                        index: state.contentIndex,
+                        delta: { type: 'thinking_delta', thinking: part.text },
+                    });
+                    continue;
+                }
                 if (!state.textBlockOpen) {
+                    closeOpenBlock();
                     sendClaudeEvent(controller, 'content_block_start', {
                         type: 'content_block_start',
                         index: state.contentIndex,
@@ -261,9 +331,19 @@ function handleNativeGeminiChunk(
 
     const usage = convertGeminiUsageToClaudeUsage(chunk.usageMetadata as Record<string, unknown> | undefined);
     if (candidate?.finishReason || usage) {
-        if (state.textBlockOpen) {
-            sendClaudeEvent(controller, 'content_block_stop', { type: 'content_block_stop', index: state.contentIndex });
-            state.textBlockOpen = false;
+        closeOpenBlock();
+        if (
+            candidate?.finishReason === 'STOP' &&
+            state.stopSequences?.length &&
+            !state.hasToolUse &&
+            !state.hasEnded
+        ) {
+            state.logger?.warn(
+                requestId,
+                `[gemini->claude] Gemini STOP is ambiguous for a request with stop_sequences: ` +
+                `a stop-sequence match cannot be distinguished from natural completion; ` +
+                `returning stop_reason "end_turn" without stop_sequence`
+            );
         }
         sendClaudeEvent(controller, 'message_delta', {
             type: 'message_delta',

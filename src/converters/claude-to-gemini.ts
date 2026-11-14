@@ -8,14 +8,26 @@ import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
 import { recursivelyCleanSchema } from './claude-to-openai.js';
 import { stringify } from '../utils/stringify.js';
+import type { Logger } from '../utils/logger.js';
 
 /**
  * Convert Claude request to Gemini generateContent format
+ *
+ * Async because an `image` block with a `source.type: 'url'` has no
+ * generateContent equivalent — the part carries bytes, not a URL — so it is
+ * fetched server-side (`fetchImageAsInlineData`, SSRF-guarded).
+ *
+ * `options.logger` carries warnings only: a field this format cannot express
+ * (Rule #8) is reported rather than dropped into a quietly different request.
  */
-export function convertClaudeToGeminiRequest(
+export async function convertClaudeToGeminiRequest(
     claudeRequest: ClaudeMessagesRequest,
-    modelId?: string
-): Record<string, unknown> {
+    modelId?: string,
+    options?: { logger?: Logger; requestId?: string },
+): Promise<Record<string, unknown>> {
+    const warn = (message: string): void => {
+        options?.logger?.warn(options.requestId ?? '', message);
+    };
     const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [];
     // Gemini's functionResponse carries a tool *name*, Claude's tool_result only
     // a tool_use_id — so remember the name of every tool_use seen so far.
@@ -34,13 +46,30 @@ export function convertClaudeToGeminiRequest(
                     parts.push({ text: (block as ClaudeTextBlock).text });
                 } else if (block.type === 'image') {
                     const imgBlock = block as ClaudeImageBlock;
-                    const data: unknown = imgBlock.source.data;
-                    parts.push({
-                        inline_data: {
-                            mime_type: imgBlock.source.media_type || 'image/jpeg',
-                            data: isBlobRef(data) ? rebindBlobRef(data, 'gemini-inline-data', '') : data
+                    if (imgBlock.source.type === 'url') {
+                        // A generateContent part carries bytes; `fileData.fileUri`
+                        // only addresses Files API URIs, so an http(s) image has to
+                        // be fetched here — the same SSRF-guarded fetch the
+                        // Completions path below uses (20 MiB cap, optional
+                        // `[fetch] image_encode` sidecar). It throws on any
+                        // failure, so a broken URL is an honest error rather than
+                        // an empty `inline_data` part the upstream rejects by name.
+                        const url = imgBlock.source.url;
+                        if (typeof url !== 'string' || url === '') {
+                            throw new Error(
+                                'Cannot convert an image block with source.type "url" to a Gemini inline_data part: no source.url'
+                            );
                         }
-                    });
+                        parts.push({ inline_data: await fetchImageAsInlineData(url) });
+                    } else {
+                        const data: unknown = imgBlock.source.data;
+                        parts.push({
+                            inline_data: {
+                                mime_type: imgBlock.source.media_type || 'image/jpeg',
+                                data: isBlobRef(data) ? rebindBlobRef(data, 'gemini-inline-data', '') : data
+                            }
+                        });
+                    }
                 } else if (block.type === 'tool_use') {
                     const toolUse = block as ClaudeToolUseBlock;
                     toolNamesById.set(toolUse.id, toolUse.name);
@@ -97,11 +126,41 @@ export function convertClaudeToGeminiRequest(
         }
     }
 
-    // Add generation config
-    if (claudeRequest.temperature !== undefined || claudeRequest.max_tokens !== undefined) {
+    // Add generation config. The guard names every knob this block can carry: it
+    // used to test temperature/max_tokens only, so a body whose whole ask was
+    // `thinking` or `stop_sequences` produced no generation_config at all and the
+    // upstream answered with its own defaults.
+    const thinking = claudeRequest.thinking;
+    const stopSequences = Array.isArray(claudeRequest.stop_sequences) ? claudeRequest.stop_sequences : [];
+    // A disabled config is not a knob — it asks for the upstream's default — so it
+    // must not create a generation_config on its own.
+    const thinkingOn = thinking !== undefined && thinking.type !== 'disabled' && thinking.type !== false;
+    if (
+        claudeRequest.temperature !== undefined ||
+        claudeRequest.max_tokens !== undefined ||
+        thinkingOn ||
+        stopSequences.length > 0
+    ) {
         const config: Record<string, unknown> = {};
         if (claudeRequest.temperature !== undefined) config.temperature = claudeRequest.temperature;
         if (claudeRequest.max_tokens !== undefined) config.max_output_tokens = claudeRequest.max_tokens;
+        // Claude `stop_sequences` -> generationConfig.stopSequences (snake_case is
+        // this block's spelling, as `max_output_tokens` above; Google's JSON
+        // parser accepts the proto field name).
+        if (stopSequences.length > 0) config.stop_sequences = stopSequences;
+        // Claude `thinking.budget_tokens` -> Gemini `thinkingBudget`, the closest
+        // analogue. `include_thoughts` is what makes the upstream emit thought
+        // parts at all — without it a thinking-enabled model answers with the
+        // reasoning withheld, so the client could never see it. `type: 'enabled'`
+        // with no budget means "dynamic" upstream: the budget field is omitted
+        // rather than guessed.
+        if (thinkingOn && thinking) {
+            const budget = 'budget_tokens' in thinking ? thinking.budget_tokens : undefined;
+            config.thinking_config = {
+                include_thoughts: true,
+                ...(typeof budget === 'number' && budget > 0 ? { thinking_budget: budget } : {}),
+            };
+        }
         request.generation_config = config;
     }
 
@@ -113,6 +172,19 @@ export function convertClaudeToGeminiRequest(
         if (nameless.length > 0) {
             throw new Error(
                 `Cannot convert ${nameless.length} Claude tool(s) to Gemini functionDeclarations: missing "name"`
+            );
+        }
+        // Rule #8: a Claude *server* tool (`web_search_20250305`,
+        // `computer_20250124`, `bash_20250124`, …) declares a `type` and no
+        // `input_schema`. It passes the name check and reaches the upstream as an
+        // ordinary function with an empty parameter object, which invites the
+        // model to call something this proxy has no way to execute.
+        const serverTools = claudeRequest.tools.filter(t =>
+            typeof (t as unknown as Record<string, unknown>).type === 'string');
+        if (serverTools.length > 0) {
+            warn(
+                `Claude server tool(s) have no generateContent equivalent and were declared as plain functions: ` +
+                serverTools.map(t => `${t.name}(${String((t as unknown as Record<string, unknown>).type)})`).join(', ')
             );
         }
         request.tools = [{
@@ -135,12 +207,60 @@ export function convertClaudeToGeminiRequest(
         } else if (toolChoice.type === 'none') {
             functionCallingConfig.mode = 'NONE';
         } else if (toolChoice.type === 'tool') {
+            // Fail Loud (Rule #8): the same case the Completions path below
+            // refuses. `mode: ANY` without an allow-list is free choice, so a
+            // forced tool with no name would let the model call a different one.
+            if (typeof toolChoice.name !== 'string' || toolChoice.name === '') {
+                throw new Error(
+                    'Cannot convert tool_choice to a Gemini functionCallingConfig: the forced-tool form has no "name"'
+                );
+            }
             functionCallingConfig.mode = 'ANY';
-            if (toolChoice.name) functionCallingConfig.allowedFunctionNames = [toolChoice.name];
+            functionCallingConfig.allowedFunctionNames = [toolChoice.name];
+        } else {
+            // Fail Loud (Rule #8): an unrecognized tool_choice used to emit no
+            // toolConfig at all — free choice for a client that asked to constrain
+            // the call.
+            throw new Error(
+                `Cannot convert tool_choice ${stringify(toolChoice)} to a Gemini functionCallingConfig`
+            );
+        }
+        // No generateContent equivalent: `functionCallingConfig` constrains *which*
+        // function may be called, not how many per turn. Report it rather than let
+        // a client that asked for serial tool calls discover the difference.
+        if ((toolChoice as unknown as Record<string, unknown>).disable_parallel_tool_use === true) {
+            warn('tool_choice.disable_parallel_tool_use has no generateContent equivalent and was dropped; the model may emit parallel calls');
         }
         if (functionCallingConfig.mode) {
             request.toolConfig = { functionCallingConfig };
         }
+    }
+
+    const hasCacheControl = (value: unknown): boolean =>
+        typeof value === 'object' && value !== null &&
+        (value as Record<string, unknown>).cache_control !== undefined;
+    const cacheControlLocations: string[] = [];
+    claudeRequest.tools?.forEach((tool, index) => {
+        if (hasCacheControl(tool)) cacheControlLocations.push(`tools[${index}]`);
+    });
+    if (Array.isArray(claudeRequest.system)) {
+        claudeRequest.system.forEach((block, index) => {
+            if (hasCacheControl(block)) cacheControlLocations.push(`system[${index}]`);
+        });
+    }
+    claudeRequest.messages.forEach((message, messageIndex) => {
+        if (!Array.isArray(message.content)) return;
+        message.content.forEach((block, blockIndex) => {
+            if (hasCacheControl(block)) {
+                cacheControlLocations.push(`messages[${messageIndex}].content[${blockIndex}]`);
+            }
+        });
+    });
+    if (cacheControlLocations.length > 0) {
+        warn(
+            `Claude cache_control has no generateContent equivalent; ignored ` +
+            `${cacheControlLocations.length} cache hint(s) at ${cacheControlLocations.join(', ')}`
+        );
     }
 
     // Add cached content

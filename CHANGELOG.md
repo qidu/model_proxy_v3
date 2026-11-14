@@ -5,6 +5,64 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): five fields `/v1/messages` → `gemini-generatecontent` dropped without a word
+
+`/v1/messages` on a `gemini-generatecontent` upstream is converted by one function,
+`convertClaudeToGeminiRequest` (`src/converters/claude-to-gemini.ts`), and by
+`convertGeminiGenerateContentToClaude` / `createGeminiStreamTransformer` on the way back. A review of
+that route found five client-visible fields it either did not model at all or modelled wrongly. Every
+one of them was dropped *silently* — no throw, no warning — which is the part that made them hard to
+notice from the client side (Rule #8).
+
+| client sent | upstream received | consequence |
+| --- | --- | --- |
+| `thinking: {type:'enabled', budget_tokens: N}` | nothing at all | Gemini applied its own default budget; with `includeThoughts` never set, thought summaries were never even returned |
+| Gemini `{thought: true, text}` reply parts | folded into the answer text (streaming: emitted as plain `text_delta`) | the client saw the model's reasoning as part of the answer, with no `thinking` block |
+| `image` block with `source.type: 'url'` | `{"inline_data":{"mime_type":"image/jpeg"}}` — the URL was discarded and `JSON.stringify` erased the empty payload | an upstream 400 about `inline_data`, naming a field the client never wrote |
+| `tools: [{type:'web_search_20250305', …}]`, `tool_choice.disable_parallel_tool_use`, a forced `tool_choice` with no `name`, an unrecognized `tool_choice.type` | declared as an ordinary function with an empty parameter schema / dropped / widened to `ANY` / no `toolConfig` at all | the model was invited to call something the proxy cannot execute, told it could pick any tool when one was forced, or given free choice when the client asked to constrain it |
+| `stop_sequences: [...]` | nothing at all | the model generated straight past every stop sequence |
+
+**The request.** `generation_config` used to be built only when `temperature` or `max_tokens` was
+present, so `thinking` and `stop_sequences` — knobs that live on the same object — had no path at all.
+The guard now names them, mapping `thinking.budget_tokens` → `thinkingConfig.thinkingBudget` with
+`includeThoughts: true` (without it the upstream withholds the reasoning entirely), `type: 'enabled'`
+with no budget → no budget field (upstream dynamic), and `stop_sequences` → `stopSequences`.
+
+A URL-source image is now fetched server-side through the existing `fetchImageAsInlineData` (SSRF
+guard, 20 MiB cap, optional `[fetch] image_encode` sidecar) — the same helper the Completions path in
+the same file already used. That makes `convertClaudeToGeminiRequest` async; its one production caller
+(`handleGeminiGenerateContentRequest`) was already async.
+
+Tool handling now distinguishes the cases that change control flow from the ones that merely change
+fidelity. A forced `tool_choice` with no `name` and an unrecognized `tool_choice.type` **throw** — the
+first would have widened `ANY` to let the model call a different tool, the second silently emitted no
+`toolConfig` at all. A Claude server tool (`type: 'web_search_20250305'`, `computer_…`, `bash_…`) and
+`tool_choice.disable_parallel_tool_use` are **reported as warnings**, because they have no
+generateContent equivalent but dropping them does not change which tool the client asked for. The
+converter gained an optional `options: { logger, requestId }` for those, wired at its call site.
+`cache_control` markers on tools, system blocks, and message content are also counted and reported
+as ignored cache hints rather than vanishing silently.
+
+**The response.** A `{thought: true, text}` part now becomes a Claude `thinking` block *ahead* of the
+text block, where Anthropic's spec puts it, carrying the part's own `thoughtSignature` and falling
+back to the shared `SYNTHETIC_THINKING_SIGNATURE` when Gemini sent none (the rule `openai-to-claude`
+and `streaming.ts` already apply). Streaming does the same: `content_block_start {type:'thinking'}`,
+`thinking_delta`, then a `signature_delta` before `content_block_stop`, closing the thinking block
+before any text or tool block opens at the next index. `handleGeminiNonStreamingResponse` now passes
+its logger to the converter, so that path's other Rule #8 reports (a reply part with no Claude
+Messages projection) are reachable — they never fired before.
+
+**Two decisions worth recording.** A matched `stopSequences` comes back as a plain `finishReason:
+"STOP"` with no indication of which sequence matched, so `stop_reason` stays `end_turn` and the
+`stop_sequence` field stays absent — reporting `stop_sequence` on every STOP of a request that
+declared sequences would be a guess presented as a fact (documented at the mapping). Both response
+paths now warn when a request that supplied sequences receives this ambiguous STOP. And the
+pre-existing mapping of `SAFETY`/`RECITATION` → `stop_sequence` is left alone here: it is wrong
+(Claude's `stop_sequence` means a *client-supplied* sequence matched) but changing it is a separate
+behaviour change, still pinned by its own test.
+
+Suite: 2933/2933, typecheck clean.
+
 ### fix(handlers): `/v1/interactions` on a `gemini-generatecontent` upstream — the request, the response, and a streaming egress that never converted
 
 `/v1/interactions` served by `upstream_mode = "gemini-generatecontent"` is the Interactions API

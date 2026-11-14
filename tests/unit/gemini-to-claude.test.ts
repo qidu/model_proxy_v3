@@ -401,12 +401,17 @@ describe('convertGeminiGenerateContentToClaude', () => {
     assert.match(warnings[0], /no Claude Messages projection: inline_data×2$/);
   });
 
-  it('reports thought parts, which this path folds into the answer text', () => {
+  it('maps thought parts to a leading thinking block instead of folding them into the answer', () => {
     const { logger, warnings } = recordingLogger();
     const resp = convertGeminiGenerateContentToClaude(
       {
         candidates: [{
-          content: { parts: [{ thought: true, text: 'considering' }, { text: 'answer' }] },
+          content: {
+            parts: [
+              { thought: true, text: 'considering', thoughtSignature: 'sig-gemini' },
+              { text: 'answer' },
+            ],
+          },
           finishReason: 'STOP',
         }],
       },
@@ -415,11 +420,70 @@ describe('convertGeminiGenerateContentToClaude', () => {
       { logger },
     );
 
-    // Current behaviour, now reported rather than silent: both parts land in one
-    // text block, because this path has no thinking projection.
-    assert.deepEqual(resp.content, [{ type: 'text', text: 'consideringanswer' }]);
+    // Anthropic puts thinking ahead of the answer and wants a signature on it.
+    assert.deepEqual(resp.content, [
+      { type: 'thinking', thinking: 'considering', signature: 'sig-gemini' },
+      { type: 'text', text: 'answer' },
+    ]);
+    assert.deepEqual(warnings, [], 'a projected thought part is no longer a drop');
+  });
+
+  it('joins multiple thought parts into one thinking block and synthesizes a missing signature', () => {
+    const resp = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{
+          content: {
+            parts: [
+              { thought: true, text: 'step one, ' },
+              { thought: true, text: 'step two' },
+              { text: 'done' },
+            ],
+          },
+          finishReason: 'STOP',
+        }],
+      },
+      'm',
+      'rid',
+    );
+
+    assert.deepEqual(resp.content, [
+      { type: 'thinking', thinking: 'step one, step two', signature: 'synthetic' },
+      { type: 'text', text: 'done' },
+    ]);
+  });
+
+  it('emits no thinking block when the upstream sent no thought parts', () => {
+    const resp = convertGeminiGenerateContentToClaude(
+      { candidates: [{ content: { parts: [{ text: 'plain' }] }, finishReason: 'STOP' }] },
+      'm',
+      'rid',
+    );
+
+    assert.deepEqual(resp.content, [{ type: 'text', text: 'plain' }]);
+  });
+
+  it('warns when STOP may hide a requested stop-sequence match', () => {
+    const { logger, warnings } = recordingLogger();
+    const resp = convertGeminiGenerateContentToClaude(
+      { candidates: [{ content: { parts: [{ text: 'done' }] }, finishReason: 'STOP' }] },
+      'm',
+      'rid',
+      { logger, stopSequences: ['END'] },
+    );
+
+    assert.equal(resp.stop_reason, 'end_turn');
+    assert.equal('stop_sequence' in resp, false);
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /folded 1 thought part\(s\) into the answer text/);
+    assert.match(warnings[0], /Gemini STOP is ambiguous for a request with stop_sequences/);
+    assert.match(warnings[0], /returning stop_reason "end_turn" without stop_sequence/);
+
+    convertGeminiGenerateContentToClaude(
+      { candidates: [{ content: { parts: [{ text: 'truncated' }] }, finishReason: 'MAX_TOKENS' }] },
+      'm',
+      'rid',
+      { logger, stopSequences: ['END'] },
+    );
+    assert.equal(warnings.length, 1, 'other finish reasons do not emit the STOP warning');
   });
 
   it('warns about nothing on a clean text response with a mapped finishReason', () => {

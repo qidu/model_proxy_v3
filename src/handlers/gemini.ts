@@ -348,6 +348,9 @@ async function handleGeminiGenerateContentRequest(
         };
         ({ body: requestBody } = runHook('before_conversion', { body: requestBody, headers: authHeaders }, hookCtxConv));
     }
+    const stopSequences = outputFormat === 'claude-format' && Array.isArray(requestBody.stop_sequences)
+        ? requestBody.stop_sequences as string[]
+        : [];
 
     // Determine if this is a native Gemini request or needs conversion from Claude format
     let geminiRequest: Record<string, unknown>;
@@ -373,7 +376,12 @@ async function handleGeminiGenerateContentRequest(
         // Claude format - convert to Gemini generateContent format
         activeLogger.debug(requestId, 'Converting Claude request to Gemini format');
         const claudeRequest = requestBody as unknown as ClaudeMessagesRequest;
-        geminiRequest = convertClaudeToGeminiRequest(claudeRequest, modelId);
+        // The logger is what makes the converter's Rule #8 warnings reachable: a
+        // field this format cannot express (a server tool, a parallel-tool-use
+        // constraint) is reported here rather than silently reshaped.
+        geminiRequest = await convertClaudeToGeminiRequest(claudeRequest, modelId, {
+            logger: activeLogger, requestId,
+        });
         isStreaming = claudeRequest.stream === true;
         effectiveModelId = effectiveModelId || claudeRequest.model;
     }
@@ -450,13 +458,13 @@ async function handleGeminiGenerateContentRequest(
             // egress came to emit the wrong dialect (see `handleGeminiStreamingResponse`).
             return handleGeminiStreamingResponse(
                 response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger,
-                outputFormat === 'claude-format' ? 'claude-format' : 'native-gemini'
+                outputFormat === 'claude-format' ? 'claude-format' : 'native-gemini', stopSequences
             );
         }
 
         // Handle non-streaming response
         const endpointType = outputFormat === 'claude-format' ? 'claude-format' : 'native-gemini';
-        return handleGeminiNonStreamingResponse(response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger, endpointType, request.signal);
+        return handleGeminiNonStreamingResponse(response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger, endpointType, request.signal, stopSequences);
 
     } catch (error) {
         activeLogger.error(requestId, `Gemini API error: ${(error as Error).message}`);
@@ -516,7 +524,8 @@ async function handleGeminiNonStreamingResponse(
     requestId: string,
     logger: Logger,
     endpointType: 'claude-format' | 'native-gemini' = 'claude-format',
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    stopSequences: string[] = []
 ): Promise<Response> {
     if (endpointType === 'native-gemini') {
         return await relayNativeGeminiResponse(response, requestId, logger, signal);
@@ -536,8 +545,10 @@ async function handleGeminiNonStreamingResponse(
             response, requestId, logger, response.url || '(upstream)', signal
         );
 
-        // Convert to Claude format
-        const claudeResponse = convertGeminiGenerateContentToClaude(geminiResponse, model, requestId);
+        // Convert to Claude format. The logger is handed over so the converter's
+        // Rule #8 reports (a reply part with no Claude Messages projection) are
+        // actually emitted — they were unreachable while this call omitted it.
+        const claudeResponse = convertGeminiGenerateContentToClaude(geminiResponse, model, requestId, { logger, stopSequences });
         logPipelineStage(logger, requestId, 'outbound', '/v1/messages (via generateContent)', claudeResponse);
 
         const genContentOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
@@ -639,7 +650,8 @@ async function handleGeminiStreamingResponse(
     model: string,
     requestId: string,
     logger: Logger,
-    dialect: ClientStreamDialect = 'interactions'
+    dialect: ClientStreamDialect = 'interactions',
+    stopSequences: string[] = []
 ): Promise<Response> {
     if (!response.body) {
         throw new Error('Response body is not readable');
@@ -664,7 +676,7 @@ async function handleGeminiStreamingResponse(
             ? transformedStream.pipeThrough(createNativeGeminiStreamTransformer(model, requestId))
             : transformedStream.pipeThrough(
                 dialect === 'claude-format'
-                    ? createGeminiStreamTransformer(model, requestId)
+                    ? createGeminiStreamTransformer(model, requestId, { logger, stopSequences })
                     : createInteractionsStreamTransformer(model, requestId, logger)
             );
 
