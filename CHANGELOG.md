@@ -5,6 +5,46 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): Gemini `ANY` reaches a non-Gemini upstream as "must call a tool"
+
+A Gemini client that constrains the model to a tool call —
+
+```json
+{"toolConfig": {"functionCallingConfig": {"mode": "ANY"}}}
+```
+
+— reached every non-Gemini upstream loosened to `"auto"`, so the model was free to answer in prose.
+`geminiToolChoiceMode` (`src/handlers/openai.ts`) filed `any` with `auto`/`dynamic`; it now maps to
+`'required'`, the Completions spelling of "a tool call and no prose":
+
+| client sent | → Completions (before) | → anthropic-messages (before) | → Completions (after) | → anthropic-messages (after) |
+| --- | --- | --- | --- | --- |
+| `{mode:'ANY'}` | `'auto'` | `{type:'auto'}` | `'required'` | `{type:'any'}` |
+| `{mode:'ANY', allowedFunctionNames:['get_weather']}` | forced function | `{type:'tool', name}` | unchanged | unchanged |
+| `{mode:'ANY', allowedFunctionNames:[a,b]}` | `'required'` | `{type:'any'}` | unchanged | unchanged |
+
+The loosening was pinned and documented as intentional on the reasoning that "the Completions
+intermediate has no spelling for `required`-as-'must call'". That was never true of this repo:
+`OpenAIRequest['tool_choice']` has carried `'required'` since the same change that introduced the
+mapping (`CHANGELOG.md`, "both Gemini front doors carry `tool_choice`"), and
+`completionsToolChoiceToClaude` already maps `'required'` → `{type:'any'}`. The reverse converters
+meanwhile send Claude's `{type:'any'}` and Completions' `'required'` out as `mode: "ANY"`
+(`src/converters/claude-to-gemini.ts`), so the pair was mapped `ANY ↔ required` outbound and
+`ANY ↔ auto` inbound — a round trip through this proxy silently widened the client's constraint, which
+is a safety-relevant loss rather than a cosmetic one.
+
+`dynamic` stays `'auto'`: it is not in the documented `ToolChoiceType` enum
+(`docs/api/interactions.md`), so it has no documented "must call" meaning to preserve. The remaining
+loss on this hop is the 2+ name allow-list, which Completions cannot express (it can name one function
+or "any", not a set) — unchanged, still pinned.
+
+Tests: `tests/unit/handlers.test.ts` — the ANY pin flipped to `'required'`, plus a new end-to-end row
+(`'required'` → `{type:'any'}` at the anthropic hop, `'required'` at the Responses hop);
+`tests/unit/gemini-interactions-to-openai.test.ts` — `'any'` row flipped and two second-hop rows added
+for both cross-mode upstreams. `docs/api/review-interactions-to-openai-responses-hops.md`'s loss table,
+its "genuinely lossy mapping" section and its trade-off row were corrected; the allow-list row is now
+the only loss in that bucket. Full unit suite 2838/2838.
+
 ### fix(converters): an `anthropic-messages` stream's text and usage reach the Gemini egress
 
 A `:streamGenerateContent` request through an `anthropic-messages` route answered with exactly one

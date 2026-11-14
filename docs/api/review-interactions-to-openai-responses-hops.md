@@ -91,16 +91,25 @@ Measured end to end (Interactions → Completions → Responses):
 |---|---|---|---|
 | `{mode:'validated', tools:['f']}` | `{type:'function',function:{name:'f'}}` | `{type:'function',name:'f'}` | faithful |
 | `{mode:'validated', tools:['f','g']}` | `'required'` | `'required'` | **allow-list lost** — model may call any tool |
-| `{mode:'any'}` | `'auto'` | `'auto'` | **loosened** — "must call a tool" became "may answer without one" |
+| `{mode:'any'}` | `'required'` | `'required'` | faithful |
 | `{mode:'none'}` | `'none'` | `'none'` | faithful |
 
-Both loosening rows are pinned as intentional by `tests/unit/gemini-interactions-to-openai.test.ts`.
-The Completions intermediate has no spelling for a name allow-list or for `required`-as-"must call",
-so the two-hop cannot preserve them; the Responses API can (`allowed_tools`). **This is the strongest
-argument for a direct converter**: a client's tool constraint silently widens, which is a
-safety-relevant change rather than mere data loss. The same argument applies to the tool families —
-Responses spells `web_search`, `file_search`, `code_interpreter`, `computer_use` and `mcp` natively,
-while Completions `tools[]` only spells functions.
+The allow-list row is the only remaining loss, and it is pinned as intentional by
+`tests/unit/gemini-interactions-to-openai.test.ts`: the Completions intermediate can say "a tool call"
+(`'required'`) but cannot name a *set* of permitted functions. The Responses API can (`allowed_tools`),
+which is the one thing a direct converter would still buy here — no longer a safety-relevant widening,
+since the "must call a tool" half now survives.
+
+`{mode:'any'}` used to ride out as `'auto'`, i.e. "may answer without a tool call": Gemini's `ANY` is
+defined as the model being *constrained to always predicting a function call*, which is exactly what
+`'required'` means, and the reverse direction (`claude-to-gemini.ts`) already maps the pair that way.
+The earlier justification for the loosening — that the intermediate had "no spelling for
+`required`-as-'must call'" — was wrong: `OpenAIRequest['tool_choice']` has carried `'required'` since
+the same change that introduced this mapping. Fixed 2026-11-14.
+
+The tool families are a separate loss and still argue for a direct converter: Responses spells
+`web_search`, `file_search`, `code_interpreter`, `computer_use` and `mcp` natively, while Completions
+`tools[]` only spells functions.
 
 ## The two-hop *was* two divergent implementations — now unified
 
@@ -163,7 +172,7 @@ instead of `input[]`, so its `input[]` indices shift down one. Pinned in
 |---|---|---|
 | new code | none | a request converter **and** a response converter |
 | `store` | in-band mapping (being fixed) | native field |
-| `tool_choice` fidelity | impossible | yes |
+| `tool_choice` allow-list fidelity | impossible | yes |
 | `temperature` / `top_p` / `max_output_tokens` / `response_format` / `thinking_level` | hop-1 fix | yes |
 | non-function tool families | impossible | yes |
 | hooks / spool / ref egress | already works on the shared body | must be re-wired |
@@ -182,7 +191,7 @@ Therefore, in order:
    `/v1/chat/completions` alike, with no architectural change.
 2. ✅ **Unify the two Completions→Responses implementations** — done, before anything else was built
    on top of them. See the section above.
-3. ⬜ **Consider a direct converter** only if `tool_choice` fidelity and the non-function tool
+3. ⬜ **Consider a direct converter** only if `tool_choice` allow-list fidelity and the non-function tool
    families are wanted — that is the entire remaining margin, and `stop_sequences` / `seed` /
    `response_modalities` / `cached_content` are unrecoverable at a Responses target under either
    design. Not started; nothing in the repo depends on it.

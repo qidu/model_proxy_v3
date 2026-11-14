@@ -83,13 +83,13 @@ function geminiToolChoiceMode(value: unknown): 'auto' | 'none' | 'required' | un
   if (typeof value !== 'string') return undefined;
   switch (value.toLowerCase()) {
     case 'auto':
-    case 'any':
     case 'dynamic':
       return 'auto';
-    case 'none':
-      return 'none';
+    case 'any':
     case 'validated':
       return 'required';
+    case 'none':
+      return 'none';
     default:
       return undefined;
   }
@@ -104,18 +104,23 @@ function geminiToolChoiceMode(value: unknown): 'auto' | 'none' | 'required' | un
  * allowedFunctionNames}`), and generateContent's own `tool_choice`. Completions
  * only has `'auto'`, `'none'`, `'required'` and a forced single function:
  *
- *   'auto' | 'any' | 'dynamic'              → 'auto'
+ *   'auto' | 'dynamic' (undocumented)       → 'auto'
+ *   'any' | 'validated'                     → 'required'
  *   'none'                                  → 'none'
- *   'validated'                             → 'required'
  *   {function:{name}} / one-name allow-list → {type:'function', function:{name}}
  *   allow-list of 2+ names                  → 'required'  (looser: the model may
  *                                             call any declared tool, not only
  *                                             one of the listed ones)
  *   absent / unrecognized                   → undefined   (key omitted)
  *
- * `any` maps to `'auto'`, not to `'required'`: a client asking for "any tool"
- * is not asking for "a tool call and no prose", and the upstream vocabularies
- * disagree on which one they mean. Both losses are documented in CHANGELOG.md.
+ * `any` and `validated` are the same constraint in Gemini's vocabulary — the
+ * model "is constrained to always predicting a function call" — which is
+ * Completions' `'required'`: a tool call and no prose. The reverse converters
+ * already read the pair that way (`claude-to-gemini.ts` sends `required` as ANY
+ * with no allow-list), so carrying `any` as `'auto'` here lost the client's
+ * constraint on the way in and contradicted the way back out. The remaining loss
+ * is the allow-list itself: Completions cannot name a *set* of permitted
+ * functions, only one.
  */
 function geminiToolChoiceToOpenAI(toolChoice: unknown): unknown {
   if (typeof toolChoice === 'string') return geminiToolChoiceMode(toolChoice);

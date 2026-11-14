@@ -745,11 +745,12 @@ describe('convertGeminiGenerateContentToOpenAI — toolConfig', () => {
     assert.deepEqual(out.tool_choice, { type: 'function', function: { name: 'get_weather' } });
   });
 
-  // Pinned, not fixed: Gemini's "must call some function" has no faithful
-  // Completions string, so ANY without an allow-list goes out as 'auto'.
-  it("maps ANY with no allow-list to 'auto'", () => {
+  // Gemini's ANY ("constrained to always predicting a function call") is
+  // Completions' 'required', not 'auto' — a client that asked for a tool call
+  // must not be handed prose.
+  it("maps ANY with no allow-list to 'required'", () => {
     const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ functionCallingConfig: { mode: 'ANY' } }));
-    assert.equal(out.tool_choice, 'auto');
+    assert.equal(out.tool_choice, 'required');
   });
 
   it("maps NONE to 'none' and AUTO to 'auto'", () => {
@@ -806,6 +807,20 @@ describe('convertGeminiGenerateContentToOpenAI — toolConfig', () => {
     const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
     const responsesBody = completionsToResponsesBody(completions as any, 'gpt-target');
 
+    assert.deepEqual(claudeBody.tool_choice, { type: 'any' });
+    assert.equal(responsesBody.tool_choice, 'required');
+  });
+
+  // The `{mode:'ANY'}` body a Gemini client sends with no allow-list: both
+  // cross-mode upstreams must still be told "a tool call, not prose".
+  it('carries ANY with no allow-list to both cross-mode upstreams as must-call-a-tool', async () => {
+    const completions = convertGeminiGenerateContentToOpenAI(
+      geminiRequest({ functionCallingConfig: { mode: 'ANY' } }),
+    );
+    const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
+    const responsesBody = await completionsToResponsesBody(completions as any, 'gpt-target');
+
+    assert.equal(completions.tool_choice, 'required');
     assert.deepEqual(claudeBody.tool_choice, { type: 'any' });
     assert.equal(responsesBody.tool_choice, 'required');
   });

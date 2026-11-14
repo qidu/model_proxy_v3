@@ -168,12 +168,11 @@ describe('convertGeminiInteractionsToOpenAI — generation_config.tool_choice', 
     assert.equal(withChoice('none').tool_choice, 'none');
   });
 
-  // Pinned, not fixed: Gemini's `any` ("must call some function") has no
-  // faithful Completions string — a client asking for "any tool" is not asking
-  // for "a tool call and no prose", and the upstream vocabularies disagree on
-  // which one `required` means. `any` therefore stays `'auto'`.
-  it("maps 'any' to 'auto', not to 'required'", () => {
-    assert.equal(withChoice('any').tool_choice, 'auto');
+  // Gemini's `any` means "constrained to always predicting a function call",
+  // which is Completions' `'required'` — the same conclusion the reverse
+  // converters reach (`claude-to-gemini.ts`: `required` → ANY, no allow-list).
+  it("maps 'any' to 'required'", () => {
+    assert.equal(withChoice('any').tool_choice, 'required');
   });
 
   it("maps the undocumented 'dynamic' to 'auto'", () => {
@@ -246,6 +245,12 @@ describe('convertGeminiInteractionsToOpenAI — cross-mode tool_choice', () => {
     assert.deepEqual(claude.tool_choice, { type: 'any' });
   });
 
+  it("reaches an anthropic-messages upstream as {type:'any'} for 'any'", async () => {
+    const claude = await completionsToClaudeBody(convertGeminiInteractionsToOpenAI(body('any')), 'claude-target') as any;
+
+    assert.deepEqual(claude.tool_choice, { type: 'any' });
+  });
+
   it("keeps 'none' as {type:'none'} at the anthropic-messages hop", async () => {
     const claude = await completionsToClaudeBody(convertGeminiInteractionsToOpenAI(body('none')), 'claude-target') as any;
 
@@ -263,6 +268,12 @@ describe('convertGeminiInteractionsToOpenAI — cross-mode tool_choice', () => {
 
   it("reaches an openai-responses upstream as 'required' for 'validated'", () => {
     const responses = completionsToResponsesBody(convertGeminiInteractionsToOpenAI(body('validated')), 'responses-target') as any;
+
+    assert.equal(responses.tool_choice, 'required');
+  });
+
+  it("reaches an openai-responses upstream as 'required' for 'any'", () => {
+    const responses = completionsToResponsesBody(convertGeminiInteractionsToOpenAI(body('any')), 'responses-target') as any;
 
     assert.equal(responses.tool_choice, 'required');
   });
