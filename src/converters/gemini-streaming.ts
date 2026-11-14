@@ -378,7 +378,7 @@ function handleGeminiEvent(
     state: StreamingState
 ) {
     switch (event.event_type) {
-        case 'interaction.start':
+        case 'interaction.created':
             // Handle interaction start
             if (event.interaction) {
                 state.currentId = event.interaction.id;
@@ -401,20 +401,21 @@ function handleGeminiEvent(
             }
             break;
 
-        case 'content.start':
+        case 'step.start':
             // Handle new content block start
-            if (event.content) {
+            if (event.step) {
                 state.contentIndex = event.index || 0;
+                const contentType = event.step.content?.[0]?.type ?? event.step.type;
                 const contentStart = {
                     type: 'content_block_start',
                     index: event.index || 0,
-                    content_block: { type: mapGeminiContentTypeToClaude(event.content.type) },
+                    content_block: { type: mapGeminiContentTypeToClaude(contentType) },
                 };
                 controller.enqueue(`event: content_block_start\ndata: ${stringify(contentStart)}\n\n`);
             }
             break;
 
-        case 'content.delta':
+        case 'step.delta':
             // Handle content delta (text chunks, tool calls, etc.)
             if (event.delta) {
                 const delta = event.delta as any;
@@ -462,12 +463,12 @@ function handleGeminiEvent(
             }
             break;
 
-        case 'content.stop':
+        case 'step.stop':
             // Handle content block stop
             controller.enqueue(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${event.index || 0}}\n\n`);
             break;
 
-        case 'interaction.complete':
+        case 'interaction.completed':
             // Handle interaction complete
             state.hasEnded = true;
             // Send message delta with stop reason and final usage when available
@@ -536,8 +537,8 @@ function mapGeminiContentTypeToClaude(geminiType: string): string {
  * `writable`, so `new TransformStream(instance)` has no `transform` to apply and
  * the client received the upstream's own `{candidates:[…]}` chunks.
  *
- * Events are framed the way the *SDK* frames them — the type is inside the
- * payload's `event_type`, with no SSE `event:` line, and the vocabulary is
+ * Events are framed the way `docs/api/interactions_new.md` frames them — the type
+ * is both the SSE `event:` line and the payload's `event_type`, and the vocabulary is
  * `interaction.created` / `step.*` / `interaction.completed`. That vocabulary and
  * the pool of frames below live in `interactions-stream-events.ts`, which the
  * cross-mode egress writes through as well: this transformer used to follow
@@ -583,7 +584,7 @@ export function createInteractionsStreamTransformer(
     const streamState = createInteractionStreamState(model, requestId);
 
     const write = (controller: TransformStreamDefaultController<string>, event: Record<string, unknown>) => {
-        controller.enqueue(`data: ${stringify(event)}\n\n`);
+        controller.enqueue(`event: ${event.event_type}\ndata: ${stringify(event)}\n\n`);
     };
 
     const writeAll = (controller: TransformStreamDefaultController<string>, events: Array<Record<string, unknown>>) => {
@@ -727,8 +728,8 @@ export function createInteractionsStreamTransformer(
         },
 
         flush() {
-            // An Interactions stream ends with `interaction.complete` (the upstream
-            // chunk that carries a `finishReason`). Reaching the end without one is
+            // An Interactions stream ends with `interaction.completed` (after the
+            // upstream chunk that carries a `finishReason`). Reaching the end without one is
             // an unexpected EOF, not a finished interaction — the same refusal
             // `createStreamTransformer` makes for a stream with no `[DONE]`.
             if (!completed) {

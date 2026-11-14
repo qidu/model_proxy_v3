@@ -5,6 +5,22 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(types): align Gemini Interaction streaming with the current SDK vocabulary
+
+Corrected stale converter paths in the API references, added the six missing converters/stream helpers to
+the conversion inventory, and fixed the documented `GeminiInteractionResponse.outputs` field.
+`docs/api/interactions.md` is now explicitly marked as a superseded historical snapshot.
+
+`GeminiSSEEvent` and its Claude-stream consumer now use the `@google/genai` event names:
+`interaction.created` / `interaction.completed`, `step.start` / `step.delta` / `step.stop`,
+`interaction.status_update`, and `error`. Both `/v1/interactions` streaming egresses now also write
+`event: <event_type>` before each `data:` payload, matching `docs/api/interactions_new.md`, while
+native generateContent and Claude framing are unchanged. Regression pins check every SSE event name
+against its payload. The stream fixture uses the SDK's empty `step.start` content shape and verifies
+the complete Claude event sequence as well as final usage.
+
+**Verification**: `npm run typecheck`, `npm run build`, and `npm run test:unit` pass (2986/2986 tests).
+
 ### fix(converters): carry Gemini thought signatures to Anthropic thinking blocks
 
 A `generateContent` request routed to an `anthropic-messages` upstream now maps a thought part's

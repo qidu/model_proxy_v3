@@ -153,7 +153,7 @@ export interface GeminiGenerationConfig {
     // Either the bare enum or the ToolChoiceConfig object form. `function` and
     // `dynamic` are not in the documented enum, but bodies carrying them reach
     // this proxy and are accepted (see geminiToolChoiceToOpenAI in
-    // src/handlers/openai.ts).
+    // src/converters/gemini-to-openai.ts).
     tool_choice?: 'auto' | 'any' | 'none' | 'validated' | 'dynamic' | 'function' | {
         type?: 'auto' | 'any' | 'none' | 'validated' | 'dynamic' | 'function';
         mode?: 'auto' | 'any' | 'none' | 'validated';
@@ -257,13 +257,16 @@ export interface GeminiInteractionResponse {
 // --- Streaming Event Types ---
 
 export interface GeminiSSEEvent {
-    event_type: 'interaction.start' | 'interaction.complete' | 'content.start' | 'content.delta' | 'content.stop' | 'interaction.status_update' | 'error';
+    event_type: 'interaction.created' | 'interaction.completed' | 'interaction.status_update' | 'step.start' | 'step.delta' | 'step.stop' | 'error';
     event_id?: string;
     interaction?: GeminiInteractionResponse;
     interaction_id?: string;
     status?: GeminiInteractionStatus;
     index?: number;
-    content?: GeminiContent;
+    step?: {
+        type: string;
+        content?: GeminiContent[];
+    };
     delta?: {
         type: string;
         text?: string;

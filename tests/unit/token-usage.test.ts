@@ -111,21 +111,30 @@ describe('streaming usage propagation', () => {
 
   it('emits Gemini interaction final usage', async () => {
     const input = sseStream([
-      'data: {"event_type":"interaction.start","interaction":{"id":"int_1","role":"model"}}',
+      'data: {"event_type":"interaction.created","interaction":{"id":"int_1","role":"model"}}',
       '',
-      'data: {"event_type":"content.start","index":0,"content":{"type":"text"}}',
+      'data: {"event_type":"step.start","index":0,"step":{"type":"model_output","content":[]}}',
       '',
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"hello"}}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"hello"}}',
       '',
-      'data: {"event_type":"content.stop","index":0}',
+      'data: {"event_type":"step.stop","index":0}',
       '',
-      'data: {"event_type":"interaction.complete","interaction":{"id":"int_1","status":"completed","object":"interaction","created":"now","updated":"now","role":"model","usage":{"total_input_tokens":13,"total_output_tokens":8,"total_cached_tokens":5,"total_tokens":26}}}',
+      'data: {"event_type":"interaction.completed","interaction":{"id":"int_1","status":"completed","object":"interaction","created":"now","updated":"now","role":"model","usage":{"total_input_tokens":13,"total_output_tokens":8,"total_cached_tokens":5,"total_tokens":26}}}',
       '',
     ].join('\n'));
 
     const output = await streamToText(input.pipeThrough(createGeminiStreamTransformer('gemini-test', 'req-test')));
-    const messageDelta = parseSse(output).find(e => e.event === 'message_delta')?.data;
+    const events = parseSse(output);
+    const messageDelta = events.find(e => e.event === 'message_delta')?.data;
 
+    assert.deepEqual(events.map(e => e.event), [
+      'message_start',
+      'content_block_start',
+      'content_block_delta',
+      'content_block_stop',
+      'message_delta',
+      'message_stop',
+    ]);
     assert.equal(messageDelta.usage.input_tokens, 13);
     assert.equal(messageDelta.usage.output_tokens, 8);
     assert.equal(messageDelta.usage.cache_read_input_tokens, 5);

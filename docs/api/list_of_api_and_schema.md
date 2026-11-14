@@ -19,7 +19,9 @@ status: agent-test material
     - configuration-reference.md   (full proxy_config.toml schema)
     - transforms-reference.md      (rewrite DSL)
     - routing-and-aliases.md       (composite / fallback / fusion / schedule)
-    - interactions.md              (Gemini Interactions wire shape)
+
+  Historical snapshots:
+    - interactions.md              (superseded Gemini Interactions wire shape)
 
   Regenerate / re-verify after any of:
     - src/server.ts route mounting changes
@@ -33,8 +35,8 @@ status: agent-test material
 
 > **Internal pi-agent test material.** Generated for pi-agent testing of the
 > model proxy. Hand-curated public references live in `api-endpoints.md`,
-> `configuration-reference.md`, `transforms-reference.md`, `routing-and-aliases.md`,
-> and `interactions.md` — link to those instead in user-facing docs.
+> `configuration-reference.md`, `transforms-reference.md`, and
+> `routing-and-aliases.md` — link to those instead in user-facing docs.
 
 A consolidated reference of every API endpoint exposed by the model proxy and every
 TypeScript schema (request/response shapes, content blocks, tool types) the proxy
@@ -250,8 +252,8 @@ is selected by the route's `defaultMode` / model config.
 | `GeminiUsage` | `{promptTokenCount, candidatesTokenCount?, totalTokenCount, cachedContentTokenCount?, thoughtsTokenCount?, toolUsePromptTokenCount?}` |
 | `GeminiInteractionRequest` | `{input, model, systemInstruction?, tools?, toolConfig?, generationConfig?, cachedContent?, agent?, previousInteractionId?, conversationId?, responseModalities?, safetySettings?, stream?}` |
 | `GeminiInteractionStatus` | `"in_progress"\|"requires_action"\|"completed"\|"failed"\|"cancelled"` |
-| `GeminiInteractionResponse` | `{id, object: "interaction", status, model, output: GeminiContent[], usage, created, updated, previousInteractionId?, conversationId?, error?}` |
-| `GeminiSSEEvent` | union of `interaction.start`, `interaction.in_progress`, `interaction.completed`, `interaction.failed`, `content.start`, `content.delta`, `content.stop`, `tool_use`, `tool_result`, `error` |
+| `GeminiInteractionResponse` | `{id, object: "interaction", status, model, outputs: GeminiContent[], usage, created, updated, previousInteractionId?, conversationId?, error?}` |
+| `GeminiSSEEvent` | union of `interaction.created`, `interaction.completed`, `interaction.status_update`, `step.start`, `step.delta`, `step.stop`, `error` |
 
 ### 5.4 Model & agent option enums
 
@@ -340,12 +342,18 @@ The proxy ships with direct and indirect request/response converters in
 | `claude-to-gemini.ts` | Claude Messages ↔ Gemini generateContent |
 | `claude-to-openai.ts` | Claude Messages ↔ Chat Completions |
 | `openai-to-claude.ts` | Chat Completions → Claude Messages |
-| `openai-to-gemini.ts` | Chat Completions → Gemini generateContent |
+| `openai-to-gemini.ts` | Chat Completions → Gemini generateContent / Interactions |
 | `gemini-to-claude.ts` | Gemini generateContent → Claude Messages |
+| `gemini-to-openai.ts` | Gemini generateContent / Interactions → Chat Completions |
+| `completions-to-claude.ts` | Chat Completions → Claude Messages |
 | `completions-to-responses.ts` | Chat Completions ↔ OpenAI Responses |
 | `responses-to-completions.ts` | OpenAI Responses → Chat Completions |
-| `gemini-streaming.ts` | Gemini SSE → OpenAI / Claude streaming events |
+| `interactions-to-gemini.ts` | Gemini Interactions request → Gemini generateContent request |
+| `gemini-to-interactions.ts` | Gemini generateContent response → Gemini Interactions response |
+| `gemini-streaming.ts` | Gemini SSE → OpenAI / Claude / Interactions streaming events |
+| `interactions-stream-events.ts` | Shared Gemini Interactions SSE event construction |
 | `streaming.ts` | shared SSE helpers (delta coalescing, finishReason mapping) |
+| `src/handlers/cross-mode-stream.ts` | OpenAI / Anthropic / Responses SSE → Completions, Gemini, Interactions, or Claude client streams |
 
 ### 8.1 Image input across format boundaries
 
@@ -407,4 +415,4 @@ require `Authorization: Bearer <dashboard.api_key>`.
   rewrite DSL.
 - [`routing-and-aliases.md`](./routing-and-aliases.md) — composite, fallback,
   fusion, coordinator, schedule semantics.
-- [`interactions.md`](./interactions.md) — Gemini Interactions wire shape.
+- [`interactions.md`](./interactions.md) — superseded historical Gemini Interactions snapshot.

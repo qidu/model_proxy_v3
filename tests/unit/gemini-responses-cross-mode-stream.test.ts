@@ -84,12 +84,19 @@ function textAnswer(text: string): Array<Record<string, unknown>> {
   ];
 }
 
-/** Every outbound SSE data frame, parsed. Gemini frames carry no event name. */
+/** Every outbound SSE data frame, parsed, with Interactions event names checked. */
 async function readFrames(response: Response): Promise<Array<Record<string, any>>> {
   const text = await response.text();
   return text.split('\n\n').filter(block => block.trim() !== '').map(block => {
-    assert.ok(block.startsWith('data: '), `every outbound frame must be a data frame, got: ${block}`);
-    return JSON.parse(block.slice(6));
+    const dataLine = block.split('\n').find(line => line.startsWith('data: '));
+    assert.ok(dataLine, `every outbound frame must carry data, got: ${block}`);
+    const frame = JSON.parse(dataLine.slice(6));
+    if (frame.event_type) {
+      assert.equal(block.split('\n')[0], `event: ${frame.event_type}`);
+    } else {
+      assert.ok(block.startsWith('data: '), `a generateContent frame must be data-only, got: ${block}`);
+    }
+    return frame;
   });
 }
 

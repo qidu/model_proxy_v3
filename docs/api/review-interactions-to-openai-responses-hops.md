@@ -27,9 +27,9 @@ Everything below applies to the **converter** paths, which rebuild the body:
 ## There is no direct converter today
 
 `grep` finds no Interactions→Responses converter in `src/`. The only Interactions request converter is
-`convertGeminiInteractionsToOpenAI` (`src/handlers/openai.ts:155`). So "direct" is not a configuration
+`convertGeminiInteractionsToOpenAI` (`src/converters/gemini-to-openai.ts:589`). So "direct" is not a configuration
 choice — it is new code, and it would need a converter in **both** directions (the response comes back
-Responses → synthetic Completions → `convertOpenAIToGeminiInteractions`, `openai.ts:1313`).
+Responses → synthetic Completions → `convertOpenAIToGeminiInteractions`, `src/converters/openai-to-gemini.ts:239`).
 
 ## The intermediate is a strict superset of losses
 
@@ -135,7 +135,7 @@ The tool families are a separate loss and still argue for a direct converter: Re
 
 **Status: settled.** At the time of this review, two implementations existed:
 
-- `/v1/interactions` → openai-responses used `completionsToResponsesBody` (`src/handlers/openai.ts`).
+- `/v1/interactions` → openai-responses used `completionsToResponsesBody` (`src/converters/completions-to-responses.ts`).
 - `/v1/messages` → openai-responses used private helpers in `src/handlers/messages.ts`
   (`completionsMessagesToResponsesInput`, `completionsToolsToResponsesTools`,
   `completionsToolChoiceToResponsesToolChoice`).
@@ -203,7 +203,7 @@ instead of `input[]`, so its `input[]` indices shift down one. Pinned in
 Only the middle bucket is an architecture question. The bottom row — 7 fields including every sampling
 knob — is a mapping gap in `convertGeminiInteractionsToOpenAI`, not a consequence of the intermediate,
 and `completionsToResponsesBody` already carries `temperature`/`top_p`/`max_tokens`
-(`completionsToResponsesBody` in `src/handlers/openai.ts`), so hop 2 was already waiting for them.
+(`completionsToResponsesBody` in `src/converters/completions-to-responses.ts`), so hop 2 was already waiting for them.
 
 Therefore, in order:
 

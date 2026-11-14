@@ -1,5 +1,14 @@
 # Gemini API
 
+> **Superseded historical snapshot.** This document predates the current
+> `@google/genai` Interactions API declarations and is retained only for historical
+> reference. In particular, its `interaction.start`, `interaction.complete`, and
+> `content.*` streaming events are obsolete: the SDK declares `interaction.created`,
+> `interaction.completed`, `interaction.status_update`, `step.start`, `step.delta`,
+> `step.stop`, and `error`. The proxy's stream emitters follow the SDK; see
+> `src/converters/interactions-stream-events.ts`. Do not use this file as the current
+> streaming reference.
+
 The Gemini Interactions API is an experimental API that allows developers to build generative AI applications using Gemini models. Gemini is our most capable model, built from the ground up to be multimodal. It can generalize and seamlessly understand, operate across, and combine different types of information including language, images, audio, video, and code. You can use the Gemini API for use cases like reasoning across text and images, content generation, dialogue agents, summarization and classification systems, and more.
 - refer to https://ai.google.dev/gemini-api/docs/interactions
 

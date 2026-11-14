@@ -490,7 +490,7 @@ function interactionStateFor(requestId: string, model: string): InteractionStrea
 
 /** Frame the events the shared Interactions stream module returns. */
 function interactionFrames(events: Array<Record<string, unknown>>): string {
-  return events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
+  return events.map(event => `event: ${event.event_type}\ndata: ${JSON.stringify(event)}\n\n`).join('');
 }
 
 /**

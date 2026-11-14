@@ -31,9 +31,9 @@
  *     a converted chunk whose only payload was the usage), so a streamed answer
  *     reported three zeros.
  *
- * Everything here is pure: the caller frames each returned event as its own
- * `data:` line. The state is per-answer and owned by the caller, so concurrent
- * streams cannot share it.
+ * Everything here is pure: the caller frames each returned event with matching
+ * SSE `event:` and payload `event_type` fields. The state is per-answer and owned
+ * by the caller, so concurrent streams cannot share it.
  */
 
 /** The step a delta is still appending to. */

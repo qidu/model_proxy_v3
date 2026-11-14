@@ -67,9 +67,17 @@ function eventsOf(sse: string): any[] {
 }
 
 describe('/v1/interactions streaming → Interactions events', () => {
-  it('renders the upstream chunks as event_type events, not as candidates chunks', async () => {
+  it('renders the upstream chunks as named event_type events, not as candidates chunks', async () => {
     stubSse(UPSTREAM_SSE);
-    const events = eventsOf(await interactionsStream());
+    const sse = await interactionsStream();
+    const events = eventsOf(sse);
+
+    const eventLines = sse.trim().split('\n\n').map(frame => frame.split('\n')[0]);
+    assert.deepEqual(
+      eventLines,
+      events.map(event => `event: ${event.event_type}`),
+      'every SSE event name matches its payload event_type',
+    );
 
     // The vocabulary is the one `@google/genai` declares for this endpoint
     // (`InteractionSSEEvent`). This transformer used to emit the bundled doc's
