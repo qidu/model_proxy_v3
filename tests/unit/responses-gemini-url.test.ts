@@ -28,6 +28,16 @@ function installMockFetch() {
     if (url.includes(':countTokens')) {
       return new Response(JSON.stringify({ totalTokens: 2 }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
+    // The streaming action frames its answer as SSE — the only content type the
+    // proxy's streaming egress accepts, and what the real upstream sends for this
+    // URL. Answering JSON here would make the four `:streamGenerateContent` cases
+    // below pass on a body the handler now refuses (see gemini-stream-endpoint.test.ts).
+    if (url.includes(':streamGenerateContent')) {
+      return new Response(`data: ${JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+      })}\n\n`, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }
     return new Response(JSON.stringify({
       candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
       usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },

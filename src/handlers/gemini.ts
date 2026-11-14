@@ -386,13 +386,33 @@ async function handleGeminiGenerateContentRequest(
         effectiveModelId = effectiveModelId || claudeRequest.model;
     }
 
-    // Determine the target endpoint
-    const fullTargetUrl = constructGeminiUrl(targetUrl, request, geminiRequest, effectiveModelId);
+    // Determine the target endpoint. Mutable: the streaming action below is
+    // decided after the URL is built, because only then is it known whether the
+    // target already carries one.
+    let fullTargetUrl = constructGeminiUrl(targetUrl, request, geminiRequest, effectiveModelId);
 
     // Check if upstream will return SSE (based on URL)
-    const upstreamIsStreaming = fullTargetUrl.includes(":streamGenerateContent");
-    if (upstreamIsStreaming) {
+    if (fullTargetUrl.includes(':streamGenerateContent')) {
         isStreaming = true;
+    }
+
+    // A streaming client reads SSE, so the upstream must be asked for SSE too.
+    // `constructGeminiUrl` addresses `:generateContent` for every target that
+    // carries no action of its own — the `/v1/responses` and `/v1/interactions`
+    // roots (`<base>/v1beta`) and `/v1/messages`'s `v1beta/models` collection — and
+    // the check above only ever turns streaming *on*. Left as `:generateContent`,
+    // the upstream answers one JSON body while the egress parses SSE, which yields
+    // zero events: the answer is discarded and the client is told the turn was
+    // empty. `?alt=sse` is part of it — the streaming action frames its answer as
+    // SSE only with it. Same rewrite the Gemini egress in `handlers/chat-completions.ts`
+    // already makes.
+    if (isStreaming) {
+        if (!fullTargetUrl.includes(':streamGenerateContent')) {
+            fullTargetUrl = fullTargetUrl.replace(/:generateContent(\?|$)/, ':streamGenerateContent$1');
+        }
+        if (fullTargetUrl.includes(':streamGenerateContent') && !fullTargetUrl.includes('alt=sse')) {
+            fullTargetUrl += (fullTargetUrl.includes('?') ? '&' : '?') + 'alt=sse';
+        }
     }
 
     // Log request info
@@ -655,6 +675,20 @@ async function handleGeminiStreamingResponse(
 ): Promise<Response> {
     if (!response.body) {
         throw new Error('Response body is not readable');
+    }
+
+    // Rule #8. This function frames the upstream's SSE for the client's dialect and
+    // is only ever entered on a request that asked to stream, so a body that is not
+    // SSE is read as zero events by every one of those transformers: the answer
+    // would be dropped and an empty turn reported to the client as a success. Fail
+    // while the client still has no headers instead.
+    const upstreamContentType = response.headers.get('content-type') || '';
+    if (!upstreamContentType.includes('text/event-stream')) {
+        throw new Error(
+            `Gemini upstream answered a streaming request with ` +
+            `'${upstreamContentType || '(no content-type)'}' instead of text/event-stream ` +
+            `(upstream: ${response.url || 'unknown URL'})`
+        );
     }
 
     try {

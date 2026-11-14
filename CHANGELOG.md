@@ -5,6 +5,58 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): a `/v1/responses` streaming request now asks the Gemini upstream to stream, and a non-SSE answer fails loudly
+
+Two defects at one seam, found by tracing `/v1/responses` + `gemini-generatecontent` + `stream: true`.
+Reported symptom: `response.output[0].content[0].text` empty and no `response.output_text.delta` events.
+
+**1. The answer was discarded.** `constructGeminiUrl` addresses `:generateContent` for every target that
+carries no action of its own — the `/v1/responses` and `/v1/interactions` roots (`<base>/v1beta`) and
+`/v1/messages`'s `v1beta/models` collection. `/v1/messages` and `/v1/interactions` reach that point with a
+model URL already carrying the streaming action (`resolveUpstreamTarget`'s `geminiStreamingAction`), but the
+`/v1/responses` branch (`src/index.ts:628`) hands over the API-version root, so `constructGeminiUrl`'s
+else-branch appended `:generateContent`. `handleGeminiGenerateContentRequest` meanwhile kept
+`isStreaming = true` from the client body — its URL-derived check can only turn streaming *on*, never off.
+The upstream therefore answered one JSON body, `createGeminiStreamTransformer` (which reads only `data: `
+lines) emitted zero Claude events, and `streamClaudeAsResponses` took its "nothing arrived" fallback:
+HTTP 200, `text/event-stream`, zero `response.output_text.delta`, an empty `output_text` part, usage of
+three zeros — the model's answer gone with no error (rule #8).
+
+The handler now applies the same rewrite `handlers/chat-completions.ts`'s Gemini egress already makes,
+in the one place where both `isStreaming` and the built URL are known. It also adds `?alt=sse`, which the
+streaming action needs to answer SSE at all — without it the upstream answers a JSON array, and
+`docs/architecture/design_passthrough_mode.md` already records that "the frame parser will not match it".
+The rewrite is skipped when the target already streams, so no action or `alt=sse` is appended twice.
+
+**2. The mismatch is no longer silent.** `handleGeminiStreamingResponse` is only ever entered on a request
+that asked to stream, and every dialect's transformer reads a non-SSE body as zero events — for
+`claude-format` that empties the answer, for `interactions` it aborts mid-stream. It now refuses a body
+that is not `text/event-stream` before the client has headers, naming the content type it received. A
+`/v1/responses` client sees a 500 whose message says what arrived instead; previously it saw a successful,
+empty turn.
+
+**Known sibling, reported rather than changed (rule #8):** `handleGeminiInteractionsRequest` has the same
+one-way asymmetry (it turns streaming on from the URL but never upgrades the URL). With the guard it now
+fails loudly instead of reporting an empty interaction, but it is not upgraded.
+
+**Adjacent finding, pre-existing and out of scope:** a client's own query string is not forwarded to a
+Gemini model-route target. `POST /v1beta/models/{model}:generateContent?key=abc` reaches the upstream as
+`…:generateContent` with no `key=abc` — measured on both sides of this change, so it is not introduced here.
+Recorded rather than pinned, since whether that query is meant to be forwarded (the credential reaches the
+upstream through headers instead) is a routing decision this change did not make.
+
+**Test moves, disclosed.** `responses-gemini-url.test.ts`'s four `:streamGenerateContent` cases answered
+`application/json` to a URL that requests SSE — a body no real Gemini upstream produces — so they were green
+only because the JSON was relayed through as "SSE". Their fixture now answers SSE for that action, which is
+what the URL means; the URL assertions are unchanged and no assertion was weakened.
+
+**Verification status**: `npm run typecheck` (clean), `npm run build` (clean), and `npm run test:unit` —
+**2983 tests, 2983 pass, 0 fail**. Baseline on this tree was 2977 tests / 4 fail, those four being the
+fixture cases above. The new `tests/unit/gemini-stream-endpoint.test.ts` (6 cases) fails 3-of-6 with the
+handler change reverted — the symptom, the guard, and the missing-`alt=sse` case — so the pins are real.
+Driven through the real router, converters and egress against a stub upstream; **not** verified against a
+live `generativelanguage.googleapis.com`, which needs a Gemini credential this machine does not have.
+
 ### fix(converters): `/v1/interactions` — the `input` steps that carry no content, the image `uri`, and the streaming dialect
 
 Four defects on one front door, found by reading `/v1/interactions` against `@google/genai`'s own
