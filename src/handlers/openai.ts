@@ -637,13 +637,14 @@ function parseJsonObject(value: unknown): Record<string, unknown> {
   }
 }
 
-function openAIChunk(text: string, model: string): Record<string, unknown> {
+function openAIChunk(text: string, model: string, usage?: Record<string, unknown>): Record<string, unknown> {
   return {
     id: `chatcmpl_${Date.now()}`,
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+    ...(usage ? { usage } : {}),
   };
 }
 
@@ -664,7 +665,60 @@ function clearAnthropicSSEState(requestId: string): void {
   clearGeminiSSEState(requestId);
 }
 
-function processAnthropicSSEBuffer(buffer: string, model: string, requestId: string, isInteractionsRequest: boolean, isGenerateContentRequest: boolean): { processed: string; remaining: string } {
+/**
+ * The usage an Anthropic SSE stream has reported so far, collected across the
+ * events of one response. Owned by `handleCrossModeStreamingResponse` and passed
+ * in, so it dies with the stream instead of living in a requestId-keyed map that
+ * a stream which never reaches `message_stop` would leak.
+ */
+interface AnthropicUsageAccumulator {
+  inputTokens?: number;
+  cachedTokens?: number;
+  cacheWrittenTokens?: number;
+  outputTokens?: number;
+}
+
+/** Absorb one `usage` object (`message_start.message.usage` or `message_delta.usage`). */
+function absorbAnthropicUsage(target: AnthropicUsageAccumulator, usage: Record<string, unknown> | undefined): void {
+  if (!usage || typeof usage !== 'object') return;
+  const read = (value: unknown): number | undefined => (typeof value === 'number' ? value : undefined);
+  // Last value wins: `message_start` carries the input side (and a partial
+  // `output_tokens`), `message_delta` the final output count.
+  target.inputTokens = read(usage.input_tokens) ?? target.inputTokens;
+  target.cachedTokens = read(usage.cache_read_input_tokens) ?? target.cachedTokens;
+  target.cacheWrittenTokens = read(usage.cache_creation_input_tokens) ?? target.cacheWrittenTokens;
+  target.outputTokens = read(usage.output_tokens) ?? target.outputTokens;
+}
+
+/**
+ * The accumulator in the Completions usage shape the Gemini converters read
+ * (`prompt_tokens` / `completion_tokens` / `total_tokens`), or `undefined` while
+ * the upstream has reported nothing yet — so a chunk emitted before any usage
+ * arrived still carries no `usageMetadata` claim it cannot make.
+ *
+ * The three Anthropic input fields are summed because the Messages API reports
+ * `input_tokens` with both cache fields *excluded*, while Gemini's
+ * `promptTokenCount` includes the cached portion (`dashboard-stats.ts` makes the
+ * same point when it reads that field back).
+ */
+function anthropicUsageToCompletionUsage(usage: AnthropicUsageAccumulator): Record<string, number> | undefined {
+  if (usage.inputTokens === undefined && usage.cachedTokens === undefined
+    && usage.cacheWrittenTokens === undefined && usage.outputTokens === undefined) {
+    return undefined;
+  }
+  const prompt = (usage.inputTokens ?? 0) + (usage.cachedTokens ?? 0) + (usage.cacheWrittenTokens ?? 0);
+  const completion = usage.outputTokens ?? 0;
+  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
+}
+
+function processAnthropicSSEBuffer(
+  buffer: string,
+  model: string,
+  requestId: string,
+  isInteractionsRequest: boolean,
+  isGenerateContentRequest: boolean,
+  usageAccum: AnthropicUsageAccumulator,
+): { processed: string; remaining: string } {
   let result = '';
   const events = buffer.split('\n\n');
   const remaining = events.pop() || '';
@@ -679,7 +733,32 @@ function processAnthropicSSEBuffer(buffer: string, model: string, requestId: str
     try {
       const parsed = JSON.parse(dataLine.slice(6));
 
-      if (parsed.type === 'content_block_start') {
+      // One path for every place an Anthropic-shaped stream can carry answer
+      // text, so each of them reports the usage collected so far (Gemini's
+      // `usageMetadata` is a running total; the final chunk is authoritative).
+      const emitText = (text: string): void => {
+        if (text === '') return;
+        const chunk = openAIChunk(text, model, anthropicUsageToCompletionUsage(usageAccum));
+        const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
+        result += processed;
+      };
+
+      if (parsed.type === 'message_start') {
+        // Some Anthropic-compatible gateways replay the finished message inside
+        // `message_start` (a non-streaming body dressed as a stream) and follow
+        // it with `message_delta`. Standard Anthropic sends `content: []` here,
+        // so this loop is a no-op for it. Text only: a `tool_use` block replayed
+        // this way is still not converted — the tool path needs the
+        // content_block_* events that feed `toolBuffers`.
+        const message = parsed.message as Record<string, unknown> | undefined;
+        absorbAnthropicUsage(usageAccum, message?.usage as Record<string, unknown> | undefined);
+        const blocks = message?.content;
+        if (Array.isArray(blocks)) {
+          for (const block of blocks as Array<Record<string, unknown>>) {
+            if (block?.type === 'text' && typeof block.text === 'string') emitText(block.text);
+          }
+        }
+      } else if (parsed.type === 'content_block_start') {
         const block = parsed.content_block as Record<string, unknown> | undefined;
         if (block?.type === 'tool_use') {
           // Standard Anthropic sends input:{} here and streams args via input_json_delta.
@@ -694,15 +773,18 @@ function processAnthropicSSEBuffer(buffer: string, model: string, requestId: str
           });
         } else if (block?.type === 'thinking') {
           if (!thinkingBuffers) { thinkingBuffers = new Map(); anthropicThinkingBuffers.set(requestId, thinkingBuffers); }
-          thinkingBuffers.set(parsed.index as number, '');
+          // Seeded from the block for the same reason as `input` above: a gateway
+          // that fills the block up front sends no thinking_delta to follow.
+          // Standard Anthropic sends `thinking: ''`, which is the previous value.
+          thinkingBuffers.set(parsed.index as number, typeof block.thinking === 'string' ? block.thinking : '');
+        } else if (block?.type === 'text' && typeof block.text === 'string') {
+          // A pre-filled text block — the same gateway behavior, for text. No
+          // text_delta follows it, so emitting nothing here loses the answer.
+          emitText(block.text);
         }
       } else if (parsed.type === 'content_block_delta') {
         const delta = parsed.delta as Record<string, unknown> | undefined;
-        if (delta?.type === 'text_delta') {
-          const chunk = openAIChunk((delta.text as string) || '', model);
-          const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
-          result += processed;
-        } else if (delta?.type === 'thinking_delta') {
+        if (delta?.type === 'thinking_delta') {
           const existing = thinkingBuffers?.get(parsed.index as number);
           if (thinkingBuffers && existing !== undefined) {
             thinkingBuffers.set(parsed.index as number, existing + ((delta.thinking as string) || ''));
@@ -710,6 +792,13 @@ function processAnthropicSSEBuffer(buffer: string, model: string, requestId: str
         } else if (delta?.type === 'input_json_delta') {
           const tool = toolBuffers?.get(parsed.index as number);
           if (tool) tool.args += (delta.partial_json as string) || '';
+        } else if (typeof delta?.text === 'string') {
+          // Keyed on the payload rather than `delta.type === 'text_delta'`:
+          // `text` is the field the text-bearing deltas use, and gateways spell
+          // the type `text`, or omit it, as well as the documented `text_delta`.
+          // A `signature_delta` carries `signature` and no `text`, so it stays
+          // out of this branch.
+          emitText(delta.text);
         }
       } else if (parsed.type === 'content_block_stop') {
         const blockIndex = parsed.index as number;
@@ -721,6 +810,7 @@ function processAnthropicSSEBuffer(buffer: string, model: string, requestId: str
           // parallel tool calls in one turn don't collide in geminiToolCallBuffer —
           // colliding indices concatenate different tools' argument JSON into one
           // string, producing invalid_args errors for the merged/clobbered call.
+          const toolUsage = anthropicUsageToCompletionUsage(usageAccum);
           const chunk = {
             id: `chatcmpl_${Date.now()}`,
             object: 'chat.completion.chunk',
@@ -733,6 +823,7 @@ function processAnthropicSSEBuffer(buffer: string, model: string, requestId: str
               },
               finish_reason: null,
             }],
+            ...(toolUsage ? { usage: toolUsage } : {}),
           };
           const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
           result += processed;
@@ -741,17 +832,18 @@ function processAnthropicSSEBuffer(buffer: string, model: string, requestId: str
           // processSSEBuffer's existing logic strips it into reasoning/cleanText.
           const thinking = thinkingBuffers.get(parsed.index as number) || '';
           thinkingBuffers.delete(parsed.index as number);
-          if (thinking) {
-            const chunk = openAIChunk(`<think>${thinking}</think>`, model);
-            const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
-            result += processed;
-          }
+          if (thinking) emitText(`<think>${thinking}</think>`);
         }
       } else if (parsed.type === 'message_delta') {
         const delta = parsed.delta as Record<string, unknown> | undefined;
         const stopReason = delta?.stop_reason as string | undefined;
         const finishReason = stopReason === 'tool_use' ? 'tool_calls'
           : stopReason === 'max_tokens' ? 'length' : 'stop';
+        // The turn's final usage rides on this event; absorbing it before the
+        // finish chunk is built is what puts real counts in that chunk's
+        // `usageMetadata` instead of the three zeros it used to carry.
+        absorbAnthropicUsage(usageAccum, parsed.usage as Record<string, unknown> | undefined);
+        const finishUsage = anthropicUsageToCompletionUsage(usageAccum);
         // Route through processSSEBuffer so its geminiToolCallBuffer flush logic fires.
         // Without this, tool calls buffered during content_block_stop are never emitted.
         const syntheticFinish = {
@@ -760,6 +852,7 @@ function processAnthropicSSEBuffer(buffer: string, model: string, requestId: str
           created: Math.floor(Date.now() / 1000),
           model,
           choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          ...(finishUsage ? { usage: finishUsage } : {}),
         };
         const { processed } = processSSEBuffer(`data: ${JSON.stringify(syntheticFinish)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
         result += processed;
@@ -813,6 +906,10 @@ async function handleCrossModeStreamingResponse(
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
+  // The usage reported so far, for the Anthropic source only; the Responses
+  // source's usage lives in `response.completed`, which this egress does not
+  // convert (unchanged behavior).
+  const usageAccum: AnthropicUsageAccumulator = {};
 
   (async () => {
     try {
@@ -827,7 +924,7 @@ async function handleCrossModeStreamingResponse(
         buffer += rawChunk;
         logPipelineStage(logger, requestId, 'upstream-response', response.url || `(upstream SSE, ${source})`, rawChunk);
         const converted = source === 'anthropic-messages'
-          ? processAnthropicSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest)
+          ? processAnthropicSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum)
           : processResponsesSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest);
         buffer = converted.remaining;
         if (converted.processed) {
@@ -837,7 +934,7 @@ async function handleCrossModeStreamingResponse(
       }
       if (buffer.trim()) {
         const converted = source === 'anthropic-messages'
-          ? processAnthropicSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest)
+          ? processAnthropicSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum)
           : processResponsesSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest);
         if (converted.processed) {
           logPipelineStage(logger, requestId, 'outbound', 'stream (final)', converted.processed);

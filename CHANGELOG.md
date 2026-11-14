@@ -5,6 +5,58 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): an `anthropic-messages` stream's text and usage reach the Gemini egress
+
+A `:streamGenerateContent` request through an `anthropic-messages` route answered with exactly one
+event — the terminal chunk — so the client saw a completed turn with no answer:
+
+```
+data: {"model":"claude-sonnet-4-6","candidates":[{"content":{"role":"model","parts":[]},"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}
+```
+
+The empty `parts` on that line is by design (`openai-to-gemini.ts` emits a finish-only chunk so a
+Gemini client sees `finishReason`); what was wrong is that it was the *only* line.
+`processAnthropicSSEBuffer` (`src/handlers/openai.ts`) recognized answer text in exactly one shape,
+`content_block_delta` with `delta.type === 'text_delta'`, and skipped every other carrier in silence.
+Three were measured against a stub upstream, each reproducing the line above byte-for-byte:
+
+| the upstream sent | before | after |
+| --- | --- | --- |
+| text in `content_block_start.content_block.text` | `parts: []` | `parts: [{"text":"Hi there!"}]` |
+| `content_block_delta` with `delta: {"text":"Hi there!"}` (`type` spelled `text`, or absent) | `parts: []` | `parts: [{"text":"Hi there!"}]` |
+| the whole message replayed in `message_start.message.content` | `parts: []` | `parts: [{"text":"Hi there!"}]` |
+
+The text branch is now keyed on `typeof delta.text === 'string'` rather than the type name (`text` is
+the field text-bearing deltas use; `signature_delta` carries `signature` and still stays out), a
+pre-filled `text` block is emitted where it is created, and `message_start.content` is read for the
+gateway that dresses a finished message as a stream — standard Anthropic sends `content: []` there,
+so that branch is a no-op for it. A pre-filled `thinking` block is seeded into the thinking buffer
+the same way `tool_use` already seeds `input`, so a block that arrives with its content and no
+deltas is no longer emptied.
+
+`usageMetadata` was independently always zero on this path: `message_delta.usage` was discarded, and
+the converters read usage off the synthetic finish chunk, which carried none. Usage is now
+accumulated across `message_start.message.usage` and `message_delta.usage` (owned by
+`handleCrossModeStreamingResponse`, not a requestId-keyed map, so a stream that never reaches
+`message_stop` cannot leak it) and attached to every chunk the egress emits, so `usageMetadata` is a
+running total the way a native Gemini stream reports it. The three Anthropic input fields are summed:
+the Messages API excludes both cache fields from `input_tokens` while Gemini's `promptTokenCount`
+includes the cached portion. Measured on a 7-in / 2-out turn: `{prompt:0,candidates:0,total:0}` on
+both chunks before → `{7,0,7}` on the text chunk and `{7,2,9}` on the finish chunk after.
+
+Tests: `tests/unit/anthropic-to-gemini-stream-parts.test.ts`, 9 cases — three text carriers plus the
+documented `text_delta` stream, a standard `message_start` that must add no chunk, the thinking and
+tool-call paths re-pinned, running-total usage, cache-field summing, and the no-usage fallback. Full
+unit suite 2835/2835.
+
+Still open, measured while writing this: (1) a `tool_use` block replayed inside `message_start` is
+still dropped — the tool path needs the `content_block_*` events that feed `toolBuffers`; (2) the
+`/v1/interactions` egress drops its terminal chunk entirely (`processSSEBuffer` skips a converted
+chunk with no `candidates`/`content`/`outputs`, and `convertOpenAIToGeminiInteractions` deletes
+`outputs` when there are none), so `total_output_tokens` still never reaches that client; (3) an
+event carrying content this converter still does not recognize is skipped without a log —
+`processAnthropicSSEBuffer` has no logger, so rule #8 remains unmet there.
+
 ### fix(converters): the chat-completions SSE egress names the speaker once
 
 An OpenAI stream identifies the speaker in its first chunk — `delta: {role: "assistant", content: ""}`
