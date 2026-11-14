@@ -156,7 +156,7 @@ export function convertClaudeToGeminiRequest(
  * (Rule #8 — Fail Loud) so the upstream receives an honest error rather than a
  * silently corrupted image part.
  *
- * Exported for reuse by `completionsToClaudeBody` (handlers/openai.ts) which
+ * Exported for reuse by `completionsToClaudeBody` (converters/completions-to-claude.ts) which
  * converts OpenAI `image_url` parts into Claude `image` blocks.
  */
 export function decodeDataUri(url: string): { mime_type: string; data: string } {

@@ -4,10 +4,8 @@ import assert from 'node:assert/strict';
 import {
   convertGeminiInteractionsToOpenAI,
 } from '../../src/converters/gemini-to-openai.js';
-import {
-  completionsToClaudeBody,
-  completionsToResponsesBody,
-} from '../../src/handlers/openai.js';
+import { completionsToClaudeBody } from '../../src/converters/completions-to-claude.js';
+import { completionsToResponsesBody } from '../../src/converters/completions-to-responses.js';
 
 /**
  * Request-level fields of the Gemini Interactions body (`system_instruction`,

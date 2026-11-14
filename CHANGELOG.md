@@ -5,6 +5,44 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refactor(converters): the Completions → Messages/Responses request hop leaves the handler
+
+The second hop of the cross-mode bridge — a Completions body re-targeted at an `anthropic-messages` or
+`openai-responses` upstream — was the last pure-conversion logic still living in a handler, and three
+other modules imported it out of `src/handlers/openai.ts`. Now:
+
+| where | contents | lines |
+| --- | --- | --- |
+| `converters/completions-to-claude.ts` (**new**) | `completionsToClaudeBody` + `parseJsonObject`, `openAIContentToClaudeStringOrBlocks`, `completionsToolChoiceToClaude` | 220 |
+| `converters/completions-to-responses.ts` (**extended**) | `completionsToResponsesBody` + `openAIContentToResponsesParts`, `pushThinkingReasoning`, `completionsToolChoiceToResponses` | 289 → 548 |
+| `handlers/openai.ts` | the hub, the two cross-mode forwarders, `claudeJsonToSyntheticCompletions`, the native `openai-completions` egress | 1191 → 748 |
+
+Both Completions-side readers the hops share — `openAIContentToText` and `completionsForcedToolName` —
+live in `completions-to-responses.ts`, and `completions-to-claude.ts` imports them. The alternative
+(shared helpers in the new file) would have made the long-standing file depend on a brand-new one; this
+way the dependency points from new to old, and both are documented in the file headers.
+
+`completions-to-responses.ts` now holds the pair in **both directions**, which its header states
+explicitly (it previously said "Chat Completions response to Responses API format" and would have been
+misleading), alongside a section divider where the request-direction code begins. It joins
+`claude-to-gemini.ts` and `gemini-to-openai.ts` in holding more than one converter for a pair; the other
+converter files remain one-directional and their headers say so.
+
+Import sites updated: `chat-completions.ts` (all three names), `messages.ts`, `responses.ts`, and three
+tests (`handlers.test.ts`, `gemini-interactions-to-openai.test.ts`, `responses-completions-roundtrip.test.ts`).
+Four stale pointers to the old home were corrected in doc comments (`claude-to-gemini.ts`,
+`responses-to-completions.ts`, `messages.ts`, `responses.ts`), and `handlers.test.ts`'s header now lists
+each symbol under the module that exports it.
+
+Verification: the ten moved definitions were sliced and re-emitted verbatim — no body was retyped; only
+the two import blocks and the two file headers are new text. A repo-wide scan for top-level function
+names confirms each of the ten now exists exactly once and in the file above, `npm run typecheck` is
+clean, and the full unit suite is 2838/2838 — the same count as before the move.
+
+What remains in `openai.ts` (748 lines): `handleOpenAIRequest` (248) as the hub, the two cross-mode
+forwarders (300), the native `openai-completions` stream/non-stream egress (136), and 26 lines of dead
+code (`convertOpenAIStreamToClaude`, no callers — see `docs/review-for-dead-duplicate-codes.md`).
+
 ### refactor(handlers): the Completions intermediate gets its own two modules
 
 `src/handlers/openai.ts` had grown to 2200 lines and owned three unrelated jobs: the Claude

@@ -5,8 +5,10 @@
  * The full request/response cycles in these handlers are exercised end-to-end
  * by ./tests/integration (integration). Here we cover the exported pure functions
  * that contain the testable conversion/decision logic:
- *   - openai.ts: completionsToClaudeBody, completionsToResponsesBody,
- *                claudeJsonToSyntheticCompletions, convertGeminiGenerateContentToOpenAI
+ *   - openai.ts: claudeJsonToSyntheticCompletions
+ *   - converters/completions-to-claude.ts: completionsToClaudeBody
+ *   - converters/completions-to-responses.ts: completionsToResponsesBody
+ *   - converters/gemini-to-openai.ts: convertGeminiGenerateContentToOpenAI
  *   - gemini.ts: isGeminiRequest
  *
  * Run with: npx tsx --test tests/unit/handlers.test.ts
@@ -15,11 +17,9 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  completionsToClaudeBody,
-  completionsToResponsesBody,
-  claudeJsonToSyntheticCompletions,
-} from '../../src/handlers/openai.js';
+import { claudeJsonToSyntheticCompletions } from '../../src/handlers/openai.js';
+import { completionsToClaudeBody } from '../../src/converters/completions-to-claude.js';
+import { completionsToResponsesBody } from '../../src/converters/completions-to-responses.js';
 import { convertGeminiGenerateContentToOpenAI } from '../../src/converters/gemini-to-openai.js';
 import { isGeminiRequest } from '../../src/handlers/gemini.js';
 import { ValidationError } from '../../src/utils/errors.js';

@@ -1,8 +1,22 @@
 /**
- * Converter: Chat Completions response to Responses API format
+ * Converter: Chat Completions ↔ Responses API — **both directions**.
+ *
+ * This file holds the pair in both directions, as `claude-to-gemini.ts` and
+ * `gemini-to-openai.ts` do for theirs:
+ *
+ *   - Completions **response** → Responses response: `convertCompletionsToResponses`
+ *     and `convertCompletionsToCompactedResponse`. What an `openai-completions`
+ *     upstream answered, re-rendered for a `/v1/responses` client.
+ *   - Completions **request body** → Responses request body: `completionsToResponsesBody`.
+ *     The second hop every client format takes before an `openai-responses` upstream
+ *     (`handleOpenAIRequest`, `chat-completions.ts`, `messages.ts`).
+ *
+ * The first half also owns the two Completions-side readers the Messages hop shares
+ * with it — `openAIContentToText` and `completionsForcedToolName` — which is why
+ * `completions-to-claude.ts` imports from here rather than the other way round.
  */
 
-import { OpenAIResponse } from '../types/openai.js';
+import { OpenAIContent, OpenAIMessage, OpenAIResponse } from '../types/openai.js';
 import { NamespaceMap } from './responses-to-completions.js';
 import { Logger } from '../utils/logger.js';
 
@@ -287,4 +301,248 @@ export function convertCompletionsToCompactedResponse(
     output: base.output,
     usage: base.usage,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Completions request body → Responses request body (the second hop)
+// ---------------------------------------------------------------------------
+
+export function openAIContentToText(content: OpenAIContent | null | undefined): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(part => part.type === 'text')
+    .map(part => 'text' in part ? part.text : '')
+    .join('');
+}
+
+/**
+ * Convert an OpenAI Chat Completions message `content` into Responses API
+ * content parts (`input_text` / `output_text` / `input_image`). Used by
+ * `completionsToResponsesBody` to route Completions clients through an
+ * `openai-responses` upstream.
+ *
+ * `image_url` parts are forwarded as `input_image`; the Chat Completions
+ * `{url, detail}` object is unwrapped into the Responses API's string `image_url`
+ * with `detail` as a sibling. The Responses upstream performs its own fetch — no
+ * in-proxy SSRF-guarded fetch is needed.
+ */
+function openAIContentToResponsesParts(
+  content: OpenAIContent | null | undefined,
+  textType: 'input_text' | 'output_text',
+): Array<Record<string, unknown>> {
+  const parts: Array<Record<string, unknown>> = [];
+  if (typeof content === 'string') {
+    parts.push({ type: textType, text: content });
+    return parts;
+  }
+  if (!Array.isArray(content)) return parts;
+  for (const part of content) {
+    if (part.type === 'text') {
+      parts.push({ type: textType, text: part.text });
+    } else if (part.type === 'image_url') {
+      // The Responses API wants `image_url` as a plain string — a fully qualified URL
+      // or a base64 data URL — with `detail` as a *sibling* on the item
+      // (`docs/api/openai-response-methods-create.md`: "image_url: optional string or
+      // null"). That is the opposite of the Chat Completions shape arriving here, where
+      // `image_url` is an object, so it is unwrapped; a client that already sent the
+      // string form is passed through unchanged.
+      const image = part.image_url as { url?: unknown; detail?: unknown } | string | undefined;
+      if (typeof image === 'string') {
+        parts.push({ type: 'input_image', image_url: image });
+      } else {
+        const imagePart: Record<string, unknown> = { type: 'input_image', image_url: image?.url };
+        if (image?.detail !== undefined) imagePart.detail = image.detail;
+        parts.push(imagePart);
+      }
+    }
+    // Unknown part types (e.g. thinking) are skipped here.
+  }
+  return parts;
+}
+
+/**
+ * Emit a Responses `reasoning` item for each `thinking` content part on an assistant
+ * message. Called where the message item is pushed rather than up front, so the item
+ * order matches the `/v1/messages` converter this one replaced: `reasoning_content`
+ * first as the turn's preamble, then the `function_call` items, then this reasoning,
+ * then the message. `openAIContentToResponsesParts` skips `thinking` parts, so the
+ * text does not also appear as `input_text`/`output_text`.
+ */
+function pushThinkingReasoning(msg: OpenAIMessage, input: unknown[]): void {
+  if (msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
+  for (const part of msg.content as unknown as Array<Record<string, unknown>>) {
+    if (part.type === 'thinking') {
+      input.push({
+        type: 'reasoning',
+        content: [{ type: 'reasoning_text', text: (part.thinking as string) ?? '' }],
+      });
+    }
+  }
+}
+
+/** The forced function name of a Completions `{type:'function', function:{name}}` tool_choice. */
+export function completionsForcedToolName(toolChoice: unknown): string | undefined {
+  if (!toolChoice || typeof toolChoice !== 'object') return undefined;
+  const name = ((toolChoice as Record<string, unknown>).function as Record<string, unknown> | undefined)?.name;
+  return typeof name === 'string' && name !== '' ? name : undefined;
+}
+
+/** Map a Completions `tool_choice` onto the Responses vocabulary. */
+function completionsToolChoiceToResponses(toolChoice: unknown): unknown {
+  if (toolChoice === 'auto' || toolChoice === 'none' || toolChoice === 'required') return toolChoice;
+  const name = completionsForcedToolName(toolChoice);
+  return name === undefined ? undefined : { type: 'function', name };
+}
+
+/**
+ * Convert an OpenAI Chat Completions body to an OpenAI Responses body (`input`).
+ * Used to route Gemini endpoints (interactions/generateContent) through an
+ * openai-responses upstream.
+ */
+export function completionsToResponsesBody(completions: Record<string, unknown>, model: string): Record<string, unknown> {
+  const messages = (completions.messages as OpenAIMessage[]) || [];
+  const input: unknown[] = [];
+  const instructions = messages
+    .filter(msg => msg.role === 'system' || msg.role === 'developer')
+    .map(msg => openAIContentToText(msg.content))
+    .filter(text => text !== '')
+    .join('\n');
+
+  for (const msg of messages) {
+    if (msg.role === 'system' || msg.role === 'developer') {
+      continue;
+    }
+
+    // Reasoning round-trip. An OpenAI thinking-mode upstream (DeepSeek) sets
+    // `reasoning_content` on the assistant message, and a `thinking` content part
+    // carries the same text; either must come back as a Responses `reasoning` item on
+    // the next turn or the upstream rejects it with "reasoning_content must be passed
+    // back". Taken from the `/v1/messages` converter, which had this and this one did
+    // not — the same body shape reaches both.
+    //
+    // Only the `reasoning_content` half is emitted here. A `thinking` content part is
+    // emitted by `pushThinkingReasoning` where the message item is pushed, which keeps
+    // the item order this converter inherited: the preamble reasoning first, then the
+    // turn's `function_call` items, then the reasoning carried inside `content[]`, then
+    // the message.
+    if (msg.role === 'assistant') {
+      const inlineReasoning = (msg as unknown as Record<string, unknown>).reasoning_content;
+      if (typeof inlineReasoning === 'string' && inlineReasoning) {
+        input.push({ type: 'reasoning', content: [{ type: 'reasoning_text', text: inlineReasoning }] });
+      }
+    }
+
+    if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+      for (const tc of msg.tool_calls) {
+        input.push({
+          type: 'function_call',
+          call_id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        });
+      }
+      pushThinkingReasoning(msg, input);
+      const contentParts = openAIContentToResponsesParts(msg.content, 'output_text');
+      if (msg.content !== '' && contentParts.length > 0) {
+        input.push({
+          type: 'message',
+          role: 'assistant',
+          content: contentParts,
+        });
+      }
+      continue;
+    }
+
+    if (msg.role === 'tool') {
+      // `output` must be a string. A string passes through unchanged and an array of
+      // parts is text-extracted as before; anything else is serialized, because a client
+      // may send the tool result as an object and the text extractor yields '' for it —
+      // that silently dropped the whole result. The serialize branch is the
+      // `/v1/messages` converter's rule, kept when the two merged
+      // (`tests/unit/messages-handler.test.ts`).
+      const toolContent = msg.content;
+      input.push({
+        type: 'function_call_output',
+        call_id: msg.tool_call_id,
+        output: typeof toolContent === 'string'
+          ? toolContent
+          : Array.isArray(toolContent)
+            ? openAIContentToText(toolContent)
+            : JSON.stringify(toolContent ?? ''),
+      });
+      continue;
+    }
+
+    // Prior assistant turns replayed as input must use `output_text` (mirrors what
+    // the upstream originally emitted); user turns use `input_text`.
+    const textType = msg.role === 'assistant' ? 'output_text' : 'input_text';
+    const contentParts = openAIContentToResponsesParts(msg.content, textType);
+    pushThinkingReasoning(msg, input);
+    input.push({
+      type: 'message',
+      role: msg.role,
+      content: contentParts.length > 0 ? contentParts : [{ type: textType, text: '' }],
+    });
+  }
+
+  const responsesBody: Record<string, unknown> = {
+    model,
+    input,
+    stream: completions.stream === true,
+  };
+  if (instructions) responsesBody.instructions = instructions;
+
+  if (completions.temperature !== undefined) responsesBody.temperature = completions.temperature;
+  if (completions.top_p !== undefined) responsesBody.top_p = completions.top_p;
+  // Legacy `max_tokens` wins when both names are present; `max_completion_tokens` is the
+  // newer OpenAI spelling and is the only one some clients send. Same precedence as
+  // `completionsToClaudeBody`. Carrying only the legacy name left a client that used the
+  // newer one with no output bound at all on a Responses upstream.
+  const maxOutputTokens = (completions.max_tokens as number | undefined)
+    ?? (completions.max_completion_tokens as number | undefined);
+  if (maxOutputTokens !== undefined) responsesBody.max_output_tokens = maxOutputTokens;
+  if (completions.prompt_cache_key !== undefined) responsesBody.prompt_cache_key = completions.prompt_cache_key;
+  // Retention and reasoning: same field name on both sides for `store`; the
+  // Completions scalar `reasoning_effort` is the Responses nested `reasoning.effort`.
+  // Both are set by `convertGeminiInteractionsToOpenAI` for an Interactions client,
+  // and either may already be on the body from a Completions client.
+  if (completions.store !== undefined) responsesBody.store = completions.store;
+  if (completions.reasoning_effort !== undefined) {
+    responsesBody.reasoning = { effort: completions.reasoning_effort };
+  }
+  // Structured output: Chat Completions spells it `response_format`, the Responses
+  // API `text.format`. The inverse of `responses-to-completions.ts:197-213`, which is
+  // the shape unwrapped here. A `type` outside the three it accepts is left unmapped,
+  // as it was before this mapping existed rather than throwing on a shared converter.
+  const responseFormat = completions.response_format as Record<string, unknown> | undefined;
+  if (responseFormat && typeof responseFormat === 'object') {
+    if (responseFormat.type === 'json_schema') {
+      const jsonSchema = responseFormat.json_schema as Record<string, unknown> | undefined;
+      responsesBody.text = {
+        format: {
+          type: 'json_schema',
+          name: (jsonSchema?.name as string) ?? 'response',
+          schema: jsonSchema?.schema,
+          ...(jsonSchema?.strict !== undefined ? { strict: jsonSchema.strict } : {}),
+        },
+      };
+    } else if (responseFormat.type === 'json_object' || responseFormat.type === 'text') {
+      responsesBody.text = { format: { type: responseFormat.type } };
+    }
+  }
+  if (completions.tools && Array.isArray(completions.tools) && (completions.tools as unknown[]).length > 0) {
+    responsesBody.tools = (completions.tools as Array<{ type: string; function: { name: string; description?: string; parameters?: unknown } }>).map(t => ({
+      type: 'function',
+      name: t.function.name,
+      description: t.function.description,
+      parameters: t.function.parameters,
+    }));
+
+    // Gated on the tools above: a tool_choice with no tools is rejected upstream.
+    const toolChoice = completionsToolChoiceToResponses(completions.tool_choice);
+    if (toolChoice !== undefined) responsesBody.tool_choice = toolChoice;
+  }
+
+  return responsesBody;
 }

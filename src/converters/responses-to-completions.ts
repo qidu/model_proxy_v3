@@ -676,7 +676,7 @@ function convertRole(role: string): OpenAIMessage['role'] {
  * - `input_file` parts still emit a `[File: ...]` text placeholder (no
  *   Completions-native file part exists).
  *
- * Note: callers that route through `completionsToClaudeBody` (handlers/openai.ts)
+ * Note: callers that route through `completionsToClaudeBody` (completions-to-claude.ts)
  * will further convert `image_url` parts into Claude `image` blocks (with
  * server-side fetch for http URLs).
  */

@@ -20,7 +20,7 @@ import { getConversation, saveConversation, normalizeInputToItems, getConversati
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { handleGeminiRequestForMessages } from './gemini.js';
-import { completionsToClaudeBody } from './openai.js';
+import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
 import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
 import { collectBlobRefs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
@@ -172,15 +172,16 @@ export function handleResponsesRetrievalRequest(
  *
  * NOTE: Kept for reference only — the call sites in `handleAsAnthropicMessages`
  * and `handleAsGemini` now reuse the more complete `completionsToClaudeBody`
- * imported from `./openai.js`. That version additionally handles consecutive
- * tool-result grouping, `reasoning_content` → `thinking` blocks, and array
- * `content` with `image_url` parts. This local copy is intentionally retained
- * as a reference for the simpler shape and as a fallback if a future refactor
- * re-decouples the responses handler from openai.ts. Do not add new call sites
- * here — use `completionsToClaudeBody` from `./openai.js` instead.
+ * imported from `../converters/completions-to-claude.js`. That version additionally
+ * handles consecutive tool-result grouping, `reasoning_content` → `thinking`
+ * blocks, and array `content` with `image_url` parts. This local copy is
+ * intentionally retained as a reference for the simpler shape and as a fallback
+ * if a future refactor re-decouples the responses handler from the shared
+ * converter. Do not add new call sites here — use `completionsToClaudeBody` from
+ * `../converters/completions-to-claude.js` instead.
  *
- * Historical callers (both internal to this file, both now using the openai.ts
- * version instead):
+ * Historical callers (both internal to this file, both now using the shared
+ * converter instead):
  *
  *   - handleAsAnthropicMessages  — `/v1/responses` → `anthropic-messages` upstream.
  *     Chain: Responses `input` → convertResponsesToChatCompletions → Completions

@@ -13,7 +13,9 @@ import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.j
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { validateOpenAICompletionsRequest } from '../utils/validation.js';
 import { ValidationError } from '../utils/errors.js';
-import { completionsToResponsesBody, completionsToClaudeBody, claudeJsonToSyntheticCompletions } from './openai.js';
+import { claudeJsonToSyntheticCompletions } from './openai.js';
+import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
+import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
 import {
   convertResponsesToChatCompletionsAnswer,
   createResponsesChatStreamState,

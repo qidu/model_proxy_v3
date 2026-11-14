@@ -7,7 +7,7 @@ import {
   convertResponsesToChatCompletionsAnswer, responsesUsageToChatCompletions,
   createResponsesChatStreamState, responsesStreamEventToChatChunks,
 } from '../../src/converters/responses-to-completions.js';
-import { completionsToClaudeBody } from '../../src/handlers/openai.js';
+import { completionsToClaudeBody } from '../../src/converters/completions-to-claude.js';
 import type { OpenAIResponse } from '../../src/types/openai.js';
 
 /**

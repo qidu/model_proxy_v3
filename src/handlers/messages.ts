@@ -35,7 +35,7 @@ import { getSpoolConfig } from '../utils/spool.js';
 import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 // The one Completions→Responses request converter, shared with the /v1/interactions and
 // /v1/chat/completions hops. No import cycle: openai.ts does not import this module.
-import { completionsToResponsesBody } from './openai.js';
+import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
 
 /**
  * Get token counting configuration from environment
@@ -80,7 +80,7 @@ function normalizeOpenAICompletionsBody(requestBody: Record<string, unknown>): R
 /**
  * The `/v1/messages` → `openai-responses` hop used to carry private copies of the three
  * Completions→Responses request conversions that live here. They had drifted from the
- * shared `completionsToResponsesBody` (`src/handlers/openai.ts`), which the
+ * shared `completionsToResponsesBody` (`src/converters/completions-to-responses.ts`), which the
  * `/v1/interactions` and `/v1/chat/completions` hops use, in four ways: the system
  * prompt was emitted as a `system` item in `input[]` instead of the canonical
  * `instructions`; `input_image.image_url` was built from the client's object rather than
