@@ -5,6 +5,57 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): `/v1/interactions` → `/v1/messages` read only three of the `input` shapes the API declares
+
+`/v1/interactions` served by an `anthropic-messages` upstream is converted in two hops —
+`convertGeminiInteractionsToOpenAI` (`src/converters/gemini-to-openai.ts`), then
+`completionsToClaudeBody` — while the *same* front door served by a native Gemini upstream goes through
+`convertInteractionsToGenerateContent` (`src/converters/interactions-to-gemini.ts`), whose
+`buildContents` discriminates every input shape `docs/api/interactions.md` declares. The OpenAI hop read
+only `input.messages`, an array of Turns/steps, and a bare string, so the remaining shapes were
+mis-read or refused — and a mis-read one reached the Claude upstream as a message with no `role` and no
+`content` at all, which the client sees as "the model ignored my prompt".
+
+| `input` the client sent | native-Gemini hop | `anthropic-messages` hop, before |
+| --- | --- | --- |
+| `[{type:'text', text:'…'}]` — `array(Content)`, the shape `interactions.md`'s own multimodal example uses | one `role:'user'` content | `{"content":""}` — **role and content both gone** |
+| `[{type:'text',…}, {type:'image', data, mime_type}]` | text + `inline_data` | `{"content":""}`, image gone |
+| a lone Turn `{role, content}`, a lone step `{type:'user_input', content}`, or a lone Content | one user content | **500** `Invalid Gemini Interactions request format` |
+| a Turn/step `content` given as one Content object, or as a number | 400 naming the field | `[object Object]` / `"42"` **in the prompt** |
+
+**The request.** `interactionsInputToMessages` now discriminates the shapes in the order `buildContents`
+does — the first entry decides whether the array is Turns (`role`), steps (`type`), or one turn's part
+list — and a lone Turn/step/Content becomes one message. `input: []` and `input.messages: []` are
+refused as `buildContents` refuses them, and so is a Turn/step `content` that is neither a string nor a
+part list: `String(content)` was what put `[object Object]` on the wire. Every refusal is a
+`ValidationError` (400) naming the field, where a 500 was the best case before.
+
+`geminiPartsToOpenAIContent` also reads the Interactions media spelling
+(`{type:'image', data, mime_type}`) alongside `inline_data`/`inlineData`, so an Interactions client's
+image is no longer dropped on the way to its `image_url` part.
+
+**The system prompt.** `convertGeminiGenerateContentToOpenAI` read only the camelCase
+`systemInstruction`, so a body carrying the Interactions `system_instruction` reached the upstream with
+no system prompt at all. Both converters now share one `systemInstructionToText`, which accepts the
+string, `{parts:[{text}]}` and `{text}` spellings and **refuses** an unrecognized shape rather than
+dropping it (Rule #8) — the behaviour `interactions-to-gemini.ts` already had.
+
+**Deliberately still permissive, so the two hops differ here:** `input.messages` is passed through as
+the client wrote it, a role-less entry included, because `defaultMissingOpenAIMessageRoles` fills the
+role in on an `openai-completions` route (`tests/unit/openai-gemini-role-default.test.ts` pins that);
+and a `role` the native-Gemini hop would refuse (`critic`, say) is passed through for the same reason.
+A part kind with no Completions spelling inside a step's `content` — a `function_call`, say — is still
+read as an empty text part rather than refused: reported here, pinned by nothing.
+
+This was *not* the pair of gaps first reported for this hop — `system_instruction` and
+`type:'user_input'`→`role:'user'` both already worked here for every documented shape, verified
+end-to-end. What the hop was missing is the parity above.
+
+Tests: `tests/unit/gemini-interactions-to-openai.test.ts` (the input shapes, the refusals, the
+`Content[]` turn reaching an `anthropic-messages` upstream, and a new describe for the
+`system_instruction` spellings) and `tests/unit/gemini-to-openai-image.test.ts` (the Interactions media
+spelling, in a step and in a bare `Content[]`). Suite: 2947/2947.
+
 ### fix(converters): five fields `/v1/messages` → `gemini-generatecontent` dropped without a word
 
 `/v1/messages` on a `gemini-generatecontent` upstream is converted by one function,

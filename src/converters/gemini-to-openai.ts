@@ -14,6 +14,7 @@
 
 import type { Logger } from '../types/shared.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
+import { ValidationError } from '../utils/errors.js';
 
 /**
  * Check if request is in Gemini Interactions format
@@ -23,12 +24,19 @@ export function isGeminiInteractionsRequest(body: Record<string, unknown>): bool
 }
 
 /**
+ * The Interactions `type` discriminators whose part carries its bytes at its own
+ * `data`/`mime_type` (`{type:'image', data, mime_type}`) rather than under
+ * generateContent's `inline_data`. The media kinds `interactions.md` declares.
+ */
+const INTERACTIONS_MEDIA_PART_TYPES = new Set(['image', 'audio', 'video', 'document']);
+
+/**
  * Convert Gemini parts into an OpenAI Completions `content` value:
  *   - text-only parts collapse to a joined string (preserves wire shape).
- *   - any `inline_data` / `inlineData` part present → returns an array
- *     mixing `{type:'text'}` and `{type:'image_url'}` parts (data-URI form).
- *     Both snake_case (`inline_data.mime_type`) and camelCase
- *     (`inlineData.mimeType`) accepted.
+ *   - any image part present → returns an array mixing `{type:'text'}` and
+ *     `{type:'image_url'}` parts (data-URI form). Both the generateContent
+ *     spellings (`inline_data.mime_type`, `inlineData.mimeType`) and the
+ *     Interactions one (`{type:'image', data, mime_type}`) are accepted.
  *   - `thought:true` text parts are skipped (thinking markers; not part of
  *     content body in this direction).
  * Returns '' for an empty / unrecognized parts list.
@@ -49,10 +57,13 @@ function geminiPartsToOpenAIContent(
     if (p && typeof p.text === 'string' && !p.thought) {
       textParts.push(p.text);
     }
+    // Whichever dialect spells the bytes: the generateContent part nests them
+    // under `inline_data`, the Interactions part carries them on itself.
     const inline = p?.inline_data ?? p?.inlineData;
-    const data: unknown = inline?.data;
+    const media = inline ?? (INTERACTIONS_MEDIA_PART_TYPES.has(p?.type) ? p : undefined);
+    const data: unknown = media?.data;
     if ((typeof data === 'string' && data !== '') || isBlobRef(data)) {
-      const mime = inline.mime_type ?? inline.mimeType;
+      const mime = media?.mime_type ?? media?.mimeType;
       imageParts.push({
         type: 'image_url',
         image_url: {
@@ -137,6 +148,154 @@ function geminiToolChoiceToOpenAI(toolChoice: unknown): unknown {
   return geminiToolChoiceMode(cfg.type ?? cfg.mode);
 }
 
+/** A plain JSON object, or undefined for anything else (arrays included). */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/**
+ * The Interactions `input`, in every shape the API declares
+ * (`docs/api/interactions.md`: a string, a Content, an array of Content, an array
+ * of Turn, or an object carrying `messages`) plus the *step* form a client may
+ * send in place of Turns (`type: 'user_input'` / `'model_output'` standing in
+ * for a Turn's `role`).
+ *
+ * The discrimination mirrors `converters/interactions-to-gemini.ts`'s
+ * `buildContents` — the same front door served by a native Gemini upstream — so
+ * one body is read the same way on both routes. It matters most for the bare
+ * `Content[]` form (the shape `interactions.md`'s own multimodal example uses),
+ * which is *one* turn's part list, not one message per part: read as Turns it
+ * produced a message whose role and content had both been dropped.
+ *
+ * A shape that yields no message is refused rather than half-read. That is what
+ * the last branch protects: an unrecognized scalar used to fall through to
+ * `String(content)`, putting `[object Object]` in the prompt, and an
+ * unrecognized array became `messages: []` at the upstream.
+ */
+function interactionsInputToMessages(input: unknown): Array<Record<string, unknown>> {
+  if (typeof input === 'string') {
+    return [{ role: 'user', content: input }];
+  }
+
+  if (Array.isArray(input)) {
+    if (input.length === 0) {
+      throw new ValidationError('Interactions request `input` array must carry at least one content');
+    }
+    // The first entry decides how the whole array is read, as in `buildContents`:
+    // a Turn carries `role`, a step carries `type`, anything else is a part list.
+    const first = asRecord(input[0]);
+    if (first && 'role' in first) {
+      return input.map(entry => turnToMessage(asRecord(entry), 'input[]'));
+    }
+    if (first && (first.type === 'user_input' || first.type === 'model_output')) {
+      return input.map(entry => stepToMessage(asRecord(entry)));
+    }
+    return [{ role: 'user', content: geminiPartsToOpenAIContent(input) }];
+  }
+
+  const record = asRecord(input);
+  if (record) {
+    if (Array.isArray(record.messages)) {
+      if (record.messages.length === 0) {
+        throw new ValidationError(
+          'Interactions request `input.messages` must contain at least one user or model message',
+        );
+      }
+      // Passed through as the client wrote it: these already are Completions
+      // messages, and a role the client left out is filled in later by
+      // `defaultMissingOpenAIMessageRoles` on an openai-completions route.
+      return record.messages as Array<Record<string, unknown>>;
+    }
+    if ('role' in record) {
+      return [turnToMessage(record, 'input')];
+    }
+    if (record.type === 'user_input' || record.type === 'model_output') {
+      return [stepToMessage(record)];
+    }
+    // A lone Content: one part, so one message holding it.
+    if (typeof record.type === 'string') {
+      return [{ role: 'user', content: geminiPartsToOpenAIContent([record]) }];
+    }
+  }
+
+  throw new ValidationError(
+    'Interactions request `input` must be a string, a Content, an array of Content or Turn, ' +
+    'or an object with `messages`',
+  );
+}
+
+/** A Turn: `role` plus `content` (a bare string, or a part list). */
+function turnToMessage(turn: Record<string, unknown> | undefined, where: string): Record<string, unknown> {
+  if (!turn) throw new ValidationError(`Interactions ${where} entry must be an object`);
+
+  return {
+    role: turn.role === 'model' ? 'assistant' : turn.role,
+    content: contentToOpenAIContent(turn.content, where),
+  };
+}
+
+/**
+ * An input *step*: a Turn whose `type` stands in for its `role`. `user_input` is
+ * the client's turn, `model_output` the model's own earlier turn.
+ */
+function stepToMessage(step: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!step) throw new ValidationError('Interactions input step must be an object');
+
+  return {
+    role: step.type === 'model_output' ? 'assistant' : 'user',
+    content: contentToOpenAIContent(step.content, `input step ${JSON.stringify(step.type)}`),
+  };
+}
+
+/**
+ * A Turn/step `content`: a bare string, or a part list. Anything else is refused
+ * rather than stringified — `String({type:'text', …})` would put `[object
+ * Object]` in the prompt the upstream reads.
+ */
+function contentToOpenAIContent(
+  content: unknown,
+  where: string,
+): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    if (content.length === 0) {
+      throw new ValidationError(`Interactions ${where}.content must carry at least one part`);
+    }
+    return geminiPartsToOpenAIContent(content);
+  }
+  throw new ValidationError(`Interactions ${where}.content must be a string or an array of Content parts`);
+}
+
+/**
+ * The declared system prompt as text, in any spelling this front door is served:
+ * the Interactions string, generateContent's `{parts:[{text}]}`, or a bare
+ * `{text}`. Shared by both converters here, since the Interactions
+ * `system_instruction` and generateContent's `systemInstruction` are the same
+ * field and either body may reach either one. An unrecognized shape is refused
+ * rather than dropped — a lost system prompt changes the answer (Rule #8).
+ */
+function systemInstructionToText(declared: unknown): string {
+  if (declared === undefined || declared === null) return '';
+  if (typeof declared === 'string') return declared;
+
+  const record = asRecord(declared);
+  if (record) {
+    const parts = record.parts;
+    if (Array.isArray(parts)) {
+      return parts
+        .map(part => {
+          const text = asRecord(part)?.text;
+          return typeof text === 'string' ? text : '';
+        })
+        .join('');
+    }
+    if (typeof record.text === 'string') return record.text;
+  }
+  throw new ValidationError('Interactions `system_instruction` must be a string or a text part list');
+}
+
 /**
  * Convert Gemini Interactions request to OpenAI format
  *
@@ -160,43 +319,14 @@ function geminiToolChoiceToOpenAI(toolChoice: unknown): unknown {
  */
 export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, unknown>): Record<string, unknown> {
   const model = (geminiRequest.model as string) || 'gemini-no-id-at-proxy';
-  let messages: unknown[] | undefined;
 
-  // Handle input.messages format (Interactions API)
-  if (geminiRequest.input && typeof geminiRequest.input === 'object') {
-    const input = geminiRequest.input as Record<string, unknown>;
-    if (Array.isArray(input.messages)) {
-      messages = input.messages;
-    }
-  }
-
-  // Handle input as array-of-turns (TC203: [{role, content}, ...]) or as
-  // array-of-steps (Interactions steps: [{type: 'user_input'|'model_output',
-  // content}, ...], where the step's `type` stands in for a Turn's `role` and
-  // `model_output` is the model's own earlier turn).
-  // String content is preserved; array content (Gemini parts shape) is
-  // routed through geminiPartsToOpenAIContent so inline_data images survive.
-  if (!messages && Array.isArray(geminiRequest.input)) {
-    messages = (geminiRequest.input as any[]).map((turn: any) => ({
-      role: turn.role === 'model' || turn.type === 'model_output'
-        ? 'assistant'
-        : turn.role === 'user' || turn.type === 'user_input' ? 'user' : turn.role,
-      content: typeof turn.content === 'string'
-        ? turn.content
-        : Array.isArray(turn.content)
-          ? geminiPartsToOpenAIContent(turn.content)
-          : String(turn.content ?? ''),
-    }));
-  }
-
-  // Handle simple input format
-  if (!messages && typeof geminiRequest.input === 'string') {
-    messages = [{ role: 'user', content: geminiRequest.input }];
-  }
-
-  // Handle contents format (Gemini generateContent shape).
-  // Each content's parts → OpenAI content via geminiPartsToOpenAIContent.
-  if (!messages && Array.isArray(geminiRequest.contents)) {
+  // The Interactions `input`, or the generateContent `contents` a body reaching
+  // this front door may carry instead (`isGeminiInteractionsRequest` accepts
+  // either). `input` wins when both are present.
+  let messages: Array<Record<string, unknown>> | undefined;
+  if (geminiRequest.input !== undefined) {
+    messages = interactionsInputToMessages(geminiRequest.input);
+  } else if (Array.isArray(geminiRequest.contents)) {
     messages = (geminiRequest.contents as any[]).map((content: any) => ({
       role: content.role === 'model' ? 'assistant' : content.role,
       content: geminiPartsToOpenAIContent(content.parts),
@@ -204,24 +334,19 @@ export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, 
   }
 
   if (!messages) {
-    throw new Error('Invalid Gemini Interactions request format');
+    throw new ValidationError('Invalid Gemini Interactions request format');
   }
 
   // `system_instruction` is a top-level string on the Interactions API, while
   // generateContent wraps it as `{parts:[{text}]}`; both forms become the
   // leading OpenAI system message (mirroring convertGeminiGenerateContentToOpenAI).
-  const sysInstr = (geminiRequest.system_instruction ?? geminiRequest.systemInstruction) as
-    string | Record<string, unknown> | undefined;
-  if (sysInstr) {
-    const parts = typeof sysInstr === 'object' ? sysInstr.parts as Array<Record<string, unknown>> | undefined : undefined;
-    const systemText = Array.isArray(parts)
-      ? parts.map(p => (typeof p.text === 'string' ? p.text : '')).join('')
-      : typeof sysInstr === 'string' ? sysInstr : typeof sysInstr.text === 'string' ? sysInstr.text : '';
-    if (systemText) {
-      // New array, not unshift: `messages` may be the caller's own
-      // `input.messages` array, which must not be mutated.
-      messages = [{ role: 'system', content: systemText }, ...messages];
-    }
+  const systemText = systemInstructionToText(
+    geminiRequest.system_instruction ?? geminiRequest.systemInstruction,
+  );
+  if (systemText) {
+    // New array, not unshift: `messages` may be the caller's own
+    // `input.messages` array, which must not be mutated.
+    messages = [{ role: 'system', content: systemText }, ...messages];
   }
 
   const result: Record<string, unknown> = {
@@ -363,16 +488,15 @@ export function convertGeminiGenerateContentToOpenAI(
   if (Array.isArray(geminiRequest.contents)) {
     const messages: Record<string, unknown>[] = [];
 
-    // Extract systemInstruction and prepend as OpenAI system message
-    const sysInstr = geminiRequest.systemInstruction as Record<string, unknown> | undefined;
-    if (sysInstr) {
-      const parts = sysInstr.parts as Array<Record<string, unknown>> | undefined;
-      const systemText = Array.isArray(parts)
-        ? parts.map(p => (typeof p.text === 'string' ? p.text : '')).join('')
-        : typeof sysInstr.text === 'string' ? sysInstr.text : '';
-      if (systemText) {
-        messages.push({ role: 'system', content: systemText });
-      }
+    // Extract systemInstruction and prepend as OpenAI system message.
+    // `systemInstruction` is generateContent's spelling and `system_instruction`
+    // the Interactions one — the same field, and a body reaching this converter
+    // may spell it either way.
+    const systemText = systemInstructionToText(
+      geminiRequest.systemInstruction ?? geminiRequest.system_instruction,
+    );
+    if (systemText) {
+      messages.push({ role: 'system', content: systemText });
     }
 
     // Track the last emitted tool_calls so tool results can recover the correct

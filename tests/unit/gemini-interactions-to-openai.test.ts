@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  convertGeminiGenerateContentToOpenAI,
   convertGeminiInteractionsToOpenAI,
 } from '../../src/converters/gemini-to-openai.js';
 import { completionsToClaudeBody } from '../../src/converters/completions-to-claude.js';
@@ -23,6 +24,20 @@ import { completionsToResponsesBody } from '../../src/converters/completions-to-
  */
 
 const userTurn = { input: [{ role: 'user', content: 'hi' }] };
+
+/**
+ * An `input` this hop cannot express is refused with a 400 naming the field,
+ * rather than reaching the upstream half-read (or 500-ing, as an unrecognized
+ * shape used to).
+ */
+function assertRefused(input: unknown, needle: RegExp): void {
+  assert.throws(
+    () => convertGeminiInteractionsToOpenAI({ model: 'm', input }),
+    (error: any) => error.name === 'ValidationError'
+      && error.status === 400
+      && needle.test(error.message),
+  );
+}
 
 describe('convertGeminiInteractionsToOpenAI — system_instruction', () => {
   it('prepends system_instruction (Interactions string form) as a system message', () => {
@@ -384,7 +399,117 @@ describe('convertGeminiInteractionsToOpenAI — input shapes', () => {
   it('throws on a body with no recognizable input', () => {
     assert.throws(
       () => convertGeminiInteractionsToOpenAI({ model: 'm' }),
-      (err: Error) => err instanceof Error && err.message === 'Invalid Gemini Interactions request format',
+      (err: any) => err.name === 'ValidationError'
+        && err.status === 400
+        && err.message === 'Invalid Gemini Interactions request format',
+    );
+  });
+
+  it('reads a bare Content[] as one turn part list, not one message per part', () => {
+    // The shape `docs/api/interactions.md`'s multimodal example uses, and the one
+    // this hop used to mis-read as Turns: each part became a message whose role
+    // and content had both been dropped.
+    const out = convertGeminiInteractionsToOpenAI({
+      model: 'm',
+      input: [{ type: 'text', text: 'hi' }, { type: 'text', text: ' again' }],
+    }) as any;
+
+    assert.deepEqual(out.messages, [{ role: 'user', content: 'hi again' }]);
+  });
+
+  it('carries that Content[] turn to an anthropic-messages upstream as a user message', async () => {
+    const claude = await completionsToClaudeBody(
+      convertGeminiInteractionsToOpenAI({ model: 'm', input: [{ type: 'text', text: 'hi' }] }),
+      'claude-target',
+    ) as any;
+
+    assert.deepEqual(claude.messages, [{ role: 'user', content: 'hi' }]);
+  });
+
+  it('reads a lone Turn, step or Content as one message', () => {
+    const one = (input: unknown) =>
+      (convertGeminiInteractionsToOpenAI({ model: 'm', input }) as any).messages;
+
+    assert.deepEqual(one({ role: 'user', content: 'hi' }), [{ role: 'user', content: 'hi' }]);
+    assert.deepEqual(one({ type: 'user_input', content: 'hi' }), [{ role: 'user', content: 'hi' }]);
+    assert.deepEqual(one({ type: 'text', text: 'hi' }), [{ role: 'user', content: 'hi' }]);
+  });
+
+  it("maps a Turn's generateContent model role to assistant", () => {
+    const out = convertGeminiInteractionsToOpenAI({
+      model: 'm',
+      input: [{ role: 'user', content: 'hi' }, { role: 'model', content: 'hello' }],
+    }) as any;
+
+    assert.deepEqual(out.messages.map((m: any) => m.role), ['user', 'assistant']);
+  });
+
+  it('keeps passing input.messages through, role-less entries included', () => {
+    // Deliberately not the native-Gemini converter's behaviour, which refuses a
+    // role it cannot express: on this hop a role the client left out is defaulted
+    // to `user` further down, on an openai-completions route
+    // (pinned in `openai-gemini-role-default.test.ts`).
+    const out = convertGeminiInteractionsToOpenAI({
+      model: 'm',
+      input: { messages: [{ content: 'hi' }] },
+    }) as any;
+
+    assert.deepEqual(out.messages, [{ content: 'hi' }]);
+  });
+
+  it('refuses an input shape that carries no message, naming the field', () => {
+    assertRefused([], /`input` array must carry at least one content/);
+    assertRefused({ messages: [] }, /`input\.messages` must contain at least one user or model message/);
+    assertRefused(5, /`input` must be a string, a Content, an array of Content or Turn/);
+    assertRefused({ nope: true }, /`input` must be a string, a Content, an array of Content or Turn/);
+  });
+
+  it('refuses a Turn/step content that is neither a string nor a part list', () => {
+    // `String(content)` used to put `[object Object]` — or `42` — in the prompt.
+    assertRefused(
+      [{ type: 'user_input', content: { type: 'text', text: 'hi' } }],
+      /input step "user_input"\.content must be a string or an array of Content parts/,
+    );
+    assertRefused(
+      [{ type: 'user_input', content: 42 }],
+      /\.content must be a string or an array of Content parts/,
+    );
+    assertRefused([{ type: 'user_input', content: [] }], /\.content must carry at least one part/);
+  });
+});
+
+describe('convertGeminiGenerateContentToOpenAI — system_instruction spellings', () => {
+  // The same field, and the same reader: the Interactions spelling is snake_case
+  // and a bare string, generateContent's is camelCase and `{parts:[…]}`. A
+  // snake_case system prompt used to be dropped here in silence.
+  const contents = [{ role: 'user', parts: [{ text: 'hi' }] }];
+  const systemText = (extra: Record<string, unknown>) =>
+    (convertGeminiGenerateContentToOpenAI({ model: 'm', contents, ...extra }) as any).messages[0];
+
+  it('reads the Interactions system_instruction (snake_case string)', () => {
+    assert.deepEqual(systemText({ system_instruction: 'be terse' }), { role: 'system', content: 'be terse' });
+  });
+
+  it('reads a snake_case text part list', () => {
+    assert.deepEqual(
+      systemText({ system_instruction: { parts: [{ text: 'be ' }, { text: 'terse' }] } }),
+      { role: 'system', content: 'be terse' },
+    );
+  });
+
+  it('still reads the generateContent systemInstruction spellings', () => {
+    assert.deepEqual(systemText({ systemInstruction: 'be terse' }), { role: 'system', content: 'be terse' });
+    assert.deepEqual(
+      systemText({ systemInstruction: { parts: [{ text: 'be terse' }] } }),
+      { role: 'system', content: 'be terse' },
+    );
+  });
+
+  it('refuses an unrecognized system prompt shape rather than dropping it', () => {
+    assert.throws(
+      () => convertGeminiGenerateContentToOpenAI({ model: 'm', contents, system_instruction: 42 }),
+      (err: any) => err.name === 'ValidationError' && err.status === 400
+        && /`system_instruction` must be a string or a text part list/.test(err.message),
     );
   });
 });

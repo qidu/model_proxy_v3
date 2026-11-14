@@ -148,6 +148,56 @@ describe('convertGeminiInteractionsToOpenAI — image parts', () => {
     ]);
   });
 
+  it('reads the Interactions media spelling ({type:image, data, mime_type}) in a step', () => {
+    // The spelling `docs/api/interactions.md` declares for a multimodal input.
+    // It was dropped: only `inline_data`/`inlineData` was read, so an
+    // Interactions client's image never reached the upstream.
+    const req = {
+      model: 'gemini',
+      input: [{
+        type: 'user_input',
+        content: [
+          { type: 'text', text: 'see' },
+          { type: 'image', data: 'QUJD', mime_type: 'image/png' },
+        ],
+      }],
+    };
+    const out = convertGeminiInteractionsToOpenAI(req) as any;
+    assert.deepEqual(out.messages[0].content, [
+      { type: 'text', text: 'see' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } },
+    ]);
+  });
+
+  it('reads it in a bare Content[] input (one turn part list)', () => {
+    const req = {
+      model: 'gemini',
+      input: [
+        { type: 'text', text: 'see' },
+        { type: 'image', data: 'QUJD', mime_type: 'image/png' },
+      ],
+    };
+    const out = convertGeminiInteractionsToOpenAI(req) as any;
+    assert.deepEqual(out.messages, [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'see' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } },
+      ],
+    }]);
+  });
+
+  it('accepts the camelCase mimeType on an Interactions media part', () => {
+    const req = {
+      model: 'gemini',
+      input: [{ type: 'image', data: 'QUJD', mimeType: 'image/webp' }],
+    };
+    const out = convertGeminiInteractionsToOpenAI(req) as any;
+    assert.deepEqual(out.messages[0].content, [
+      { type: 'image_url', image_url: { url: 'data:image/webp;base64,QUJD' } },
+    ]);
+  });
+
   it('collapses text-only parts to a string (preserves wire shape)', () => {
     const req = {
       contents: [{
