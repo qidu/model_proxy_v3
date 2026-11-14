@@ -723,6 +723,85 @@ describe('claudeJsonToSyntheticCompletions', () => {
 });
 
 // ---------------------------------------------------------------------------
+// convertGeminiGenerateContentToOpenAI — thought signatures
+// ---------------------------------------------------------------------------
+
+describe('convertGeminiGenerateContentToOpenAI — thought signatures', () => {
+  it('carries thoughtSignature to the Anthropic thinking block on a tool-call turn', async () => {
+    const completions = convertGeminiGenerateContentToOpenAI({
+      model: 'gpt-target',
+      contents: [
+        { role: 'user', parts: [{ text: 'weather in Paris?' }] },
+        {
+          role: 'model',
+          parts: [
+            { thought: true, text: 'call the tool', thoughtSignature: 'gemini-signature' },
+            { functionCall: { name: 'get_weather', args: { city: 'Paris' } } },
+          ],
+        },
+        { role: 'user', parts: [{ functionResponse: { name: 'get_weather', response: { temp: 21 } } }] },
+      ],
+    });
+
+    assert.deepEqual((completions.messages as any[])[1], {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_get_weather_0',
+        type: 'function',
+        function: { name: 'get_weather', arguments: '{"city":"Paris"}' },
+      }],
+      reasoning_content: 'call the tool',
+      reasoning_signature: 'gemini-signature',
+    });
+
+    const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
+    assert.deepEqual((claudeBody.messages as any[])[1], {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'call the tool', signature: 'gemini-signature' },
+        { type: 'tool_use', id: 'call_get_weather_0', name: 'get_weather', input: { city: 'Paris' } },
+      ],
+    });
+  });
+
+  it('carries thoughtSignature on an assistant turn without tool calls', async () => {
+    const completions = convertGeminiGenerateContentToOpenAI({
+      model: 'gpt-target',
+      contents: [{
+        role: 'model',
+        parts: [
+          { thought: true, text: 'pondering', thoughtSignature: 'gemini-signature' },
+          { text: 'answer' },
+        ],
+      }],
+    });
+    const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
+
+    assert.deepEqual((claudeBody.messages as any[])[0].content, [
+      { type: 'thinking', thinking: 'pondering', signature: 'gemini-signature' },
+      { type: 'text', text: 'answer' },
+    ]);
+  });
+
+  it('does not invent a signature when thoughtSignature is absent', async () => {
+    const completions = convertGeminiGenerateContentToOpenAI({
+      model: 'gpt-target',
+      contents: [{
+        role: 'model',
+        parts: [{ thought: true, text: 'pondering' }, { text: 'answer' }],
+      }],
+    });
+    const message = (completions.messages as any[])[0];
+    const claudeBody = await completionsToClaudeBody(completions as any, 'claude-target');
+    const thinking = (claudeBody.messages as any[])[0].content[0];
+
+    assert.equal('reasoning_signature' in message, false);
+    assert.deepEqual(thinking, { type: 'thinking', thinking: 'pondering' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // convertGeminiGenerateContentToOpenAI — toolConfig.functionCallingConfig
 // ---------------------------------------------------------------------------
 

@@ -818,6 +818,7 @@ export function convertGeminiGenerateContentToOpenAI(
       // assistant turn that performed a tool call — see
       // docs/review_of_antigravity_gemini_with_ds_tools.md.
       const thinkingContent = parts.filter((p: any) => p.thought && p.text).map((p: any) => p.text as string).join('');
+      const thinkingSignature = parts.find((p: any) => p.thought && p.text && typeof p.thoughtSignature === 'string' && p.thoughtSignature !== '')?.thoughtSignature as string | undefined;
       const textContent = parts.filter((p: any) => p.text && !p.thought).map((p: any) => p.text as string).join('');
 
       if (funcCallParts.length > 0) {
@@ -843,7 +844,10 @@ export function convertGeminiGenerateContentToOpenAI(
             },
           })),
         };
-        if (thinkingContent) msg.reasoning_content = thinkingContent;
+        if (thinkingContent) {
+          msg.reasoning_content = thinkingContent;
+          if (thinkingSignature) msg.reasoning_signature = thinkingSignature;
+        }
         messages.push(msg);
       } else if (funcRespParts.length > 0) {
         // User turn: convert functionResponse parts to OpenAI tool messages.
@@ -911,7 +915,10 @@ export function convertGeminiGenerateContentToOpenAI(
           for (const ip of imageParts) contentArr.push(ip);
           msg = { role, content: contentArr };
         }
-        if (thinkingContent) msg.reasoning_content = thinkingContent;
+        if (thinkingContent) {
+          msg.reasoning_content = thinkingContent;
+          if (thinkingSignature) msg.reasoning_signature = thinkingSignature;
+        }
         messages.push(msg);
       }
     }

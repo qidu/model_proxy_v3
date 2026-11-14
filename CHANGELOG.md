@@ -5,6 +5,19 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): carry Gemini thought signatures to Anthropic thinking blocks
+
+A `generateContent` request routed to an `anthropic-messages` upstream now maps a thought part's
+`thoughtSignature` through the Completions intermediate as `reasoning_signature`, then emits it as
+`signature` on the Claude `thinking` content block. Both assistant tool-call turns and ordinary
+assistant turns are covered. Missing or empty signatures remain omitted; none is synthesized.
+
+This is a schema mapping only: the opaque value is copied verbatim, without claiming that a
+Gemini-issued signature satisfies Anthropic's own signature verification.
+
+**Verification**: the focused handler suite passes 75/75 tests, including three new mapping cases;
+`npm run typecheck`, `npm run build`, and the full `npm run test:unit` suite pass (2986/2986).
+
 ### fix(handlers): a `/v1/responses` streaming request now asks the Gemini upstream to stream, and a non-SSE answer fails loudly
 
 Two defects at one seam, found by tracing `/v1/responses` + `gemini-generatecontent` + `stream: true`.

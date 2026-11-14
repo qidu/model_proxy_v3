@@ -123,9 +123,11 @@ export async function completionsToClaudeBody(completions: Record<string, unknow
   while (i < otherMessages.length) {
     const m = otherMessages[i];
     const thinking = (m as unknown as Record<string, unknown>).reasoning_content as string | undefined;
+    const reasoningSignature = (m as unknown as Record<string, unknown>).reasoning_signature;
+    const signature = typeof reasoningSignature === 'string' && reasoningSignature !== '' ? reasoningSignature : undefined;
     if (m.tool_calls) {
       const content: unknown[] = [];
-      if (thinking) content.push({ type: 'thinking', thinking });
+      if (thinking) content.push({ type: 'thinking', thinking, ...(signature ? { signature } : {}) });
       content.push(...m.tool_calls.map(tc => ({
         type: 'tool_use',
         id: tc.id,
@@ -154,7 +156,7 @@ export async function completionsToClaudeBody(completions: Record<string, unknow
       const blocks = typeof textOrBlocks === 'string'
         ? [{ type: 'text', text: textOrBlocks }]
         : textOrBlocks;
-      claudeMessages.push({ role: m.role, content: [{ type: 'thinking', thinking }, ...blocks] });
+      claudeMessages.push({ role: m.role, content: [{ type: 'thinking', thinking, ...(signature ? { signature } : {}) }, ...blocks] });
       i++;
     } else {
       const content = await openAIContentToClaudeStringOrBlocks(m.content);

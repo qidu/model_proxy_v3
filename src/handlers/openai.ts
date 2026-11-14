@@ -64,9 +64,9 @@ async function forwardCompletionsAsAnthropicMessages(
   // DeepSeek's anthropic-compatible endpoint REQUIRES a `content[].thinking`
   // block on any assistant turn that carried tool_use in thinking mode — a turn
   // with only tool_use blocks is rejected with "content[].thinking ... must be
-  // passed back". Gemini strips thoughtSignature so the real thinking cannot be
-  // replayed, but an unsigned (even empty) thinking block is accepted. Ensure a
-  // leading thinking block on every assistant tool_use turn that lacks one.
+  // passed back". Gemini clients often omit thoughtSignature; DeepSeek accepts
+  // an unsigned (even empty) thinking block. Ensure a leading thinking block on
+  // every assistant tool_use turn that lacks one.
   // Verified against the live upstream (2026-08-02).
   for (const m of (claudeBody.messages as Array<Record<string, unknown>>)) {
     if (m.role === 'assistant' && Array.isArray(m.content)) {
