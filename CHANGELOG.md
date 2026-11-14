@@ -5,6 +5,42 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refactor(handlers): the Completions intermediate gets its own two modules
+
+`src/handlers/openai.ts` had grown to 2200 lines and owned three unrelated jobs: the Claude
+`/v1/messages` front door, the Gemini front doors, and the whole cross-mode bridge. Two moves, no
+behavior change:
+
+| moved | from | to | lines |
+| --- | --- | --- | --- |
+| Gemini request → Completions (`convertGeminiGenerateContentToOpenAI`, `convertGeminiInteractionsToOpenAI` + `isGeminiInteractionsRequest`, `geminiPartsToOpenAIContent`, `geminiToolChoiceMode`, `geminiToolChoiceToOpenAI`, `normalizeGeminiSchema`, `defaultMissingOpenAIMessageRoles`) | `handlers/openai.ts` | `converters/gemini-to-openai.ts` | 553 |
+| the SSE egress seam (`handleCrossModeStreamingResponse`, `processAnthropicSSEBuffer`, `processResponsesSSEBuffer`, `processSSEBuffer`, `clearAnthropicSSEState`, `clearGeminiSSEState`, the per-request buffers, `openAIChunk` and the usage accumulators) | `handlers/openai.ts` | `handlers/cross-mode-stream.ts` | 503 |
+| what remains (native `openai-completions` paths, the second hop `completionsToClaudeBody` / `completionsToResponsesBody`, the two forwarders) | — | `handlers/openai.ts` | 1191 |
+
+The dependency now runs one way — `openai.ts` → both new modules, `cross-mode-stream.ts` →
+`openai-to-claude.ts` / `openai-to-gemini.ts` — so there is no import cycle. `processSSEBuffer` moved
+with the seam even though it also serves the native `openai-completions` stream: keeping it behind
+would have made the two modules import each other.
+
+The ingress converters now sit beside the other `from`-`to` pairs (`claude-to-openai.ts`,
+`openai-to-gemini.ts`, …) instead of inside a handler, which is the convention the file's own siblings
+already followed. Two stale cross-references were corrected while moving
+(`converters/openai-to-gemini.ts` now names the module `clearGeminiSSEState` lives in;
+`converters/claude-to-gemini.ts` drops a line number that was already wrong by ~550 lines), and the
+misplaced `/** Convert OpenAI streaming chunk to Claude format */` comment — separated from its
+function by the buffer block — is now adjacent to it.
+
+Verified as a pure move rather than by inspection: the two new files are **byte-identical** to the
+ranges they replace, apart from the `export` keywords the split requires and one doc-comment line
+reference, and `openai.ts` is byte-identical to the original minus those ranges plus the new import
+block. `npm run typecheck` clean, full unit suite 2838/2838 — the same 2838 tests that passed before
+the move.
+
+Docs: `docs/api/review-interactions-to-openai-responses-hops.md`'s hop-2 reference now names
+`completionsToResponsesBody` instead of a line number. The `docs/review-*` and `docs/contributing/review_*`
+snapshots still cite old `openai.ts` line numbers — those were already stale before this move and were
+left as historical records.
+
 ### fix(converters): Gemini `ANY` reaches a non-Gemini upstream as "must call a tool"
 
 A Gemini client that constrains the model to a tool call —

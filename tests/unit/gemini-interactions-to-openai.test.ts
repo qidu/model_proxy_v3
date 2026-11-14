@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   convertGeminiInteractionsToOpenAI,
+} from '../../src/converters/gemini-to-openai.js';
+import {
   completionsToClaudeBody,
   completionsToResponsesBody,
 } from '../../src/handlers/openai.js';

@@ -183,7 +183,7 @@ instead of `input[]`, so its `input[]` indices shift down one. Pinned in
 Only the middle bucket is an architecture question. The bottom row — 7 fields including every sampling
 knob — is a mapping gap in `convertGeminiInteractionsToOpenAI`, not a consequence of the intermediate,
 and `completionsToResponsesBody` already carries `temperature`/`top_p`/`max_tokens`
-(`src/handlers/openai.ts:1018-1020`), so hop 2 was already waiting for them.
+(`completionsToResponsesBody` in `src/handlers/openai.ts`), so hop 2 was already waiting for them.
 
 Therefore, in order:
 

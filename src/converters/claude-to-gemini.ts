@@ -187,7 +187,7 @@ export function decodeDataUriOrRef(value: string | BlobRef): { mime_type: string
 /**
  * Convert an OpenAI Chat Completions request body into a Gemini
  * generateContent request body. Mirrors `completionsToClaudeBody`
- * (src/handlers/openai.ts:499) for the anthropic-messages cross-mode route.
+ * (`src/handlers/openai.ts`) for the anthropic-messages cross-mode route.
  *
  * Async because http(s) image_url values are fetched server-side with an SSRF
  * guard (src/utils/image-fetch.ts). `data:` URIs are decoded synchronously.

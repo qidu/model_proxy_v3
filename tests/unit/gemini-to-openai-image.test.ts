@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { convertGeminiGenerateContentToOpenAI, convertGeminiInteractionsToOpenAI } from '../../src/handlers/openai.js';
+import { convertGeminiGenerateContentToOpenAI, convertGeminiInteractionsToOpenAI } from '../../src/converters/gemini-to-openai.js';
 
 /**
  * Coverage for image-part handling in the Gemini generateContent request ->

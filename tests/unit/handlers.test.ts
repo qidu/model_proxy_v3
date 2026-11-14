@@ -19,8 +19,8 @@ import {
   completionsToClaudeBody,
   completionsToResponsesBody,
   claudeJsonToSyntheticCompletions,
-  convertGeminiGenerateContentToOpenAI,
 } from '../../src/handlers/openai.js';
+import { convertGeminiGenerateContentToOpenAI } from '../../src/converters/gemini-to-openai.js';
 import { isGeminiRequest } from '../../src/handlers/gemini.js';
 import { ValidationError } from '../../src/utils/errors.js';
 import type { Logger } from '../../src/types/shared.js';

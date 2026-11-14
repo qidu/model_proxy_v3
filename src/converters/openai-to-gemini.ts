@@ -44,7 +44,7 @@ export function registerGeminiToolSchemas(requestId: string, schemasByName: Map<
     geminiToolSchemas.set(requestId, schemasByName);
 }
 
-/** Remove a request's tool-parameter schemas (called from clearGeminiSSEState). */
+/** Remove a request's tool-parameter schemas (called from `clearGeminiSSEState` in `handlers/cross-mode-stream.ts`). */
 export function clearGeminiToolSchemas(requestId: string): void {
     geminiToolSchemas.delete(requestId);
 }
