@@ -134,6 +134,7 @@ export type BlobRefKind =
   | 'chat-input-audio'
   | 'chat-file-data'
   | 'gemini-inline-data'
+  | 'interactions-media-data'
   | 'responses-input-image'
   | 'responses-input-file'
   | 'responses-inline-skill'
@@ -292,6 +293,24 @@ function addGeminiPart(node: Holder, add: AddPosition): void {
 }
 
 /**
+ * The Interactions `Content` media part, appended by both allowlists: it names
+ * itself with `type` (`image`, `audio`, `video`, `document`) and carries its bytes
+ * bare in `data`, where the generateContent part declares no discriminator and
+ * nests them under `inline_data`.
+ *
+ * `Content` is the one schema the Interactions API uses in *both* directions —
+ * a request's `input` and a response's `outputs` — which is why this is the only
+ * predicate the response allowlist shares with the request's. Its `type` values
+ * overlap Claude's, so the two are told apart by where the payload sits: `data`
+ * here, `source.data` there. Each predicate is a no-op on the other's shape.
+ */
+function addInteractionsMedia(node: Holder, add: AddPosition): void {
+  if (node.type === 'image' || node.type === 'audio' || node.type === 'video' || node.type === 'document') {
+    add(node, 'data', 'interactions-media-data', 'bare');
+  }
+}
+
+/**
  * Every §5.4 payload position in one request node, keyed on the documented `type`
  * discriminators. Anything the client could put in a field of the same name
  * elsewhere is untouched.
@@ -343,6 +362,7 @@ function positionsFor(node: Holder): FoundPositions {
     }
 
     addGeminiPart(node, add);
+    addInteractionsMedia(node, add);
   });
 }
 
@@ -361,6 +381,11 @@ function positionsFor(node: Holder): FoundPositions {
  * be exactly the indiscriminate use of a request predicate §5.7 rules out. A
  * streaming binary field outside this list needs its own predicate and
  * round-trip tests before it is added.
+ *
+ * The one predicate it shares with the request list is the Interactions media
+ * content (`addInteractionsMedia`), because that schema — unlike Claude's or Chat
+ * Completions' — is the documented shape of a response's `outputs` as well as a
+ * request's `input`.
  */
 function positionsForResponse(node: Holder): FoundPositions {
   return findPositions((add) => {
@@ -369,6 +394,7 @@ function positionsForResponse(node: Holder): FoundPositions {
     if (node.type === 'image_generation_call') add(node, 'result', 'responses-image-generation-result', 'bare');
 
     addGeminiPart(node, add);
+    addInteractionsMedia(node, add);
   });
 }
 

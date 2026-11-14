@@ -5,6 +5,116 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): `/v1/interactions` on a `gemini-generatecontent` upstream — the request, the response, and a streaming egress that never converted
+
+`/v1/interactions` served by `upstream_mode = "gemini-generatecontent"` is the Interactions API
+converted both ways by one function (`handleGeminiInteractionsRequest`). A review of that route found
+six defects, five in the conversion and one in the streaming egress. All six are fixed here.
+
+**The request.** The mapping was inline in the handler and translated only `text` parts; the rest of
+the Interactions request surface was copied through under names the upstream rejects (Google's JSON
+parser fails the whole request on an unknown field name, so the client received an error naming a
+field it never wrote):
+
+| client sent | upstream received | consequence |
+| --- | --- | --- |
+| `input` as a single `Content`, a single `Turn`, an unknown shape, or `[]` | `contents: []`, or one content with an empty `parts` | an upstream 400 about `contents`, a field the client never wrote |
+| `input: "…"` plus an `image`/`audio`/`video`/`document` part | the Interactions part verbatim | `type`/`mime_type`/`data` are not generateContent part fields |
+| `function_call`, `function_result`, `thought`, `code_execution_*` parts | the Interactions part verbatim | as above |
+| `tools: [{type:'function', name, …}]` | the flat Interactions `Tool` | needs `{functionDeclarations:[…]}`; a predefined family needs `{googleSearch:{}}` |
+| `generation_config: {top_p, max_output_tokens, stop_sequences, thinking_level, thinking_summaries, tool_choice, …}` | the same object as `generationConfig` | only `topP`/`maxOutputTokens`/`stopSequences`/`thinkingConfig` exist; `tool_choice` belongs in `toolConfig.functionCallingConfig` |
+| `response_format`, `response_mime_type`, `response_modalities` | dropped silently | they are `generationConfig.responseSchema`/`responseMimeType`/`responseModalities` |
+
+The conversion now lives in **`converters/interactions-to-gemini.ts`** and maps every declared part
+type, both tool dialects (the flat Interactions one, and a `{functionDeclarations:[…]}` a transform or
+native client wrote — the sibling converter reads both in the other direction), the generation knobs,
+and the top-level response knobs. Choices worth knowing:
+
+- **A body that yields no content is refused with a 400**, not sent as `contents: []`. `input: []` is
+  the case the old suite pinned as acceptable; it now pins the refusal.
+- **A `system`/`developer` message inside `input.messages` is hoisted into `systemInstruction`**
+  rather than refused, joining a top-level `system_instruction` when both are present. `contents` only
+  knows 'user' and 'model', and this front door's Completions hop already carries a system message.
+- **`thinking_level`/`thinking_summaries` map to `thinkingConfig.thinkingLevel`/`includeThoughts`**;
+  `thinking_level` is carried by name — a model that does not take a level says so itself — and
+  re-cased, because every generateContent enum identifier this route emits is upper case
+  (`AUTO`/`ANY`/`NONE`, `OUTCOME_OK`, `PYTHON`, `responseModalities`) while the Interactions level is
+  declared lower case (`interactions.md:51`).
+- **Unmappable fields are logged, not dropped in silence** (rule #8): `agent`, `agent_config`,
+  `background`, `previous_interaction_id`, `store`, `speech_config`. `mcp_server` tools and an
+  unparseable `tool_choice` are refused (400) instead, because guessing either earns an upstream error
+  naming the guess. `speech_config` and `mcp_server` are one-line maps once the upstream spelling is
+  pinned; nothing in this repo pins it.
+- Parts are read tolerantly in the three dialects a body reaching this front door can hold:
+  generateContent's own (`{inline_data}`, `{functionCall}`, …) is relayed unchanged, so §5.4's ref
+  positions do not move; Claude's `{type:'image', source:{…}}` is read from `source.data`. The relay
+  list is limited to the spellings something in this repo reads or writes — the camelCase keys plus
+  the `inline_data`/`file_data` snake twins (`gemini-to-openai.ts:52`, `gemini-to-claude.ts:230`,
+  §5.4's allowlist). A snake twin with no reader (`function_call`, `function_response`,
+  `executable_code`, `code_execution_result`) is **refused**, not relayed: generateContent does not
+  declare those names either, so relaying one would earn the same upstream error naming a field the
+  client never wrote that this converter exists to prevent.
+
+**The response.** A new **`converters/gemini-to-interactions.ts`** replaces the inline mapping, which
+had two defects a client acts on directly:
+
+- **`status` was the literal `'completed'`** and `candidates[0].finishReason` was never read. A
+  `MAX_TOKENS` answer claimed to be complete; a `SAFETY` block with no candidate content claimed to be
+  a completed answer with `outputs: []`. The Interactions `status` enum has no "truncated" member and
+  the resource does declare an `error`, so blocked and truncated answers are now `failed`, with any
+  partial outputs retained and the upstream's own reason in `error.code` (a URI naming the
+  `FinishReason`/`BlockReason` enum member, e.g.
+  `https://ai.google.dev/api/generate-content#FinishReason.MAX_TOKENS`) and in `error.message`. A
+  cleanly stopped `functionCall` is `requires_action`, matching the Interactions response contract.
+  `promptFeedback.blockReason` is a block too, and only a non-unspecified one — a `promptFeedback`
+  carrying just `safetyRatings` is not.
+- **Non-text parts arrived in the upstream's dialect.** `{inlineData}`/`{functionCall}` reached the
+  client with no `type` discriminator, which the Interactions `Content` requires; a `{thought:true,
+  text}` part became `{type:'text'}`, i.e. the model's reasoning was served as its answer. Each part
+  kind is now the `Content` that expresses it, and `usage` carries `total_thought_tokens`/
+  `total_tool_use_tokens` instead of dropping them.
+- **`id` is the upstream's own `responseId`** rather than a minted `v1_<timestamp>_<requestId>`. That
+  id is the one a client would send back as `previous_interaction_id`; the minted one was never
+  resolvable anywhere. A minted id remains only as the fallback for an upstream that supplies none.
+
+**The streaming egress never converted.** `handleGeminiStreamingResponse` wrapped its transformer in a
+second `TransformStream`, and a `TransformStream` instance exposes only `readable`/`writable` — so the
+wrapper had no `transform` and passed every byte through. The client received the upstream's own
+`{candidates:[…]}` chunks **whatever dialect it had asked in**: this file's own regression pins for
+`/v1/messages` over a Gemini upstream are included in this change for that reason. The egress now
+selects by client dialect — a native client keeps the upstream framing, a `/v1/messages` client gets
+Claude SSE, and a `/v1/interactions` client gets the `event_type` events
+(`createInteractionsStreamTransformer`, new): `interaction.start`, `content.start`/`content.delta`
+(one text content, appended per chunk)/`content.stop`, then `interaction.complete`. The closing
+interaction is produced by calling `convertGenerateContentToInteraction` over the parts the stream
+accumulated, so the streamed and non-streamed `status`, `error`, `outputs` and `usage` cannot drift. A
+stream that ends before a `finishReason` now aborts rather than closing as a finished interaction (the
+same refusal `createStreamTransformer` makes for a missing `[DONE]`), and a blocked prompt — which
+arrives as a chunk with `promptFeedback` and no `finishReason` at all — is terminal instead. The one
+field the two paths could still have disagreed on is an id minted for a `functionCall` the upstream
+sent without one (Gemini omits it): the streamed content was converted as a one-part answer, so it
+announced `call_0` while the closing interaction reported `call_1` — and two such calls were announced
+as `call_0` twice. Both paths now mint from the part's position in the answer
+(`convertGenerateContentToInteraction`'s new `partIndexBase`).
+
+**§5.4/§5.7 grew one position.** The response's `outputs` are the Interactions `Content`, whose media
+part holds its bytes bare in `data` under a `type` discriminator; the allowlists knew only the
+generateContent part. `addInteractionsMedia` adds that position to both lists (kind
+`interactions-media-data`) — the response list's one shared predicate, because `Content` is the single
+schema the Interactions API uses in both directions. Without it the converted response's image would
+have left the §5.7 allowlist and stayed inline instead of moving to the response's scratch store; the
+§5.4 request walk gains the same position, so an Interactions-dialect image is now a ref position on
+the way in too.
+
+Four new test files/expansions pin this: `interactions-to-gemini.test.ts` (the request tables, the
+refusals — the snake part keys generateContent does not declare among them —, the dropped report, the
+re-cased thinking level), `gemini-to-interactions.test.ts` (the finish-reason split, part translation,
+`responseId`), `interactions-stream-events.test.ts` (the three dialects, the truncation abort, and the
+one id a streamed call and its closing interaction must agree on), and the
+`gemini-interactions-input.test.ts` rewrite (the input shapes, with the empty-`contents` pin
+reversed). `gemini-response-spool.test.ts`'s expected converted part and `blob-refs`/`auth-projection`'s
+predicate matrices were updated for the new position.
+
 ### fix(handlers): a Gemini client on an `openai-responses` upstream gets `finishReason`, tool calls, reasoning and usage
 
 `/v1beta/models/{model}:streamGenerateContent?alt=sse` (and `/v1/interactions`) routed to

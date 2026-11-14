@@ -131,6 +131,9 @@ function matrixBody(): Record<string, unknown> {
       { inline_data: { mime_type: 'video/mp4', data: bytes('g') } },
       { inlineData: { mimeType: 'audio/mp3', data: bytes('h') } },
     ],
+    interactions: [
+      { type: 'image', data: bytes('m'), mime_type: 'image/png' },
+    ],
     responses: [
       { type: 'input_image', image_url: `data:image/jpeg;base64,${bytes('i')}` },
       { type: 'input_image', image_url: { url: `data:image/jpeg;base64,${bytes('j')}` } },
@@ -161,6 +164,7 @@ const POSITIONS: Array<{
   { path: ['chat', 3, 'file', 'file_data'], kind: 'chat-file-data', mediaType: 'application/pdf' },
   { path: ['gemini', 0, 'inline_data', 'data'], kind: 'gemini-inline-data', mediaType: 'video/mp4' },
   { path: ['gemini', 1, 'inlineData', 'data'], kind: 'gemini-inline-data', mediaType: 'audio/mp3' },
+  { path: ['interactions', 0, 'data'], kind: 'interactions-media-data', mediaType: 'image/png' },
   { path: ['responses', 0, 'image_url'], kind: 'responses-input-image', mediaType: 'image/jpeg' },
   { path: ['responses', 1, 'image_url', 'url'], kind: 'responses-input-image', mediaType: 'image/jpeg' },
   { path: ['responses', 2, 'file_data'], kind: 'responses-input-file', mediaType: null },

@@ -505,7 +505,11 @@ describe('gemini.ts /v1/interactions non-SSE converted response (§5.7)', () => 
     assert.deepEqual(parsed.outputs[0], { type: 'text', text: '日本語 — ✓ ok' }, 'the text part is converted');
     assert.deepEqual(
       parsed.outputs[1],
-      { inlineData: { mimeType: 'image/png', data: IMAGE_B64 } },
+      // The Interactions `Content` the client asked in, not the upstream's own
+      // `{inlineData:{…}}` dialect: `type` is required by that schema, and the
+      // response allowlist grew the matching `data` position
+      // (`addInteractionsMedia`), which is what keeps this payload extracted.
+      { type: 'image', data: IMAGE_B64, mime_type: 'image/png' },
       'the generated image round-trips at its own position',
     );
     assert.ok(text.includes(IMAGE_B64), 'the payload is on the wire, not just a marker');

@@ -10,8 +10,10 @@ import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStre
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { GeminiInteractionRequest, GeminiInteractionResponse } from '../types/gemini.js';
 import { convertClaudeToGeminiRequest } from '../converters/claude-to-gemini.js';
+import { convertInteractionsToGenerateContent } from '../converters/interactions-to-gemini.js';
+import { convertGenerateContentToInteraction } from '../converters/gemini-to-interactions.js';
 import { convertGeminiGenerateContentToClaude } from '../converters/gemini-to-claude.js';
-import { createGeminiStreamTransformer, createNativeGeminiStreamTransformer } from '../converters/gemini-streaming.js';
+import { createGeminiStreamTransformer, createNativeGeminiStreamTransformer, createInteractionsStreamTransformer } from '../converters/gemini-streaming.js';
 import { ClaudeProxyError, handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
@@ -162,87 +164,25 @@ async function handleGeminiInteractionsRequest(
     logPipelineHeaders(activeLogger, requestId, 'inbound', '/v1/interactions', request.headers);
 
     activeLogger.debug(requestId, `Interactions request to: ${targetUrl}`);
-    
-    // Convert Interactions format to generateContent format
-    const geminiRequest: Record<string, unknown> = {
-        contents: []
-    };
-    
-    // Handle input field (string, object with messages, Content, array of Content, or array of Turn)
-    if (typeof requestBody.input === 'string') {
-        geminiRequest.contents = [{ role: 'user', parts: [{ text: requestBody.input }] }];
-    } else if (requestBody.input && typeof requestBody.input === 'object' && 'messages' in requestBody.input) {
-        // Handle input.messages format (Interactions API standard)
-        const input = requestBody.input as Record<string, unknown>;
-        if (Array.isArray(input.messages)) {
-            geminiRequest.contents = input.messages.map((msg: any) => ({
-                role: msg.role === 'assistant' ? 'model' : msg.role,
-                parts: typeof msg.content === 'string' 
-                    ? [{ text: msg.content }]
-                    : Array.isArray(msg.content)
-                        ? msg.content.map((c: any) => c.type === 'text' ? { text: c.text } : c)
-                        : [{ text: String(msg.content) }]
-            }));
-        }
-    } else if (Array.isArray(requestBody.input)) {
-        // Check if it's array of Turn (has role field), array of input steps
-        // (has type field), or array of Content
-        const firstItem = requestBody.input[0] as any;
-        if (firstItem && 'role' in firstItem) {
-            // Array of Turn format
-            geminiRequest.contents = requestBody.input.map((turn: any) => ({
-                role: turn.role === 'model' ? 'model' : 'user',
-                parts: typeof turn.content === 'string' 
-                    ? [{ text: turn.content }]
-                    : Array.isArray(turn.content)
-                        ? turn.content.map((c: any) => c.type === 'text' ? { text: c.text } : c)
-                        : [{ text: String(turn.content) }]
-            }));
-        } else if (firstItem && (firstItem.type === 'user_input' || firstItem.type === 'model_output')) {
-            // Array of input steps: a step's `type` stands in for a Turn's
-            // `role`. `user_input` is the client's turn; `model_output` is the
-            // model's own earlier turn, which generateContent spells 'model'.
-            geminiRequest.contents = requestBody.input.map((step: any) => ({
-                role: step.type === 'model_output' ? 'model' : 'user',
-                parts: typeof step.content === 'string'
-                    ? [{ text: step.content }]
-                    : Array.isArray(step.content)
-                        ? step.content.map((c: any) => c.type === 'text' ? { text: c.text } : c)
-                        : [{ text: String(step.content) }]
-            }));
-        } else {
-            // Array of Content format
-            geminiRequest.contents = [{ 
-                role: 'user', 
-                parts: requestBody.input.map((c: any) => c.type === 'text' ? { text: c.text } : c)
-            }];
-        }
+
+    // Convert Interactions format to generateContent format. The mapping lives in
+    // `converters/interactions-to-gemini.ts`; a body this route cannot express is
+    // refused there with a 400 rather than sent upstream to be rejected by name.
+    const { body: geminiRequest, dropped } = convertInteractionsToGenerateContent(requestBody);
+    if (dropped.length > 0) {
+        // Rule #8: a field with no generateContent equivalent changes what the
+        // client asked for, so the drop is reported rather than inferred from a
+        // quietly different answer.
+        activeLogger.warn(
+            requestId,
+            `Interactions request fields with no generateContent equivalent were dropped: ${dropped.join(', ')}`
+        );
     }
-    
+
     // Check for streaming
-    const isStreaming = requestBody.stream === true;
-    
-    // Copy generation config
-    if (requestBody.generation_config) {
-        geminiRequest.generationConfig = requestBody.generation_config;
-    }
-    if (requestBody.system_instruction) {
-        geminiRequest.systemInstruction = { parts: [{ text: requestBody.system_instruction as string }] };
-    }
-    if (requestBody.tools) {
-        geminiRequest.tools = requestBody.tools;
-    }
-    if (requestBody.cached_content) {
-        geminiRequest.cachedContent = requestBody.cached_content;
-    }
-    
-    // Add stream parameter to gemini request
-    if (isStreaming) {
-        geminiRequest.stream = true;
-    }
-    
+    let isStreaming = geminiRequest.stream === true;
+
     activeLogger.debug(requestId, `Converted request: ${JSON.stringify(geminiRequest).substring(0, 200)}...`);
-    activeLogger.debug(requestId, `Is streaming: ${isStreaming}`);
     
     // Prepare headers for Gemini API - authHeaders already contains the correct format
     // from the main router (x-goog-api-key for native Gemini mode)
@@ -254,6 +194,14 @@ async function handleGeminiInteractionsRequest(
     activeLogger.debug(requestId, `Using auth headers: ${Object.keys(geminiHeaders).join(', ')}`);
     geminiHeaders = addForwardedHeaders(geminiHeaders, request);
     const fullTargetUrl = constructGeminiUrl(targetUrl, request, geminiRequest, modelId || requestBody.model as string | undefined);
+
+    // A target that names the streaming method streams whether or not the client
+    // asked to — the same rule the generateContent branch below applies. Without
+    // it an SSE body was taken for a JSON one and failed to parse.
+    if (fullTargetUrl.includes(':streamGenerateContent')) {
+        isStreaming = true;
+    }
+    activeLogger.debug(requestId, `Is streaming: ${isStreaming}`);
 
     let upstreamBodyGemini: Record<string, unknown> = geminiRequest;
     if (route) {
@@ -324,44 +272,31 @@ async function handleGeminiInteractionsRequest(
     try {
         const geminiResponseText = await received.readText();
         logPipelineStage(activeLogger, requestId, 'upstream-response', fullTargetUrl, geminiResponseText);
-        const geminiResponse = JSON.parse(geminiResponseText) as any;
 
-        const interactionResponse = {
-            id: `v1_${Date.now()}_${requestId}`,
-            model: requestBody.model || modelId || 'gemini-no-id-at-proxy',
-            status: 'completed',
-            object: 'interaction',
-            created: new Date().toISOString(),
-            updated: new Date().toISOString(),
-            role: 'model',
-            outputs: [] as any[],
-            usage: {
-                total_input_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
-                total_output_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0,
-                total_tokens: geminiResponse.usageMetadata?.totalTokenCount || 0,
-                ...(geminiResponse.usageMetadata?.cachedContentTokenCount ? { total_cached_tokens: geminiResponse.usageMetadata.cachedContentTokenCount } : {}),
-            }
-        };
-
-        // Convert candidates to outputs
-        if (geminiResponse.candidates && geminiResponse.candidates.length > 0) {
-            const candidate = geminiResponse.candidates[0];
-            if (candidate.content && candidate.content.parts) {
-                interactionResponse.outputs = candidate.content.parts.map((part: any) => {
-                    if (part.text) {
-                        return { type: 'text', text: part.text };
-                    }
-                    return part;
-                });
-            }
+        // The mapping lives in `converters/gemini-to-interactions.ts`: it carries
+        // the upstream's `finishReason` into the interaction's `status`/`error`
+        // and translates every content kind, rather than relaying the
+        // generateContent parts through in their own dialect.
+        const { interaction, dropped: droppedParts } = convertGenerateContentToInteraction(
+            JSON.parse(geminiResponseText),
+            (requestBody.model as string) || modelId || 'gemini-no-id-at-proxy',
+            requestId
+        );
+        if (droppedParts.length > 0) {
+            // Rule #8: a content kind with no Interactions projection would
+            // otherwise leave a shorter answer with no trace of what went missing.
+            activeLogger.warn(
+                requestId,
+                `Upstream content with no Interactions projection was dropped: ${droppedParts.join(', ')}`
+            );
         }
 
-        logPipelineStage(activeLogger, requestId, 'outbound', '/v1/interactions', interactionResponse);
+        logPipelineStage(activeLogger, requestId, 'outbound', '/v1/interactions', interaction);
         // §5.7 converted-response egress: the generated image in a non-text part
         // goes to this response's own scratch store and comes back as the client
         // takes the skeleton, so relaying it costs one chunk rather than a second
         // full copy. The parsed body's spill is released below, before the send.
-        converted = await createConvertedResponseBody(interactionResponse);
+        converted = await createConvertedResponseBody(interaction);
     } finally {
         lease.release();
         await received.release();
@@ -510,12 +445,17 @@ async function handleGeminiGenerateContentRequest(
 
         // Handle streaming response
         if (isStreaming) {
-            const endpointType = outputFormat === 'claude-format' ? 'interactions' : 'native-gemini';
-            return handleGeminiStreamingResponse(response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger, endpointType);
+            // `claude-format` is a `/v1/messages` client: it reads Claude SSE. The
+            // name `interactions` used to stand in for it here, which is how this
+            // egress came to emit the wrong dialect (see `handleGeminiStreamingResponse`).
+            return handleGeminiStreamingResponse(
+                response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger,
+                outputFormat === 'claude-format' ? 'claude-format' : 'native-gemini'
+            );
         }
 
         // Handle non-streaming response
-        const endpointType = outputFormat === 'claude-format' ? 'interactions' : 'native-gemini';
+        const endpointType = outputFormat === 'claude-format' ? 'claude-format' : 'native-gemini';
         return handleGeminiNonStreamingResponse(response, effectiveModelId || 'gemini-no-id-at-proxy', requestId, activeLogger, endpointType, request.signal);
 
     } catch (error) {
@@ -564,13 +504,18 @@ function constructGeminiUrl(targetUrl: string, request: Request, geminiRequest: 
 
 /**
  * Handle non-streaming response
+ *
+ * `endpointType` here is `'claude-format'` for a `/v1/messages` client (converted
+ * to a Claude response) and `'native-gemini'` for a native client (relayed). It
+ * was spelled `'interactions'` for the first of those, which is the name the
+ * streaming egress then took for a third dialect it did not have.
  */
 async function handleGeminiNonStreamingResponse(
     response: Response,
     model: string,
     requestId: string,
     logger: Logger,
-    endpointType: 'interactions' | 'native-gemini' = 'interactions',
+    endpointType: 'claude-format' | 'native-gemini' = 'claude-format',
     signal?: AbortSignal
 ): Promise<Response> {
     if (endpointType === 'native-gemini') {
@@ -679,6 +624,14 @@ async function relayNativeGeminiResponse(
 }
 
 /**
+ * The dialect the *client* asked in, which decides how the upstream's SSE is
+ * rendered. They are not interchangeable: a `/v1beta/models/…:streamGenerateContent`
+ * client reads generateContent chunks, a `/v1/messages` client reads Claude SSE
+ * events, and a `/v1/interactions` client reads `event_type` events.
+ */
+type ClientStreamDialect = 'native-gemini' | 'claude-format' | 'interactions';
+
+/**
  * Handle streaming response
  */
 async function handleGeminiStreamingResponse(
@@ -686,27 +639,36 @@ async function handleGeminiStreamingResponse(
     model: string,
     requestId: string,
     logger: Logger,
-    endpointType: 'interactions' | 'native-gemini' = 'interactions'
+    dialect: ClientStreamDialect = 'interactions'
 ): Promise<Response> {
     if (!response.body) {
         throw new Error('Response body is not readable');
     }
 
     try {
-        logger.debug(requestId, 'Gemini streaming response started');
+        logger.debug(requestId, `Gemini streaming response started (${dialect} client)`);
 
-        // Create streaming transformer based on endpoint type
-        const transformer = endpointType === 'native-gemini'
-            ? createNativeGeminiStreamTransformer(model, requestId)
-            : createGeminiStreamTransformer(model, requestId);
+        // A native client reads the upstream's own framing. The other two get the
+        // transformer for their dialect — each of which returns a TransformStream
+        // already, so it is piped as itself. It used to be wrapped in a second
+        // `TransformStream`, which has no `transform` of its own and therefore
+        // passed every byte through: `/v1/messages` and `/v1/interactions`
+        // streaming clients both received raw generateContent chunks.
+        const transformedStream = response.body
+            .pipeThrough(observeStream(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', 'sse-lines'));
 
         // §5.7: both the raw upstream SSE and the outbound events are logged by
         // observing the one path the client already reads, rather than by teeing
         // each a second reader that would pull the stream through on its own.
-        const transformerObj = transformer as any;
-        const transformedStream = response.body
-            .pipeThrough(observeStream(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', 'sse-lines'))
-            .pipeThrough(new TransformStream(transformerObj))
+        const convertedStream = dialect === 'native-gemini'
+            ? transformedStream.pipeThrough(createNativeGeminiStreamTransformer(model, requestId))
+            : transformedStream.pipeThrough(
+                dialect === 'claude-format'
+                    ? createGeminiStreamTransformer(model, requestId)
+                    : createInteractionsStreamTransformer(model, requestId, logger)
+            );
+
+        const outboundStream = convertedStream
             .pipeThrough(observeStream(logger, requestId, 'outbound', 'stream', 'sse-lines'));
 
         const streamOutHeaders = {
@@ -716,7 +678,7 @@ async function handleGeminiStreamingResponse(
             'x-request-id': requestId,
         };
         logPipelineHeaders(logger, requestId, 'outbound', 'stream', streamOutHeaders);
-        return new Response(transformedStream, { status: 200, headers: streamOutHeaders });
+        return new Response(outboundStream, { status: 200, headers: streamOutHeaders });
     } catch (error) {
         logger.error(requestId, `Error creating streaming response: ${(error as Error).message}`);
         throw new Error(`Failed to create streaming response: ${(error as Error).message}`);

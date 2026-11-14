@@ -187,6 +187,9 @@ function matrixBody(): Record<string, unknown> {
       { inline_data: { mime_type: 'video/mp4', data: bytes('g') } },
       { inlineData: { mimeType: 'audio/mp3', data: bytes('h') } },
     ],
+    interactions: [
+      { type: 'image', data: bytes('m'), mime_type: 'image/png' },
+    ],
     responses: [
       { type: 'input_image', image_url: `data:image/jpeg;base64,${bytes('i')}` },
       { type: 'input_image', image_url: { url: `data:image/jpeg;base64,${bytes('j')}` } },
@@ -204,16 +207,16 @@ describe('§5.4 allowlist round-trip matrix', () => {
 
     const result = await extractInlineBlobs(body);
 
-    // Twelve positions, twelve refs, and the byte total is what left the body.
-    assert.equal(result.refs, 12, 'every allowlisted position must hold a ref');
-    assert.equal(result.bytes, 12 * MATRIX_CHARS);
-    assert.equal(collectBlobRefs(body).length, 12);
-    assert.equal(blobFiles(config).length, 12, 'each distinct payload is one L2 file');
-    assert.equal(getBlobStoreStats().diskBytes, 12 * MATRIX_CHARS);
+    // Thirteen positions, thirteen refs, and the byte total is what left the body.
+    assert.equal(result.refs, 13, 'every allowlisted position must hold a ref');
+    assert.equal(result.bytes, 13 * MATRIX_CHARS);
+    assert.equal(collectBlobRefs(body).length, 13);
+    assert.equal(blobFiles(config).length, 13, 'each distinct payload is one L2 file');
+    assert.equal(getBlobStoreStats().diskBytes, 13 * MATRIX_CHARS);
 
     // The parse tree is small now: no field at an extracted position holds bytes.
     const skeleton = JSON.stringify(body);
-    assert.ok(skeleton.length < 4096, `a ref skeleton must be small, got ${skeleton.length} bytes for 12 MiB of payload`);
+    assert.ok(skeleton.length < 4096, `a ref skeleton must be small, got ${skeleton.length} bytes for 13 MiB of payload`);
     for (const ref of collectBlobRefs(body)) {
       assert.equal(ref.size, MATRIX_CHARS);
     }
@@ -223,13 +226,13 @@ describe('§5.4 allowlist round-trip matrix', () => {
     // one body per attempt); the original body keeps its refs and its leases.
     const copy = snapshot(body);
     const expanded = await rehydrateInlineBlobs(copy);
-    assert.equal(expanded, 12);
+    assert.equal(expanded, 13);
     assert.deepStrictEqual(copy, before);
     assert.equal(JSON.stringify(copy), JSON.stringify(before), 'wire bytes must match the input exactly');
 
     // The body owner gives back one lease per ref; nothing stays leased.
-    assert.equal(releaseInlineBlobs(body), 12);
-    assert.equal((await evictIdleBlobs(Date.now() + (config.ttlSeconds * 1000) + 1000)), 12);
+    assert.equal(releaseInlineBlobs(body), 13);
+    assert.equal((await evictIdleBlobs(Date.now() + (config.ttlSeconds * 1000) + 1000)), 13);
     assert.equal(getBlobStoreStats().diskEntries, 0);
   });
 
@@ -248,6 +251,7 @@ describe('§5.4 allowlist round-trip matrix', () => {
       [['chat', 3, 'file', 'file_data'], 'chat-file-data', 'data:application/pdf;base64,'],
       [['gemini', 0, 'inline_data', 'data'], 'gemini-inline-data', ''],
       [['gemini', 1, 'inlineData', 'data'], 'gemini-inline-data', ''],
+      [['interactions', 0, 'data'], 'interactions-media-data', ''],
       [['responses', 0, 'image_url'], 'responses-input-image', 'data:image/jpeg;base64,'],
       [['responses', 1, 'image_url', 'url'], 'responses-input-image', 'data:image/jpeg;base64,'],
       [['responses', 2, 'file_data'], 'responses-input-file', ''],
@@ -264,13 +268,13 @@ describe('§5.4 allowlist round-trip matrix', () => {
     // Only the payload went to the blob, so the rehydrated field is the original
     // string — prefix included — rather than a rewritten data URL.
     const refs = collectBlobRefs(body);
-    assert.equal(await rehydrateInlineBlobs(body), 12);
+    assert.equal(await rehydrateInlineBlobs(body), 13);
     assert.equal(at(body, 'chat', 0, 'image_url', 'url'), `data:image/png;base64,${payload('c', MATRIX_CHARS)}`);
     assert.equal(at(body, 'responses', 3, 'source', 'data'), payload('l', MATRIX_CHARS));
 
     for (const ref of refs) releaseBlob(ref.hash);
-    assert.equal(blobFiles(config).length, 12, 'a released blob file is still there until it is idle-evicted');
-    assert.equal(await evictIdleBlobs(Date.now() + (SPOOL_DEFAULTS.ttlSeconds * 1000) + 1000), 12);
+    assert.equal(blobFiles(config).length, 13, 'a released blob file is still there until it is idle-evicted');
+    assert.equal(await evictIdleBlobs(Date.now() + (SPOOL_DEFAULTS.ttlSeconds * 1000) + 1000), 13);
     assert.equal(blobFiles(config).length, 0);
     assert.equal(getBlobStoreStats().cacheEntries, 0, 'an idle-evicted blob must leave L1 too');
   });
@@ -389,6 +393,13 @@ function responseMatrixBody(): Record<string, unknown> {
       output_index: 0,
       item: { type: 'image_generation_call', id: 'ig_2', status: 'completed', result: bytes('D') },
     },
+    // The Interactions `outputs` shape an `/v1/interactions` client is served: the
+    // one response schema that is also a request schema, so its media content is
+    // the single position both allowlists read.
+    outputs: [
+      { type: 'text', text: 'here is the generated image' },
+      { type: 'image', data: bytes('E'), mime_type: 'image/png' },
+    ],
   };
 }
 
@@ -401,13 +412,14 @@ describe('§5.7 response allowlist', () => {
 
     const result = await extractResponseBlobs(body, store);
 
-    // Two Gemini parts (both spellings) and two generated images — the second in
-    // a nested SSE event object, which the walk reaches without a special case.
-    assert.equal(result.refs, 4);
-    assert.equal(result.bytes, 4 * MATRIX_CHARS);
+    // Three Gemini parts (both spellings), two generated images — the second in
+    // a nested SSE event object, which the walk reaches without a special case —
+    // and the Interactions media content an `/v1/interactions` client is served.
+    assert.equal(result.refs, 5);
+    assert.equal(result.bytes, 5 * MATRIX_CHARS);
     assert.equal(result.skipped, 0);
-    assert.equal(store.size, 4, 'the scratch store holds all four payloads');
-    assert.equal(spillFiles(config, RESPONSE_BLOB_SCOPE.subdir).length, 4, 'one scratch file per payload');
+    assert.equal(store.size, 5, 'the scratch store holds all five payloads');
+    assert.equal(spillFiles(config, RESPONSE_BLOB_SCOPE.subdir).length, 5, 'one scratch file per payload');
     assert.equal(
       JSON.stringify(body).length < 4096,
       true,
@@ -423,6 +435,7 @@ describe('§5.7 response allowlist', () => {
       [['candidates', 0, 'content', 'parts', 1, 'inline_data', 'data'], 'gemini-inline-data'],
       [['output', 0, 'result'], 'responses-image-generation-result'],
       [['event', 'item', 'result'], 'responses-image-generation-result'],
+      [['outputs', 1, 'data'], 'interactions-media-data'],
     ];
     for (const [path, kind] of expected) {
       const ref = refAt(body, ...path);
@@ -434,15 +447,15 @@ describe('§5.7 response allowlist', () => {
     // Rehydration reproduces the response the upstream sent, byte for byte, and
     // reads the scratch store — the hashes exist nowhere else.
     const copy = snapshot(body);
-    assert.equal(await rehydrateInlineBlobs(copy, store), 4);
+    assert.equal(await rehydrateInlineBlobs(copy, store), 5);
     assert.deepStrictEqual(copy, before);
     assert.equal(JSON.stringify(copy), JSON.stringify(before));
 
     // §5.7: a response's blobs are per-response scratch, released when the client
     // write finishes. The final release schedules deletion; `dispose` awaits it.
-    assert.equal(releaseExtractedBlobs(result, store), 4);
+    assert.equal(releaseExtractedBlobs(result, store), 5);
     assert.equal(store.size, 0, 'no payload stays readable after its last lease');
-    assert.deepStrictEqual(await store.dispose(), { deleted: 4, failed: [], leaked: 0 });
+    assert.deepStrictEqual(await store.dispose(), { deleted: 5, failed: [], leaked: 0 });
     assert.equal(spillFiles(config, RESPONSE_BLOB_SCOPE.subdir).length, 0, 'the files are gone from disk');
     assert.deepStrictEqual(getBlobStoreStats(), { cacheBytes: 0, cacheEntries: 0, diskBytes: 0, diskEntries: 0 });
   });
