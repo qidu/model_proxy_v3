@@ -638,8 +638,13 @@ function callingMode(value: unknown): string | undefined {
  * A call's arguments. The spec declares an object, but the JSON-string spelling
  * reaches this front door too; parsing it beats sending `{}` and losing the call's
  * arguments to a silent default (Rule #8).
+ *
+ * Exported for `gemini-to-openai.ts`, which reads the same field off the same
+ * `function_call` step on the other front door — the two converters share this
+ * reader rather than keeping a copy each, as `completions-to-responses.ts` does
+ * for its own pair.
  */
-function functionArgs(value: unknown, where: string): Record<string, unknown> {
+export function functionArgs(value: unknown, where: string): Record<string, unknown> {
     if (value === undefined || value === null) return {};
     if (typeof value === 'string') {
         if (value === '') return {};

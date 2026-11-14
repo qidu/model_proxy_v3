@@ -7,8 +7,12 @@ const THINK_REGEX = /<(?:thinking|think)>([\s\S]*?)<\/(?:thinking|think)>/g;
 /**
  * Extract <think>/<thinking> content from text, returning the reasoning and
  * the cleaned text separately. Both are empty strings if no tags are present.
+ *
+ * Exported because the interactions SSE egress splits a Completions delta the
+ * same way, into a `thought` step and a `model_output` step
+ * (`handlers/cross-mode-stream.ts`).
  */
-function extractThinkContent(text: string): { reasoning: string; cleanText: string } {
+export function extractThinkContent(text: string): { reasoning: string; cleanText: string } {
     THINK_REGEX.lastIndex = 0;
     let reasoning = '';
     let m;
@@ -20,7 +24,15 @@ function extractThinkContent(text: string): { reasoning: string; cleanText: stri
     return { reasoning, cleanText };
 }
 
-function parseToolArguments(value: unknown): Record<string, unknown> {
+/**
+ * A tool call's `arguments` as an object: the object form as it stands, the JSON
+ * string the wire usually carries parsed, `{}` for anything unparseable.
+ *
+ * Exported for the interactions SSE egress, which reads the same field off the
+ * tool calls it accumulated before announcing them as `function_call` steps
+ * (`handlers/cross-mode-stream.ts`).
+ */
+export function parseToolArguments(value: unknown): Record<string, unknown> {
     if (value && typeof value === 'object') return value as Record<string, unknown>;
     if (typeof value !== 'string' || value === '') return {};
     try {

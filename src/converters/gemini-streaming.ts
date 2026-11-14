@@ -7,6 +7,17 @@ import { GeminiSSEEvent, GeminiContent } from '../types/gemini.js';
 import { stringify } from '../utils/stringify.js';
 import type { Logger } from '../utils/logger.js';
 import { convertGenerateContentToInteraction, blockedPromptReason } from './gemini-to-interactions.js';
+import {
+    createInteractionStreamState,
+    interactionStepFromContent,
+    interactionStreamAdoptId,
+    interactionStreamCreated,
+    interactionStreamEnded,
+    interactionStreamError,
+    interactionStreamFinish,
+    interactionStreamText,
+    interactionStreamWholeStep,
+} from './interactions-stream-events.js';
 import { SYNTHETIC_THINKING_SIGNATURE } from './openai-to-claude.js';
 
 type ClaudeUsage = {
@@ -525,18 +536,24 @@ function mapGeminiContentTypeToClaude(geminiType: string): string {
  * `writable`, so `new TransformStream(instance)` has no `transform` to apply and
  * the client received the upstream's own `{candidates:[…]}` chunks.
  *
- * Events are framed the way the Interactions API frames them — the type is inside
- * the payload's `event_type`, with no SSE `event:` line — which is also how this
- * module's `handleGeminiEvent` already reads them.
+ * Events are framed the way the *SDK* frames them — the type is inside the
+ * payload's `event_type`, with no SSE `event:` line, and the vocabulary is
+ * `interaction.created` / `step.*` / `interaction.completed`. That vocabulary and
+ * the pool of frames below live in `interactions-stream-events.ts`, which the
+ * cross-mode egress writes through as well: this transformer used to follow
+ * `docs/api/interactions.md`'s older names (`interaction.start`,
+ * `content.*`, `interaction.complete`) while the cross-mode egress emitted
+ * neither, so one endpoint spoke two dialects and a typed client could read
+ * only this one's.
  *
- * The closing `interaction.complete` is not assembled here: the accumulated
- * generateContent parts are handed to `convertGenerateContentToInteraction`, so
- * the streamed interaction's `status`, `error`, `outputs` and `usage` are the
- * same objects the non-streaming egress produces, and the two cannot drift. The
- * one field either path could have got wrong on its own — an id minted for a call
- * the upstream sent without one — is minted from the part's position in the
- * answer on both, which is why a streamed content block is converted at that
- * position rather than as a one-part answer.
+ * What is *not* shared is the part bookkeeping: the accumulated generateContent
+ * parts are handed to `convertGenerateContentToInteraction`, so the answer's
+ * `status`, `usage` and any `error` are what the non-streaming egress reports for
+ * the same answer, and the two cannot drift. The one field either path could have
+ * got wrong on its own — an id minted for a call the upstream sent without one —
+ * is minted from the part's position in the answer on both, which is why a
+ * streamed content block is converted at that position rather than as a one-part
+ * answer.
  */
 export function createInteractionsStreamTransformer(
     model: string,
@@ -546,59 +563,58 @@ export function createInteractionsStreamTransformer(
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     let buffer = '';
-    let started = false;
     let completed = false;
     /** Upstream-shaped parts, so the closing conversion sees one conversation. */
     const parts: Array<Record<string, unknown>> = [];
     /** The text part still being appended to, or null once another part starts. */
     let openText: Record<string, unknown> | null = null;
-    let openTextIndex: number | null = null;
-    let contentIndex = 0;
     let usageMetadata: Record<string, unknown> | undefined;
     let promptFeedback: Record<string, unknown> | undefined;
     let responseId: string | undefined;
     /** Content kinds already reported as unprojectable, so each is named once. */
     const reportedDrops = new Set<string>();
 
-    const started_at = new Date().toISOString();
-    let interactionId: string | undefined;
+    /**
+     * The dialect itself — the SDK's `InteractionSSEEvent` — is the shared module
+     * `handlers/cross-mode-stream.ts` writes through as well, so the two egresses
+     * cannot describe one answer two ways. What stays local is the part
+     * bookkeeping the closing conversion reads (`parts`) and the drop report.
+     */
+    const streamState = createInteractionStreamState(model, requestId);
 
     const write = (controller: TransformStreamDefaultController<string>, event: Record<string, unknown>) => {
         controller.enqueue(`data: ${stringify(event)}\n\n`);
     };
 
+    const writeAll = (controller: TransformStreamDefaultController<string>, events: Array<Record<string, unknown>>) => {
+        for (const event of events) write(controller, event);
+    };
+
+    /**
+     * The opening frame, whenever the answer first has something to say. The
+     * upstream's own id is adopted here rather than minted: a client that streams
+     * an answer and then fetches it must name the same interaction.
+     */
     const ensureStarted = (controller: TransformStreamDefaultController<string>) => {
-        if (started) return;
-        started = true;
-        interactionId = responseId ?? `v1_${Date.now()}_${requestId}`;
-        write(controller, {
-            event_type: 'interaction.start',
-            interaction: {
-                id: interactionId,
-                model,
-                status: 'in_progress',
-                object: 'interaction',
-                created: started_at,
-                updated: started_at,
-                role: 'model',
-                outputs: [],
-            },
-        });
+        interactionStreamAdoptId(streamState, responseId);
+        writeAll(controller, interactionStreamCreated(streamState));
     };
 
-    const closeText = (controller: TransformStreamDefaultController<string>) => {
-        if (openTextIndex === null) return;
-        write(controller, { event_type: 'content.stop', index: openTextIndex });
+    /**
+     * Close the text part this stream was appending to. No frame is written: the
+     * shared state closes its own step at the same moment, whether that is because
+     * another step opened or because the answer ended.
+     */
+    const closeText = () => {
         openText = null;
-        openTextIndex = null;
     };
 
-    /** One non-text part: it arrives whole, so it opens and closes at once. */
+    /** One non-text part: it arrives whole, so it is announced whole. */
     const writeWholeContent = (
         controller: TransformStreamDefaultController<string>,
         part: Record<string, unknown>
     ) => {
-        closeText(controller);
+        closeText();
         // The position this part holds in the answer, which is where the closing
         // conversion will find it again — it converts the accumulated parts as one
         // candidate, so a call id it mints comes from this index. Minting here from
@@ -606,7 +622,6 @@ export function createInteractionsStreamTransformer(
         // streamed content and in the closing interaction.
         const position = parts.length;
         parts.push(part);
-        const index = contentIndex++;
         const { content, dropped } = convertPartForStream(part, position);
         if (dropped.length > 0) {
             // Rule #8: a part this stream cannot project would otherwise leave a
@@ -618,8 +633,7 @@ export function createInteractionsStreamTransformer(
             }
         }
         if (!content) return;
-        write(controller, { event_type: 'content.start', index, content });
-        write(controller, { event_type: 'content.stop', index });
+        writeAll(controller, interactionStreamWholeStep(streamState, interactionStepFromContent(content)));
     };
 
     const handleChunk = (chunk: Record<string, unknown>, controller: TransformStreamDefaultController<string>) => {
@@ -639,19 +653,9 @@ export function createInteractionsStreamTransformer(
                 if (!openText) {
                     openText = { text: '' };
                     parts.push(openText);
-                    openTextIndex = contentIndex++;
-                    write(controller, {
-                        event_type: 'content.start',
-                        index: openTextIndex,
-                        content: { type: 'text', text: '' },
-                    });
                 }
                 openText.text = `${openText.text as string}${part.text}`;
-                write(controller, {
-                    event_type: 'content.delta',
-                    index: openTextIndex,
-                    delta: { type: 'text', text: part.text },
-                });
+                writeAll(controller, interactionStreamText(streamState, part.text));
                 continue;
             }
             writeWholeContent(controller, part);
@@ -664,10 +668,11 @@ export function createInteractionsStreamTransformer(
         if ((typeof finishReason !== 'string' || finishReason === '') && !blocked) return;
 
         ensureStarted(controller);
-        closeText(controller);
+        closeText();
 
         // The same conversion the non-streaming egress runs, over the parts this
-        // stream accumulated: one place decides what a finish reason means.
+        // stream accumulated: one place decides what a finish reason means — the
+        // interaction's `status`, its `usage`, and any `error`.
         const { interaction } = convertGenerateContentToInteraction(
             {
                 ...(responseId ? { responseId } : {}),
@@ -681,8 +686,14 @@ export function createInteractionsStreamTransformer(
             model,
             requestId
         );
-        interaction.id = interactionId!;
-        write(controller, { event_type: 'interaction.complete', interaction });
+        // `InteractionSseEventInteraction` declares no `error` field, so a refusal
+        // the conversion reports reaches the client on the union's `error` event —
+        // it would otherwise vanish with the frame that used to carry it.
+        if (interaction.error) {
+            writeAll(controller, interactionStreamError(interaction.error as Record<string, unknown>));
+        }
+        interactionStreamEnded(streamState, interaction.usage as Record<string, unknown> | undefined);
+        writeAll(controller, interactionStreamFinish(streamState, interaction.status as string));
         completed = true;
     };
 

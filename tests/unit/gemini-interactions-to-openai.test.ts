@@ -478,6 +478,159 @@ describe('convertGeminiInteractionsToOpenAI — input shapes', () => {
   });
 });
 
+describe('convertGeminiInteractionsToOpenAI — steps that carry no content of their own', () => {
+  const one = (input: unknown) =>
+    (convertGeminiInteractionsToOpenAI({ model: 'm', input }) as any).messages;
+
+  it('maps a function_call step to an assistant tool_calls message', () => {
+    const messages = one([
+      { type: 'user_input', content: [{ type: 'text', text: 'weather?' }] },
+      { type: 'function_call', id: 'c1', name: 'get_weather', arguments: { city: 'SF' } },
+    ]);
+
+    assert.deepEqual(messages, [
+      { role: 'user', content: 'weather?' },
+      // `null`, not '', beside `tool_calls` — the reason
+      // `claudeJsonToSyntheticCompletions` gives.
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'c1',
+          type: 'function',
+          function: { name: 'get_weather', arguments: '{"city":"SF"}' },
+        }],
+      },
+    ]);
+  });
+
+  it('maps a function_result step to the role:tool message answering the call', () => {
+    const messages = one([
+      { type: 'function_call', id: 'c1', name: 'get_weather', arguments: {} },
+      { type: 'function_result', call_id: 'c1', name: 'get_weather', result: '72F' },
+    ]);
+
+    assert.deepEqual(messages[1], { role: 'tool', tool_call_id: 'c1', content: '72F' });
+  });
+
+  it('serializes a tool result that is neither a string nor a part list', () => {
+    const messages = one([{ type: 'function_result', call_id: 'c1', result: { temp: 72 } }]);
+
+    assert.equal(messages[0].content, '{"temp":72}');
+  });
+
+  it('reads a tool result part list as its text, the way the hop above reads it', () => {
+    const messages = one([{
+      type: 'function_result',
+      call_id: 'c1',
+      result: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }],
+    }]);
+
+    assert.equal(messages[0].content, 'ab');
+  });
+
+  it('folds a thought step into the assistant turn it introduces', () => {
+    // Completions has no reasoning *part*: the position is the turn's
+    // `reasoning_content`, which the openai-responses hop reads back as a
+    // `reasoning` item. An assistant message holding reasoning and no content would
+    // instead become an empty message item there.
+    const messages = one([
+      { type: 'user_input', content: 'hi' },
+      { type: 'thought', summary: [{ type: 'text', text: 'weighing it up' }] },
+      { type: 'model_output', content: [{ type: 'text', text: 'answer' }] },
+    ]);
+
+    assert.deepEqual(messages, [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'answer', reasoning_content: 'weighing it up' },
+    ]);
+  });
+
+  it('reads the thought summary in the bundled doc spelling as well', () => {
+    const messages = one([
+      { type: 'thought', summary: { content: { type: 'text', text: 'doc spelling' } } },
+      { type: 'model_output', content: 'answer' },
+    ]);
+
+    assert.equal(messages[0].reasoning_content, 'doc spelling');
+  });
+
+  it('carries a thought with no assistant turn after it as its own message', () => {
+    // Folding it forward would move the reasoning across the client's own turn.
+    const messages = one([
+      { type: 'thought', summary: [{ type: 'text', text: 'stray' }] },
+      { type: 'user_input', content: 'hi' },
+    ]);
+
+    assert.deepEqual(messages, [
+      { role: 'assistant', content: '', reasoning_content: 'stray' },
+      { role: 'user', content: 'hi' },
+    ]);
+  });
+
+  it('refuses a step with no Completions equivalent, naming it', () => {
+    // Each of these was read as a *part list*, matched no part, and reached the
+    // upstream as `content: ''` with the step's payload gone (rule #8).
+    for (const type of ['google_search_call', 'code_execution_call', 'url_context_call', 'mcp_server_tool_call']) {
+      assertRefused(
+        [{ type, id: 'x', arguments: {} }],
+        new RegExp(`input step "${type}" has no Completions equivalent`),
+      );
+    }
+  });
+
+  it('refuses a function_call step with no id rather than inventing one', () => {
+    // The matching `function_result` is paired by `id`, so a synthesized one would
+    // leave the call and its result unmatched at the upstream.
+    assertRefused([{ type: 'function_call', name: 'f', arguments: {} }], /\.id must be a non-empty string/);
+  });
+
+  it('takes a step whose content is absent, which the SDK types as optional', () => {
+    // `UserInputStep.content?` / `ModelOutputStep.content?` are optional, so a
+    // step carrying none is an empty turn rather than a malformed one. An explicit
+    // `content: []` is still refused — the two are not the same thing.
+    assert.deepEqual(one([{ type: 'user_input' }, { type: 'model_output' }]), [
+      { role: 'user', content: '' },
+      { role: 'assistant', content: '' },
+    ]);
+    assertRefused([{ type: 'user_input', content: [] }], /\.content must carry at least one part/);
+  });
+
+  it('refuses a message-level part sent inside `content`', () => {
+    // `thought`, `function_call` and `function_result` are Content types as well as
+    // step types. Inside a content list this wire has no position for them — each
+    // needs a message of its own — so they are refused by name rather than dropped
+    // (the SDK puts them at the top level of `input`).
+    assertRefused(
+      { type: 'user_input', content: [{ type: 'function_call', id: 'c1', name: 'f', arguments: {} }] },
+      /part of type "function_call" needs a message of its own/,
+    );
+  });
+
+  it('relays a media part by its uri, the declared alternative to inline bytes', () => {
+    // `ImageContent.uri` is a first-class field of the same union member `data`
+    // is, and a URL is a position every target of this hop already has — so the
+    // part used to be skipped and the turn sent upstream empty.
+    assert.deepEqual(
+      one({ type: 'image', uri: 'https://x.test/a.png', mime_type: 'image/png' }),
+      [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://x.test/a.png' } }] }],
+    );
+  });
+
+  it('refuses a media part that carries neither bytes nor a uri', () => {
+    assertRefused(
+      { type: 'image', mime_type: 'image/png' },
+      /"image" part carries neither base64/,
+    );
+  });
+
+  it('still carries an explicitly empty text part', () => {
+    // The client wrote an empty text, which is a value this converter does not get
+    // to refuse; only a list that recognized *nothing* is refused.
+    assert.deepEqual(one([{ type: 'text', text: '' }]), [{ role: 'user', content: '' }]);
+  });
+});
+
 describe('convertGeminiGenerateContentToOpenAI — system_instruction spellings', () => {
   // The same field, and the same reader: the Interactions spelling is snake_case
   // and a bare string, generateContent's is camelCase and `{parts:[…]}`. A

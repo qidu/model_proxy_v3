@@ -15,6 +15,7 @@
 import type { Logger } from '../types/shared.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { ValidationError } from '../utils/errors.js';
+import { functionArgs } from './interactions-to-gemini.js';
 
 /**
  * Check if request is in Gemini Interactions format
@@ -31,6 +32,32 @@ export function isGeminiInteractionsRequest(body: Record<string, unknown>): bool
 const INTERACTIONS_MEDIA_PART_TYPES = new Set(['image', 'audio', 'video', 'document']);
 
 /**
+ * The `input` *step* vocabulary: the `type` discriminator of every member of the
+ * SDK's `Step` union, which is the `Array<Step>` arm of `InteractionsInput`
+ * (`@google/genai` `genai.d.ts`). `function_call`, `function_result` and
+ * `thought` are also Content part types, so an array headed by one is ambiguous
+ * between a step list and a part list — both readings mean the same thing, and
+ * the step reading is the one that gives a tool call or a thought the message of
+ * its own that Completions needs.
+ *
+ * The last fourteen are recognized so that an array headed by one is read as a
+ * step list, where the step can be refused by name. None has a Completions
+ * spelling; read as a part list instead they matched nothing and the whole array
+ * became an empty `content`, with no warning (rule #8).
+ */
+const INTERACTIONS_STEP_TYPES = new Set([
+  'user_input', 'model_output',
+  'function_call', 'function_result', 'thought',
+  'code_execution_call', 'code_execution_result',
+  'file_search_call', 'file_search_result',
+  'google_maps_call', 'google_maps_result',
+  'google_search_call', 'google_search_result',
+  'mcp_server_tool_call', 'mcp_server_tool_result',
+  'processing_call', 'processing_result',
+  'url_context_call', 'url_context_result',
+]);
+
+/**
  * Convert Gemini parts into an OpenAI Completions `content` value:
  *   - text-only parts collapse to a joined string (preserves wire shape).
  *   - any image part present → returns an array mixing `{type:'text'}` and
@@ -41,6 +68,18 @@ const INTERACTIONS_MEDIA_PART_TYPES = new Set(['image', 'audio', 'video', 'docum
  *     content body in this direction).
  * Returns '' for an empty / unrecognized parts list.
  *
+ * A part this hop cannot express is refused rather than skipped: skipping it is
+ * what let a whole turn arrive at the upstream as an empty `content`, with the
+ * part's payload gone and nothing said (rule #8). The three refused kinds are
+ * the ones needing a *message*-level position on this wire — `thought`
+ * (`reasoning_content`), `function_call` / `function_result` (`tool_calls` /
+ * `role:'tool'`) — plus a media part carrying no inline bytes. They are read at
+ * the top level of `input` as steps, which is where the SDK puts them.
+ * `interactions-to-gemini.ts` translates the same three as *parts*, which fits
+ * there because generateContent declares a part for each; Completions declares
+ * none, so the two front doors diverge on where the value can sit, not on
+ * whether it survives.
+ *
  * Used by `convertGeminiInteractionsToOpenAI` (Interactions-API client →
  * openai-completions upstream). `convertGeminiGenerateContentToOpenAI` keeps
  * its own inline copy (see `convertGeminiGenerateContentToOpenAI` below) because the image extraction there
@@ -49,21 +88,27 @@ const INTERACTIONS_MEDIA_PART_TYPES = new Set(['image', 'audio', 'video', 'docum
  */
 function geminiPartsToOpenAIContent(
   parts: any[] | undefined,
+  where: string,
 ): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> {
   if (!Array.isArray(parts)) return '';
   const textParts: string[] = [];
   const imageParts: Array<{ type: 'image_url'; image_url: { url: string | BlobRef } }> = [];
-  for (const p of parts as any[]) {
-    if (p && typeof p.text === 'string' && !p.thought) {
-      textParts.push(p.text);
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i] as any;
+    const at = `${where}[${i}]`;
+    let claimed = false;
+    if (p && typeof p.text === 'string') {
+      claimed = true;
+      if (!p.thought) textParts.push(p.text);
     }
     // Whichever dialect spells the bytes: the generateContent part nests them
     // under `inline_data`, the Interactions part carries them on itself.
     const inline = p?.inline_data ?? p?.inlineData;
     const media = inline ?? (INTERACTIONS_MEDIA_PART_TYPES.has(p?.type) ? p : undefined);
+    const mime = media?.mime_type ?? media?.mimeType;
     const data: unknown = media?.data;
     if ((typeof data === 'string' && data !== '') || isBlobRef(data)) {
-      const mime = media?.mime_type ?? media?.mimeType;
+      claimed = true;
       imageParts.push({
         type: 'image_url',
         image_url: {
@@ -73,8 +118,28 @@ function geminiPartsToOpenAIContent(
         },
       });
     }
+    // The declared alternative to bytes: an `ImageContent.uri` (and its audio,
+    // video and document twins). It is relayed as the part's URL rather than
+    // fetched here, because a URL is a position every target this hop reaches
+    // already has — the Completions `image_url`, the Responses `input_image`, and
+    // the Claude image source, which fetches it itself under its SSRF guard.
+    const uri = media?.uri;
+    if (!claimed && typeof uri === 'string' && uri !== '') {
+      claimed = true;
+      imageParts.push({ type: 'image_url', image_url: { url: uri } });
+    }
+    if (!claimed) throw unexpressibleContentPart(p?.type, media !== undefined, at);
   }
+
   if (imageParts.length === 0) {
+    if (textParts.length === 0) {
+      // Every part was recognized but none carried content — a `thought:true`
+      // marker list. The upstream would be handed an empty prompt for a message
+      // the client did write.
+      throw new ValidationError(
+        `Interactions ${where} carries no text or media this conversion can express`,
+      );
+    }
     return textParts.join('');
   }
   const out: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> = [];
@@ -82,6 +147,24 @@ function geminiPartsToOpenAIContent(
   if (text !== '') out.push({ type: 'text', text });
   out.push(...imageParts);
   return out;
+}
+
+/** The refusal for a Content part this hop has no Completions position for. */
+function unexpressibleContentPart(type: unknown, isMediaType: boolean, where: string): ValidationError {
+  if (type === 'thought' || type === 'function_call' || type === 'function_result') {
+    return new ValidationError(
+      `Interactions ${where} part of type ${JSON.stringify(type)} needs a message of its own; ` +
+      'send it as an input step rather than inside `content`',
+    );
+  }
+  if (isMediaType) {
+    return new ValidationError(
+      `Interactions ${where} ${JSON.stringify(type)} part carries neither base64 \`data\` nor a \`uri\``,
+    );
+  }
+  return new ValidationError(
+    `Interactions ${where} part of type ${JSON.stringify(type)} has no Completions equivalent`,
+  );
 }
 
 /** Map a Gemini guided-decoding mode/type onto the Completions vocabulary. */
@@ -160,7 +243,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * (`docs/api/interactions.md`: a string, a Content, an array of Content, an array
  * of Turn, or an object carrying `messages`) plus the *step* form a client may
  * send in place of Turns (`type: 'user_input'` / `'model_output'` standing in
- * for a Turn's `role`).
+ * for a Turn's `role`, and the tool and thought steps beside them).
  *
  * The discrimination mirrors `converters/interactions-to-gemini.ts`'s
  * `buildContents` — the same front door served by a native Gemini upstream — so
@@ -168,6 +251,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * `Content[]` form (the shape `interactions.md`'s own multimodal example uses),
  * which is *one* turn's part list, not one message per part: read as Turns it
  * produced a message whose role and content had both been dropped.
+ *
+ * The array's first entry decides how the whole array is read, as in
+ * `buildContents`: a Turn carries `role`, a step carries one of the step `type`s,
+ * anything else is a part list. A *step* list is read by `stepsToMessages`, which
+ * gives a tool call and a thought the message of its own this wire needs — before
+ * that, an array headed by anything but `user_input` / `model_output` was read as
+ * a part list, matched no part, and became a single empty `content` (rule #8).
  *
  * A shape that yields no message is refused rather than half-read. That is what
  * the last branch protects: an unrecognized scalar used to fall through to
@@ -183,16 +273,14 @@ function interactionsInputToMessages(input: unknown): Array<Record<string, unkno
     if (input.length === 0) {
       throw new ValidationError('Interactions request `input` array must carry at least one content');
     }
-    // The first entry decides how the whole array is read, as in `buildContents`:
-    // a Turn carries `role`, a step carries `type`, anything else is a part list.
     const first = asRecord(input[0]);
     if (first && 'role' in first) {
       return input.map(entry => turnToMessage(asRecord(entry), 'input[]'));
     }
-    if (first && (first.type === 'user_input' || first.type === 'model_output')) {
-      return input.map(entry => stepToMessage(asRecord(entry)));
+    if (first && typeof first.type === 'string' && INTERACTIONS_STEP_TYPES.has(first.type)) {
+      return stepsToMessages(input);
     }
-    return [{ role: 'user', content: geminiPartsToOpenAIContent(input) }];
+    return [{ role: 'user', content: geminiPartsToOpenAIContent(input, '`input`') }];
   }
 
   const record = asRecord(input);
@@ -211,12 +299,12 @@ function interactionsInputToMessages(input: unknown): Array<Record<string, unkno
     if ('role' in record) {
       return [turnToMessage(record, 'input')];
     }
-    if (record.type === 'user_input' || record.type === 'model_output') {
-      return [stepToMessage(record)];
+    if (typeof record.type === 'string' && INTERACTIONS_STEP_TYPES.has(record.type)) {
+      return stepsToMessages([record]);
     }
     // A lone Content: one part, so one message holding it.
     if (typeof record.type === 'string') {
-      return [{ role: 'user', content: geminiPartsToOpenAIContent([record]) }];
+      return [{ role: 'user', content: geminiPartsToOpenAIContent([record], '`input`') }];
     }
   }
 
@@ -237,33 +325,202 @@ function turnToMessage(turn: Record<string, unknown> | undefined, where: string)
 }
 
 /**
- * An input *step*: a Turn whose `type` stands in for its `role`. `user_input` is
- * the client's turn, `model_output` the model's own earlier turn.
+ * An `input` step list → the Completions messages that carry it.
+ *
+ * `user_input` and `model_output` are the client's and the model's turns. The
+ * three remaining expressible steps have no Completions *part*: a
+ * `function_call` is a message-level `tool_calls[]`, its `function_result` the
+ * `role:'tool'` message that answers it, and a `thought` a message-level
+ * `reasoning_content`. The hop above turns the first pair into the Responses
+ * `function_call` / `function_call_output` items and the third into a `reasoning`
+ * item, so all three reach an `openai-responses` upstream intact.
+ *
+ * A `thought` carries the reasoning of the turn it introduces, so it is folded
+ * into that turn rather than given a message of its own — an assistant message
+ * holding reasoning and no content is what the hop above would turn into an empty
+ * message item. A thought with no assistant turn after it (before a
+ * `user_input`, or at the end of the list) is carried as its own message: the
+ * alternative is silently moving it across the client's turn.
+ *
+ * A step with no Completions spelling is refused by name (rule #8). Reading such
+ * an array as a part list is what used to send the upstream an empty `content`
+ * with the whole step missing and nothing said.
  */
-function stepToMessage(step: Record<string, unknown> | undefined): Record<string, unknown> {
-  if (!step) throw new ValidationError('Interactions input step must be an object');
+function stepsToMessages(steps: unknown[]): Array<Record<string, unknown>> {
+  const messages: Array<Record<string, unknown>> = [];
+  let reasoning = '';
 
-  return {
-    role: step.type === 'model_output' ? 'assistant' : 'user',
-    content: contentToOpenAIContent(step.content, `input step ${JSON.stringify(step.type)}`),
+  /** Give whatever thought is pending to `message`, as its reasoning. */
+  const attachReasoning = (message: Record<string, unknown>): void => {
+    if (reasoning === '') return;
+    message.reasoning_content = reasoning;
+    reasoning = '';
   };
+
+  /** Carry a pending thought as a message of its own — it belongs to no turn. */
+  const flushReasoning = (): void => {
+    if (reasoning === '') return;
+    messages.push({ role: 'assistant', content: '', reasoning_content: reasoning });
+    reasoning = '';
+  };
+
+  for (const entry of steps) {
+    const step = asRecord(entry);
+    if (!step) throw new ValidationError('Interactions input step must be an object');
+    const where = `input step ${JSON.stringify(step.type)}`;
+
+    switch (step.type) {
+      case 'thought':
+        reasoning += thoughtSummaryText(step.summary);
+        break;
+
+      case 'user_input':
+        flushReasoning();
+        messages.push({ role: 'user', content: contentToOpenAIContent(step.content, where) });
+        break;
+
+      case 'model_output': {
+        const message: Record<string, unknown> = {
+          role: 'assistant',
+          content: contentToOpenAIContent(step.content, where),
+        };
+        attachReasoning(message);
+        messages.push(message);
+        break;
+      }
+
+      case 'function_call': {
+        const message: Record<string, unknown> = {
+          role: 'assistant',
+          // `null`, not '', beside `tool_calls`: the reason
+          // `claudeJsonToSyntheticCompletions` gives — upstreams reject the empty
+          // string there, and the hop above reads null as "no message content".
+          content: null,
+          tool_calls: [functionCallToToolCall(step, where)],
+        };
+        attachReasoning(message);
+        messages.push(message);
+        break;
+      }
+
+      case 'function_result':
+        messages.push({
+          role: 'tool',
+          tool_call_id: requireStepString(step.call_id, `${where}.call_id`),
+          content: toolResultContent(step.result, where),
+        });
+        break;
+
+      default:
+        throw new ValidationError(
+          `Interactions ${where} has no Completions equivalent; this route cannot replay it`,
+        );
+    }
+  }
+
+  flushReasoning();
+  return messages;
+}
+
+/** A required, non-empty string field of an input step. */
+function requireStepString(value: unknown, where: string): string {
+  if (typeof value !== 'string' || value === '') {
+    throw new ValidationError(`Interactions ${where} must be a non-empty string`);
+  }
+  return value;
+}
+
+/**
+ * A `function_call` step → the Completions `tool_calls[]` entry carrying it. The
+ * hop above maps it onto a Responses `function_call` item and uses `id` as that
+ * item's `call_id`, which is how the matching `function_result` is paired.
+ */
+function functionCallToToolCall(step: Record<string, unknown>, where: string): Record<string, unknown> {
+  const name = requireStepString(step.name, `${where}.name`);
+  // Required by the spec, and the pairing above depends on it: inventing an id
+  // would leave the call and its result unmatched at the upstream.
+  const id = requireStepString(step.id, `${where}.id`);
+  const args = JSON.stringify(functionArgs(step.arguments, `${where}.arguments`));
+  return { id, type: 'function', function: { name, arguments: args } };
+}
+
+/**
+ * A `function_result` step's `result` as the content of the `role:'tool'` message
+ * that answers its call — the same three-way reading the `/v1/messages` hop gives
+ * the same field: a string as it stands, anything else serialized.
+ *
+ * A part list is read as text, because that is what the hop above does with an
+ * array tool result (`completions-to-responses.ts`). A part that is not text is
+ * refused here rather than dropped by that extraction without a word (rule #8).
+ */
+function toolResultContent(result: unknown, where: string): string {
+  if (typeof result === 'string') return result;
+  if (Array.isArray(result)) {
+    let text = '';
+    for (let i = 0; i < result.length; i++) {
+      const part = asRecord(result[i]);
+      if (!part || typeof part.text !== 'string') {
+        throw new ValidationError(
+          `Interactions ${where}[${i}] part of type ${JSON.stringify(part?.type)} has no Completions ` +
+          'tool-result position',
+        );
+      }
+      text += part.text;
+    }
+    return text;
+  }
+  if (result === undefined) {
+    throw new ValidationError(`Interactions ${where} must carry the tool call result`);
+  }
+  return JSON.stringify(result);
+}
+
+/**
+ * The reasoning text of a `thought` step. The SDK declares `summary` a list of
+ * Content (`ThoughtSummaryContent = ImageContent | TextContent`), while
+ * `docs/api/interactions.md` declares it a `ThoughtSummary` object wrapping one
+ * under `content`. Both are read: the two disagree, and each front door may be
+ * sent the spelling its own doc describes.
+ */
+function thoughtSummaryText(summary: unknown): string {
+  if (typeof summary === 'string') return summary;
+  let parts: unknown[];
+  if (Array.isArray(summary)) {
+    parts = summary;
+  } else {
+    const content = asRecord(summary)?.content;
+    if (content === undefined) return '';
+    parts = Array.isArray(content) ? content : [content];
+  }
+  return parts
+    .map(part => {
+      const text = asRecord(part)?.text;
+      return typeof text === 'string' ? text : '';
+    })
+    .join('');
 }
 
 /**
  * A Turn/step `content`: a bare string, or a part list. Anything else is refused
  * rather than stringified — `String({type:'text', …})` would put `[object
  * Object]` in the prompt the upstream reads.
+ *
+ * An *absent* content is not one of those: the SDK types a step's `content` as
+ * optional (`UserInputStep.content?`), so a step that carries none is an empty
+ * turn rather than a malformed one. An explicit empty *list* is still refused
+ * — a client that wrote `content: []` wrote something the step cannot mean.
  */
 function contentToOpenAIContent(
   content: unknown,
   where: string,
 ): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> {
   if (typeof content === 'string') return content;
+  if (content === undefined) return '';
   if (Array.isArray(content)) {
     if (content.length === 0) {
       throw new ValidationError(`Interactions ${where}.content must carry at least one part`);
     }
-    return geminiPartsToOpenAIContent(content);
+    return geminiPartsToOpenAIContent(content, `${where}.content`);
   }
   throw new ValidationError(`Interactions ${where}.content must be a string or an array of Content parts`);
 }
@@ -344,7 +601,7 @@ export function convertGeminiInteractionsToOpenAI(
   } else if (Array.isArray(geminiRequest.contents)) {
     messages = (geminiRequest.contents as any[]).map((content: any) => ({
       role: content.role === 'model' ? 'assistant' : content.role,
-      content: geminiPartsToOpenAIContent(content.parts),
+      content: geminiPartsToOpenAIContent(content.parts, '`contents`'),
     }));
   }
 

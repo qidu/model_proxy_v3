@@ -28,7 +28,19 @@
 import { logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import type { Logger } from '../types/shared.js';
 import { convertOpenAIToClaudeResponse } from '../converters/openai-to-claude.js';
-import { convertOpenAIToGeminiGenerateContent, convertOpenAIToGeminiInteractions, clearGeminiToolSchemas } from '../converters/openai-to-gemini.js';
+import { convertOpenAIToGeminiGenerateContent, clearGeminiToolSchemas, extractThinkContent, parseToolArguments } from '../converters/openai-to-gemini.js';
+import {
+  completionsUsageToInteractionUsage,
+  createInteractionStreamState,
+  interactionStreamAdoptId,
+  interactionStreamEnded,
+  interactionStreamFinish,
+  interactionStreamReasoning,
+  interactionStreamStatus,
+  interactionStreamText,
+  interactionStreamWholeStep,
+  type InteractionStreamState,
+} from '../converters/interactions-stream-events.js';
 import {
   createResponsesChatStreamState,
   responsesStreamEventToChatChunks,
@@ -336,6 +348,9 @@ function processResponsesSSEBuffer(
       const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
       result += processed;
     }
+    if (isInteractionsRequest && parsed.type === 'response.incomplete') {
+      interactionStateFor(requestId, model).failed = true;
+    }
     // Nothing may follow the terminal event on the client stream: a Gemini client
     // ends the answer on `finishReason`.
     if (state.finished) break;
@@ -405,6 +420,18 @@ export async function handleCrossModeStreamingResponse(
       if (source === 'openai-responses' && !responsesState.finished) {
         throw new Error(`Responses stream ended before response.completed (request ${requestId})`);
       }
+      // The Interactions dialect ends on `interaction.completed`, and it is written
+      // here rather than per chunk so the answer's usage — which an upstream may
+      // report on a frame after the finish reason — is what the terminal frames
+      // carry. Throws instead of completing when no finish reason ever arrived,
+      // so a truncated answer is not announced as a finished interaction.
+      if (isInteractionsRequest) {
+        const terminal = finishInteractionsStream(requestId);
+        if (terminal) {
+          logPipelineStage(logger, requestId, 'outbound', 'stream (terminal)', terminal);
+          await writer.write(encoder.encode(terminal));
+        }
+      }
       if (source === 'openai-responses') {
         warnDroppedOutputItems(logger, requestId, clientPath, responsesState.dropped);
       }
@@ -416,6 +443,7 @@ export async function handleCrossModeStreamingResponse(
       // Prevent leaking per-request buffer entries if the stream errors out
       // before message_stop/[DONE] triggers the normal cleanup.
       if (source === 'anthropic-messages') clearAnthropicSSEState(requestId);
+      if (isInteractionsRequest) clearGeminiSSEState(requestId);
     }
   })();
 
@@ -446,10 +474,114 @@ let thinkStreamBuffers: Map<string, string> = new Map();
 interface GeminiToolCallAccum { id: string; name: string; args: string; }
 let geminiToolCallBuffers: Map<string, Map<number, GeminiToolCallAccum>> = new Map();
 
+// Per-request `/v1/interactions` SSE state, keyed by requestId for the same reason
+// as the two maps above: the step a delta appends to must be this answer's.
+let interactionStreamStates: Map<string, InteractionStreamState> = new Map();
+
+/** The state one Interactions answer builds its events on, created on first use. */
+function interactionStateFor(requestId: string, model: string): InteractionStreamState {
+  let state = interactionStreamStates.get(requestId);
+  if (!state) {
+    state = createInteractionStreamState(model, requestId);
+    interactionStreamStates.set(requestId, state);
+  }
+  return state;
+}
+
+/** Frame the events the shared Interactions stream module returns. */
+function interactionFrames(events: Array<Record<string, unknown>>): string {
+  return events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
+}
+
+/**
+ * The `/v1/interactions` frames for one parsed Completions chunk.
+ *
+ * This dialect is the SDK's `InteractionSSEEvent`, so there is no converted
+ * intermediate chunk to render and filter: the Completions chunk's own fields are
+ * read into `step.*` events, and a chunk carrying none of them yields no frame.
+ * The events are the same ones the Gemini upstream's transformer emits, through
+ * the same module, so the two front doors speak one dialect.
+ *
+ * The terminal `interaction.completed` is not written here: an upstream may report
+ * the answer's usage on a frame after the one carrying the finish reason, so the
+ * terminal frames wait for the drain (`finishInteractionsStream`).
+ */
+function interactionsFramesForChunk(
+  parsed: Record<string, any>,
+  requestId: string,
+  model: string,
+  toolCallBuffer: Map<number, GeminiToolCallAccum> | undefined,
+): string {
+  const state = interactionStateFor(requestId, model);
+  const choice = parsed?.choices?.[0];
+  const delta = choice?.delta as Record<string, any> | undefined;
+  // The Completions chunk carries the upstream's own id, so the interaction the
+  // client streams is named the same as the one it can fetch back.
+  interactionStreamAdoptId(state, parsed?.id);
+  let events: Array<Record<string, unknown>> = [];
+
+  // A `<think>…</think>` block in the text is reasoning, not answer text — the
+  // split `convertOpenAIToGeminiInteractions` made, so a reasoning model's tags
+  // reach the client as a `thought` step rather than inside `model_output`.
+  if (typeof delta?.content === 'string' && delta.content !== '') {
+    const { reasoning, cleanText } = extractThinkContent(delta.content);
+    events = [...events, ...interactionStreamReasoning(state, reasoning), ...interactionStreamText(state, cleanText)];
+  }
+  if (typeof delta?.reasoning_content === 'string') {
+    events = [...events, ...interactionStreamReasoning(state, delta.reasoning_content)];
+  }
+
+  // Fragmented tool calls are announced once, complete, on the frame that ends the
+  // turn — the same deferral the Gemini paths make, for the same reason: a
+  // fragment would announce a call with no name and no arguments.
+  if (choice?.finish_reason) {
+    for (const call of toolCallBuffer?.values() ?? []) {
+      if (!call.name) continue;
+      events = [...events, ...interactionStreamWholeStep(state, {
+        type: 'function_call',
+        id: call.id,
+        name: call.name,
+        arguments: parseToolArguments(call.args),
+      })];
+    }
+    toolCallBuffer?.clear();
+    geminiToolCallBuffers.delete(requestId);
+    interactionStreamEnded(state);
+  }
+
+  // Recorded whenever it arrives, which is not always the frame that ended the
+  // answer: the openai-completions upstreams that gate usage behind
+  // `stream_options.include_usage` report it on a later, choice-less frame.
+  const usage = completionsUsageToInteractionUsage(parsed?.usage);
+  if (usage) interactionStreamEnded(state, usage);
+
+  return interactionFrames(events);
+}
+
+/**
+ * The terminal `/v1/interactions` frames, written once the upstream stream is
+ * drained. '' when this request has no state (its frames were already written on
+ * its `[DONE]`, or it is not an Interactions request at all).
+ *
+ * A stream that stops without a finish reason is refused rather than completed:
+ * a truncated answer announced as `interaction.completed` is a silent success
+ * (rule #8), and the caller's error path aborts the client stream.
+ */
+export function finishInteractionsStream(requestId: string): string {
+  const state = interactionStreamStates.get(requestId);
+  if (!state) return '';
+  interactionStreamStates.delete(requestId);
+  if (!state.ended) {
+    throw new Error(`Interactions stream ended before a finish reason (request ${requestId})`);
+  }
+  return interactionFrames(interactionStreamFinish(state, interactionStreamStatus(state)));
+}
+
 /** Remove all per-request SSE conversion state for a finished/aborted request. */
 export function clearGeminiSSEState(requestId: string): void {
     thinkStreamBuffers.delete(requestId);
     geminiToolCallBuffers.delete(requestId);
+    interactionStreamStates.delete(requestId);
     clearGeminiToolSchemas(requestId);
 }
 
@@ -476,12 +608,16 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
             if (line.startsWith('data: ')) {
                 const data = line.slice(6).trim();
                 if (data === '[DONE]') {
-                    clearGeminiSSEState(requestId);
                     toolCallBuffer = undefined;
-                    if (isGenerateContentRequest) {
-                        // Gemini generateContent doesn't need explicit end marker
-                        continue;
-                    } else {
+                    // `[DONE]` is the end-of-stream marker of an OpenAI-shaped
+                    // upstream. An Interactions client reads no such marker — its
+                    // dialect ends on `interaction.completed` — so the terminal
+                    // frames are written here, before the state is released. A
+                    // stream that never reported a finish reason throws instead of
+                    // completing: see `finishInteractionsStream`.
+                    if (isInteractionsRequest) result += finishInteractionsStream(requestId);
+                    clearGeminiSSEState(requestId);
+                    if (!isGenerateContentRequest && !isInteractionsRequest) {
                         result += 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
                     }
                 } else {
@@ -519,14 +655,30 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
                             }
                         }
 
+                        // If the converter will not consume the buffer-tail (tag never
+                        // closed), carry it forward. Before the dialect branch below, so
+                        // every dialect keeps the tag out of its answer text.
+                        const emittedContent: string | undefined = parsed?.choices?.[0]?.delta?.content;
+                        if (emittedContent) {
+                            const partialOpen = emittedContent.lastIndexOf('<');
+                            if (partialOpen !== -1 && !emittedContent.slice(partialOpen).includes('>')) {
+                                thinkStreamBuffers.set(requestId, emittedContent.slice(partialOpen));
+                            }
+                        }
+
+                        // The Interactions dialect has no converted intermediate chunk
+                        // to render and filter: the chunk's own fields become events.
+                        if (isInteractionsRequest) {
+                            const frames = interactionsFramesForChunk(parsed, requestId, modelId, toolCallBuffer);
+                            if (frames) result += frames;
+                            continue;
+                        }
+
                         let convertedChunk: Record<string, any> | null = null;
 
                         if (isGenerateContentRequest) {
                             // Convert to Gemini generateContent format
                             convertedChunk = convertOpenAIToGeminiGenerateContent(parsed, modelId, requestId);
-                        } else if (isInteractionsRequest) {
-                            // Convert to Gemini Interactions format
-                            convertedChunk = convertOpenAIToGeminiInteractions(parsed, modelId, requestId);
                         } else {
                             // Convert to Claude format
                             convertedChunk = convertOpenAIToClaudeResponse(parsed, modelId, requestId);
@@ -535,7 +687,7 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
                         // Flush accumulated tool calls when the turn finishes, injecting
                         // them as complete functionCall parts into the converted chunk.
                         const finishReason = parsed?.choices?.[0]?.finish_reason;
-                        if ((isGenerateContentRequest || isInteractionsRequest) && finishReason && toolCallBuffer && toolCallBuffer.size > 0) {
+                        if (isGenerateContentRequest && finishReason && toolCallBuffer && toolCallBuffer.size > 0) {
                             const accumulated = Array.from(toolCallBuffer.values()).filter(a => a.name);
                             toolCallBuffer.clear();
                             geminiToolCallBuffers.delete(requestId);
@@ -554,25 +706,14 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
                                     finish_reason: finishReason,
                                 }],
                             };
-                            convertedChunk = isGenerateContentRequest
-                                ? convertOpenAIToGeminiGenerateContent(synthetic, modelId, requestId)
-                                : convertOpenAIToGeminiInteractions(synthetic, modelId, requestId);
+                            convertedChunk = convertOpenAIToGeminiGenerateContent(synthetic, modelId, requestId);
                         }
 
-                        // If converter didn't consume the buffer-tail (tag never closed), carry it forward
-                        const emittedContent: string | undefined = parsed?.choices?.[0]?.delta?.content;
-                        if (emittedContent) {
-                            const partialOpen = emittedContent.lastIndexOf('<');
-                            if (partialOpen !== -1 && !emittedContent.slice(partialOpen).includes('>')) {
-                                thinkStreamBuffers.set(requestId, emittedContent.slice(partialOpen));
-                            }
-                        }
-                        
                         // Skip chunks with no endpoint-specific payload.
-                        if (!convertedChunk || (!convertedChunk.candidates && !convertedChunk.content && !convertedChunk.outputs)) {
+                        if (!convertedChunk || (!convertedChunk.candidates && !convertedChunk.content)) {
                             continue;
                         }
-                        
+
                         result += `data: ${JSON.stringify(convertedChunk)}\n\n`;
                     } catch {
                         // Skip invalid JSON

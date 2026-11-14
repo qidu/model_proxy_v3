@@ -5,6 +5,101 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): `/v1/interactions` — the `input` steps that carry no content, the image `uri`, and the streaming dialect
+
+Four defects on one front door, found by reading `/v1/interactions` against `@google/genai`'s own
+declarations rather than against `docs/api/interactions.md`, which predates several of them. Measured
+before/after through the real handlers; every claim below has a regression pin.
+
+**1. The `input` steps that carry no content became an empty prompt, silently.** The SDK types
+`InteractionsInput` as `Content_2 | Array<Step> | Array<Content_2> | string`, and its `Step` union
+includes `function_call`, `function_result` and `thought` — steps with no `content` field at all.
+`interactionsInputToMessages` read the whole array from its first entry and, for anything that was not
+`user_input` / `model_output`, fell back to reading it as one turn's *part list*. A step list headed by
+a tool call therefore matched no part and reached the upstream as a prompt the client never wrote:
+
+```
+in : [{"type":"function_call","id":"c1","name":"get_weather","arguments":{"city":"SF"}}, …]
+out: [{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]    HTTP 200, no warning
+```
+
+And when the array *was* headed by `user_input`, every entry went through `stepToMessage`, whose
+`contentToOpenAIContent(step.content)` threw on a step that has no `content` — so a tool-using
+conversation could not be replayed at all:
+
+```
+in : [{"type":"user_input",…},{"type":"function_call",…}]
+out: 400 ValidationError: Interactions input step "function_call".content must be a string or an array of Content parts
+```
+
+`stepsToMessages` now reads the step vocabulary and gives each step the message this wire needs — a
+`function_call` an assistant `tool_calls` message, its `function_result` the `role:'tool'` message that
+answers it, a `thought` the `reasoning_content` of the turn it introduces. The hop above turns the first
+pair into the Responses `function_call` / `function_call_output` items and the third into a `reasoning`
+item, so all three arrive intact. A step with no Completions spelling at all (`google_search_call`,
+`code_execution_*`, `url_context_*`, `mcp_server_tool_*`, `processing_*`, `file_search_*`,
+`google_maps_*`) is refused by name rather than emptied; so is a `function_call` whose `id` is missing,
+because the matching result is paired by it. `interactions-to-gemini.ts` translates the same parts on
+the native-Gemini door — the two now agree on the value, and differ only where a target must.
+
+**2. A message-level part inside `content` was dropped in silence.** `thought`, `function_call` and
+`function_result` are Content types as well as step types. Inside a content list this wire has no
+position for them, so they are refused by name, naming the step form to use instead. A media part
+carrying neither `data` nor a `uri` is refused the same way.
+
+**3. `ImageContent.uri` was dropped.** It is a first-class alternative to `data` in the same union
+member, and only `data` was read, so `{"type":"image","uri":"https://…"}` became an empty `content`.
+It is now relayed as the part's URL rather than fetched here, because a URL is a position all three
+targets of that hop already have — the Completions `image_url`, the Responses `input_image`, and the
+Claude image source, which fetches it itself under its own SSRF guard.
+
+**4. The streaming dialect was not the one the SDK declares, and the usage never arrived.**
+`InteractionSSEEvent` is `interaction.created | step.start | step.delta | step.stop |
+interaction.status_update | interaction.completed | error`, and the two `/v1/interactions` streaming
+egresses spoke neither it nor each other: the Gemini-upstream transformer followed the bundled doc's
+older names (`interaction.start`, `content.start|delta|stop`, `interaction.complete`), and the
+cross-mode one emitted a whole *non-streaming* Interaction object per delta with no `event_type` at
+all — so a client generated from the SDK could dispatch on neither. Worse, the cross-mode egress
+computed the answer's usage and then discarded the frame holding it: `convertOpenAIToGeminiInteractions`
+deletes `outputs` when a finish-only chunk carries none, and `processSSEBuffer` skipped the result as
+payload-less. The client got text deltas and then nothing:
+
+```
+data: {…"outputs":[{"type":"text","text":"hi "}],"usage":{"total_input_tokens":0,…}}
+data: {…"outputs":[{"type":"text","text":"there"}],"usage":{"total_input_tokens":0,…}}
+                                     ← no terminal frame; real usage was 19/7/26
+```
+
+Both egresses now write through `converters/interactions-stream-events.ts`, which owns the dialect:
+`interaction.created`, `step.start` / `step.delta` / `step.stop` for each step, and
+`interaction.completed`. The lifecycle events carry an `InteractionSseEventInteraction`, whose answer
+field is `steps` — not the `outputs` a REST Interaction resource has — so an answer accumulates the
+same `Step` objects the live events announce, and the interaction adopts the upstream's own id rather
+than a minted one. Usage rides the two positions the SDK gives it, the closing `step.stop` and the
+completed interaction:
+
+```
+data: {"event_type":"step.stop","index":0,"usage":{"total_input_tokens":19,"total_output_tokens":7,"total_tokens":26}}
+data: {"event_type":"interaction.completed","interaction":{"id":"resp_s",…,"steps":[{"type":"model_output",
+       "content":[{"type":"text","text":"hi there"}]}],
+       "usage":{"total_input_tokens":19,"total_output_tokens":7,"total_tokens":26}}}
+```
+
+The terminal frames are written once the upstream stream is drained, not on the frame carrying the
+finish reason: an `openai-completions` upstream that gates usage behind `stream_options.include_usage`
+reports it on a later frame, and completing early would publish zeros. A stream that ends with no finish
+reason at all is aborted rather than completed. A failure the closing conversion reports now reaches the
+client on the union's `error` event, because `InteractionSseEventInteraction` declares no `error` field
+to carry it. On an `openai-responses` route, both streaming and non-streaming `incomplete` answers now
+report `status: "failed"`, even when the answer also contains a function call.
+
+**Known gap, pinned not fixed:** a `document`, `audio` or `video` part is still relayed as an
+`image_url` (and so an `input_image`), because `INTERACTIONS_MEDIA_PART_TYPES` treats the four alike.
+The Responses API declares a separate `input_file` for documents and no input item at all for audio and
+video, so a PDF rides a field that does not describe it. Mapping it properly needs a shape decision
+across all three targets of that hop — the Completions `file`, the Responses `input_file`, and Claude's
+own `document` source — not just this one.
+
 ### feat(converters): `/v1/interactions` `labels` reach an `openai-completions` upstream as `metadata`
 
 The Interactions API declares a request-level `labels` map — "the labels with user-defined metadata for

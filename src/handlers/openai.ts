@@ -16,7 +16,7 @@ import { handleTargetApiError } from '../utils/errors.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
 import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 
-import { handleCrossModeStreamingResponse, processSSEBuffer, clearGeminiSSEState, warnDroppedOutputItems } from './cross-mode-stream.js';
+import { handleCrossModeStreamingResponse, processSSEBuffer, clearGeminiSSEState, finishInteractionsStream, warnDroppedOutputItems } from './cross-mode-stream.js';
 import {
   convertGeminiGenerateContentToOpenAI,
   convertGeminiInteractionsToOpenAI,
@@ -325,6 +325,9 @@ async function forwardCompletionsAsOpenAIResponses(
   }
   if (isInteractionsRequest) {
     const interactionResponse = convertOpenAIToGeminiInteractions(syntheticCompletions, model, requestId);
+    if (responsesJson.status === 'incomplete' || responsesJson.status === 'failed') {
+      interactionResponse.status = 'failed';
+    }
     logPipelineStage(logger, requestId, 'outbound', '/v1/interactions', interactionResponse);
     const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
     logPipelineHeaders(logger, requestId, 'outbound', '/v1/interactions', outHeaders);
@@ -643,6 +646,19 @@ async function handleOpenAIStreamingResponse(
                 if (processed) {
                     logPipelineStage(logger, requestId, 'outbound', 'stream (final)', processed);
                     await writer.write(encoder.encode(processed));
+                }
+            }
+
+            // The Interactions dialect ends on `interaction.completed`, which is
+            // written here rather than on `[DONE]`: an `openai-completions` upstream
+            // that gates usage behind `stream_options.include_usage` reports it on a
+            // frame after the end marker, and completing on the marker would publish
+            // zeros. '' when that drain already ran on the marker.
+            if (isInteractionsRequest) {
+                const terminal = finishInteractionsStream(requestId);
+                if (terminal) {
+                    logPipelineStage(logger, requestId, 'outbound', 'stream (terminal)', terminal);
+                    await writer.write(encoder.encode(terminal));
                 }
             }
 

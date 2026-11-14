@@ -272,10 +272,12 @@ describe('Gemini front door → openai-responses: the SSE egress', () => {
     assertNoTerminalFrame(partial);
   });
 
-  it('serves the /v1/interactions front door from the same conversion', async () => {
+  it("serves the /v1/interactions front door in the SDK's InteractionSSEEvent dialect", async () => {
     const { frames } = await run([
-      { type: 'response.created', response: { id: 'resp_int' } },
-      { type: 'response.output_text.delta', delta: 'interaction answer' },
+      { type: 'response.created', response: { id: 'resp_int', model: 'gpt-upstream' } },
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_1' } },
+      { type: 'response.output_text.delta', output_index: 0, delta: 'interaction ' },
+      { type: 'response.output_text.delta', output_index: 0, delta: 'answer' },
       { type: 'response.completed', response: { id: 'resp_int', usage: { input_tokens: 3, output_tokens: 5, total_tokens: 8 } } },
     ], {
       path: '/v1/interactions',
@@ -284,8 +286,119 @@ describe('Gemini front door → openai-responses: the SSE egress', () => {
       body: { input: [{ type: 'user_input', content: 'hi' }], stream: true },
     });
 
-    const outputs = frames.flatMap(frame => frame.outputs ?? []);
-    assert.deepEqual(outputs.filter((o: any) => o.type === 'text'), [{ type: 'text', text: 'interaction answer' }]);
+    // The vocabulary is the one `@google/genai` declares for this endpoint
+    // (`InteractionSSEEvent`), and a typed client dispatches on `event_type` — so
+    // every frame carries one. The frames this egress used to send carried none:
+    // they were whole non-streaming Interaction objects, once per delta.
+    assert.deepEqual(frames.map(frame => frame.event_type), [
+      'interaction.created',
+      'step.start',
+      'step.delta',
+      'step.delta',
+      'step.stop',
+      'interaction.completed',
+    ]);
+
+    // The lifecycle events carry an `InteractionSseEventInteraction`, whose answer
+    // field is `steps` — not the `outputs` a REST Interaction resource has.
+    assert.equal(frames[0].interaction.id, 'resp_int');
+    assert.equal(frames[0].interaction.status, 'in_progress');
+    assert.deepEqual(frames[0].interaction.steps, []);
+
+    assert.deepEqual(frames[1].step, { type: 'model_output', content: [] });
+    assert.equal(frames[1].index, frames[2].index, 'a delta names the step it appends to');
+    assert.deepEqual(frames[2].delta, { type: 'text', text: 'interaction ' });
+    assert.deepEqual(frames[3].delta, { type: 'text', text: 'answer' });
+
+    // The step the deltas built is the one the closing interaction publishes.
+    assert.deepEqual(frames[5].interaction.steps, [
+      { type: 'model_output', content: [{ type: 'text', text: 'interaction answer' }] },
+    ]);
+    assert.equal(frames[5].interaction.status, 'completed');
+  });
+
+  it('reports the upstream usage on the terminal frames', async () => {
+    // The defect this replaces: the usage was computed and then thrown away, because
+    // the frame carrying it was the one payload `processSSEBuffer` did not recognise.
+    // The SDK gives `usage` two positions at the end of an answer and both are filled.
+    const { frames } = await run([
+      { type: 'response.created', response: { id: 'resp_usage' } },
+      { type: 'response.output_text.delta', delta: 'hi' },
+      { type: 'response.completed', response: { id: 'resp_usage', usage: { input_tokens: 19, output_tokens: 7, total_tokens: 26 } } },
+    ], { path: '/v1/interactions', body: { input: [{ type: 'user_input', content: 'hi' }], stream: true } });
+
+    const expected = { total_input_tokens: 19, total_output_tokens: 7, total_tokens: 26 };
+    const stop = frames.find(frame => frame.event_type === 'step.stop');
+    assert.deepEqual(stop?.usage, expected, 'the closing step carries the usage');
+    const completed = frames.find(frame => frame.event_type === 'interaction.completed');
+    assert.deepEqual(completed?.interaction.usage, expected, 'so does the completed interaction');
+  });
+
+  it('carries a tool call as a function_call step and ends requires_action', async () => {
+    const { frames } = await run([
+      { type: 'response.created', response: { id: 'resp_tool' } },
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '' } },
+      { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":"SF"}' },
+      { type: 'response.completed', response: { id: 'resp_tool', usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 } } },
+    ], { path: '/v1/interactions', body: { input: [{ type: 'user_input', content: 'hi' }], stream: true } });
+
+    assert.deepEqual(frames.map(frame => frame.event_type), [
+      'interaction.created',
+      'step.start',
+      'step.stop',
+      'interaction.completed',
+    ]);
+    // Fragments are announced once, whole, on the frame that ends the turn.
+    assert.deepEqual(frames[1].step, {
+      type: 'function_call', id: 'call_1', name: 'get_weather', arguments: { city: 'SF' },
+    });
+    assert.equal(frames[3].interaction.status, 'requires_action');
+  });
+
+  it('reports response.incomplete as failed even after a tool call', async () => {
+    const { frames } = await run([
+      { type: 'response.created', response: { id: 'resp_cut' } },
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '' } },
+      { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":"SF"}' },
+      {
+        type: 'response.incomplete',
+        response: { id: 'resp_cut', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } },
+      },
+    ], { path: '/v1/interactions', body: { input: [{ type: 'user_input', content: 'hi' }], stream: true } });
+
+    const terminal = frames.at(-1);
+    assert.equal(terminal.event_type, 'interaction.completed');
+    assert.equal(terminal.interaction.status, 'failed');
+  });
+
+  it('reports upstream reasoning as a thought step, not as answer text', async () => {
+    const { frames } = await run([
+      { type: 'response.created', response: { id: 'resp_think' } },
+      { type: 'response.reasoning_summary_text.delta', output_index: 0, delta: 'weighing it up' },
+      { type: 'response.output_text.delta', delta: 'answer' },
+      { type: 'response.completed', response: { id: 'resp_think' } },
+    ], { path: '/v1/interactions', body: { input: [{ type: 'user_input', content: 'hi' }], stream: true } });
+
+    // A step's deltas do not interleave with another's: the thought step closes
+    // before the answer's opens.
+    assert.deepEqual(frames.map(frame => frame.event_type), [
+      'interaction.created',
+      'step.start',
+      'step.delta',
+      'step.stop',
+      'step.start',
+      'step.delta',
+      'step.stop',
+      'interaction.completed',
+    ]);
+    assert.deepEqual(frames[1].step, { type: 'thought', summary: [] });
+    assert.deepEqual(frames[2].delta, {
+      type: 'thought_summary', content: { type: 'text', text: 'weighing it up' },
+    });
+    assert.deepEqual(frames[7].interaction.steps, [
+      { type: 'thought', summary: [{ type: 'text', text: 'weighing it up' }] },
+      { type: 'model_output', content: [{ type: 'text', text: 'answer' }] },
+    ]);
   });
 
   it('closes cleanly when a partial frame trails the terminal event', async () => {
@@ -340,6 +453,19 @@ describe('Gemini front door → openai-responses: the non-streaming egress', () 
     assert.deepEqual(out.candidates[0].content.parts, [{ text: 'partial answer' }]);
     assert.equal(out.candidates[0].finishReason, 'MAX_TOKENS');
     assert.deepEqual(out.usageMetadata, { promptTokenCount: 5, candidatesTokenCount: 3, totalTokenCount: 8 });
+  });
+
+  it('reports an incomplete Responses answer as a failed Interaction even after a tool call', async () => {
+    const out = await runJson({
+      id: 'resp_cut', object: 'response', status: 'incomplete', model: 'gpt-upstream',
+      incomplete_details: { reason: 'max_output_tokens' },
+      output: [
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'partial answer' }] },
+        { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"SF"}' },
+      ],
+    }, { path: '/v1/interactions' });
+
+    assert.equal(out.status, 'failed');
   });
 
   it('reports a content-filtered answer as SAFETY', async () => {

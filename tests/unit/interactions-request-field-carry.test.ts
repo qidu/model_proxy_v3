@@ -191,3 +191,77 @@ describe('/v1/interactions → openai-responses: request fields reach the upstre
     assert.equal('temperature' in upstream, false);
   });
 });
+
+/**
+ * The `input` steps that carry no content of their own — a tool call, its result,
+ * a thought. The SDK's `InteractionsInput` declares `Array<Step>`, so a client
+ * replaying a conversation sends these beside its `user_input` / `model_output`
+ * turns, and every one of them used to reach the upstream as an empty prompt.
+ */
+describe('/v1/interactions → openai-responses: the steps that carry no content', () => {
+  it('replays a function_call / function_result pair as Responses items', async () => {
+    const upstream = await send({
+      model: 'gemini-test',
+      input: [
+        { type: 'user_input', content: [{ type: 'text', text: 'weather in SF?' }] },
+        { type: 'function_call', id: 'c1', name: 'get_weather', arguments: { city: 'SF' } },
+        { type: 'function_result', call_id: 'c1', name: 'get_weather', result: '72F' },
+        { type: 'model_output', content: [{ type: 'text', text: 'It is 72F' }] },
+      ],
+    }, 'openai-responses');
+
+    // The call and its result land on the two items the Responses API pairs by
+    // `call_id`, and the empty `content: null` of the tool-call turn adds no
+    // message item of its own.
+    assert.deepEqual(upstream.input, [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'weather in SF?' }] },
+      { type: 'function_call', call_id: 'c1', name: 'get_weather', arguments: '{"city":"SF"}' },
+      { type: 'function_call_output', call_id: 'c1', output: '72F' },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'It is 72F' }] },
+    ]);
+  });
+
+  it('carries a thought step as a reasoning item', async () => {
+    const upstream = await send({
+      model: 'gemini-test',
+      input: [
+        { type: 'user_input', content: 'hi' },
+        { type: 'thought', summary: [{ type: 'text', text: 'weighing it up' }] },
+        { type: 'model_output', content: [{ type: 'text', text: 'answer' }] },
+      ],
+    }, 'openai-responses');
+
+    assert.deepEqual(upstream.input, [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+      { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'weighing it up' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
+    ]);
+  });
+
+  it('reaches an openai-completions upstream as the tool-call pair it already spells', async () => {
+    // The same steps on the native Completions route: no second hop, so what the
+    // converter wrote is what the upstream reads.
+    const upstream = await send({
+      model: 'gemini-test',
+      input: [
+        { type: 'user_input', content: 'weather?' },
+        { type: 'function_call', id: 'c1', name: 'get_weather', arguments: { city: 'SF' } },
+        { type: 'function_result', call_id: 'c1', result: '72F' },
+      ],
+    }, 'openai-completions');
+
+    assert.deepEqual(upstream.messages, [
+      { role: 'user', content: 'weather?' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'c1',
+          type: 'function',
+          function: { name: 'get_weather', arguments: '{"city":"SF"}' },
+        }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: '72F' },
+    ]);
+  });
+});

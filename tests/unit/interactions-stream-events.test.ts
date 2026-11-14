@@ -71,30 +71,35 @@ describe('/v1/interactions streaming → Interactions events', () => {
     stubSse(UPSTREAM_SSE);
     const events = eventsOf(await interactionsStream());
 
+    // The vocabulary is the one `@google/genai` declares for this endpoint
+    // (`InteractionSSEEvent`). This transformer used to emit the bundled doc's
+    // older names — `interaction.start`, `content.*`, `interaction.complete` —
+    // which the SDK no longer declares, so a client generated from the SDK could
+    // not dispatch on any frame.
     assert.deepEqual(
       events.map(event => event.event_type),
-      ['interaction.start', 'content.start', 'content.delta', 'content.delta', 'content.stop',
-        'content.start', 'content.stop', 'interaction.complete'],
+      ['interaction.created', 'step.start', 'step.delta', 'step.delta', 'step.stop',
+        'step.start', 'step.stop', 'error', 'interaction.completed'],
     );
     // The pin for the wrapper bug: none of the upstream's own framing may survive.
     assert.equal(JSON.stringify(events).includes('"candidates"'), false, 'a raw upstream chunk reached the client');
   });
 
-  it('streams text as deltas into one content, then the call as its own content', async () => {
+  it('streams text as deltas into one step, then the call as a step of its own', async () => {
     stubSse(UPSTREAM_SSE);
     const events = eventsOf(await interactionsStream());
 
-    assert.deepEqual(events.filter(e => e.event_type === 'content.delta'), [
-      { event_type: 'content.delta', index: 0, delta: { type: 'text', text: 'Hi' } },
-      { event_type: 'content.delta', index: 0, delta: { type: 'text', text: ' there' } },
+    assert.deepEqual(events.filter(e => e.event_type === 'step.delta'), [
+      { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'Hi' } },
+      { event_type: 'step.delta', index: 0, delta: { type: 'text', text: ' there' } },
     ]);
-    // The call is one content that opens and closes at once, at the next index.
+    // The call arrives whole, so it is announced whole, at the next step index.
     assert.deepEqual(events[5], {
-      event_type: 'content.start',
+      event_type: 'step.start',
       index: 1,
-      content: { type: 'function_call', name: 'f', arguments: { a: 1 }, id: 'c1' },
+      step: { type: 'function_call', name: 'f', arguments: { a: 1 }, id: 'c1' },
     });
-    assert.deepEqual(events[6], { event_type: 'content.stop', index: 1 });
+    assert.deepEqual(events[6], { event_type: 'step.stop', index: 1 });
   });
 
   it('closes with the interaction the non-streaming egress would have produced', async () => {
@@ -102,22 +107,32 @@ describe('/v1/interactions streaming → Interactions events', () => {
     const events = eventsOf(await interactionsStream());
     const complete = events.at(-1);
 
-    assert.equal(complete.event_type, 'interaction.complete');
+    assert.equal(complete.event_type, 'interaction.completed');
     // The upstream's own id identifies the interaction from start to completion.
     assert.equal(events[0].interaction.id, 'UPSTREAM-ID');
     assert.equal(complete.interaction.id, events[0].interaction.id);
-    assert.deepEqual(complete.interaction.outputs, [
-      { type: 'text', text: 'Hi there' },
+    // The lifecycle event carries an `InteractionSseEventInteraction`, whose answer
+    // field is `steps` — not the `outputs` a REST Interaction resource has.
+    assert.deepEqual(complete.interaction.steps, [
+      { type: 'model_output', content: [{ type: 'text', text: 'Hi there' }] },
       { type: 'function_call', name: 'f', arguments: { a: 1 }, id: 'c1' },
     ]);
     assert.equal(complete.interaction.status, 'failed');
-    assert.match(complete.interaction.error.code, /#FinishReason\.MAX_TOKENS$/);
     assert.deepEqual(complete.interaction.usage, {
       total_input_tokens: 3, total_output_tokens: 4, total_tokens: 7,
     });
+
+    // The failure the closing interaction used to carry: `InteractionSseEventInteraction`
+    // declares no `error` field, so it is the union's `error` event now.
+    const error = events.find(e => e.event_type === 'error');
+    assert.match(error.error.code, /#FinishReason\.MAX_TOKENS$/);
+    assert.ok(
+      events.indexOf(error) < events.length - 1,
+      'the reason precedes the closing frame',
+    );
   });
 
-  it('names a minted call once, in the streamed content and in the closing interaction', async () => {
+  it('names a minted call once, in the streamed step and in the closing interaction', async () => {
     // The closing conversion runs over the accumulated parts again, at their own
     // indices, so a call the upstream sent without an id (Gemini omits one often)
     // used to be announced as `call_0` and then reported as `call_1` — and two of
@@ -130,24 +145,27 @@ describe('/v1/interactions streaming → Interactions events', () => {
     const events = eventsOf(await interactionsStream());
 
     const announced = events
-      .filter(e => e.event_type === 'content.start' && e.content.type === 'function_call')
-      .map(e => e.content.id);
-    const complete = events.at(-1).interaction.outputs
-      .filter((o: any) => o.type === 'function_call')
-      .map((o: any) => o.id);
+      .filter(e => e.event_type === 'step.start' && e.step.type === 'function_call')
+      .map(e => e.step.id);
+    const complete = events.at(-1).interaction.steps
+      .filter((s: any) => s.type === 'function_call')
+      .map((s: any) => s.id);
 
     assert.deepEqual(announced, ['call_1', 'call_2'], 'a minted id is the call’s position in the answer');
     assert.deepEqual(complete, announced, 'the stream and the closing interaction must agree');
   });
 
-  it('states a withheld answer as a failed interaction', async () => {
+  it('states a withheld answer as a failed interaction, with the reason on an error event', async () => {
     stubSse('data: {"candidates":[{"finishReason":"SAFETY"}],"promptFeedback":{"blockReason":"SAFETY"}}\n\n');
     const events = eventsOf(await interactionsStream());
     const complete = events.at(-1);
 
+    assert.equal(complete.event_type, 'interaction.completed');
     assert.equal(complete.interaction.status, 'failed');
-    assert.match(complete.interaction.error.code, /#BlockReason\.SAFETY$/);
-    assert.deepEqual(complete.interaction.outputs, []);
+    assert.deepEqual(complete.interaction.steps, []);
+    // A recoverable refusal is not recoverable in silence (rule #8).
+    const error = events.find(e => e.event_type === 'error');
+    assert.match(error.error.code, /#BlockReason\.SAFETY$/);
   });
 });
 
@@ -188,7 +206,7 @@ describe('/v1/interactions streaming — the other two dialects are unaffected',
 
 describe('createInteractionsStreamTransformer — a truncated upstream stream', () => {
   it('fails loudly when the stream ends without a finishReason', async () => {
-    // A finished interaction is announced by `interaction.complete`; an EOF before
+    // A finished interaction is announced by `interaction.completed`; an EOF before
     // one is a truncated stream, and reporting it as complete would hide the loss.
     const source = new ReadableStream<Uint8Array>({
       start(controller) {
