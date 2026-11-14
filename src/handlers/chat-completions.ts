@@ -14,6 +14,7 @@ import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { validateOpenAICompletionsRequest } from '../utils/validation.js';
 import { ValidationError } from '../utils/errors.js';
 import { claudeJsonToSyntheticCompletions } from './openai.js';
+import { warnDroppedOutputItems } from './cross-mode-stream.js';
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
 import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
 import {
@@ -745,21 +746,4 @@ export async function handleChatCompletionsPassthrough(
     statusText: upstreamResponse.statusText,
     headers: responseHeaders,
   });
-}
-
-/**
- * Report Responses output items the conversion had no Chat Completions position
- * for. Called on both the JSON and the SSE egress; a silent drop is forbidden
- * (rule #8) — an `image_generation_call` result or a `web_search_call` vanishes
- * from the client's answer, and the log is the only place that can say so.
- */
-function warnDroppedOutputItems(
-  logger: Logger,
-  requestId: string,
-  path: string,
-  dropped: Record<string, number>,
-): void {
-  for (const [type, count] of Object.entries(dropped)) {
-    logger.warn(requestId, `${path} openai-responses → chat.completion: dropped ${count} output item(s) of type '${type}' (no Chat Completions representation)`);
-  }
 }

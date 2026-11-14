@@ -16,7 +16,7 @@ import { handleTargetApiError } from '../utils/errors.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
 import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 
-import { handleCrossModeStreamingResponse, processSSEBuffer, clearGeminiSSEState } from './cross-mode-stream.js';
+import { handleCrossModeStreamingResponse, processSSEBuffer, clearGeminiSSEState, warnDroppedOutputItems } from './cross-mode-stream.js';
 import {
   convertGeminiGenerateContentToOpenAI,
   convertGeminiInteractionsToOpenAI,
@@ -25,6 +25,7 @@ import {
 } from '../converters/gemini-to-openai.js';
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
 import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
+import { convertResponsesToChatCompletionsAnswer } from '../converters/responses-to-completions.js';
 
 /**
  * Forward an OpenAI Chat Completions body as a Claude Messages request to an
@@ -276,40 +277,22 @@ async function forwardCompletionsAsOpenAIResponses(
   const responsesJson = await receiveJsonResponse<Record<string, unknown>>(
     response, requestId, logger, targetUrl, originalRequest.signal,
   );
-  // Build a synthetic Completions response from the Responses output items so
-  // we can reuse the existing Gemini response converters.
-  const outputItems = (responsesJson.output as Array<Record<string, unknown>>) ?? [];
-  const textMsg = outputItems.find(o => o.type === 'message');
-  const textPart = (textMsg?.content as Array<Record<string, unknown>> | undefined)?.find(c => c.type === 'output_text');
-  const toolCallItems = outputItems.filter(o => o.type === 'function_call');
-  const usageObj = responsesJson.usage as Record<string, unknown> | undefined;
-
-  const syntheticCompletions: Record<string, unknown> = {
-    id: responsesJson.id ?? `chatcmpl_${Date.now()}`,
-    object: 'chat.completion',
-    created: (responsesJson.created_at as number) ?? Math.floor(Date.now() / 1000),
-    model: (responsesJson.model as string) ?? model,
-    choices: [{
-      index: 0,
-      message: {
-        role: 'assistant',
-        content: (textPart?.text as string) ?? '',
-        ...(toolCallItems.length > 0 ? {
-          tool_calls: toolCallItems.map(tc => ({
-            id: (tc.call_id as string) ?? (tc.id as string) ?? `call_${Date.now()}`,
-            type: 'function',
-            function: { name: tc.name ?? '', arguments: tc.arguments ?? '' },
-          })),
-        } : {}),
-      },
-      finish_reason: toolCallItems.length > 0 ? 'tool_calls' : 'stop',
-    }],
-    usage: usageObj ? {
-      prompt_tokens: usageObj.input_tokens ?? 0,
-      completion_tokens: usageObj.output_tokens ?? 0,
-      total_tokens: usageObj.total_tokens ?? 0,
-    } : undefined,
-  };
+  // The answer is converted by the same function the `/v1/chat/completions`
+  // egress uses (`convertResponsesToChatCompletionsAnswer`), so both routes read a
+  // Responses answer the same way before the Gemini converters render it. The
+  // hand-built substitute this replaces read only `output_text` parts and
+  // `function_call` items and then reported `finish_reason: 'stop'` for every
+  // answer that called no tool — a turn truncated at the output cap was told to
+  // the client as STOP (MAX_TOKENS in Gemini terms) when the upstream had said
+  // `incomplete_details.reason: "max_output_tokens"`. It also dropped `reasoning`
+  // items, which belong in `reasoning_content` for the Gemini converters' thought
+  // parts.
+  const answer = convertResponsesToChatCompletionsAnswer(responsesJson, model);
+  // A silent drop is forbidden (rule #8): an `image_generation_call` result or a
+  // `web_search_call` has no Gemini position either, and the log is the only place
+  // that can say so.
+  warnDroppedOutputItems(logger, requestId, new URL(originalRequest.url).pathname, answer.dropped);
+  const syntheticCompletions = answer.completions;
 
   if (isGenerateContentRequest) {
     const geminiResponse = convertOpenAIToGeminiGenerateContent(syntheticCompletions, model, requestId);

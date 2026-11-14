@@ -9,6 +9,15 @@
  * also the egress for an `openai-completions` upstream, which is why it lives here
  * beside the two drivers rather than in `handlers/openai.ts`.
  *
+ * The two drivers differ in how much of their event vocabulary they map.
+ * `processAnthropicSSEBuffer` maps the Anthropic events inline (its stream is
+ * already close to what the clients want). `processResponsesSSEBuffer` maps none
+ * of them itself: a Responses stream has almost no field in common with the
+ * Completions chunk the next stage reads, so it defers the whole vocabulary to
+ * `responsesStreamEventToChatChunks` — the same converter the
+ * `/v1/chat/completions` egress uses — and only adds the one thing that converter
+ * leaves to its caller, the usage Gemini clients read off the terminal chunk.
+ *
  * Every per-request buffer below is keyed by `requestId` because concurrent
  * streams interleave on the event loop across `await reader.read()` suspension
  * points.
@@ -20,6 +29,11 @@ import { logPipelineStage, logPipelineHeaders } from '../utils/logger.js';
 import type { Logger } from '../types/shared.js';
 import { convertOpenAIToClaudeResponse } from '../converters/openai-to-claude.js';
 import { convertOpenAIToGeminiGenerateContent, convertOpenAIToGeminiInteractions, clearGeminiToolSchemas } from '../converters/openai-to-gemini.js';
+import {
+  createResponsesChatStreamState,
+  responsesStreamEventToChatChunks,
+  type ResponsesChatStreamState,
+} from '../converters/responses-to-completions.js';
 
 function openAIChunk(text: string, model: string, usage?: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -252,7 +266,43 @@ function processAnthropicSSEBuffer(
   return { processed: result, remaining };
 }
 
-function processResponsesSSEBuffer(buffer: string, model: string, requestId: string, isInteractionsRequest: boolean, isGenerateContentRequest: boolean): { processed: string; remaining: string } {
+/**
+ * Render a Responses SSE stream into the Completions chunks `processSSEBuffer`
+ * expects, then let it produce the client's endpoint format.
+ *
+ * Every event is mapped by `responsesStreamEventToChatChunks`, which is what the
+ * `/v1/chat/completions` egress uses for this upstream family. This driver used
+ * to hand-map `response.output_text.delta` and nothing else, so a Gemini client
+ * on this route received text deltas and then a plain end of stream: no
+ * `finishReason` (it lives on `response.completed` / `response.incomplete`, which
+ * were dropped), no `functionCall` parts (`output_item.added`,
+ * `function_call_arguments.delta` dropped), no thought parts (both reasoning
+ * deltas dropped), and `usageMetadata` of three zeros on every frame.
+ *
+ * `state` carries the cross-event facts the converter needs and is owned by
+ * `handleCrossModeStreamingResponse`, for the same reason as `usageAccum` there:
+ * a stream that never reaches its terminal event must not leave its state behind
+ * in a requestId-keyed map.
+ *
+ * Three failures are thrown rather than skipped — an unparseable frame, an
+ * upstream `response.failed`, and (at the caller) a stream that ends before its
+ * terminal event. All three would otherwise reach the client as a short but
+ * apparently complete answer (rule #8). The caller aborts the client stream.
+ */
+function processResponsesSSEBuffer(
+  buffer: string,
+  model: string,
+  requestId: string,
+  isInteractionsRequest: boolean,
+  isGenerateContentRequest: boolean,
+  state: ResponsesChatStreamState,
+): { processed: string; remaining: string } {
+  // The terminal event already ended the answer: whatever is still buffered came
+  // after it, and converting it would either repeat the ending or — for a partial
+  // frame left in the tail flush — throw and abort a stream that has already told
+  // the client it is complete.
+  if (state.finished) return { processed: '', remaining: '' };
+
   let result = '';
   const events = buffer.split('\n\n');
   const remaining = events.pop() || '';
@@ -262,17 +312,33 @@ function processResponsesSSEBuffer(buffer: string, model: string, requestId: str
     const dataLine = event.split('\n').find(line => line.startsWith('data: '));
     if (!dataLine) continue;
     const data = dataLine.slice(6).trim();
-    if (data === '[DONE]') continue;
+    if (data === '' || data === '[DONE]') continue;
+    let parsed: Record<string, unknown>;
     try {
-      const parsed = JSON.parse(data);
-      if (parsed.type === 'response.output_text.delta') {
-        const chunk = openAIChunk(parsed.delta || '', model);
-        const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
-        result += processed;
-      }
+      parsed = JSON.parse(data) as Record<string, unknown>;
     } catch {
-      // Skip invalid SSE data.
+      throw new Error(`Invalid JSON in Responses SSE data (request ${requestId})`);
     }
+    if (parsed.type === 'response.failed') {
+      throw new Error(`Responses stream failed (request ${requestId})`);
+    }
+    for (const chunk of responsesStreamEventToChatChunks(state, parsed)) {
+      // The converter leaves the usage on its state (`handleChatCompletionsPassthrough`
+      // sends it as a separate `include_usage` frame after the finish chunk).
+      // Gemini carries `usageMetadata` on the candidate and this egress has no
+      // separate usage frame, so the terminal chunk is the only place it can ride.
+      // Every other chunk stays usage-free: `convertOpenAIToGeminiGenerateContent`
+      // fills the three zero fields when the object is missing.
+      const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
+      if (choice && choice.finish_reason != null && state.usage) {
+        chunk.usage = state.usage;
+      }
+      const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
+      result += processed;
+    }
+    // Nothing may follow the terminal event on the client stream: a Gemini client
+    // ends the answer on `finishReason`.
+    if (state.finished) break;
   }
 
   return { processed: result, remaining };
@@ -290,10 +356,16 @@ export async function handleCrossModeStreamingResponse(
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
-  // The usage reported so far, for the Anthropic source only; the Responses
-  // source's usage lives in `response.completed`, which this egress does not
-  // convert (unchanged behavior).
+  // The usage reported so far, for the Anthropic source only.
   const usageAccum: AnthropicUsageAccumulator = {};
+  // The Responses source's cross-event state: the id/created/model adopted from
+  // `response.created`, the `output_index` → `tool_calls[].index` map, the usage
+  // and the output-item drop counts. Owned here rather than in a requestId-keyed
+  // map so it dies with the stream.
+  const responsesState = createResponsesChatStreamState(model);
+  // The client-facing endpoint this egress writes, for the drop report below.
+  // Both callers of this function come from the Gemini front doors.
+  const clientPath = isGenerateContentRequest ? ':generateContent' : '/v1/interactions';
 
   (async () => {
     try {
@@ -309,7 +381,7 @@ export async function handleCrossModeStreamingResponse(
         logPipelineStage(logger, requestId, 'upstream-response', response.url || `(upstream SSE, ${source})`, rawChunk);
         const converted = source === 'anthropic-messages'
           ? processAnthropicSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum)
-          : processResponsesSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest);
+          : processResponsesSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest, responsesState);
         buffer = converted.remaining;
         if (converted.processed) {
           logPipelineStage(logger, requestId, 'outbound', 'stream', converted.processed);
@@ -319,11 +391,22 @@ export async function handleCrossModeStreamingResponse(
       if (buffer.trim()) {
         const converted = source === 'anthropic-messages'
           ? processAnthropicSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum)
-          : processResponsesSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest);
+          : processResponsesSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest, responsesState);
         if (converted.processed) {
           logPipelineStage(logger, requestId, 'outbound', 'stream (final)', converted.processed);
           await writer.write(encoder.encode(converted.processed));
         }
+      }
+      // A Responses stream that stops before its terminal event leaves a Gemini
+      // client with no `finishReason` at all — the stream just ends, and strict
+      // SDKs reject that ("stream ended without a finish reason"). Abort instead,
+      // so the client sees a broken stream rather than a complete answer; the
+      // other two Responses egresses refuse the same way.
+      if (source === 'openai-responses' && !responsesState.finished) {
+        throw new Error(`Responses stream ended before response.completed (request ${requestId})`);
+      }
+      if (source === 'openai-responses') {
+        warnDroppedOutputItems(logger, requestId, clientPath, responsesState.dropped);
       }
       await writer.close();
     } catch (error) {
@@ -500,4 +583,25 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
     }
     
     return { processed: result, remaining };
+}
+
+/**
+ * Report Responses output items the conversion had no Chat Completions position
+ * for. Called on every Responses egress; a silent drop is forbidden (rule #8) —
+ * an `image_generation_call` result or a `web_search_call` vanishes from the
+ * client's answer, and the log is the only place that can say so.
+ *
+ * The wording names the Completions hop rather than the client's format, because
+ * that hop is where the item is lost: the Gemini egress reports the same drop
+ * through this function.
+ */
+export function warnDroppedOutputItems(
+  logger: Logger,
+  requestId: string,
+  path: string,
+  dropped: Record<string, number>,
+): void {
+  for (const [type, count] of Object.entries(dropped)) {
+    logger.warn(requestId, `${path} openai-responses → chat.completion: dropped ${count} output item(s) of type '${type}' (no Chat Completions representation)`);
+  }
 }

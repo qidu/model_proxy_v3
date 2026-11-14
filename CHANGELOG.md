@@ -5,6 +5,80 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): a Gemini client on an `openai-responses` upstream gets `finishReason`, tool calls, reasoning and usage
+
+`/v1beta/models/{model}:streamGenerateContent?alt=sse` (and `/v1/interactions`) routed to
+`upstream_mode = "openai-responses"` reached `processResponsesSSEBuffer`, which hand-mapped
+**one** Responses event — `response.output_text.delta` — and discarded the rest. The stop reason is
+not on a text delta: a Responses upstream states it on `response.completed` /
+`response.incomplete` (`status` + `incomplete_details.reason`), and `convertOpenAIToGeminiGenerateContent`
+derives `candidate.finishReason` from `choices[0].finish_reason` alone. So the field was simply never
+produced: the client read text deltas and then a bare end of stream, which strict Gemini clients
+(`@google/genai`) reject with "stream ended without a finish reason".
+
+That one dropped event took four things with it, all reported together here rather than fixed
+separately, because they had one cause:
+
+| lost on this route | where it actually lives | reached the client as |
+| --- | --- | --- |
+| `finishReason` | `response.completed` / `response.incomplete` | absent → SDK throws |
+| `functionCall` parts | `response.output_item.added`, `response.function_call_arguments.delta` | absent — a tool-calling turn arrived as an empty answer |
+| thought parts | `response.reasoning_summary_text.delta`, `response.reasoning_text.delta` | absent |
+| `usageMetadata` | `response.completed.response.usage` | `{0,0,0}` on every frame |
+
+The driver now maps **no** event vocabulary of its own: it defers the whole thing to
+`responsesStreamEventToChatChunks`, the converter `handleChatCompletionsPassthrough` already uses for
+this upstream family (`converters/responses-to-completions.ts`), and adds only the one thing that
+converter leaves to its caller. Its mapping — the `output_index` → dense `tool_calls[].index` map,
+`incomplete_details.reason` → `length`/`content_filter`, refusal handling — was already unit-tested in
+`responses-completions-roundtrip.test.ts`; this route simply was not using it.
+
+Three things are new behavior around the conversion, all of them rule #8 (fail loud):
+
+- **Usage now rides the terminal frame.** The converter leaves usage on its state
+  (`handleChatCompletionsPassthrough` emits it as a separate `include_usage` frame after the finish
+  chunk). Gemini carries `usageMetadata` on the candidate and this egress has no separate usage frame,
+  so the terminal chunk is the only place it can ride; every other chunk stays usage-free and keeps the
+  converter's three zeros.
+- **`response.failed` aborts the client stream** instead of ending it like a complete answer, and so
+  does an unparseable `data:` frame. `handleChatCompletionsPassthrough` and
+  `handleResponsesStreamAsClaude` already refuse both.
+- **A stream that ends before its terminal event is aborted**, rather than closed. That is the case
+  that used to look most like success: a truncated answer became a bare end of stream with no
+  `finishReason`.
+
+The same route's **non-streaming** half (`forwardCompletionsAsOpenAIResponses`, reached by
+`:generateContent`) had the milder version of this bug, and is fixed the same way: a hand-built
+"synthetic Completions" substitute read `output_text` parts and `function_call` items and then set
+`finish_reason: tool_calls ? 'tool_calls' : 'stop'`, so an answer truncated at the output cap
+(`status: "incomplete"`, `incomplete_details.reason: "max_output_tokens"`) reached the client as `STOP`
+instead of `MAX_TOKENS` — and one filtered by `content_filter` did too. It now calls
+`convertResponsesToChatCompletionsAnswer`, the same function the `/v1/chat/completions` JSON egress
+uses, which brings three further agreement points at no extra cost: a `content_filter` reason becomes
+`SAFETY`, `reasoning` items become `reasoning_content` (so `{thought: true}` parts, previously absent
+on this half), and output items with no position are counted and reported through
+`warnDroppedOutputItems` instead of vanishing. `message.content` is `null` rather than `''` for a
+tool-calls-only answer, which the Gemini converters already read as "no text".
+
+The per-request state (`createResponsesChatStreamState`) is owned by `handleCrossModeStreamingResponse`
+and passed in, like `usageAccum` beside it, so a stream that never reaches its terminal event does not
+leave state behind in a requestId-keyed map.
+
+`warnDroppedOutputItems` moved from `handlers/chat-completions.ts` to `handlers/cross-mode-stream.ts`
+(exported; both callers import it) — the drop counts it reports are produced by the shared converter, so
+both egresses must report them through one function, and `cross-mode-stream.ts` is the leaf module that
+can hold it without the import cycle `chat-completions.ts → openai.ts → cross-mode-stream.ts` would
+otherwise create. Its message still names the Completions hop, which is where the item is lost.
+
+`tests/unit/gemini-responses-cross-mode-stream.test.ts` (new, 15 cases) drives `handleOpenAIRequest`
+with the reported request and pins what a Gemini client receives. Streaming: one `finishReason` (`STOP`,
+and `MAX_TOKENS` for `response.incomplete`), a complete `functionCall` part flushed once from fragmented
+arguments, thought parts, real `usageMetadata` on the terminal frame only, the `image_generation_call`
+drop report, and the three abort paths. Non-streaming: `MAX_TOKENS` for a capped answer, `SAFETY` for a
+filtered one, thought parts ahead of the text, tool calls in output order, and the same drop report.
+Full unit suite 2853/2853. Four of the five non-streaming cases and nine of the ten streaming ones fail
+against the pre-fix handlers.
+
 ### refactor(converters): the Completions → Messages/Responses request hop leaves the handler
 
 The second hop of the cross-mode bridge — a Completions body re-targeted at an `anthropic-messages` or
