@@ -50,6 +50,17 @@ async function forwardCompletionsAsAnthropicMessages(
 ): Promise<Response> {
   let claudeBody = await completionsToClaudeBody(openaiRequest, model);
 
+  // Rule #8: an Interactions client's `labels` rides the intermediate as `metadata`
+  // (`convertGeminiInteractionsToOpenAI`), and this hop has nowhere to put it —
+  // `completionsToClaudeBody` maps no metadata, and Claude's own `metadata` accepts
+  // only `user_id`. Reported rather than dropped in silence. Only the
+  // /v1/interactions and :generateContent front doors reach this function, and only
+  // that converter emits `metadata`, so the field here is the client's labels.
+  if (openaiRequest.metadata !== undefined) {
+    logger.warn(requestId,
+      'labels not carried to the anthropic-messages upstream: Claude metadata accepts only user_id; dropped');
+  }
+
   // DeepSeek's anthropic-compatible endpoint REQUIRES a `content[].thinking`
   // block on any assistant turn that carried tool_use in thinking mode — a turn
   // with only tool_use blocks is rejected with "content[].thinking ... must be
@@ -228,6 +239,17 @@ async function forwardCompletionsAsOpenAIResponses(
   route?: ModelRouteConfig,
 ): Promise<Response> {
   let responsesBody: Record<string, unknown> = completionsToResponsesBody(openaiRequest, model);
+
+  // Rule #8: the Interactions `labels` map reaches this hop as `metadata`, and
+  // `completionsToResponsesBody` maps no such field. The Responses API does declare
+  // `metadata`, so this is an unmapped hop rather than an impossible one — reported
+  // now rather than dropped in silence. See the `anthropic-messages` twin above for
+  // why `metadata` here can only be the client's labels.
+  if (openaiRequest.metadata !== undefined) {
+    logger.warn(requestId,
+      'labels not carried to the openai-responses upstream: completionsToResponsesBody does not map metadata; dropped');
+  }
+
   logger.debug(requestId, `Interactions/generateContent -> openai-responses body: ${JSON.stringify(responsesBody).substring(0, 500)}`);
 
   if (route) {
@@ -421,7 +443,7 @@ export async function handleOpenAIRequest(
         openaiRequest = convertGeminiGenerateContentToOpenAI(requestBody, { logger: activeLogger, requestId });
       } else {
         activeLogger.debug(requestId, 'Detected Interactions format with input field');
-        openaiRequest = convertGeminiInteractionsToOpenAI(requestBody);
+        openaiRequest = convertGeminiInteractionsToOpenAI(requestBody, { logger: activeLogger, requestId });
       }
       
       isStreaming = (openaiRequest.stream as boolean) === true;

@@ -56,6 +56,7 @@ async function send(
   body: Record<string, unknown>,
   upstreamMode: string,
   clientPath = '/v1/interactions',
+  logger: any = LOGGER,
 ): Promise<Record<string, unknown>> {
   upstreamBodies = [];
   const response = await handleOpenAIRequest(
@@ -64,7 +65,7 @@ async function send(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }),
-    TARGET, AUTH, 'r-fields', 'gemini-test', ENV, LOGGER, false, undefined, upstreamMode,
+    TARGET, AUTH, 'r-fields', 'gemini-test', ENV, logger, false, undefined, upstreamMode,
   );
   await response.text();
   assert.equal(upstreamBodies.length, 1, 'the handler must have made exactly one upstream call');
@@ -115,9 +116,45 @@ describe('/v1/interactions → openai-responses: request fields reach the upstre
   it('invents nothing when the client sent none of them', async () => {
     const upstream = await send(minimalBody(), 'openai-responses');
 
-    for (const key of ['temperature', 'top_p', 'max_output_tokens', 'reasoning', 'text', 'store']) {
+    for (const key of ['temperature', 'top_p', 'max_output_tokens', 'reasoning', 'text', 'store', 'metadata']) {
       assert.equal(key in upstream, false, `${key} must not be invented`);
     }
+  });
+
+  it('carries the Interactions labels as Completions metadata', async () => {
+    // `labels` is the Interactions request's user-defined metadata map
+    // (`@google/genai` CreateModelInteraction.labels: `{[k:string]: string}`), and
+    // `metadata` is the Completions field of the same shape — so the map is asserted
+    // exactly, on the bytes the upstream fetch received.
+    const upstream = await send(minimalBody({ labels: { team: 'qa', round: 'r32' } }), 'openai-completions');
+
+    assert.deepEqual(upstream.metadata, { team: 'qa', round: 'r32' });
+    assert.equal('labels' in upstream, false, 'the Interactions spelling must not reach the upstream');
+  });
+
+  it('stops labels at the openai-responses hop, and says so', async () => {
+    // Pinned, not fixed: the Responses API does declare `metadata`, but
+    // `completionsToResponsesBody` re-emits none, so the field stops at this hop. The
+    // handler warns instead of dropping it in silence (rule #8).
+    const warnings: string[] = [];
+    const logger = { ...LOGGER, warn: (_id: string, message: string) => { warnings.push(message); } };
+    const upstream = await send(minimalBody({ labels: { team: 'qa' } }), 'openai-responses', '/v1/interactions', logger);
+
+    assert.equal('metadata' in upstream, false);
+    // Filtered rather than counted: the response-side converters on this path have
+    // warnings of their own, and this case is about the request-side one.
+    assert.equal(warnings.filter(w => /labels not carried to the openai-responses upstream/.test(w)).length, 1);
+  });
+
+  it('stops labels at the anthropic-messages hop, and says so', async () => {
+    // Claude's `metadata` carries only `user_id`, so a free-form map has no position
+    // there at all — a different reason from the Responses hop's unmapped field.
+    const warnings: string[] = [];
+    const logger = { ...LOGGER, warn: (_id: string, message: string) => { warnings.push(message); } };
+    const upstream = await send(minimalBody({ labels: { team: 'qa' } }), 'anthropic-messages', '/v1/interactions', logger);
+
+    assert.equal('metadata' in upstream, false);
+    assert.equal(warnings.filter(w => /labels not carried to the anthropic-messages upstream/.test(w)).length, 1);
   });
 
   it('leaves a mime type with no JSON equivalent alone', async () => {

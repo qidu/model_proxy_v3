@@ -5,6 +5,42 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(converters): `/v1/interactions` `labels` reach an `openai-completions` upstream as `metadata`
+
+The Interactions API declares a request-level `labels` map — "the labels with user-defined metadata for
+the request", typed `{[k: string]: string}` on `CreateModelInteraction` / `CreateAgentInteraction` in
+`@google/genai`. `docs/api/interactions.md` predates the field, and `convertGeminiInteractionsToOpenAI`
+rebuilds the body field by field, so `labels` reached no upstream at all and nothing said so:
+
+```
+in : {"model":"openai-model","input":"Say OK","labels":{"team":"qa","round":"r32"}}
+out: {"model":"openai-model","messages":[{"role":"user","content":"Say OK"}],"stream":false}
+```
+
+**The mapping.** `labels` now rides the intermediate as `metadata` — the Completions field
+`docs/api/list_of_api_and_schema.md:203` lists, typed `Record<string, string>` at
+`src/types/openai.ts:72`, and the one `responses-to-completions.ts:219` already maps in the other
+direction. An `openai-completions` upstream thus receives a field it already has, in-band: no side
+channel, and no new wire value for a request that carried none — no `labels`, or an empty `{}`, emits
+no `metadata` at all. As with `store`, which the same block forwards, OpenAI retains `metadata` only
+for stored completions.
+
+**The hops that cannot carry it.** `/v1/interactions` is a three-upstream front door, and `labels`
+stops at the second hop for the other two: `completionsToClaudeBody` maps no metadata and Claude's own
+`metadata` accepts only `user_id`, while `completionsToResponsesBody` maps none either even though the
+Responses API declares the field. Both hops now warn rather than dropping it in silence (rule #8) —
+route through an `openai-completions` upstream for the labels to arrive.
+
+**A malformed map is reported, not forwarded.** The declared type is `map<string,string>`, so a
+non-object, an array, a string, `null`, or a non-string value is dropped with a warning naming the
+field, and the turn is still served: labels are attribution metadata, not model input.
+`convertGeminiInteractionsToOpenAI` takes the same optional `{logger, requestId}` its generateContent
+sibling already does, for that warning.
+
+**Known gap, pinned not fixed:** the synthesized Interaction response does not echo `labels`, though
+the `Interaction` resource declares them — a client reading `interaction.labels` after a create gets
+`undefined`, since nothing retains the request's labels past the conversion.
+
 ### fix(converters): `/v1/interactions` → `/v1/messages` read only three of the `input` shapes the API declares
 
 `/v1/interactions` served by an `anthropic-messages` upstream is converted in two hops —

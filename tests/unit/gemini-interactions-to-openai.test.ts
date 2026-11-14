@@ -602,6 +602,77 @@ describe('convertGeminiInteractionsToOpenAI — sampling knobs, retention and st
   });
 });
 
+describe('convertGeminiInteractionsToOpenAI — labels', () => {
+  const body = (extra: Record<string, unknown> = {}) => ({ model: 'm', input: 'hi', ...extra });
+
+  /** Collects the converter's warnings so the fail-loud (Rule #8) path can be asserted. */
+  function recordingLogger(): { logger: any; warnings: string[] } {
+    const warnings: string[] = [];
+    return {
+      warnings,
+      logger: { warn: (_requestId: string, message: string) => { warnings.push(message); } },
+    };
+  }
+
+  it('carries labels as the Completions metadata map, verbatim', () => {
+    const { logger, warnings } = recordingLogger();
+    const out = convertGeminiInteractionsToOpenAI(
+      body({ labels: { team: 'qa', round: 'r32' } }), { logger, requestId: 'r1' },
+    ) as any;
+
+    // The Interactions type is `map<string,string>` (`@google/genai`
+    // CreateModelInteraction.labels) and `metadata` is the Completions field of the
+    // same shape, so the map is asserted exactly rather than as "a key exists".
+    assert.deepEqual(out.metadata, { team: 'qa', round: 'r32' });
+    assert.equal('labels' in out, false, 'the Interactions spelling must not survive');
+    assert.deepEqual(warnings, [], 'a well-typed map is not a warning');
+  });
+
+  it('invents no metadata when the client sent no labels', () => {
+    const out = convertGeminiInteractionsToOpenAI(body()) as any;
+
+    assert.equal('metadata' in out, false);
+  });
+
+  it('omits an empty labels map rather than sending metadata: {}', () => {
+    // `{}` is well-typed and means "no labels"; `metadata: {}` would be a new wire
+    // value for an upstream that never saw the field, as `stop: []` would be.
+    const { logger, warnings } = recordingLogger();
+    const out = convertGeminiInteractionsToOpenAI(body({ labels: {} }), { logger, requestId: 'r1' }) as any;
+
+    assert.equal('metadata' in out, false);
+    assert.deepEqual(warnings, [], 'an empty map is not a malformed one');
+  });
+
+  it('warns and drops a labels value that breaks the declared map<string,string>', () => {
+    for (const bad of [{ team: 5 }, ['qa'], 'qa', null]) {
+      const { logger, warnings } = recordingLogger();
+      const out = convertGeminiInteractionsToOpenAI(body({ labels: bad }), { logger, requestId: 'r1' }) as any;
+
+      assert.equal('metadata' in out, false, `${JSON.stringify(bad)} must not reach the wire`);
+      assert.equal(warnings.length, 1, `${JSON.stringify(bad)} must be reported (rule #8)`);
+      assert.match(warnings[0], /labels is not a map of strings/);
+      // The turn is still served: labels are attribution metadata, not model input.
+      assert.deepEqual(out.messages, [{ role: 'user', content: 'hi' }]);
+    }
+  });
+
+  it('is dropped by both second hops, though only one of them lacks the field', async () => {
+    const intermediate = convertGeminiInteractionsToOpenAI(
+      body({ labels: { team: 'qa' } }),
+    ) as any;
+
+    // The native hop forwards the intermediate as-is, so this is what an
+    // openai-completions upstream receives.
+    assert.deepEqual(intermediate.metadata, { team: 'qa' });
+    // Pinned, not fixed: the Responses API declares `metadata` but
+    // `completionsToResponsesBody` maps none, and Claude's `metadata` accepts only
+    // `user_id`. `src/handlers/openai.ts` warns at both hops (rule #8).
+    assert.equal('metadata' in (completionsToResponsesBody(intermediate, 'responses-target') as any), false);
+    assert.equal('metadata' in (await completionsToClaudeBody(intermediate, 'claude-target') as any), false);
+  });
+});
+
 describe('convertGeminiInteractionsToOpenAI — the sampling knobs at the second hop', () => {
   const body = {
     model: 'm',

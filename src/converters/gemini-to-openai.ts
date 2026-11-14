@@ -302,11 +302,19 @@ function systemInstructionToText(declared: unknown): string {
  * Carries every request-level field the Interactions body declares that has a
  * Completions spelling: the system prompt, the tool declarations, `stop_sequences`,
  * `tool_choice`, the `generation_config` sampling knobs (`temperature`, `top_p`,
- * `max_output_tokens`, `thinking_level`), `store`, and `response_format` /
- * `response_mime_type`. This matters because the body is re-targeted to three
- * upstream families — openai-completions natively, anthropic-messages via
- * `completionsToClaudeBody`, openai-responses via `completionsToResponsesBody` — and
- * whatever this hop drops is unreachable at every one of them.
+ * `max_output_tokens`, `thinking_level`), `store`, `labels` (as `metadata`), and
+ * `response_format` / `response_mime_type`. This matters because the body is
+ * re-targeted to three upstream families — openai-completions natively,
+ * anthropic-messages via `completionsToClaudeBody`, openai-responses via
+ * `completionsToResponsesBody` — and whatever this hop drops is unreachable at every
+ * one of them.
+ *
+ * `labels` is the one field that rides the intermediate and then stops: the
+ * openai-completions target receives `metadata` natively, while both second hops drop
+ * it — `completionsToClaudeBody` maps no metadata and Claude's `metadata` accepts only
+ * `user_id`, and `completionsToResponsesBody` maps none either even though the
+ * Responses API declares the field. `src/handlers/openai.ts` warns at those two hops
+ * rather than dropping it in silence (rule #8).
  *
  * Still dropped here, as on the generateContent path: `seed` and the rest of
  * `generation_config` (`thinking_summaries`, `speech_config`), `background`,
@@ -316,8 +324,15 @@ function systemInstructionToText(declared: unknown): string {
  * spelling, so only a direct Interactions→Responses converter could reach them;
  * `seed` and `stop_sequences` are unreachable at a Responses target under either
  * design. See `docs/api/review-interactions-to-openai-responses-hops.md`.
+ *
+ * `options.logger` is optional and carries warnings only: rule #8 requires a
+ * `labels` map that breaks its declared type to be reported rather than dropped in
+ * silence, as the generateContent sibling reports an unpaired `functionResponse` id.
  */
-export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, unknown>): Record<string, unknown> {
+export function convertGeminiInteractionsToOpenAI(
+  geminiRequest: Record<string, unknown>,
+  options?: { logger?: Logger; requestId?: string },
+): Record<string, unknown> {
   const model = (geminiRequest.model as string) || 'gemini-no-id-at-proxy';
 
   // The Interactions `input`, or the generateContent `contents` a body reaching
@@ -432,6 +447,37 @@ export function convertGeminiInteractionsToOpenAI(geminiRequest: Record<string, 
   // openai-responses hop re-emits it under the same name. Omitted when the client
   // did not send it, so an upstream's own default still applies.
   if (typeof geminiRequest.store === 'boolean') result.store = geminiRequest.store;
+
+  // `labels` is the Interactions request's user-defined metadata map
+  // (`@google/genai` declares it `labels?: {[k: string]: string}` on
+  // CreateModelInteraction / CreateAgentInteraction; `docs/api/interactions.md`
+  // predates the field). Chat Completions carries the same channel under the name
+  // `metadata` — the Completions spelling `docs/api/list_of_api_and_schema.md:203`
+  // lists and `responses-to-completions.ts:219` already maps in the other direction —
+  // so the two spellings ride one in-band field rather than a side channel. It is an
+  // attribution channel the model never reads, and OpenAI retains it only under
+  // `store`, which the block above forwards. A non-empty map only: `labels: {}` means
+  // "no labels", and `metadata: {}` would be a new wire value for an upstream that
+  // never saw the field (the same reason `stop: []` is omitted above).
+  const labels = geminiRequest.labels;
+  if (labels !== undefined) {
+    const entries = labels !== null && typeof labels === 'object' && !Array.isArray(labels)
+      ? Object.entries(labels as Record<string, unknown>)
+      : null;
+    if (entries === null || entries.some(([, value]) => typeof value !== 'string')) {
+      // Rule #8: the spec types this field as map<string,string>, so a body that
+      // breaks the declared type is reported rather than forwarded half-read. The
+      // request is still served — labels are attribution metadata, not model input,
+      // so refusing the turn over them would cost the client more than it protects.
+      options?.logger?.warn(
+        options?.requestId ?? 'unknown',
+        `[gemini->openai] labels is not a map of strings (got ${JSON.stringify(labels).substring(0, 200)}); ` +
+        `not forwarded as metadata`,
+      );
+    } else if (entries.length > 0) {
+      result.metadata = Object.fromEntries(entries);
+    }
+  }
 
   // Structured output. The Interactions field carries the JSON schema itself, while
   // the Completions spelling wraps it in a named `json_schema` — the shape

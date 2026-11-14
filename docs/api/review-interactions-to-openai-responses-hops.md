@@ -65,6 +65,26 @@ direct converter would lose, plus more**.
 Today the two-hop loses roughly **17** of the Interactions request surface. A direct converter would
 lose roughly **6**.
 
+## `labels` (2026-11-14) — bucket 3 at hop 1, a hop-2 gap after it
+
+`labels` is a request-level map the Interactions API declares ("the labels with user-defined metadata
+for the request"), typed `{[k: string]: string}` on `CreateModelInteraction` / `CreateAgentInteraction`
+in `@google/genai`; `docs/api/interactions.md` predates the field, which is why it went unnoticed. It
+became a bucket-3 hop-1 fix: hop 1 now emits it as the Completions `metadata`, so the in-band design
+holds again — no side channel, no new wire value for a request that carried no labels.
+
+What it lands on is the one place this review's architecture question bites, because `metadata` is
+declared by **both** OpenAI APIs and by neither `anthropic-messages` nor a free-form map:
+
+| target | outcome |
+|---|---|
+| `openai-completions` | receives `metadata` — the field it already has |
+| `openai-responses` | **dropped**: `completionsToResponsesBody` maps no `metadata`, though the Responses API declares it. A direct converter would close this one — the field is present at the target, only the hop-2 mapping is missing |
+| `anthropic-messages` | **dropped**: Claude's `metadata` accepts only `user_id`, which no free-form map can fill at any architecture — so this loss is not attributable to the intermediate |
+
+`src/handlers/openai.ts` warns at both dropping hops rather than dropping in silence (rule #8), and
+`tests/unit/gemini-interactions-to-openai.test.ts` pins each landing.
+
 ## Correction: `store` was never blocked by the intermediate
 
 An earlier reading of this route — repeated in the code comment and the CHANGELOG entry for the `store`
