@@ -5,6 +5,91 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): a PDF is a `document`, and audio or video is dropped by name, instead of every file arriving as an image
+
+One finding, three media kinds, two halves that fail differently.
+
+**On the way out of Gemini** (`gemini-to-openai.ts`) every binary part became a Completions `image_url`,
+whatever its media type — so an audio or video part was sent upstream under a type meaning "an image", and
+the Claude hop downstream turned it into an `image` block that does not declare that media type. Both are
+now dropped and reported by kind and media type, on the Interactions `input` path and on the native
+`:generateContent` one, which had the same branch. The drop is uniform rather than
+per-target on purpose: this intermediate is target-agnostic, and the Completions *dialect* does declare
+an audio block (`input_audio`, `openai-prompt-caching.md:49`) — but the same body can be re-targeted to
+Claude or Responses, whose hops drop audio anyway (`chat-completions→anthropic-messages` reports it as a
+drop, not a projection), so mapping it here would serve exactly one of the three targets. Audio needed
+no new machinery to be *not* carried; video has no position on any target.
+
+**On the way in to Claude** (`completions-to-claude.ts`) the media block was hardcoded `image`, whose
+`source.media_type` declares image types only — so a PDF was a 400 for the whole request
+(`messages-create.md:248`). A `application/pdf` now becomes a `document` block: the API declares
+`ClaudeDocumentBlock` for exactly this payload, and both blocks take the same base64 source, so the
+block type is the only difference. The MIME type decides, not the position or the client, so a PDF
+reaching this hop as `image_url` from any door is fixed at once.
+
+Left alone deliberately: `completionsToResponsesBody` still sends a PDF to a Responses upstream as
+`input_image` (the input-side twin of finding #23, which the ruling covered on the output side only).
+
+**Verification**: of the five new cases, three fail against the previous code; the other two pin the
+PDF's *unchanged* position in the intermediate, which is what makes the Claude hop's projection
+reachable, so they are guards rather than sensitivity pins.
+
+- `tests/unit/handlers.test.ts` — the `:generateContent` drop, both `inline_data` and `inlineData`
+  spellings, asserting the surviving text-only message and one warn per media type naming kind *and*
+  media type; a PDF still riding as the intermediate `image_url` there; and, in the
+  `completionsToClaudeBody` suite, a PDF data URI arriving as a `document` block with an image media
+  type still taking the `image` block.
+- `tests/unit/gemini-interactions-to-openai.test.ts` — the same drop on the Interactions `input` path,
+  by part `type`, and a PDF `document` part kept.
+- `tests/unit/request-ref-matrix.test.ts` — the three `:generateContent→…` rows now carry the image
+  payload alone and report the audio one (`GEM_CAMEL`) as dropped; the `→gemini` row still carries both,
+  that upstream being the dialect the part was written in.
+
+`npm run typecheck`, `npm run build` and `npm run test:unit` pass (3068/3068).
+
+### fix(handlers): carry an upstream refusal through the two streaming mappers, so a route stops disagreeing with itself
+
+The `refusal` work below aligned each route's *non-streaming* shape but not its streaming twin, leaving
+two routes answering the same upstream answer two ways:
+
+| route | non-streaming | streaming (before → now) |
+|---|---|---|
+| `/v1/chat/completions` + `anthropic-messages` | `refusal` → `content_filter` | `stop` → **`content_filter`** |
+| `:generateContent` / `/v1/interactions` + `anthropic-messages` | `refusal` → `content_filter` → `SAFETY` | `stop` → **`SAFETY`** |
+
+Both are the same one-line arm beside the existing `tool_use`/`max_tokens` ones. The second row is also
+the Gemini-dialect half of the blocked-answer question: a Claude upstream's refusal reached a Gemini
+client as a clean `finishReason: "STOP"`, while the same route's non-streaming answer already said
+`SAFETY`.
+
+**Verification**: one case per mapper, both failing against the previous code — the Completions client's
+finish chunk (`chat-completions-anthropic-streaming.test.ts`) and the Gemini client's terminal
+`finishReason` (`anthropic-to-gemini-stream-parts.test.ts`). `npm run typecheck`, `npm run build` and
+`npm run test:unit` pass (3063/3063).
+
+### fix(converters): stop putting an `input_image` inside a Responses *output* message item
+
+`convertCompletionsToResponses` forwarded an upstream answer's `image_url` part as `input_image` in the
+output message item it builds. `ResponseOutputMessage.content` is `ResponseOutputText or
+ResponseOutputRefusal` (`openai-response.md`), so that is a type the item does not declare — and an
+*input* member, on the answer side. It also contradicted the repo's own documented rule that the
+cross-mode response converters drop reply parts they cannot project (`api-endpoints.md`).
+
+The part is now dropped and reported through the converter's existing logger option, naming the kind
+(rule #8). An answer that carried only an image therefore loses its message item, and the "output is
+never empty" fallback puts the empty-text item back — pinned, because that is the shape where dropping
+a part could have broken an invariant.
+
+Rejected alternative: mapping the part to an `image_generation_call` output item, which is where a
+Responses answer carries a model-produced image. That item's `result` is base64 and this converter does
+not fetch, so a URL could only be put there by inventing a value or an SSRF-guarded fetch on the answer
+path — neither of which this finding asks for.
+
+**Verification**: two shapes in `responses-completions-roundtrip.test.ts`, the first failing against the
+previous code — text beside the image (the text survives, the drop is reported once) and an image-only
+answer (output stays non-empty with no image item left behind). `npm run typecheck`, `npm run build` and
+`npm run test:unit` pass (3063/3063).
+
 ### fix(converters): a withheld answer and a blocked prompt are `refusal`, not a clean empty answer
 
 Two findings that turn out to be one: what a policy block looks like on the Claude dialect.

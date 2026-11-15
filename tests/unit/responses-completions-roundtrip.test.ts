@@ -52,6 +52,67 @@ describe('convertCompletionsToResponses', () => {
     assert.equal(msgItem!.content![0].text, 'hello world');
   });
 
+  it('drops an answer image part, which an output message item has no position for, and says so', () => {
+    // finding #23: `ResponseOutputMessage.content` is `ResponseOutputText or
+    // ResponseOutputRefusal` (`openai-response.md`), so an `input_image` there is a
+    // type the API does not declare on that item — and it is an *input* type inside
+    // an *output* item. A reply part with no position is dropped, which is what the
+    // cross-mode response converters do (`api-endpoints.md`: "cross-mode response
+    // converters drop image parts"), but not in silence (rule #8).
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    const out = convertCompletionsToResponses(
+      baseCompletion({
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'look at this' },
+              { type: 'image_url', image_url: { url: 'https://example.com/x.png' } },
+            ],
+          },
+          finish_reason: 'stop',
+        }],
+      } as any),
+      'gpt-4o',
+      undefined,
+      { logger, requestId: 'req-23' },
+    );
+
+    const msgItem = out.output.find(o => o.type === 'message')!;
+    assert.deepEqual(msgItem.content, [{ type: 'output_text', text: 'look at this', annotations: [] }]);
+    assert.equal(out.output_text, 'look at this', 'the text beside it must survive');
+    assert.equal(warnings.filter(w => /image/i.test(w)).length, 1, 'the drop must be reported');
+
+    // An answer that carried *only* an image loses its message item, so the
+    // "output is never empty" rule has to put the fallback back — which it does,
+    // and the part is still reported.
+    const imageOnly = convertCompletionsToResponses(
+      baseCompletion({
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: [{ type: 'image_url', image_url: { url: 'https://example.com/x.png' } }] },
+          finish_reason: 'stop',
+        }],
+      } as any),
+      'gpt-4o',
+      undefined,
+      { logger, requestId: 'req-23b' },
+    );
+    assert.deepEqual(imageOnly.output, [{
+      id: imageOnly.output[0].id,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: '', annotations: [] }],
+    }], 'output must stay non-empty, with no image item left behind');
+  });
+
   it('maps usage fields correctly', () => {
     const out = convertCompletionsToResponses(baseCompletion(), 'gpt-4o');
 

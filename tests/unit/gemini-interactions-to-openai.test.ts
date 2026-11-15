@@ -30,6 +30,15 @@ const userTurn = { input: [{ role: 'user', content: 'hi' }] };
  * rather than reaching the upstream half-read (or 500-ing, as an unrecognized
  * shape used to).
  */
+/** Collects the converter's warnings so the fail-loud (Rule #8) path can be asserted. */
+function recordingLogger(): { logger: any; warnings: string[] } {
+  const warnings: string[] = [];
+  return {
+    warnings,
+    logger: { warn: (_requestId: string, message: string) => { warnings.push(message); } },
+  };
+}
+
 function assertRefused(input: unknown, needle: RegExp): void {
   assert.throws(
     () => convertGeminiInteractionsToOpenAI({ model: 'm', input }),
@@ -630,6 +639,43 @@ describe('convertGeminiInteractionsToOpenAI — steps that carry no content of t
     ]);
   });
 
+  it('drops an audio or video part, which this hop has no position for, and says so', () => {
+    // finding #8: all four media kinds were emitted as an OpenAI `image_url`, so an
+    // audio or video part reached an upstream under a type that means "an image" —
+    // and the Claude hop then made it an `image` block, which is a 400. A PDF has a
+    // position downstream (`ClaudeDocumentBlock`), so it still rides the
+    // intermediate; these two have none on any target, so they are dropped and
+    // reported (rule #8).
+    const { logger, warnings } = recordingLogger();
+    const out = convertGeminiInteractionsToOpenAI({
+      model: 'm',
+      input: [{
+        type: 'user_input',
+        content: [
+          { type: 'text', text: 'listen' },
+          { type: 'audio', data: 'YXVk', mime_type: 'audio/mp3' },
+          { type: 'video', data: 'dmlk', mime_type: 'video/mp4' },
+        ],
+      }],
+    }, { logger, requestId: 'r-media' }) as any;
+
+    assert.deepEqual(out.messages, [{ role: 'user', content: 'listen' }]);
+    assert.equal(warnings.filter(w => /audio\/mp3/.test(w)).length, 1);
+    assert.equal(warnings.filter(w => /video\/mp4/.test(w)).length, 1);
+  });
+
+  it('keeps a PDF part in the intermediate, where the Claude hop has a position for it', () => {
+    const out = convertGeminiInteractionsToOpenAI({
+      model: 'm',
+      input: [{ type: 'user_input', content: [{ type: 'document', data: 'JVBERi0=', mime_type: 'application/pdf' }] }],
+    }) as any;
+
+    assert.deepEqual(out.messages[0].content, [{
+      type: 'image_url',
+      image_url: { url: 'data:application/pdf;base64,JVBERi0=' },
+    }]);
+  });
+
   it('refuses a step with no Completions equivalent, naming it', () => {
     // Each of these was read as a *part list*, matched no part, and reached the
     // upstream as `content: ''` with the step's payload gone (rule #8).
@@ -819,15 +865,6 @@ describe('convertGeminiInteractionsToOpenAI — sampling knobs, retention and st
 
 describe('convertGeminiInteractionsToOpenAI — labels', () => {
   const body = (extra: Record<string, unknown> = {}) => ({ model: 'm', input: 'hi', ...extra });
-
-  /** Collects the converter's warnings so the fail-loud (Rule #8) path can be asserted. */
-  function recordingLogger(): { logger: any; warnings: string[] } {
-    const warnings: string[] = [];
-    return {
-      warnings,
-      logger: { warn: (_requestId: string, message: string) => { warnings.push(message); } },
-    };
-  }
 
   it('carries labels as the Completions metadata map, verbatim', () => {
     const { logger, warnings } = recordingLogger();

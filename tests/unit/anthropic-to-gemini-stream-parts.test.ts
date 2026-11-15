@@ -125,6 +125,22 @@ function answerText(chunks: GeminiChunk[]): string {
 const USAGE = { input_tokens: 7, output_tokens: 2 };
 
 describe('anthropic-messages → :streamGenerateContent: the answer reaches the client', () => {
+  it('reports an upstream refusal as finishReason SAFETY, not as a clean STOP', async () => {
+    // What the Messages API calls `refusal` (`messages-create.md:4521`) is what
+    // generateContent calls a `SAFETY` finish. Reading it as `stop` told a Gemini
+    // client the model had finished normally — and disagreed with this route's
+    // non-streaming shape, which already answers `SAFETY` (the Claude `refusal`
+    // becomes `content_filter`, which `openai-to-gemini.ts` maps to `SAFETY`).
+    const chunks = await convert([
+      messageStart([], { input_tokens: 7, output_tokens: 0 }),
+      messageDelta({ output_tokens: 0 }, 'refusal'),
+      MESSAGE_STOP,
+    ]);
+
+    const terminal = chunks.find(c => c.candidates?.[0]?.finishReason)?.candidates?.[0];
+    assert.equal(terminal?.finishReason, 'SAFETY');
+  });
+
   it('converts the documented `text_delta` stream (regression pin)', async () => {
     const chunks = await convert([
       messageStart([], { input_tokens: 7, output_tokens: 0 }),

@@ -125,6 +125,9 @@ export function convertCompletionsToResponses(
       reasoningText += reasoningMsg.reasoning_content;
     }
 
+    // Reply parts this answer has no position for, reported once below (rule #8).
+    const suppressedParts: string[] = [];
+
     // Handle text content
     if (message.content) {
       if (typeof message.content === 'string') {
@@ -147,11 +150,14 @@ export function convertCompletionsToResponses(
               annotations: [],
             });
           } else if (part.type === 'image_url') {
-            // Forward image as input_image with the URL
-            contentParts.push({
-              type: 'input_image',
-              image_url: part.image_url?.url,
-            });
+            // Dropped, and reported. `ResponseOutputMessage.content` is
+            // `ResponseOutputText or ResponseOutputRefusal` (`openai-response.md`), so
+            // an output message item has no image position — and `input_image` is an
+            // *input* member, which is what this emitted inside an output item: a type
+            // the item does not declare, for a part that belongs to the request side.
+            // The cross-mode response converters drop reply parts they cannot project
+            // (`api-endpoints.md`), so this one does too, naming the part (rule #8).
+            suppressedParts.push('image_url');
           } else if (part.type === 'thinking') {
             // OpenAI-style thinking content part — capture for reasoning item
             reasoningText += (part as { thinking?: string }).thinking ?? '';
@@ -181,6 +187,14 @@ export function convertCompletionsToResponses(
           text: reasoningText,
         } as unknown as NonNullable<typeof outputItem.content>[0]);
       }
+    }
+
+    if (suppressedParts.length > 0) {
+      options?.logger?.warn(
+        options?.requestId ?? '',
+        `[responses] dropped ${suppressedParts.length} answer part(s) an output message item cannot carry: ` +
+        `${suppressedParts.join(', ')}`,
+      );
     }
 
     // Handle tool calls. allowedTools is a hard constraint (spec): calls to

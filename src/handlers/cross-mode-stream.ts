@@ -248,8 +248,14 @@ function processAnthropicSSEBuffer(
       } else if (parsed.type === 'message_delta') {
         const delta = parsed.delta as Record<string, unknown> | undefined;
         const stopReason = delta?.stop_reason as string | undefined;
+        // `refusal` is the Anthropic dialect's member for a withheld answer; the
+        // Completions spelling of the same fact is `content_filter`, which the
+        // generateContent egress renders as `finishReason: "SAFETY"` — reading it
+        // as `stop` told a Gemini client the model had finished normally, while the
+        // non-streaming shape of this route already answers `SAFETY`.
         const finishReason = stopReason === 'tool_use' ? 'tool_calls'
-          : stopReason === 'max_tokens' ? 'length' : 'stop';
+          : stopReason === 'max_tokens' ? 'length'
+          : stopReason === 'refusal' ? 'content_filter' : 'stop';
         // The turn's final usage rides on this event; absorbing it before the
         // finish chunk is built is what puts real counts in that chunk's
         // `usageMetadata` instead of the three zeros it used to carry.

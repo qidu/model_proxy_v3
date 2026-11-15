@@ -89,6 +89,34 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
     return chunks.filter(s => s !== '[DONE]').map(s => JSON.parse(s));
   }
 
+  it('reports an upstream refusal as content_filter, not as a clean stop', async () => {
+    // The Anthropic dialect's member for a withheld answer is `refusal`
+    // (`messages-create.md:4521`); the Completions member for the same fact is
+    // `content_filter` (`openai-api-reference.md:92`). Mapping it to `stop` here
+    // made this route's streaming shape disagree with its own non-streaming shape,
+    // which reads the same answer through `claudeJsonToSyntheticCompletions`.
+    const blocked = () => {
+      const encoder = new TextEncoder();
+      const events = [
+        { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 0 } } },
+        { type: 'content_block_delta', delta: { type: 'text_delta', text: '' } },
+        { type: 'message_delta', delta: { stop_reason: 'refusal' }, usage: { output_tokens: 1 } },
+        { type: 'message_stop' },
+      ];
+      return new Response(new ReadableStream({
+        start(controller) {
+          for (const e of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(e)}\n\n`));
+          controller.close();
+        },
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+
+    const parsed = await runStream({}, blocked);
+
+    const finish = parsed.find((c: any) => c.choices[0]?.finish_reason);
+    assert.equal(finish.choices[0].finish_reason, 'content_filter');
+  });
+
   it('without stream_options: no usage chunk, finish_reason stop', async () => {
     const parsed = await runStream({});
     const contents = parsed.map((c: any) => c.choices[0]?.delta?.content).filter(Boolean);

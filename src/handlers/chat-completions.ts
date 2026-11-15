@@ -274,7 +274,14 @@ export async function handleChatCompletionsPassthrough(
                   // in message_start and the real cumulative counts only in message_delta.
                   if (typeof usage?.input_tokens === 'number' && usage.input_tokens > 0) usagePromptTokens = usage.input_tokens;
                   if (typeof usage?.output_tokens === 'number') usageCompletionTokens = usage.output_tokens;
-                  const finishReason = delta?.stop_reason === 'tool_use' ? 'tool_calls' : delta?.stop_reason === 'max_tokens' ? 'length' : 'stop';
+                  // `refusal` is the Anthropic dialect's member for a withheld answer
+                  // and `content_filter` the Completions one, so the block survives to
+                  // the client — as it does on this route's non-streaming shape, which
+                  // reads it through `claudeJsonToSyntheticCompletions`.
+                  const finishReason = delta?.stop_reason === 'tool_use' ? 'tool_calls'
+                    : delta?.stop_reason === 'max_tokens' ? 'length'
+                    : delta?.stop_reason === 'refusal' ? 'content_filter'
+                    : 'stop';
                   const chunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] };
                   logPipelineStage(logger, requestId, 'outbound', path, chunk);
                   await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));

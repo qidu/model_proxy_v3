@@ -64,6 +64,7 @@ function geminiPartsToOpenAIContent(
   parts: any[] | undefined,
   where: string,
   startIndex = 0,
+  options?: { logger?: Logger; requestId?: string },
 ): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> {
   if (!Array.isArray(parts)) return '';
   const textParts: string[] = [];
@@ -84,7 +85,17 @@ function geminiPartsToOpenAIContent(
     const media = inline ?? (INTERACTIONS_MEDIA_PART_TYPES.has(p?.type) ? p : undefined);
     const mime = media?.mime_type ?? media?.mimeType;
     const data: unknown = media?.data;
-    if ((typeof data === 'string' && data !== '') || isBlobRef(data)) {
+    // Claimed, so the `!claimed` refusal below does not also fire for it: this part
+    // is recognized, it just has no position to go to.
+    if (media && isDroppedMedia(p?.type, mime)) {
+      claimed = true;
+      options?.logger?.warn(
+        options?.requestId ?? '',
+        `[gemini->openai] dropped ${mediaLabel(p?.type, mime)} at ${at}: ` +
+        'no target of this hop has a position for an audio or video part',
+      );
+    }
+    if (!claimed && ((typeof data === 'string' && data !== '') || isBlobRef(data))) {
       claimed = true;
       imageParts.push({
         type: 'image_url',
@@ -124,6 +135,39 @@ function geminiPartsToOpenAIContent(
   if (text !== '') out.push({ type: 'text', text });
   out.push(...imageParts);
   return out;
+}
+
+/** `audio (audio/mp3)` — the kind and the media type, so a log names both. */
+function mediaLabel(kind: unknown, mimeType: unknown): string {
+  const name = typeof kind === 'string' && kind !== '' ? kind : 'media';
+  return typeof mimeType === 'string' && mimeType !== '' ? `${name} (${mimeType})` : name;
+}
+
+/**
+ * Whether a media part is one *no* target of this hop declares.
+ *
+ * Completions has an `image_url` and nothing else for media, and the Claude hop's
+ * blocks are `image` and `document` — so an audio or video part emitted as an
+ * `image_url` reached an upstream under a type that means "an image", and became a
+ * Claude `image` block whose media type that block does not declare (finding #8).
+ * A PDF has a position downstream (`ClaudeDocumentBlock`), so it rides the
+ * intermediate; these two have none on any target this hop reaches, so they are
+ * dropped and reported.
+ *
+ * The Completions *dialect* does declare an audio block (`input_audio`), but this
+ * intermediate is target-agnostic: mapping it here would serve the
+ * openai-completions target alone, and the Claude and Responses hops the same body
+ * can be re-targeted to drop audio anyway (`chat-completions→anthropic-messages`
+ * reports it as a drop, not a projection).
+ *
+ * Classified by the part's own `type` as well as its MIME type: the Interactions
+ * spelling carries both, and a part that declares one of these kinds is one
+ * whatever it says its media type is.
+ */
+function isDroppedMedia(kind: unknown, mimeType: unknown): boolean {
+  if (kind === 'audio' || kind === 'video') return true;
+  return typeof mimeType === 'string'
+    && (mimeType.startsWith('audio/') || mimeType.startsWith('video/'));
 }
 
 /** The refusal for a Content part this hop has no Completions position for. */
@@ -235,7 +279,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * `String(content)`, putting `[object Object]` in the prompt, and an
  * unrecognized array became `messages: []` at the upstream.
  */
-function interactionsInputToMessages(input: unknown): Array<Record<string, unknown>> {
+function interactionsInputToMessages(
+  input: unknown,
+  options?: { logger?: Logger; requestId?: string },
+): Array<Record<string, unknown>> {
   if (typeof input === 'string') {
     return [{ role: 'user', content: input }];
   }
@@ -244,7 +291,7 @@ function interactionsInputToMessages(input: unknown): Array<Record<string, unkno
     if (input.length === 0) {
       throw new ValidationError('Interactions request `input` array must carry at least one content');
     }
-    return inputEntriesToMessages(classifyInteractionsInput(input, '`input`'));
+    return inputEntriesToMessages(classifyInteractionsInput(input, '`input`'), options);
   }
 
   const record = asRecord(input);
@@ -261,12 +308,12 @@ function interactionsInputToMessages(input: unknown): Array<Record<string, unkno
       return record.messages as Array<Record<string, unknown>>;
     }
     if ('role' in record) {
-      return [turnToMessage(record, 'input')];
+      return [turnToMessage(record, 'input', options)];
     }
     // A lone step or a lone Content: the same element-by-element reading the array
     // form uses, so the two shapes cannot drift.
     if (typeof record.type === 'string') {
-      return inputEntriesToMessages(classifyInteractionsInput([record], '`input`'));
+      return inputEntriesToMessages(classifyInteractionsInput([record], '`input`'), options);
     }
   }
 
@@ -277,12 +324,16 @@ function interactionsInputToMessages(input: unknown): Array<Record<string, unkno
 }
 
 /** A Turn: `role` plus `content` (a bare string, or a part list). */
-function turnToMessage(turn: Record<string, unknown> | undefined, where: string): Record<string, unknown> {
+function turnToMessage(
+  turn: Record<string, unknown> | undefined,
+  where: string,
+  options?: { logger?: Logger; requestId?: string },
+): Record<string, unknown> {
   if (!turn) throw new ValidationError(`Interactions ${where} entry must be an object`);
 
   return {
     role: turn.role === 'model' ? 'assistant' : turn.role,
-    content: contentToOpenAIContent(turn.content, where),
+    content: contentToOpenAIContent(turn.content, where, options),
   };
 }
 
@@ -308,7 +359,10 @@ function turnToMessage(turn: Record<string, unknown> | undefined, where: string)
  * an array as a part list is what used to send the upstream an empty `content`
  * with the whole step missing and nothing said.
  */
-function stepsToMessages(steps: unknown[]): Array<Record<string, unknown>> {
+function stepsToMessages(
+  steps: unknown[],
+  options?: { logger?: Logger; requestId?: string },
+): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
   let reasoning = '';
 
@@ -338,13 +392,13 @@ function stepsToMessages(steps: unknown[]): Array<Record<string, unknown>> {
 
       case 'user_input':
         flushReasoning();
-        messages.push({ role: 'user', content: contentToOpenAIContent(step.content, where) });
+        messages.push({ role: 'user', content: contentToOpenAIContent(step.content, where, options) });
         break;
 
       case 'model_output': {
         const message: Record<string, unknown> = {
           role: 'assistant',
-          content: contentToOpenAIContent(step.content, where),
+          content: contentToOpenAIContent(step.content, where, options),
         };
         attachReasoning(message);
         messages.push(message);
@@ -399,13 +453,16 @@ function stepsToMessages(steps: unknown[]): Array<Record<string, unknown>> {
  * keeps whatever role the client wrote — including the ones this door cannot
  * classify, which `completionsToClaudeBody` is the layer that judges.
  */
-function inputEntriesToMessages(entries: InteractionsInputEntry[]): Array<Record<string, unknown>> {
+function inputEntriesToMessages(
+  entries: InteractionsInputEntry[],
+  options?: { logger?: Logger; requestId?: string },
+): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
   let steps: Array<Record<string, unknown>> = [];
 
   const flushSteps = (): void => {
     if (steps.length === 0) return;
-    messages.push(...stepsToMessages(steps));
+    messages.push(...stepsToMessages(steps, options));
     steps = [];
   };
 
@@ -416,8 +473,8 @@ function inputEntriesToMessages(entries: InteractionsInputEntry[]): Array<Record
     }
     flushSteps();
     messages.push(entry.kind === 'turn'
-      ? turnToMessage(entry.element, `\`input\`[${entry.index}]`)
-      : { role: 'user', content: geminiPartsToOpenAIContent(entry.parts, '`input`', entry.start) });
+      ? turnToMessage(entry.element, `\`input\`[${entry.index}]`, options)
+      : { role: 'user', content: geminiPartsToOpenAIContent(entry.parts, '`input`', entry.start, options) });
   }
 
   flushSteps();
@@ -515,6 +572,7 @@ function thoughtSummaryText(summary: unknown): string {
 function contentToOpenAIContent(
   content: unknown,
   where: string,
+  options?: { logger?: Logger; requestId?: string },
 ): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> {
   if (typeof content === 'string') return content;
   if (content === undefined) return '';
@@ -522,7 +580,7 @@ function contentToOpenAIContent(
     if (content.length === 0) {
       throw new ValidationError(`Interactions ${where}.content must carry at least one part`);
     }
-    return geminiPartsToOpenAIContent(content, `${where}.content`);
+    return geminiPartsToOpenAIContent(content, `${where}.content`, 0, options);
   }
   throw new ValidationError(`Interactions ${where}.content must be a string or an array of Content parts`);
 }
@@ -598,11 +656,11 @@ export function convertGeminiInteractionsToOpenAI(
   // either). `input` wins when both are present.
   let messages: Array<Record<string, unknown>> | undefined;
   if (geminiRequest.input !== undefined) {
-    messages = interactionsInputToMessages(geminiRequest.input);
+    messages = interactionsInputToMessages(geminiRequest.input, options);
   } else if (Array.isArray(geminiRequest.contents)) {
     messages = (geminiRequest.contents as any[]).map((content: any) => ({
       role: content.role === 'model' ? 'assistant' : content.role,
-      content: geminiPartsToOpenAIContent(content.parts, '`contents`'),
+      content: geminiPartsToOpenAIContent(content.parts, '`contents`', 0, options),
     }));
   }
 
@@ -893,6 +951,18 @@ export function convertGeminiGenerateContentToOpenAI(
             const inline = p.inline_data ?? p.inlineData;
             if (!inline) return null;
             const mime = inline.mime_type ?? inline.mimeType;
+            // Dropped, and reported, for the same reason the Interactions path drops
+            // them: this hop projects no audio or video part, so an `image_url` here is
+            // a type that means "an image", and the Claude hop downstream turns it into
+            // an `image` block that does not declare that media type (finding #8).
+            if (isDroppedMedia(undefined, mime)) {
+              options?.logger?.warn(
+                options?.requestId ?? '',
+                `[gemini->openai] dropped ${mediaLabel(undefined, mime)}: ` +
+                'no target of this hop has a position for an audio or video part',
+              );
+              return null;
+            }
             const data: unknown = inline.data;
             if (typeof data !== 'string' && !isBlobRef(data)) return null;
             if (typeof data === 'string' && data === '') return null;

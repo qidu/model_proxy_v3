@@ -61,8 +61,13 @@ async function openAIContentToClaudeStringOrBlocks(
       const img = isBlobRef(url) || url.startsWith('data:')
         ? decodeDataUriOrRef(url)
         : await fetchImageAsInlineData(url);
+      // A PDF is a *document* here, not an image: the image block declares image
+      // media types only, so a PDF emitted as one was a 400 for the whole request
+      // (`messages-create.md:248`, finding #8). Both blocks take the same base64
+      // source, so the block type is the only difference — and the `document`
+      // spelling is what the API declares for exactly this payload.
       blocks.push({
-        type: 'image',
+        type: img.mime_type === 'application/pdf' ? 'document' : 'image',
         source: {
           type: 'base64',
           media_type: img.mime_type,

@@ -289,14 +289,18 @@ const ROWS: Row[] = [
   { name: ':generateContent→gemini', clientPath: '/v1beta/models/gemini-test:generateContent', body: GEMINI_BODY, upstreamUrl: TARGET_GEMINI,
     refs: 2, carried: ALL_GEMINI, dropped: [], streamed: true,
     call: (r) => handleGeminiRequest(r, TARGET, {}, 'r9', 'gemini-test', ENV, LOGGER) },
+  // The audio payload is the finding #8 drop: this hop projects no audio part, so the
+  // `:generateContent` door drops it rather than send an `image_url` the Completions
+  // and Claude targets would each have to drop again (the `→gemini` row still carries
+  // it — that upstream is the dialect the part was written in).
   { name: ':generateContent→anthropic-messages', clientPath: '/v1beta/models/gemini-test:generateContent', body: GEMINI_BODY, upstreamUrl: TARGET,
-    refs: 2, carried: ALL_GEMINI, dropped: [], streamed: true,
+    refs: 2, carried: [GEM_SNAKE], dropped: [GEM_CAMEL], streamed: true,
     call: (r) => handleOpenAIRequest(r, TARGET, AUTH, 'r10', 'gemini-test', ENV, LOGGER, false, undefined, 'anthropic-messages') },
   { name: ':generateContent→openai-responses', clientPath: '/v1beta/models/gemini-test:generateContent', body: GEMINI_BODY, upstreamUrl: TARGET,
-    refs: 2, carried: ALL_GEMINI, dropped: [], streamed: true,
+    refs: 2, carried: [GEM_SNAKE], dropped: [GEM_CAMEL], streamed: true,
     call: (r) => handleOpenAIRequest(r, TARGET, AUTH, 'r11', 'gemini-test', ENV, LOGGER, false, undefined, 'openai-responses') },
   { name: ':generateContent→openai-completions', clientPath: '/v1beta/models/gemini-test:generateContent', body: GEMINI_BODY, upstreamUrl: TARGET,
-    refs: 2, carried: ALL_GEMINI, dropped: [], streamed: true,
+    refs: 2, carried: [GEM_SNAKE], dropped: [GEM_CAMEL], streamed: true,
     call: (r) => handleOpenAIRequest(r, TARGET, AUTH, 'r12', 'gemini-test', ENV, LOGGER, false, undefined, 'openai-completions') },
 
   { name: 'interactions→gemini', clientPath: '/v1/interactions', body: INTERACTIONS_BODY, upstreamUrl: TARGET_GEMINI,

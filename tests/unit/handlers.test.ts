@@ -380,6 +380,35 @@ describe('completionsToClaudeBody — image conversion', () => {
     ]);
   });
 
+  it('decodes a PDF data URI into a Claude document block, not an image block', async () => {
+    // finding #8: a PDF rode the Completions intermediate as an `image_url` data
+    // URI, and this hop emitted `{type:'image', source:{media_type:'application/pdf'}}`
+    // — a media type Claude's image block does not declare, so the whole request was
+    // a 400. The block the API declares for a PDF is `document`
+    // (`messages-create.md:248`, `list_of_api_and_schema.md:137`).
+    const body = await completionsToClaudeBody({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'summarise this' },
+          { type: 'image_url', image_url: { url: 'data:application/pdf;base64,JVBERi0=' } },
+        ],
+      }],
+    } as any, 'm');
+
+    assert.deepEqual((body.messages as any[])[0].content, [
+      { type: 'text', text: 'summarise this' },
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+    ]);
+
+    // An image media type still takes the image block, unchanged.
+    const image = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/webp;base64,QUJD' } }] }],
+    } as any, 'm');
+    assert.deepEqual((image.messages as any[])[0].content,
+      [{ type: 'image', source: { type: 'base64', media_type: 'image/webp', data: 'QUJD' } }]);
+  });
+
   it('collapses a text-only array back to a string (preserves wire shape)', async () => {
     const body = await completionsToClaudeBody({
       messages: [{
@@ -888,6 +917,51 @@ describe('convertGeminiGenerateContentToOpenAI — thought signatures', () => {
 // ---------------------------------------------------------------------------
 // convertGeminiGenerateContentToOpenAI — toolConfig.functionCallingConfig
 // ---------------------------------------------------------------------------
+
+describe('convertGeminiGenerateContentToOpenAI — media parts', () => {
+  it('drops audio and video inline data, which this hop has no position for, and says so', () => {
+    // The same finding #8 on the `:generateContent` front door, whose media
+    // extraction is its own copy of the Interactions one: every `inline_data` part
+    // became an `image_url`, so an audio or video payload reached the upstream (and
+    // then a Claude image block) as a picture.
+    const warnings: string[] = [];
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {},
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    } as any;
+
+    const out = convertGeminiGenerateContentToOpenAI({
+      model: 'gpt-target',
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: 'listen' },
+          { inline_data: { mime_type: 'audio/mp3', data: 'YXVk' } },
+          { inlineData: { mimeType: 'video/mp4', data: 'dmlk' } },
+        ],
+      }],
+    }, { logger, requestId: 'r-media-gc' }) as any;
+
+    assert.deepEqual(out.messages, [{ role: 'user', content: 'listen' }]);
+    assert.equal(warnings.filter(w => /audio\/mp3/.test(w)).length, 1);
+    assert.equal(warnings.filter(w => /video\/mp4/.test(w)).length, 1);
+  });
+
+  it('keeps a PDF inline data as the intermediate image_url the Claude hop projects', () => {
+    // The ruling for #8: a PDF maps to `ClaudeDocumentBlock`, and the position it
+    // rides to get there is the intermediate `image_url` — the Completions content
+    // union has nothing else for it. `completionsToClaudeBody` is what turns the
+    // `application/pdf` data URI into the `document` block.
+    const out = convertGeminiGenerateContentToOpenAI({
+      model: 'gpt-target',
+      contents: [{ role: 'user', parts: [{ inline_data: { mime_type: 'application/pdf', data: 'JVBERi0=' } }] }],
+    }) as any;
+
+    assert.deepEqual(out.messages[0].content, [
+      { type: 'image_url', image_url: { url: 'data:application/pdf;base64,JVBERi0=' } },
+    ]);
+  });
+});
 
 describe('convertGeminiGenerateContentToOpenAI — toolConfig', () => {
   const weatherTool = { functionDeclarations: [{ name: 'get_weather', parameters: { type: 'OBJECT', properties: {} } }] };
