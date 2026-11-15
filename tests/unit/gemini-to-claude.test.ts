@@ -238,6 +238,29 @@ describe('convertGeminiGenerateContentToClaude', () => {
     assert.ok(resp.id.startsWith('msg_'), 'id must carry msg_ prefix');
   });
 
+  it('counts the model\'s thoughts as output tokens, as Claude bills thinking', () => {
+    // Finding #19: `thoughtsTokenCount` was read by no Claude egress, so a thinking
+    // model's billed reasoning vanished from the usage a /v1/messages client sees.
+    // Gemini reports it *beside* `candidatesTokenCount` (the SDK: "the number of
+    // tokens that were part of the model's generated 'thoughts' output"), and
+    // Anthropic has no field of its own — it bills the thinking as output
+    // (`claude-extended-thinking.md:3289`, "Output tokens (billed)") — so the two
+    // are summed.
+    const resp = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{ content: { parts: [{ text: 'hi' }] }, finishReason: 'STOP' }],
+        usageMetadata: {
+          promptTokenCount: 10, candidatesTokenCount: 5,
+          thoughtsTokenCount: 900, cachedContentTokenCount: 4,
+        },
+      } as any,
+      'gemini-2',
+      'reqid-abcdef12',
+    );
+
+    assert.deepEqual(resp.usage, { input_tokens: 10, output_tokens: 905, cache_read_input_tokens: 4 });
+  });
+
   it('maps MAX_TOKENS -> max_tokens', () => {
     const resp = convertGeminiGenerateContentToClaude(
       {

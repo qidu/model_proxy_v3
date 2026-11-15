@@ -34,16 +34,22 @@ function convertGeminiUsageToClaudeUsage(usage: Record<string, unknown> | undefi
     if (!usage) return undefined;
 
     const inputTokens = toNumber(usage.total_input_tokens) ?? toNumber(usage.promptTokenCount);
-    const outputTokens = toNumber(usage.total_output_tokens) ?? toNumber(usage.candidatesTokenCount);
+    const candidateTokens = toNumber(usage.total_output_tokens) ?? toNumber(usage.candidatesTokenCount);
+    // Either dialect spells the model's thoughts: the Interactions `Usage` names them
+    // `total_thought_tokens`, generateContent `thoughtsTokenCount`. They are output
+    // Anthropic bills for and has no field of, so they are summed into
+    // `output_tokens` — a count no Claude client could otherwise see (finding #19).
+    const thoughtTokens = toNumber(usage.total_thought_tokens) ?? toNumber(usage.thoughtsTokenCount);
     const cachedTokens = toNumber(usage.total_cached_tokens) ?? toNumber(usage.cachedContentTokenCount);
 
-    if (inputTokens === undefined && outputTokens === undefined && cachedTokens === undefined) {
+    if (inputTokens === undefined && candidateTokens === undefined
+        && thoughtTokens === undefined && cachedTokens === undefined) {
         return undefined;
     }
 
     const claudeUsage: ClaudeUsage = {
         input_tokens: inputTokens ?? 0,
-        output_tokens: outputTokens ?? 0,
+        output_tokens: (candidateTokens ?? 0) + (thoughtTokens ?? 0),
     };
     if (cachedTokens !== undefined) {
         claudeUsage.cache_read_input_tokens = cachedTokens;

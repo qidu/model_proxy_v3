@@ -54,6 +54,35 @@ async function convert(chunks: unknown[]) {
 }
 
 describe('createGeminiStreamTransformer — thought parts', () => {
+  it('counts the model\'s thoughts as output tokens', async () => {
+    // Finding #19, streaming half: the thought count reached no Claude client, so a
+    // `message_delta` reported less output than the turn billed. Summed for the same
+    // reason as the non-streaming egress (`gemini-to-claude.test.ts`).
+    const events = await convert([
+      {
+        candidates: [{ content: { role: 'model', parts: [{ text: 'answer' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 3, thoughtsTokenCount: 41 },
+      },
+    ]);
+
+    const delta = events.find(e => e.event === 'message_delta')!;
+    assert.deepEqual(delta.data.usage, { input_tokens: 7, output_tokens: 44 });
+  });
+
+  it('counts the thoughts too when the upstream reports the Interactions usage shape', async () => {
+    // The same helper reads the Interactions `Usage`, where the thought count has a
+    // field of its own (`total_thought_tokens`) and must fold the same way.
+    const events = await convert([
+      {
+        event_type: 'interaction.completed',
+        interaction: { usage: { total_input_tokens: 11, total_output_tokens: 4, total_thought_tokens: 50 } },
+      },
+    ]);
+
+    const delta = events.find(e => e.event === 'message_delta')!;
+    assert.deepEqual(delta.data.usage, { input_tokens: 11, output_tokens: 54 });
+  });
+
   it('streams a thought part as a thinking block ahead of the answer', async () => {
     const events = await convert([
       {

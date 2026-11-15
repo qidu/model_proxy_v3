@@ -330,7 +330,13 @@ export function convertGeminiGenerateContentToClaude(
         stop_reason: stopReason,
         usage: {
             input_tokens: usageMetadata?.promptTokenCount || 0,
-            output_tokens: usageMetadata?.candidatesTokenCount || 0,
+            // The model's thoughts are output, and Anthropic has no field of its own
+            // for them: it bills the thinking as output tokens
+            // (`claude-extended-thinking.md:3289`) and counts it towards `max_tokens`
+            // (`messages-create.md:2598`). Gemini reports the count *beside*
+            // `candidatesTokenCount` rather than inside it, so the two are summed —
+            // otherwise a thinking model's billed reasoning reaches no Claude client.
+            output_tokens: (usageMetadata?.candidatesTokenCount || 0) + (usageMetadata?.thoughtsTokenCount || 0),
             ...(usageMetadata?.cachedContentTokenCount ? { cache_read_input_tokens: usageMetadata.cachedContentTokenCount } : {}),
         },
     };

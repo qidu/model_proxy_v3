@@ -5,6 +5,30 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): a Gemini turn's thought tokens are counted in the Claude usage
+
+`thoughtsTokenCount` was read by no Claude egress, so a thinking model's billed reasoning reached a
+`/v1/messages` client as nothing: the non-streaming converter reported `candidatesTokenCount` alone
+(`gemini-to-claude.ts`) and so did the streaming dialect's usage helper (`gemini-streaming.ts`).
+
+Anthropic has no field for thoughts and bills them as output — "Output tokens (billed)"
+(`claude-extended-thinking.md:3289`), counted towards `max_tokens` (`messages-create.md:2598`) — while
+Gemini reports the count *beside* the candidates rather than inside them (`@google/genai`:
+`candidatesTokenCount` is "the total number of tokens in the generated candidates",
+`thoughtsTokenCount` the "tokens that were part of the model's generated 'thoughts' output"). The two
+are summed into `output_tokens`, and both spellings are read: `thoughtsTokenCount` from
+generateContent, `total_thought_tokens` from the Interactions `Usage`.
+
+Nothing else moves: the Interactions egress still reports the thought count under its own field, and
+`dashboard-stats.ts` reads `candidatesTokenCount` straight off the upstream body, so no surface can
+double count.
+
+**Verification**: three cases — `gemini-to-claude.test.ts` (a turn with 5 candidate and 900 thought
+tokens reports `output_tokens: 905`) and two in `gemini-stream-thinking.test.ts` (the same fold on the
+streamed `message_delta`, for the generateContent and Interactions usage shapes). All three fail
+against the previous code. `npm run typecheck`, `npm run build` and `npm run test:unit` pass
+(3008/3008).
+
 ### fix(handlers): fill a missing message role on every upstream mode, not only openai-completions
 
 A Gemini front door forwards `input.messages` verbatim, and nothing requires the client to put a
