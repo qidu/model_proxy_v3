@@ -365,19 +365,22 @@ function stepsToMessages(
 ): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
   let reasoning = '';
+  let reasoningSignature: string | undefined;
 
   /** Give whatever thought is pending to `message`, as its reasoning. */
   const attachReasoning = (message: Record<string, unknown>): void => {
-    if (reasoning === '') return;
-    message.reasoning_content = reasoning;
+    if (reasoning !== '') message.reasoning_content = reasoning;
+    if (reasoningSignature) message.reasoning_signature = reasoningSignature;
     reasoning = '';
+    reasoningSignature = undefined;
   };
 
   /** Carry a pending thought as a message of its own — it belongs to no turn. */
   const flushReasoning = (): void => {
-    if (reasoning === '') return;
-    messages.push({ role: 'assistant', content: '', reasoning_content: reasoning });
-    reasoning = '';
+    if (reasoning === '' && !reasoningSignature) return;
+    const message: Record<string, unknown> = { role: 'assistant', content: '' };
+    attachReasoning(message);
+    messages.push(message);
   };
 
   for (const entry of steps) {
@@ -386,9 +389,19 @@ function stepsToMessages(
     const where = `input step ${JSON.stringify(step.type)}`;
 
     switch (step.type) {
-      case 'thought':
+      case 'thought': {
         reasoning += thoughtSummaryText(step.summary);
+        const signature = typeof step.signature === 'string' && step.signature !== '' ? step.signature : undefined;
+        if (signature && reasoningSignature && signature !== reasoningSignature) {
+          options?.logger?.warn(
+            options?.requestId ?? '',
+            '[gemini->openai] adjacent thought steps carry different signatures; kept the first and dropped the later one because Completions has one reasoning_signature slot',
+          );
+        } else if (signature) {
+          reasoningSignature ??= signature;
+        }
         break;
+      }
 
       case 'user_input':
         flushReasoning();
@@ -877,7 +890,21 @@ export function convertGeminiGenerateContentToOpenAI(
       // assistant turn that performed a tool call — see
       // docs/review_of_antigravity_gemini_with_ds_tools.md.
       const thinkingContent = parts.filter((p: any) => p.thought && p.text).map((p: any) => p.text as string).join('');
-      const thinkingSignature = parts.find((p: any) => p.thought && p.text && typeof p.thoughtSignature === 'string' && p.thoughtSignature !== '')?.thoughtSignature as string | undefined;
+      const signedParts = parts.filter((p: any) =>
+        (p.thought === true || p.functionCall) &&
+        typeof p.thoughtSignature === 'string' && p.thoughtSignature !== '');
+      // A thought's signature belongs beside its reasoning text. Only when the
+      // turn has none may a functionCall's signature take the one intermediate slot.
+      const thinkingSignature = signedParts.find((p: any) => p.thought === true)?.thoughtSignature
+        ?? signedParts.find((p: any) => p.functionCall)?.thoughtSignature as string | undefined;
+      const droppedSignatures = signedParts.filter((p: any) => p.thoughtSignature !== thinkingSignature).length;
+      if (droppedSignatures > 0) {
+        options?.logger?.warn(
+          options?.requestId ?? '',
+          `[gemini->openai] dropped ${droppedSignatures} additional thought signature(s) on one turn; ` +
+          'kept the first thought-part signature, or the first functionCall signature when no thought part was signed',
+        );
+      }
       const textContent = parts.filter((p: any) => p.text && !p.thought).map((p: any) => p.text as string).join('');
 
       if (funcCallParts.length > 0) {
@@ -903,10 +930,8 @@ export function convertGeminiGenerateContentToOpenAI(
             },
           })),
         };
-        if (thinkingContent) {
-          msg.reasoning_content = thinkingContent;
-          if (thinkingSignature) msg.reasoning_signature = thinkingSignature;
-        }
+        if (thinkingContent) msg.reasoning_content = thinkingContent;
+        if (thinkingSignature) msg.reasoning_signature = thinkingSignature;
         messages.push(msg);
       } else if (funcRespParts.length > 0) {
         // User turn: convert functionResponse parts to OpenAI tool messages.
@@ -986,10 +1011,8 @@ export function convertGeminiGenerateContentToOpenAI(
           for (const ip of imageParts) contentArr.push(ip);
           msg = { role, content: contentArr };
         }
-        if (thinkingContent) {
-          msg.reasoning_content = thinkingContent;
-          if (thinkingSignature) msg.reasoning_signature = thinkingSignature;
-        }
+        if (thinkingContent) msg.reasoning_content = thinkingContent;
+        if (thinkingSignature) msg.reasoning_signature = thinkingSignature;
         messages.push(msg);
       }
     }

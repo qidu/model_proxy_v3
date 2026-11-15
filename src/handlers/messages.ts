@@ -267,6 +267,7 @@ export async function handleMessagesRequest(
       let responsesBody: Record<string, unknown> = completionsToResponsesBody(
         openaiRequestBody as unknown as Record<string, unknown>,
         (openaiRequestBody.model as string | undefined) ?? model,
+        { logger: activeLogger, requestId },
       );
       // Re-asserted rather than taken from the converter: `stream` here is the proxy's
       // own decision (`?alt=sse` and the streaming doorways can force it), not a field
@@ -550,6 +551,7 @@ export async function handleMessagesRequest(
     const responsesBody: Record<string, unknown> = completionsToResponsesBody(
       openaiRequest as unknown as Record<string, unknown>,
       openaiRequest.model,
+      { logger: activeLogger, requestId },
     );
     responsesBody.stream = isStreaming;
 

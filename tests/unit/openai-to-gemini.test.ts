@@ -130,12 +130,12 @@ describe('convertOpenAIToGeminiGenerateContent', () => {
     assert.equal(parts[1].text, 'answer');
   });
 
-  it('maps reasoning_content into a thought part', () => {
+  it('maps reasoning_content and its signature into a thought part', () => {
     const out = convertOpenAIToGeminiGenerateContent(
       {
         choices: [
           {
-            message: { content: 'answer', reasoning_content: 'internal reasoning' },
+            message: { content: 'answer', reasoning_content: 'internal reasoning', reasoning_signature: 'sig-reasoning' },
             finish_reason: 'stop',
             index: 0,
           },
@@ -148,6 +148,7 @@ describe('convertOpenAIToGeminiGenerateContent', () => {
     const parts = out.candidates[0].content.parts;
     assert.equal(parts[0].thought, true);
     assert.equal(parts[0].text, 'internal reasoning');
+    assert.equal(parts[0].thoughtSignature, 'sig-reasoning');
     assert.equal(parts[1].text, 'answer');
   });
 

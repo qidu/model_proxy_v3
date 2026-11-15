@@ -12,6 +12,7 @@
  */
 
 import { OpenAIContent, OpenAIMessage } from '../types/openai.js';
+import type { Logger } from '../types/shared.js';
 import { ValidationError } from '../utils/errors.js';
 import { decodeDataUriOrRef } from './claude-to-gemini.js';
 import { normalizeEffort } from './claude-to-openai.js';
@@ -105,7 +106,11 @@ function completionsToolChoiceToClaude(toolChoice: unknown): Record<string, unkn
  * URLs requires a server-side fetch (SSRF-guarded; see `fetchImageAsInlineData`).
  * `data:` URIs are decoded synchronously via `decodeDataUri`.
  */
-export async function completionsToClaudeBody(completions: Record<string, unknown>, model: string): Promise<Record<string, unknown>> {
+export async function completionsToClaudeBody(
+  completions: Record<string, unknown>,
+  model: string,
+  options?: { logger?: Logger; requestId?: string },
+): Promise<Record<string, unknown>> {
   const messages = (completions.messages as OpenAIMessage[]) || [];
   // Claude carries one top-level `system`, not system turns inside `messages`, so
   // every system-level message — OpenAI's `developer` included — is merged into it
@@ -131,6 +136,13 @@ export async function completionsToClaudeBody(completions: Record<string, unknow
     const thinking = (m as unknown as Record<string, unknown>).reasoning_content as string | undefined;
     const reasoningSignature = (m as unknown as Record<string, unknown>).reasoning_signature;
     const signature = typeof reasoningSignature === 'string' && reasoningSignature !== '' ? reasoningSignature : undefined;
+    if (signature && !thinking) {
+      options?.logger?.warn(
+        options?.requestId ?? '',
+        `[openai->claude] reasoning_signature on messages[${i}] has no reasoning_content; ` +
+        'dropped because a Claude thinking block needs thinking text',
+      );
+    }
     if (m.tool_calls) {
       const content: unknown[] = [];
       if (thinking) content.push({ type: 'thinking', thinking, ...(signature ? { signature } : {}) });

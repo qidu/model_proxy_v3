@@ -169,20 +169,28 @@ export function convertOpenAIToGeminiGenerateContent(
         // Reasoning-model upstreams (e.g. DeepSeek) emit thinking as a dedicated
         // reasoning_content field rather than inline <think> tags.
         const reasoningContent = choice.delta?.reasoning_content || choice.message?.reasoning_content || '';
+        const rawReasoningSignature = choice.delta?.reasoning_signature ?? choice.message?.reasoning_signature;
+        const reasoningSignature = typeof rawReasoningSignature === 'string' && rawReasoningSignature !== ''
+            ? rawReasoningSignature
+            : undefined;
         const toolCalls = choice.message?.tool_calls || choice.delta?.tool_calls || [];
         const parts: any[] = [];
+        const thoughtParts: any[] = [];
+        const { reasoning, cleanText } = extractThinkContent(content);
 
         if (reasoningContent !== '') {
-            parts.push({ thought: true, text: reasoningContent });
+            thoughtParts.push({ thought: true, text: reasoningContent });
         }
-        if (content !== '') {
-            const { reasoning, cleanText } = extractThinkContent(content);
-            if (reasoning) {
-                parts.push({ thought: true, text: reasoning });
-            }
-            if (cleanText) {
-                parts.push({ text: cleanText });
-            }
+        if (reasoning) {
+            thoughtParts.push({ thought: true, text: reasoning });
+        }
+        if (reasoningSignature) {
+            if (thoughtParts.length > 0) thoughtParts[0].thoughtSignature = reasoningSignature;
+            else thoughtParts.push({ thought: true, thoughtSignature: reasoningSignature });
+        }
+        parts.push(...thoughtParts);
+        if (cleanText) {
+            parts.push({ text: cleanText });
         }
         const schemasByName = geminiToolSchemas.get(requestId);
         for (const toolCall of toolCalls) {

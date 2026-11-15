@@ -912,6 +912,79 @@ describe('convertGeminiGenerateContentToOpenAI — thought signatures', () => {
     assert.equal('reasoning_signature' in message, false);
     assert.deepEqual(thinking, { type: 'thinking', thinking: 'pondering' });
   });
+
+  it('carries a functionCall part signature even when the turn has no thinking text', async () => {
+    const completions = convertGeminiGenerateContentToOpenAI({
+      contents: [{
+        role: 'model',
+        parts: [{ functionCall: { name: 'f', args: {} }, thoughtSignature: 'call-signature' }],
+      }],
+    });
+    const message = (completions.messages as any[])[0];
+
+    assert.equal(message.reasoning_signature, 'call-signature');
+    assert.equal('reasoning_content' in message, false);
+
+    const warnings: string[] = [];
+    const logger = { warn: (_requestId: string, message: string) => { warnings.push(message); } } as any;
+    const claudeBody = await completionsToClaudeBody(completions, 'claude-target', { logger, requestId: 'r-signature' });
+    assert.deepEqual((claudeBody.messages as any[])[0].content, [
+      { type: 'tool_use', id: 'call_f_0', name: 'f', input: {} },
+    ]);
+    assert.match(warnings.join('\n'), /no reasoning_content/);
+  });
+
+  it('prefers a text-less thought signature over the functionCall signature and reports the drop', () => {
+    const warnings: string[] = [];
+    const logger = { warn: (_requestId: string, message: string) => { warnings.push(message); } } as any;
+    const completions = convertGeminiGenerateContentToOpenAI({
+      contents: [{
+        role: 'model',
+        parts: [
+          { thought: true, thoughtSignature: 'thought-signature' },
+          { functionCall: { name: 'f', args: {} }, thoughtSignature: 'call-signature' },
+        ],
+      }],
+    }, { logger, requestId: 'r-signature' });
+    const message = (completions.messages as any[])[0];
+
+    assert.equal(message.reasoning_signature, 'thought-signature');
+    assert.equal('reasoning_content' in message, false);
+    assert.match(warnings.join('\n'), /dropped 1 additional thought signature/);
+  });
+
+  it('keeps the first signature when adjacent signed thoughts share one reasoning block', () => {
+    const warnings: string[] = [];
+    const logger = { warn: (_requestId: string, message: string) => { warnings.push(message); } } as any;
+    const completions = convertGeminiGenerateContentToOpenAI({
+      contents: [{
+        role: 'model',
+        parts: [
+          { thought: true, text: 'first ', thoughtSignature: 'sig-a' },
+          { thought: true, text: 'second', thoughtSignature: 'sig-b' },
+        ],
+      }],
+    }, { logger, requestId: 'r-signature' });
+
+    assert.deepEqual((completions.messages as any[])[0], {
+      role: 'assistant',
+      content: '',
+      reasoning_content: 'first second',
+      reasoning_signature: 'sig-a',
+    });
+    assert.match(warnings.join('\n'), /dropped 1 additional thought signature/);
+  });
+
+  it('reports a reasoning signature that the Responses hop cannot represent', () => {
+    const warnings: string[] = [];
+    const logger = { warn: (_requestId: string, message: string) => { warnings.push(message); } } as any;
+    const body = completionsToResponsesBody({
+      messages: [{ role: 'assistant', content: 'answer', reasoning_signature: 'sig' }],
+    }, 'responses-target', { logger, requestId: 'r-signature' });
+
+    assert.equal(JSON.stringify(body.input).includes('reasoning_signature'), false);
+    assert.match(warnings.join('\n'), /no Responses reasoning-item equivalent/);
+  });
 });
 
 // ---------------------------------------------------------------------------

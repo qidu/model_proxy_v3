@@ -210,17 +210,33 @@ describe('anthropic-messages → :streamGenerateContent: the answer reaches the 
     assert.equal(answerText(standard), 'ok');
   });
 
-  it('still wraps a thinking block into a thought part', async () => {
+  it('wraps a thinking block into a thought part with its signature', async () => {
     const chunks = await convert([
       messageStart([], { input_tokens: 7, output_tokens: 0 }),
       event('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }),
       event('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'pondering' } }),
+      event('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig-stream' } }),
       event('content_block_stop', { type: 'content_block_stop', index: 0 }),
       messageDelta(USAGE),
       MESSAGE_STOP,
     ]);
     const thought = (chunks[0].candidates?.[0]?.content?.parts ?? []).find(p => p.thought === true);
-    assert.equal(thought?.text, 'pondering', 'thinking must surface as a thought part');
+    assert.deepEqual(thought, { thought: true, text: 'pondering', thoughtSignature: 'sig-stream' });
+  });
+
+  it('carries a signature even when the thinking block has no text', async () => {
+    const chunks = await convert([
+      messageStart([], { input_tokens: 7, output_tokens: 0 }),
+      event('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }),
+      event('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig-only' } }),
+      event('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      messageDelta(USAGE),
+      MESSAGE_STOP,
+    ]);
+
+    assert.deepEqual(chunks[0].candidates?.[0]?.content?.parts, [
+      { thought: true, thoughtSignature: 'sig-only' },
+    ]);
   });
 
   it('still emits a complete functionCall for a tool turn', async () => {

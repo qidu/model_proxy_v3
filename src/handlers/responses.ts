@@ -665,7 +665,7 @@ async function handleAsAnthropicMessages(
   if ('error' in stateResult) return stateResult.error;
   const completionsRequest = convertResponsesToChatCompletions(stateResult.body, model, { logger, requestId });
   const allowedTools = extractAllowedTools(stateResult.body);
-  let claudeBody: Record<string, unknown> = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
+  let claudeBody: Record<string, unknown> = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model, { logger, requestId });
 
   // before_upstream: apply declared transforms to the upstream-format body.
   // Required for anthropic-messages routes so per-model quirks (e.g. inject
@@ -761,7 +761,7 @@ async function handleAsGemini(
   if ('error' in stateResult) return stateResult.error;
   const completionsRequest = convertResponsesToChatCompletions(stateResult.body, model, { logger, requestId });
   const allowedTools = extractAllowedTools(stateResult.body);
-  const claudeBody = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model);
+  const claudeBody = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model, { logger, requestId });
 
   logger.debug(requestId, `Responses->${upstreamMode}: ${JSON.stringify(claudeBody).substring(0, 500)}`);
 

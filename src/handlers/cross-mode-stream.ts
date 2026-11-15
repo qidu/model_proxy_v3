@@ -38,6 +38,7 @@ import {
   interactionStreamReasoning,
   interactionStreamStatus,
   interactionStreamText,
+  interactionStreamThoughtSignature,
   interactionStreamWholeStep,
   type InteractionStreamState,
 } from '../converters/interactions-stream-events.js';
@@ -47,13 +48,28 @@ import {
   type ResponsesChatStreamState,
 } from '../converters/responses-to-completions.js';
 
-function openAIChunk(text: string, model: string, usage?: Record<string, unknown>): Record<string, unknown> {
+function openAIChunk(
+  text: string,
+  model: string,
+  usage?: Record<string, unknown>,
+  reasoningSignature?: string,
+): Record<string, unknown> {
   return {
     id: `chatcmpl_${Date.now()}`,
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+    choices: [{
+      index: 0,
+      delta: {
+        content: text,
+        ...(reasoningSignature ? {
+          reasoning_signature: reasoningSignature,
+          reasoning_block_complete: true,
+        } : {}),
+      },
+      finish_reason: null,
+    }],
     ...(usage ? { usage } : {}),
   };
 }
@@ -64,9 +80,10 @@ function openAIChunk(text: string, model: string, usage?: Record<string, unknown
 // shared buffer would corrupt unrelated requests' tool-call args. Entries are
 // removed on message_stop / stream completion (see cleanup call sites below).
 interface AnthropicToolBuffer { id: string; name: string; args: string; }
+interface AnthropicThinkingBuffer { text: string; signature?: string; }
 let anthropicToolBuffers: Map<string, Map<number, AnthropicToolBuffer>> = new Map();
-// Keyed by requestId -> block index -> accumulated thinking text.
-let anthropicThinkingBuffers: Map<string, Map<number, string>> = new Map();
+// Keyed by requestId -> block index -> accumulated thinking text and signature.
+let anthropicThinkingBuffers: Map<string, Map<number, AnthropicThinkingBuffer>> = new Map();
 
 /** Remove all per-request SSE conversion state for a finished/aborted request. */
 function clearAnthropicSSEState(requestId: string): void {
@@ -147,9 +164,9 @@ function processAnthropicSSEBuffer(
       // One path for every place an Anthropic-shaped stream can carry answer
       // text, so each of them reports the usage collected so far (Gemini's
       // `usageMetadata` is a running total; the final chunk is authoritative).
-      const emitText = (text: string): void => {
-        if (text === '') return;
-        const chunk = openAIChunk(text, model, anthropicUsageToCompletionUsage(usageAccum));
+      const emitText = (text: string, reasoningSignature?: string): void => {
+        if (text === '' && !reasoningSignature) return;
+        const chunk = openAIChunk(text, model, anthropicUsageToCompletionUsage(usageAccum), reasoningSignature);
         const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
         result += processed;
       };
@@ -187,7 +204,10 @@ function processAnthropicSSEBuffer(
           // Seeded from the block for the same reason as `input` above: a gateway
           // that fills the block up front sends no thinking_delta to follow.
           // Standard Anthropic sends `thinking: ''`, which is the previous value.
-          thinkingBuffers.set(parsed.index as number, typeof block.thinking === 'string' ? block.thinking : '');
+          thinkingBuffers.set(parsed.index as number, {
+            text: typeof block.thinking === 'string' ? block.thinking : '',
+            ...(typeof block.signature === 'string' && block.signature !== '' ? { signature: block.signature } : {}),
+          });
         } else if (block?.type === 'text' && typeof block.text === 'string') {
           // A pre-filled text block — the same gateway behavior, for text. No
           // text_delta follows it, so emitting nothing here loses the answer.
@@ -197,8 +217,11 @@ function processAnthropicSSEBuffer(
         const delta = parsed.delta as Record<string, unknown> | undefined;
         if (delta?.type === 'thinking_delta') {
           const existing = thinkingBuffers?.get(parsed.index as number);
-          if (thinkingBuffers && existing !== undefined) {
-            thinkingBuffers.set(parsed.index as number, existing + ((delta.thinking as string) || ''));
+          if (existing) existing.text += ((delta.thinking as string) || '');
+        } else if (delta?.type === 'signature_delta') {
+          const existing = thinkingBuffers?.get(parsed.index as number);
+          if (existing && typeof delta.signature === 'string' && delta.signature !== '') {
+            existing.signature = delta.signature;
           }
         } else if (delta?.type === 'input_json_delta') {
           const tool = toolBuffers?.get(parsed.index as number);
@@ -239,11 +262,11 @@ function processAnthropicSSEBuffer(
           const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
           result += processed;
         } else if (thinkingBuffers?.has(parsed.index as number)) {
-          // Emit the completed thinking block as a <think>…</think>-wrapped text so
-          // processSSEBuffer's existing logic strips it into reasoning/cleanText.
-          const thinking = thinkingBuffers.get(parsed.index as number) || '';
+          // Emit the completed thinking block as <think>…</think> text so the existing
+          // reasoning split applies, with its signature beside it on the same chunk.
+          const thinking = thinkingBuffers.get(parsed.index as number)!;
           thinkingBuffers.delete(parsed.index as number);
-          if (thinking) emitText(`<think>${thinking}</think>`);
+          emitText(thinking.text === '' ? '' : `<think>${thinking.text}</think>`, thinking.signature);
         }
       } else if (parsed.type === 'message_delta') {
         const delta = parsed.delta as Record<string, unknown> | undefined;
@@ -537,12 +560,29 @@ function interactionsFramesForChunk(
   // A `<think>…</think>` block in the text is reasoning, not answer text — the
   // split `convertOpenAIToGeminiInteractions` made, so a reasoning model's tags
   // reach the client as a `thought` step rather than inside `model_output`.
+  const signature = typeof delta?.reasoning_signature === 'string' && delta.reasoning_signature !== ''
+    ? delta.reasoning_signature
+    : undefined;
+  const hasDedicatedReasoning = typeof delta?.reasoning_content === 'string' && delta.reasoning_content !== '';
+  let signatureWritten = false;
+  if (signature && delta?.reasoning_block_complete === true) {
+    events = [...events, ...interactionStreamThoughtSignature(state, signature, true)];
+    signatureWritten = true;
+  }
   if (typeof delta?.content === 'string' && delta.content !== '') {
     const { reasoning, cleanText } = extractThinkContent(delta.content);
-    events = [...events, ...interactionStreamReasoning(state, reasoning), ...interactionStreamText(state, cleanText)];
+    events = [...events, ...interactionStreamReasoning(state, reasoning)];
+    if (signature && !hasDedicatedReasoning && !signatureWritten) {
+      events = [...events, ...interactionStreamThoughtSignature(state, signature)];
+      signatureWritten = true;
+    }
+    events = [...events, ...interactionStreamText(state, cleanText)];
   }
   if (typeof delta?.reasoning_content === 'string') {
     events = [...events, ...interactionStreamReasoning(state, delta.reasoning_content)];
+  }
+  if (signature && !signatureWritten) {
+    events = [...events, ...interactionStreamThoughtSignature(state, signature)];
   }
 
   // Fragmented tool calls are announced once, complete, on the frame that ends the

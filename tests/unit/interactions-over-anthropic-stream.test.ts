@@ -220,4 +220,37 @@ describe('/v1/interactions ← anthropic-messages: the SSE egress', () => {
 
     assert.match(warnings.join('\n'), /toolu_9/, 'the dropped call must be reported by id');
   });
+
+  it('emits thought_signature deltas and keeps each signature on its closing thought step', async () => {
+    const frames = await run([
+      { type: 'message_start', message: { id: 'msg_1', usage: { input_tokens: 5, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'first thought' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig-a' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'content_block_start', index: 1, content_block: { type: 'thinking', thinking: '' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'signature_delta', signature: 'sig-b' } },
+      { type: 'content_block_stop', index: 1 },
+      { type: 'content_block_start', index: 2, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 2, delta: { type: 'text_delta', text: 'answer' } },
+      { type: 'content_block_stop', index: 2 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 12 } },
+      { type: 'message_stop' },
+    ]);
+
+    assert.deepEqual(
+      frames.filter(frame => frame.delta?.type === 'thought_signature').map(frame => ({
+        index: frame.index, delta: frame.delta,
+      })),
+      [
+        { index: 0, delta: { type: 'thought_signature', signature: 'sig-a' } },
+        { index: 1, delta: { type: 'thought_signature', signature: 'sig-b' } },
+      ],
+    );
+    assert.deepEqual(frames.at(-1)?.interaction.steps, [
+      { type: 'thought', summary: [{ type: 'text', text: 'first thought' }], signature: 'sig-a' },
+      { type: 'thought', summary: [], signature: 'sig-b' },
+      { type: 'model_output', content: [{ type: 'text', text: 'answer' }] },
+    ]);
+  });
 });

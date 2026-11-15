@@ -48,7 +48,7 @@ async function forwardCompletionsAsAnthropicMessages(
   env?: Env,
   route?: ModelRouteConfig,
 ): Promise<Response> {
-  let claudeBody = await completionsToClaudeBody(openaiRequest, model);
+  let claudeBody = await completionsToClaudeBody(openaiRequest, model, { logger, requestId });
 
   // Rule #8: an Interactions client's `labels` rides the intermediate as `metadata`
   // (`convertGeminiInteractionsToOpenAI`), and this hop has nowhere to put it —
@@ -253,7 +253,7 @@ async function forwardCompletionsAsOpenAIResponses(
   isStreaming?: boolean,
   route?: ModelRouteConfig,
 ): Promise<Response> {
-  let responsesBody: Record<string, unknown> = completionsToResponsesBody(openaiRequest, model);
+  let responsesBody: Record<string, unknown> = completionsToResponsesBody(openaiRequest, model, { logger, requestId });
 
   // No warning for the Interactions `labels` map here: it rides the intermediate as
   // `metadata`, which `completionsToResponsesBody` re-emits into a field the Responses

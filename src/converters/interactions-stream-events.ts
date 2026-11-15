@@ -41,6 +41,8 @@ interface OpenStep {
   kind: 'model_output' | 'thought';
   /** The text the deltas have appended so far. */
   text: string;
+  /** The signature a thought_signature delta attached to this thought. */
+  signature?: string;
 }
 
 /**
@@ -150,7 +152,11 @@ function closeStep(
   if (!open) return;
   const index = state.steps.length;
   state.steps.push(open.kind === 'thought'
-    ? { type: 'thought', summary: [{ type: 'text', text: open.text }] }
+    ? {
+      type: 'thought',
+      summary: open.text === '' ? [] : [{ type: 'text', text: open.text }],
+      ...(open.signature ? { signature: open.signature } : {}),
+    }
     : { type: 'model_output', content: [{ type: 'text', text: open.text }] });
   events.push({
     event_type: 'step.stop',
@@ -216,6 +222,25 @@ export function interactionStreamReasoning(state: InteractionStreamState, text: 
     event_type: 'step.delta',
     index: state.steps.length,
     delta: { type: 'thought_summary', content: { type: 'text', text } },
+  });
+  return events;
+}
+
+/** A thought's signature, including the normal signature-without-summary shape. */
+export function interactionStreamThoughtSignature(
+  state: InteractionStreamState,
+  signature: string,
+  newBlock = false,
+): Array<Record<string, unknown>> {
+  if (signature === '') return [];
+  const events = interactionStreamCreated(state);
+  if (newBlock) closeStep(state, events);
+  openStep(state, events, 'thought');
+  state.open!.signature = signature;
+  events.push({
+    event_type: 'step.delta',
+    index: state.steps.length,
+    delta: { type: 'thought_signature', signature },
   });
   return events;
 }

@@ -555,6 +555,34 @@ describe('convertGeminiInteractionsToOpenAI — steps that carry no content of t
     ]);
   });
 
+  it('carries a signature-only thought into the assistant turn it introduces', () => {
+    const messages = one([
+      { type: 'thought', signature: 'sig-only' },
+      { type: 'model_output', content: 'answer' },
+    ]);
+
+    assert.deepEqual(messages, [{
+      role: 'assistant', content: 'answer', reasoning_signature: 'sig-only',
+    }]);
+  });
+
+  it('keeps the first signature when adjacent thought steps are merged, and reports the later one', () => {
+    const { logger, warnings } = recordingLogger();
+    const out = convertGeminiInteractionsToOpenAI({
+      model: 'm',
+      input: [
+        { type: 'thought', summary: [{ type: 'text', text: 'first ' }], signature: 'sig-a' },
+        { type: 'thought', summary: [{ type: 'text', text: 'second' }], signature: 'sig-b' },
+        { type: 'model_output', content: 'answer' },
+      ],
+    }, { logger, requestId: 'r-signatures' }) as any;
+
+    assert.deepEqual(out.messages, [{
+      role: 'assistant', content: 'answer', reasoning_content: 'first second', reasoning_signature: 'sig-a',
+    }]);
+    assert.match(warnings.join('\n'), /adjacent thought steps carry different signatures/);
+  });
+
   it('reads the thought summary in the bundled doc spelling as well', () => {
     const messages = one([
       { type: 'thought', summary: { content: { type: 'text', text: 'doc spelling' } } },
@@ -573,6 +601,18 @@ describe('convertGeminiInteractionsToOpenAI — steps that carry no content of t
 
     assert.deepEqual(messages, [
       { role: 'assistant', content: '', reasoning_content: 'stray' },
+      { role: 'user', content: 'hi' },
+    ]);
+  });
+
+  it('flushes a signature-only thought that has no assistant turn after it', () => {
+    const messages = one([
+      { type: 'thought', signature: 'sig-stray' },
+      { type: 'user_input', content: 'hi' },
+    ]);
+
+    assert.deepEqual(messages, [
+      { role: 'assistant', content: '', reasoning_signature: 'sig-stray' },
       { role: 'user', content: 'hi' },
     ]);
   });

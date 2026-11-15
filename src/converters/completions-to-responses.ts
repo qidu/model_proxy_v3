@@ -414,7 +414,11 @@ function completionsToolChoiceToResponses(toolChoice: unknown): unknown {
  * Used to route Gemini endpoints (interactions/generateContent) through an
  * openai-responses upstream.
  */
-export function completionsToResponsesBody(completions: Record<string, unknown>, model: string): Record<string, unknown> {
+export function completionsToResponsesBody(
+  completions: Record<string, unknown>,
+  model: string,
+  options?: { logger?: Logger; requestId?: string },
+): Record<string, unknown> {
   const messages = (completions.messages as OpenAIMessage[]) || [];
   const input: unknown[] = [];
   const instructions = messages
@@ -441,9 +445,16 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
     // turn's `function_call` items, then the reasoning carried inside `content[]`, then
     // the message.
     if (msg.role === 'assistant') {
-      const inlineReasoning = (msg as unknown as Record<string, unknown>).reasoning_content;
+      const record = msg as unknown as Record<string, unknown>;
+      const inlineReasoning = record.reasoning_content;
       if (typeof inlineReasoning === 'string' && inlineReasoning) {
         input.push({ type: 'reasoning', content: [{ type: 'reasoning_text', text: inlineReasoning }] });
+      }
+      if (typeof record.reasoning_signature === 'string' && record.reasoning_signature !== '') {
+        options?.logger?.warn(
+          options?.requestId ?? '',
+          '[openai->responses] reasoning_signature has no Responses reasoning-item equivalent; dropped',
+        );
       }
     }
 

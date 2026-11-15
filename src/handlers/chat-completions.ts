@@ -103,7 +103,7 @@ export async function handleChatCompletionsPassthrough(
     // Use the model name from the (already alias-rewritten) request body, falling back to modelId.
     // modelId carries the original alias name; parsedBody.model carries the rewritten target name.
     const model = (parsedBody.model as string || modelId || 'unknown');
-    let claudeBody = await completionsToClaudeBody(parsedBody, model);
+    let claudeBody = await completionsToClaudeBody(parsedBody, model, { logger, requestId });
     logger.debug(requestId, `${path} converted to anthropic-messages body`);
 
     // Paired before the transforms run, not after (see the same call in
@@ -326,7 +326,7 @@ export async function handleChatCompletionsPassthrough(
   // When the upstream is openai-responses, convert the completions body to Responses API format
   if (upstreamMode === 'openai-responses') {
     const model = (modelId || parsedBody.model as string || 'unknown');
-    let responsesBody: Record<string, unknown> = completionsToResponsesBody(parsedBody, model);
+    let responsesBody: Record<string, unknown> = completionsToResponsesBody(parsedBody, model, { logger, requestId });
     logger.debug(requestId, `${path} converted to openai-responses body`);
 
     // before_upstream on the converted responses body (handles max_tokens rename etc.)
