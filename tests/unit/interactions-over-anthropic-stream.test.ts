@@ -164,6 +164,21 @@ describe('/v1/interactions ← anthropic-messages: the SSE egress', () => {
     assert.equal(frames[0].event_type, 'interaction.created');
   });
 
+  it('reports an Anthropic refusal as an error and a failed interaction', async () => {
+    const frames = await run([
+      { type: 'message_start', message: { id: 'msg_refusal', usage: { input_tokens: 5, output_tokens: 0 } } },
+      { type: 'message_delta', delta: { stop_reason: 'refusal' }, usage: { output_tokens: 1 } },
+      { type: 'message_stop' },
+    ]);
+
+    const error = frames.find(frame => frame.event_type === 'error');
+    assert.match(error?.error?.code, /#FinishReason\.SAFETY$/);
+    assert.match(error?.error?.message, /content_filter/);
+    assert.equal(frames.at(-1)?.event_type, 'interaction.completed');
+    assert.equal(frames.at(-1)?.interaction?.status, 'failed');
+    assert.deepEqual(frames.at(-1)?.interaction?.steps, []);
+  });
+
   it('refuses a truncated turn that never stated a finish reason, even when it carried usage', async () => {
     // This is the #4 case: `message_start` reports usage, so `ended` is set before
     // any finish reason exists and the truncation guard passes. A stream whose only

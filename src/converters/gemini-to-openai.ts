@@ -891,18 +891,20 @@ export function convertGeminiGenerateContentToOpenAI(
       // docs/review_of_antigravity_gemini_with_ds_tools.md.
       const thinkingContent = parts.filter((p: any) => p.thought && p.text).map((p: any) => p.text as string).join('');
       const signedParts = parts.filter((p: any) =>
-        (p.thought === true || p.functionCall) &&
+        (p.thought === true || p.functionCall || typeof p.text === 'string') &&
         typeof p.thoughtSignature === 'string' && p.thoughtSignature !== '');
-      // A thought's signature belongs beside its reasoning text. Only when the
-      // turn has none may a functionCall's signature take the one intermediate slot.
+      // A thought's signature belongs beside its reasoning text. A functionCall's
+      // signature is next because tool replay needs it; an ordinary text part's
+      // signature takes the one intermediate slot only when neither is present.
       const thinkingSignature = signedParts.find((p: any) => p.thought === true)?.thoughtSignature
-        ?? signedParts.find((p: any) => p.functionCall)?.thoughtSignature as string | undefined;
+        ?? signedParts.find((p: any) => p.functionCall)?.thoughtSignature
+        ?? signedParts.find((p: any) => typeof p.text === 'string')?.thoughtSignature as string | undefined;
       const droppedSignatures = signedParts.filter((p: any) => p.thoughtSignature !== thinkingSignature).length;
       if (droppedSignatures > 0) {
         options?.logger?.warn(
           options?.requestId ?? '',
           `[gemini->openai] dropped ${droppedSignatures} additional thought signature(s) on one turn; ` +
-          'kept the first thought-part signature, or the first functionCall signature when no thought part was signed',
+          'kept the first thought-part, functionCall, then ordinary-text signature in that precedence order',
         );
       }
       const textContent = parts.filter((p: any) => p.text && !p.thought).map((p: any) => p.text as string).join('');

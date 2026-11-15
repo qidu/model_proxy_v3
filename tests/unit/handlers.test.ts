@@ -796,6 +796,22 @@ describe('claudeJsonToSyntheticCompletions', () => {
     assert.equal((out.choices as any[])[0].finish_reason, 'length');
   });
 
+  it('keeps max_tokens and refusal authoritative when the answer also has a tool call', () => {
+    for (const [stopReason, finishReason] of [
+      ['max_tokens', 'length'],
+      ['refusal', 'content_filter'],
+    ] as const) {
+      const out = claudeJsonToSyntheticCompletions({
+        content: [{ type: 'tool_use', id: 't1', name: 'search', input: { q: 'x' } }],
+        stop_reason: stopReason,
+      }, 'm');
+
+      const choice = (out.choices as any[])[0];
+      assert.equal(choice.finish_reason, finishReason);
+      assert.equal(choice.message.tool_calls[0].id, 't1', 'the answer content must survive the finish-reason fix');
+    }
+  });
+
   it('preserves thinking blocks as reasoning_content', () => {
     const out = claudeJsonToSyntheticCompletions({
       content: [
@@ -895,6 +911,38 @@ describe('convertGeminiGenerateContentToOpenAI — thought signatures', () => {
       { type: 'thinking', thinking: 'pondering', signature: 'gemini-signature' },
       { type: 'text', text: 'answer' },
     ]);
+  });
+
+  it('carries a thoughtSignature on an ordinary text part', () => {
+    const completions = convertGeminiGenerateContentToOpenAI({
+      contents: [{
+        role: 'model',
+        parts: [{ text: 'visible answer', thoughtSignature: 'text-signature' }],
+      }],
+    });
+
+    assert.deepEqual((completions.messages as any[])[0], {
+      role: 'assistant',
+      content: 'visible answer',
+      reasoning_signature: 'text-signature',
+    });
+  });
+
+  it('prefers a functionCall signature over an ordinary text-part signature', () => {
+    const warnings: string[] = [];
+    const logger = { warn: (_requestId: string, message: string) => { warnings.push(message); } } as any;
+    const completions = convertGeminiGenerateContentToOpenAI({
+      contents: [{
+        role: 'model',
+        parts: [
+          { text: 'visible answer', thoughtSignature: 'text-signature' },
+          { functionCall: { name: 'f', args: {} }, thoughtSignature: 'call-signature' },
+        ],
+      }],
+    }, { logger, requestId: 'r-text-signature' });
+
+    assert.equal((completions.messages as any[])[0].reasoning_signature, 'call-signature');
+    assert.match(warnings.join('\n'), /dropped 1 additional thought signature/);
   });
 
   it('does not invent a signature when thoughtSignature is absent', async () => {

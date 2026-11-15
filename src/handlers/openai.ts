@@ -211,10 +211,11 @@ export function claudeJsonToSyntheticCompletions(claudeJson: Record<string, unkn
       // so a block survives this last hop instead of reading as a clean `stop`. The
       // Claude `refusal` reaches here from either upstream dialect: the Gemini
       // egresses report it directly, and a Claude upstream carries it natively.
-      finish_reason: toolUseBlocks.length > 0
-        ? 'tool_calls'
-        : claudeJson.stop_reason === 'max_tokens' ? 'length'
+      // An explicit truncation or refusal also outranks the presence of a tool block:
+      // the block is answer content, not evidence that the upstream stopped for it.
+      finish_reason: claudeJson.stop_reason === 'max_tokens' ? 'length'
         : claudeJson.stop_reason === 'refusal' ? 'content_filter'
+        : toolUseBlocks.length > 0 ? 'tool_calls'
         : 'stop',
     }],
     usage: (() => {

@@ -5,6 +5,24 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): preserve terminal failures and signed text parts across cross-mode hops
+
+Three follow-up review findings are fixed:
+
+- Non-streaming Claude-to-Completions conversion now keeps `max_tokens` and `refusal` authoritative when the
+  answer also contains a tool block, producing `length` and `content_filter` instead of incorrectly reporting
+  `tool_calls`. The tool content itself remains intact.
+- Streaming `/v1/interactions` now maps a Completions `content_filter` finish to an error frame and a failed
+  terminal interaction rather than announcing a successful completion. This covers Anthropic refusals and other
+  upstreams sharing that mapper.
+- GenerateContent history conversion now carries `thoughtSignature` from ordinary text parts into the Completions
+  intermediate. Existing precedence is preserved: thought-part signatures win, followed by function-call and then
+  ordinary-text signatures; additional signatures are reported.
+
+Regression coverage includes both terminal reasons beside a tool call, the real Anthropic-to-Interactions refusal
+route, ordinary signed text, and function-call precedence over signed text. `npm run typecheck`, `npm run build`,
+and the full `npm run test:unit` suite pass (3081/3081).
+
 ### fix(converters): preserve thought signatures across Gemini, Completions, and Anthropic hops
 
 Finding #13 had three independent losses. A generateContent turn now carries a `functionCall` part's

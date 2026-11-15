@@ -34,6 +34,7 @@ import {
   createInteractionStreamState,
   interactionStreamAdoptId,
   interactionStreamEnded,
+  interactionStreamError,
   interactionStreamFinish,
   interactionStreamReasoning,
   interactionStreamStatus,
@@ -607,6 +608,13 @@ function interactionsFramesForChunk(
     }
     toolCallBuffer?.clear();
     geminiToolCallBuffers.delete(requestId);
+    if (choice.finish_reason === 'content_filter') {
+      state.failed = true;
+      events = [...events, ...interactionStreamError({
+        code: 'https://ai.google.dev/api/generate-content#FinishReason.SAFETY',
+        message: 'The upstream withheld the answer (content_filter).',
+      })];
+    }
     interactionStreamEnded(state);
   }
 
