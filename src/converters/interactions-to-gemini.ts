@@ -47,6 +47,16 @@ const INTERACTIONS_PART_TYPES = new Set([
     'text', 'image', 'audio', 'video', 'document',
     'function_call', 'function_result', 'thought',
     'code_execution_call', 'code_execution_result',
+    // Declared by the same union (`interactions.md:1037-1133`) but with no
+    // generateContent Content part to land on: generateContent declares these
+    // families as *tools* (`{googleSearch:{}}`, `{urlContext:{}}`, `{mcpServer:{}}`,
+    // `{fileSearch:{}}`), and their results arrive as candidate metadata rather
+    // than as parts. They are listed so that `toGeminiPart` refuses them by name
+    // instead of telling a conforming client its part is not a Content part at all.
+    'url_context_call', 'url_context_result',
+    'google_search_call', 'google_search_result',
+    'mcp_server_tool_call', 'mcp_server_tool_result',
+    'file_search_call', 'file_search_result',
 ]);
 
 /**
@@ -315,19 +325,50 @@ function toGeminiPart(part: Record<string, unknown> | undefined, where: string):
                 const args = asRecord(part.arguments) ?? {};
                 return {
                     executableCode: {
-                        language: typeof args.language === 'string' ? args.language : 'PYTHON',
+                        // Re-cased, like every other generateContent enum identifier this
+                        // module emits: the Interactions enum is declared lower case
+                        // (`interactions.md:1006`, whose only value is `python`) and
+                        // generateContent's is upper case (`PYTHON`).
+                        language: typeof args.language === 'string' && args.language !== ''
+                            ? args.language.toUpperCase()
+                            : 'PYTHON',
                         code: requireString(args.code, `${where}.arguments.code`),
                     },
                 };
             }
 
-            default:
+            case 'url_context_call':
+            case 'url_context_result':
+            case 'google_search_call':
+            case 'google_search_result':
+            case 'mcp_server_tool_call':
+            case 'mcp_server_tool_result':
+            case 'file_search_call':
+            case 'file_search_result':
+                // Refused by name, the way the sibling Completions converter refuses
+                // a step it cannot express: the family exists on both APIs, but here
+                // as a tool selector rather than as a part, so there is no
+                // generateContent part to translate this into.
+                throw new ValidationError(
+                    `Interactions ${where} part of type ${stringify(part.type)} has no generateContent ` +
+                    'equivalent; generateContent declares this family as a tool, not as a Content part'
+                );
+
+            case 'code_execution_result':
                 return {
                     codeExecutionResult: {
                         outcome: part.is_error === true ? 'OUTCOME_FAILED' : 'OUTCOME_OK',
                         output: typeof part.result === 'string' ? part.result : stringify(part.result),
                     },
                 };
+
+            default:
+                // Unreachable while the set above and this switch agree; a type added
+                // to the set without a case would otherwise be served as a code
+                // execution result, which is what the catch-all here used to do.
+                throw new ValidationError(
+                    `Interactions ${where} part of type ${stringify(part.type)} has no generateContent equivalent`
+                );
         }
     }
 

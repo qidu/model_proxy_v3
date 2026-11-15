@@ -106,7 +106,7 @@ describe('convertInteractionsToGenerateContent — input → contents', () => {
 });
 
 describe('convertInteractionsToGenerateContent — parts', () => {
-  it('translates every declared part type to its generateContent part', () => {
+  it('translates every part type that has a generateContent part', () => {
     const out = body({
       input: {
         messages: [{
@@ -130,9 +130,48 @@ describe('convertInteractionsToGenerateContent — parts', () => {
       { file_data: { file_uri: 'files/abc', mime_type: 'audio/mp3' } },
       { functionResponse: { id: 'call_1', name: 'f', response: { content: '{"ok":true}' } } },
       { thought: true, text: 'reasoning', thoughtSignature: 'sig' },
-      { executableCode: { language: 'python', code: 'print(1)' } },
+      { executableCode: { language: 'PYTHON', code: 'print(1)' } },
       { codeExecutionResult: { outcome: 'OUTCOME_OK', output: '1' } },
     ]);
+  });
+
+  it('re-cases a code execution language into generateContent’s upper-case enum', () => {
+    // review_fixes.md #10: the Interactions enum is declared lower case
+    // (`interactions.md:1006`: the only value is `python`) and every
+    // generateContent enum identifier this module emits is upper case, so the
+    // lower-case spelling reached the upstream as an enum value it does not
+    // declare.
+    const parts = (language?: string) => (body({
+      input: [{
+        role: 'user',
+        content: [{ type: 'code_execution_call', arguments: language === undefined ? { code: 'print(1)' } : { language, code: 'print(1)' } }],
+      }],
+    }).body as any).contents[0].parts;
+
+    assert.deepEqual(parts('python'), [{ executableCode: { language: 'PYTHON', code: 'print(1)' } }]);
+    // A body already in the generateContent spelling survives, and an absent
+    // language keeps the default it had.
+    assert.deepEqual(parts('PYTHON'), [{ executableCode: { language: 'PYTHON', code: 'print(1)' } }]);
+    assert.deepEqual(parts(), [{ executableCode: { language: 'PYTHON', code: 'print(1)' } }]);
+  });
+
+  it('refuses each declared part type no generateContent part can express, naming it', () => {
+    // review_fixes.md #24: all eight are Content types the Interactions API
+    // declares (`interactions.md:1037-1133`), and generateContent declares these
+    // families as *tools* (`{googleSearch:{}}`, `{urlContext:{}}`, …), not as
+    // Content parts. Before this they failed the type check, so a conforming
+    // client was told its request was not a Content part at all.
+    for (const type of [
+      'url_context_call', 'url_context_result',
+      'google_search_call', 'google_search_result',
+      'mcp_server_tool_call', 'mcp_server_tool_result',
+      'file_search_call', 'file_search_result',
+    ]) {
+      assertRefused(
+        { input: [{ role: 'user', content: [{ type, result: [] }] }] },
+        new RegExp(`part of type "${type}" has no generateContent equivalent`),
+      );
+    }
   });
 
   it('relays a part already in the upstream dialect, type key and all', () => {

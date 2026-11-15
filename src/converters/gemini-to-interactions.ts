@@ -40,12 +40,6 @@ const BLOCKING_FINISH_REASONS = new Set([
     'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_RECITATION',
 ]);
 
-/** Finish reasons that ended the answer early, or failed it after it started. */
-const TRUNCATING_FINISH_REASONS = new Set([
-    'MAX_TOKENS', 'MALFORMED_FUNCTION_CALL', 'UNEXPECTED_TOOL_CALL', 'TOO_MANY_TOOL_CALLS',
-    'LANGUAGE', 'OTHER',
-]);
-
 export interface InteractionConversion {
     interaction: Record<string, unknown>;
     /** Content kinds the response carried that have no Interactions equivalent. */
@@ -84,16 +78,14 @@ export function convertGenerateContentToInteraction(
 
     const finishReason = typeof candidate?.finishReason === 'string' ? candidate.finishReason : '';
     const blockReason = blockedPromptReason(response.promptFeedback);
-    const blocked = blockReason !== undefined;
 
-    const error = interactionError(finishReason, blockReason);
-    const failed = blocked
-        || BLOCKING_FINISH_REASONS.has(finishReason)
-        || TRUNCATING_FINISH_REASONS.has(finishReason);
+    const error = interactionError(finishOutcome(finishReason, blockReason), finishReason, blockReason);
+    const failed = error !== undefined;
     const requiresAction = outputs.some(output => output.type === 'function_call');
     const status = failed ? 'failed' : requiresAction ? 'requires_action' : 'completed';
 
     const now = new Date().toISOString();
+    const usage = convertUsage(asRecord(response.usageMetadata));
     const interaction: Record<string, unknown> = {
         // The upstream's own id when it has one; §5.4's rule against synthesizing
         // an identifier applies to a `previous_interaction_id` round trip too.
@@ -107,7 +99,9 @@ export function convertGenerateContentToInteraction(
         updated: now,
         role: 'model',
         outputs,
-        usage: convertUsage(asRecord(response.usageMetadata)),
+        // Omitted when the upstream reported no count at all: `Usage` is optional on
+        // the Interactions type, so an empty object is a claim where there is none.
+        ...(Object.keys(usage).length > 0 ? { usage } : {}),
         ...(error ? { error } : {}),
     };
 
@@ -129,20 +123,44 @@ export function blockedPromptReason(promptFeedback: unknown): string | undefined
         : undefined;
 }
 
+/**
+ * How the upstream ended the turn, classified once.
+ *
+ * `status` and `error` are both derived from this, so they cannot disagree — which
+ * is what they did while `status` asked two hand-maintained sets and `error` asked
+ * "is this outside the clean values": a reason in neither set (`NO_IMAGE`,
+ * `IMAGE_OTHER`, or a reason a later SDK adds) was reported as `status:
+ * "completed"` *and* an `error` at once. Anything that is neither clean nor a
+ * withheld answer stopped the turn short of what was asked for, which is what
+ * "truncated" says — the conservative reading, and the one that cannot silently
+ * turn a failure into a finished answer.
+ */
+type FinishOutcome = 'clean' | 'blocked' | 'truncated';
+
+function finishOutcome(finishReason: string, blockReason?: string): FinishOutcome {
+    if (blockReason) return 'blocked';
+    if (finishReason === '' || finishReason === 'STOP' || finishReason === 'FINISH_REASON_UNSPECIFIED') {
+        return 'clean';
+    }
+    return BLOCKING_FINISH_REASONS.has(finishReason) ? 'blocked' : 'truncated';
+}
+
 /** The error object: `code` a URI naming the upstream's own reason, `message` prose. */
 function interactionError(
+    outcome: FinishOutcome,
     finishReason: string,
     blockReason?: string
-): { code: string; message: string } | undefined {    if (blockReason) {
+): { code: string; message: string } | undefined {
+    if (outcome === 'clean') {
+        return undefined;
+    }
+    if (blockReason) {
         return {
             code: `https://ai.google.dev/api/generate-content#BlockReason.${blockReason}`,
             message: `The upstream blocked the prompt (${blockReason}) and returned no candidate.`,
         };
     }
-    if (finishReason === '' || finishReason === 'STOP' || finishReason === 'FINISH_REASON_UNSPECIFIED') {
-        return undefined;
-    }
-    const where = BLOCKING_FINISH_REASONS.has(finishReason)
+    const where = outcome === 'blocked'
         ? 'The upstream withheld the answer'
         : 'The upstream stopped the answer early';
     return {
@@ -194,7 +212,11 @@ function convertPart(
         return {
             type: 'code_execution_call',
             arguments: {
-                language: typeof executableCode.language === 'string' ? executableCode.language : 'python',
+                // Re-cased: generateContent's `Language` enum is upper case, the
+                // Interactions one lower case (`interactions.md:1006`).
+                language: typeof executableCode.language === 'string' && executableCode.language !== ''
+                    ? executableCode.language.toLowerCase()
+                    : 'python',
                 code: typeof executableCode.code === 'string' ? executableCode.code : '',
             },
         };
@@ -273,27 +295,25 @@ function partKind(part: Record<string, unknown>): string {
 /**
  * `usageMetadata` -> the Interactions `usage`. Includes the thought and cached
  * counts the Interactions type declares (`types/gemini.ts:188`); every field is
- * omitted rather than defaulted when the upstream did not report it.
+ * omitted rather than defaulted when the upstream did not report it — the three
+ * totals included, which were the ones still reporting a zero the upstream never
+ * sent. Every field of the SDK's `Usage` is optional, so an omitted count is a
+ * valid body where a zero is a claim about tokens that were never spent.
  */
 function convertUsage(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
-    const usage: Record<string, unknown> = {
-        total_input_tokens: numberOr(metadata?.promptTokenCount, 0),
-        total_output_tokens: numberOr(metadata?.candidatesTokenCount, 0),
-        total_tokens: numberOr(metadata?.totalTokenCount, 0),
-    };
-    const optional: Array<[string, string]> = [
+    const usage: Record<string, unknown> = {};
+    const counts: Array<[string, string]> = [
+        ['total_input_tokens', 'promptTokenCount'],
+        ['total_output_tokens', 'candidatesTokenCount'],
+        ['total_tokens', 'totalTokenCount'],
         ['total_cached_tokens', 'cachedContentTokenCount'],
         ['total_thought_tokens', 'thoughtsTokenCount'],
         ['total_tool_use_tokens', 'toolUsePromptTokenCount'],
     ];
-    for (const [target, source] of optional) {
+    for (const [target, source] of counts) {
         if (typeof metadata?.[source] === 'number') usage[target] = metadata[source];
     }
     return usage;
-}
-
-function numberOr(value: unknown, fallback: number): number {
-    return typeof value === 'number' ? value : fallback;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

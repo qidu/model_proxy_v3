@@ -5,6 +5,137 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): derive the Interactions status and error from one classification of the finish reason
+
+`convertGenerateContentToInteraction` decided `status` from two hand-maintained sets of finish reasons
+and `error` from "anything outside the clean values". Every reason in neither set — `NO_IMAGE` ("the
+model was expected to generate an image, but none was generated"), `IMAGE_OTHER`, or any reason a
+later `@google/genai` adds — produced an interaction that was `status: "completed"` *and* carried an
+`error`, a pair a client cannot act on: it either reports a finished answer that has no answer in it,
+or discards the error it was sent.
+
+There is now one `finishOutcome` classification (`clean` / `blocked` / `truncated`) that both fields
+read, so they cannot disagree. Anything that is neither clean nor a withheld answer is truncated,
+which is the conservative reading and the one that cannot turn a failure into a finished answer. The
+`TRUNCATING_FINISH_REASONS` set is gone: with that default it decided nothing, and a set that looks
+load-bearing while deciding nothing is how the two derived fields drifted apart.
+
+**Verification**: two cases in `gemini-to-interactions.test.ts`, both failing against the previous
+code — an invariant over the whole `FinishReason` enum plus a value the SDK does not declare yet
+(no reason may yield `completed` together with an `error`), and by-value pins for `NO_IMAGE` and
+`IMAGE_OTHER`. `npm run typecheck`, `npm run build` and `npm run test:unit` pass (3018/3018).
+
+### fix(converters): omit an unreported token count instead of reporting zero
+
+`convertUsage` declared "every field is omitted rather than defaulted when the upstream did not report
+it", and the very next line defaulted the three totals to `0` while omitting the optional ones — so a
+response that reported only `promptTokenCount` and `totalTokenCount` reached the client as
+`total_output_tokens: 0`, a claim that no output tokens were spent. Its own test name denied it
+("omits an absent count rather than reporting a zero it did not receive") while pinning the zero.
+
+All six counts now go through one list and are emitted only when the upstream sent a number. A
+response that reports no usage at all now omits the `usage` object rather than sending `usage: {}`:
+the SDK declares `Interaction.usage` optional and every field of `Usage` optional, so an omission is
+a valid body where an empty object is a claim about tokens that were never counted. The streaming
+egress already reads these fields through `toNumber(...) ?? undefined` with an all-absent guard, so
+it is unaffected.
+
+**Verification**: two cases in `gemini-to-interactions.test.ts`, both failing against the previous
+code — the existing case now asserts the omitted count rather than the fabricated zero, and a new one
+asserts `usage` is absent when the upstream reported none.
+`npm run typecheck`, `npm run build` and `npm run test:unit` pass (3018/3018).
+
+### fix(converters): refuse the Interactions tool-family Content types by name, not as "not a Content part"
+
+`interactions.md` declares eighteen Content part types; the converter's type set listed ten. The eight
+it left out — `url_context_call`/`_result`, `google_search_call`/`_result`,
+`mcp_server_tool_call`/`_result`, `file_search_call`/`_result` — fell through to the catch-all and were
+refused with "is not a Content part: no recognized `type`", which tells a client sending a documented
+part that its request is nonsense. The CHANGELOG entry for this converter repeated the mistake in the
+other direction, claiming it "maps every declared part type".
+
+Both are corrected. The eight are now in the type set and each is refused with what is actually true:
+generateContent declares these families as *tools* (`{googleSearch:{}}`, `{urlContext:{}}`,
+`{mcpServer:{}}`, `{fileSearch:{}}`) and delivers their results as candidate metadata, so there is no
+Content part to translate them into, and this route cannot replay one. The message names the type, the
+way the sibling Completions converter's `has no Completions equivalent` refusal does.
+
+The switch's catch-all became `case 'code_execution_result'` with a throwing `default`. While the set
+and the switch agreed that catch-all was unreachable; a type added to the set without a case would
+have been served as a code execution result, which is exactly the hazard that adding eight types next
+to it would have created.
+
+**Verification**: two cases in `interactions-to-gemini.test.ts`, both failing against the previous
+code — one loops all eight types and asserts the message names the type and the tool-family reason,
+and the "translates every part type" case is renamed to the set that actually has a generateContent
+part. `npm run typecheck`, `npm run build` and `npm run test:unit` pass (3015/3015).
+
+### fix(converters): re-case the code execution language on both Interactions ↔ generateContent hops
+
+The Interactions `CodeExecutionCallContent.arguments.language` enum declares one value, `python`
+(`interactions.md:1006`), and generateContent's `Language` enum is upper case (`PYTHON`). Neither
+converter re-cased: `interactions-to-gemini.ts` forwarded `python` into `executableCode.language`, an
+enum value generateContent does not declare, and `gemini-to-interactions.ts` forwarded `PYTHON` back
+into `arguments.language`, which the Interactions enum does not declare either. This was the one place
+the converter did not follow its own stated rule — "every generateContent enum identifier this route
+emits is upper case (`AUTO`/`ANY`/`NONE`, `OUTCOME_OK`, `PYTHON`, `responseModalities`)" — so the
+CHANGELOG claim and the code disagreed.
+
+Each direction now re-cases, with the absent-value default unchanged (`PYTHON` inbound, `python`
+outbound). Re-casing is a complete mapping: `python` is the only value in one enum and `PYTHON` the
+only one in the other.
+
+**Verification**: three cases, all failing against the previous code — both existing part-translation
+cases flipped to the correct casing, plus one dedicated case per direction covering the
+generateContent spelling arriving already upper case and the absent language keeping its default.
+`npm run typecheck`, `npm run build` and `npm run test:unit` pass (3015/3015).
+
+### fix(converters): stop dropping metadata and parallel_tool_calls on the way to an openai-responses upstream
+
+`completionsToResponsesBody` is a whitelist, and two fields the Responses create request declares were
+missing from it: `metadata` (`openai-response-methods-create.md:4369`) and `parallel_tool_calls`
+(`:4629`). Both are spelled the same way in Chat Completions, both are mapped by the reverse hop
+(`responses-to-completions.ts`), so a client's values survived one direction and vanished in the other
+— `/v1/chat/completions → openai-responses` lost them silently, and a `labels` map from an
+Interactions client stopped one hop short of a target that has the field.
+
+Both are now forwarded when present, and not invented when absent. The warning in
+`forwardCompletionsAsOpenAIResponses` is withdrawn because it is no longer true; the
+`anthropic-messages` twin stays, since Claude's `metadata` accepts only `user_id` and that loss is
+real.
+
+**Verification**: two new cases and two rewritten ones. New: `handlers.test.ts` (the converter maps
+both, and invents neither) and `chat-completions-responses-streaming.test.ts` (end to end through
+`handleChatCompletionsPassthrough`, asserting the bytes the upstream fetch received). Rewritten, from
+pinning the drop to pinning the carry: `interactions-request-field-carry.test.ts` and
+`gemini-interactions-to-openai.test.ts`. All four fail against the previous code.
+`npm run typecheck`, `npm run build` and `npm run test:unit` pass (3012/3012).
+
+### fix(converters): carry a refused Responses answer to the client instead of dropping it
+
+The non-streaming answer converter keeps a refusal (`output[...].content[type=refusal]` →
+`message.refusal`), but the streaming mapper `responsesEventToChatChunks` had no branch for
+`response.refusal.delta` — like every other event it does not name, the event mapped to no chunk. A
+turn the upstream refused therefore reached a Chat Completions client as a well-formed empty answer:
+a `role` chunk, a `finish_reason: "stop"`, no text and no reason. The same mapper feeds the Gemini
+front doors, which lose the refusal for the same reason.
+
+`response.refusal.delta` now maps to `delta.refusal` (`openai-response-final.md:132540`: "`delta:
+string` — The refusal text that is added"), matching the field the non-streaming path already fills.
+`response.refusal.done` stays chunk-less, as `response.output_text.done` does: it only restates what
+streamed.
+
+Left as-is and reported: the Gemini and Interactions egresses do not render a `refusal` delta, so a
+refused turn is still invisible there. What a blocked turn should look like on those dialects is the
+open question behind review_fixes.md #6, and answering it here would have meant inventing a shape.
+
+**Verification**: two new cases, both failing against the previous code — the mapper-level pin in
+`responses-completions-roundtrip.test.ts` (fragments concatenate, `refusal.done` adds nothing, no
+`content` frame carries the refusal) and the wiring pin in
+`chat-completions-responses-streaming.test.ts` (end to end through the handler:
+`handleChatCompletionsPassthrough` on the `openai-responses` route). `npm run typecheck`,
+`npm run build` and `npm run test:unit` pass (3010/3010).
+
 ### fix(converters): a Gemini turn's thought tokens are counted in the Claude usage
 
 `thoughtsTokenCount` was read by no Claude egress, so a thinking model's billed reasoning reached a
@@ -495,7 +626,12 @@ field it never wrote):
 | `response_format`, `response_mime_type`, `response_modalities` | dropped silently | they are `generationConfig.responseSchema`/`responseMimeType`/`responseModalities` |
 
 The conversion now lives in **`converters/interactions-to-gemini.ts`** and maps every declared part
-type, both tool dialects (the flat Interactions one, and a `{functionDeclarations:[…]}` a transform or
+type that has a generateContent part — corrected 2026-11-15 (review_fixes.md #24): the eight
+tool-family Content types (`url_context_*`, `google_search_*`, `mcp_server_tool_*`, `file_search_*`)
+have no generateContent part, since generateContent declares those families as tools; they are now
+refused *by name* instead of failing the "is this a Content part" check, which told a conforming
+client its request was nonsense. It maps both tool dialects (the flat Interactions one, and a
+`{functionDeclarations:[…]}` a transform or
 native client wrote — the sibling converter reads both in the other direction), the generation knobs,
 and the top-level response knobs. Choices worth knowing:
 

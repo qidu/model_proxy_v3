@@ -107,6 +107,40 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
     assert.equal(out.status, 'completed');
     assert.equal('error' in out, false);
   });
+
+  it('never reports a completed interaction that also carries an error', () => {
+    // review_fixes.md #11: `status` was derived from two hand-maintained sets while
+    // `error` was derived from "outside the clean values", so every reason in neither
+    // set (`NO_IMAGE`, `IMAGE_OTHER`, …) produced `status: "completed"` *and* an
+    // `error` — a contradiction a client cannot act on. Pinned as an invariant over
+    // the whole enum, plus a value the SDK does not declare yet, so a reason added
+    // later cannot regress the same way.
+    const reasons = [
+      'FINISH_REASON_UNSPECIFIED', 'STOP', 'MAX_TOKENS', 'SAFETY', 'RECITATION', 'LANGUAGE', 'OTHER',
+      'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'MALFORMED_FUNCTION_CALL', 'IMAGE_SAFETY',
+      'UNEXPECTED_TOOL_CALL', 'TOO_MANY_TOOL_CALLS', 'IMAGE_PROHIBITED_CONTENT', 'NO_IMAGE',
+      'IMAGE_RECITATION', 'IMAGE_OTHER',
+      'A_REASON_THE_SDK_DOES_NOT_DECLARE_YET',
+    ];
+
+    for (const reason of reasons) {
+      const out = interaction(upstream([{ text: 'hi' }], reason));
+      if (out.error) {
+        assert.notEqual(out.status, 'completed', `${reason} carried an error, so it cannot be a clean answer`);
+      }
+    }
+  });
+
+  it('reports an image generation that produced no image as failed, naming the reason', () => {
+    // The two reasons the sets missed, pinned by value so the classification stays
+    // what the upstream means: the answer is missing what was asked for.
+    for (const reason of ['NO_IMAGE', 'IMAGE_OTHER']) {
+      const out = interaction(upstream([{ text: 'hi' }], reason));
+
+      assert.equal(out.status, 'failed', `${reason} is not a completed answer`);
+      assert.match(out.error.code, new RegExp(`#FinishReason\\.${reason}$`));
+    }
+  });
 });
 
 describe('convertGenerateContentToInteraction — outputs', () => {
@@ -129,9 +163,22 @@ describe('convertGenerateContentToInteraction — outputs', () => {
       { type: 'video', data: 'dmlk', mime_type: 'video/mp4' },
       { type: 'document', data: 'cGRm', mime_type: 'application/pdf' },
       { type: 'function_call', name: 'get_weather', arguments: { location: 'Boston' }, id: 'call_1' },
-      { type: 'code_execution_call', arguments: { language: 'PYTHON', code: 'print(1)' } },
+      { type: 'code_execution_call', arguments: { language: 'python', code: 'print(1)' } },
       { type: 'code_execution_result', result: '1', is_error: false },
     ]);
+  });
+
+  it('re-cases a code execution language into the Interactions lower-case enum', () => {
+    // review_fixes.md #10, the other direction: generateContent's `Language` enum
+    // is upper case (`PYTHON`), the Interactions one lower case
+    // (`interactions.md:1006`), and the upstream spelling was forwarded as-is —
+    // a value the Interactions enum does not declare.
+    const language = (executableCode: Record<string, unknown>) =>
+      (interaction(upstream([{ executableCode }])).outputs[0] as any).arguments.language;
+
+    assert.equal(language({ language: 'PYTHON', code: 'print(1)' }), 'python');
+    // An absent language keeps the default it had.
+    assert.equal(language({ code: 'print(1)' }), 'python');
   });
 
   it('serves a thought part as a thought, not as the answer', () => {
@@ -191,9 +238,19 @@ describe('convertGenerateContentToInteraction — usage', () => {
   });
 
   it('omits an absent count rather than reporting a zero it did not receive', () => {
+    // review_fixes.md #12: the three totals were defaulted to 0 while the optional
+    // counts were omitted, so this case pinned the very zero its own name denied.
     const out = interaction({ ...upstream([{ text: 'hi' }]), usageMetadata: { promptTokenCount: 1, totalTokenCount: 1 } });
 
-    assert.deepEqual(out.usage, { total_input_tokens: 1, total_output_tokens: 0, total_tokens: 1 });
+    assert.deepEqual(out.usage, { total_input_tokens: 1, total_tokens: 1 });
+  });
+
+  it('omits usage entirely when the upstream reported none', () => {
+    // Every field of `Usage` is optional in the SDK's declaration, so an empty
+    // object is not a safer default — it is a token count of nothing.
+    const out = interaction({ candidates: [{ content: { parts: [{ text: 'hi' }] }, finishReason: 'STOP' }] });
+
+    assert.equal('usage' in out, false);
   });
 });
 
