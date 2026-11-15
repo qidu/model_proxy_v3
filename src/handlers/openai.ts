@@ -78,6 +78,13 @@ async function forwardCompletionsAsAnthropicMessages(
       }
     }
   }
+  // Paired with the body *before* the transforms run, not after. `filter_anthropic_beta`
+  // is what makes the configured `anthropic_beta_map` authoritative, so a header added
+  // afterwards bypasses it: a gateway configured to drop this legacy flag still received
+  // it and could fail with "invalid beta flag". With no map the builtin passes the header
+  // through unchanged, so nothing else moves.
+  ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
+
   // Declared transforms and the per-entry maxTokens cap both run inside this hook
   // (`applyMaxTokensCap`, src/utils/request-transform.ts). Every other egress in the
   // repo runs it — including this function's sibling
@@ -98,7 +105,6 @@ async function forwardCompletionsAsAnthropicMessages(
 
   // anthropic-messages expects x-api-key (or Authorization). Normalize headers.
   const anthropicHeaders: Record<string, string> = { ...authHeaders };
-  ensureStructuredOutputsBetaHeader(anthropicHeaders, claudeBody);
   if (anthropicHeaders['x-api-key']) {
     delete anthropicHeaders['Authorization'];
   }

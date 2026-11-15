@@ -11,6 +11,36 @@ import { stringify } from '../utils/stringify.js';
 import type { Logger } from '../utils/logger.js';
 
 /**
+ * A Claude `system` value as the text generateContent's `systemInstruction` takes.
+ *
+ * The Messages API declares both forms — a bare string, or `TextBlockParam[]`
+ * (`docs/api/claude_api_docs/messages-create.md:2465`) — and the array is the shape
+ * a client uses to mark a cache breakpoint (`{type:'text', text, cache_control?}`).
+ * generateContent carries a single text prompt, so the blocks are concatenated with
+ * no separator: that reproduces the prompt the client wrote, where a join with a
+ * newline would insert characters the model never saw.
+ *
+ * A block that is not a text block is refused rather than dropped. Claude's own
+ * spec declares text blocks only in `system`, so the body is malformed, and losing
+ * part of a system prompt silently changes the answer (rule #8).
+ */
+function claudeSystemInstructionText(system: string | ClaudeTextBlock[]): string {
+    if (typeof system === 'string') return system;
+    let text = '';
+    for (let i = 0; i < system.length; i++) {
+        const block = system[i] as unknown as Record<string, unknown>;
+        if (block?.type !== 'text' || typeof block.text !== 'string') {
+            throw new Error(
+                `Cannot convert Claude system[${i}] of type ${JSON.stringify(block?.type)}: ` +
+                'a system prompt carries text blocks only'
+            );
+        }
+        text += block.text;
+    }
+    return text;
+}
+
+/**
  * Convert Claude request to Gemini generateContent format
  *
  * Async because an `image` block with a `source.type: 'url'` has no
@@ -119,10 +149,15 @@ export async function convertClaudeToGeminiRequest(
         contents
     };
 
-    // Add system instruction
+    // Add system instruction. Both declared forms are projected; only the string
+    // form used to be, so a request carrying `system` as `TextBlockParam[]` — the
+    // canonical shape for a client that marks cache breakpoints — reached the
+    // upstream with no system prompt at all, and nothing said so (rule #8). An
+    // empty prompt still emits no key, so a body that declared none is unchanged.
     if (claudeRequest.system) {
-        if (typeof claudeRequest.system === 'string') {
-            request.system_instruction = { parts: [{ text: claudeRequest.system }] };
+        const systemText = claudeSystemInstructionText(claudeRequest.system);
+        if (systemText !== '') {
+            request.system_instruction = { parts: [{ text: systemText }] };
         }
     }
 

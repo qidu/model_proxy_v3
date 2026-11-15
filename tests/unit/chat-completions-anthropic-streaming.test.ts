@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { handleChatCompletionsPassthrough } from '../../src/handlers/chat-completions.js';
 import { createLogger } from '../../src/utils/logger.js';
+import type { ModelRouteConfig } from '../../src/utils/config-loader.js';
 
 /**
  * Coverage for the anthropic-messages cross-mode route in the
@@ -69,6 +70,7 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
     body: Record<string, unknown>,
     responder: () => Response = () => anthropicStreamResponse(19, 7),
     onUpstream?: (init?: RequestInit) => void,
+    route?: ModelRouteConfig,
   ): Promise<any[]> {
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       onUpstream?.(init);
@@ -78,6 +80,7 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
       makeRequest({ model: 'a', messages: [{ role: 'user', content: 'hi' }], ...body }, true),
       'https://upstream/v1/messages',
       { Authorization: 'Bearer k' }, 'rid', testLogger, env, 'a', 'anthropic-messages',
+      route,
     );
     assert.equal(res.headers.get('content-type'), 'text/event-stream');
     const text = await res.text();
@@ -148,6 +151,52 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
     assert.deepEqual(upstreamBody?.output_config, {
       format: { type: 'json_schema', schema: { type: 'object' } },
     });
+  });
+
+  it('lets a configured anthropic_beta_map drop the legacy structured-outputs flag', async () => {
+    // #20: the flag was paired with the body *after* `before_upstream` had run, so
+    // `filter_anthropic_beta` never saw it — a gateway configured to drop it still
+    // received it, and could fail with "invalid beta flag".
+    let upstreamHeaders: Headers | undefined;
+    await runStream(
+      { response_format: { type: 'json_object' } },
+      undefined,
+      (init) => { upstreamHeaders = new Headers(init?.headers); },
+      {
+        transforms: [{
+          name: 'betas',
+          schema: {},
+          // The map names a different flag, so this one is "not in map → drop".
+          anthropic_beta_map: { 'prompt-caching-scope-2026-01-05': 'prompt-caching-scope-2026-01-05' },
+          before_upstream: { builtins: ['filter_anthropic_beta'] },
+        }],
+      } as unknown as ModelRouteConfig,
+    );
+
+    assert.equal(upstreamHeaders?.get('anthropic-beta'), null,
+      'a flag the configured map does not allow must not reach the upstream');
+  });
+
+  it('keeps the flag when the configured map allows it', async () => {
+    // The other half, and the proof that the filter actually ran on the injected
+    // entry: the map renames it, so a header that came through untouched (the old
+    // ordering) would still read `structured-outputs-2025-11-13` here.
+    let upstreamHeaders: Headers | undefined;
+    await runStream(
+      { response_format: { type: 'json_object' } },
+      undefined,
+      (init) => { upstreamHeaders = new Headers(init?.headers); },
+      {
+        transforms: [{
+          name: 'betas',
+          schema: {},
+          anthropic_beta_map: { 'structured-outputs-2025-11-13': 'renamed-by-map' },
+          before_upstream: { builtins: ['filter_anthropic_beta'] },
+        }],
+      } as unknown as ModelRouteConfig,
+    );
+
+    assert.equal(upstreamHeaders?.get('anthropic-beta'), 'renamed-by-map');
   });
 });
 

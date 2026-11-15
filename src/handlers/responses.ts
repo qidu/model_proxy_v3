@@ -671,6 +671,13 @@ async function handleAsAnthropicMessages(
   // Required for anthropic-messages routes so per-model quirks (e.g. inject
   // missing tool_result blocks for DeepSeek's Anthropic-compatible endpoint)
   // can rewrite the Anthropic-format body before fetch.
+  // Paired with the body *before* the transforms run, not after, so the configured
+  // `anthropic_beta_map` stays authoritative — `filter_anthropic_beta` is what drops
+  // or renames beta entries, and a header added past it reaches a gateway that asked
+  // for it to be gone (see the same call in `handlers/openai.ts`). With no map the
+  // builtin passes the header through unchanged.
+  ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
+
   if (route) {
     const hookCtx: HookContext = {
       hook: 'before_upstream',
@@ -689,7 +696,6 @@ async function handleAsAnthropicMessages(
     logger.debug(requestId, `Responses->anthropic-messages msg structure: ${JSON.stringify((claudeBody.messages as Array<Record<string, unknown>>).map(m => ({ role: m.role, content: Array.isArray(m.content) ? (m.content as Array<Record<string, unknown>>).map(b => b.type === 'tool_use' ? `tu:${b.id}` : b.type === 'tool_result' ? `tr:${b.tool_use_id}` : String(b.type)) : `str:${String(m.content).substring(0, 20)}` })))}`);
   }
   logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
-  ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
   const anthropicFetchHeaders = {
     'Content-Type': 'application/json',
     ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), request),

@@ -5,6 +5,38 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters, handlers): keep the array-form system prompt, and pair the beta header before the transforms run
+
+Two defects from the review of the last 25 commits (`review_fixes.md` #1 and #20).
+
+**1. A Claude `system` given as `TextBlockParam[]` was dropped whole.**
+`convertClaudeToGeminiRequest` projected only the string form, so a request using the array form —
+the canonical shape for a client that marks a cache breakpoint (`{type:'text', text,
+cache_control}`) — reached a `gemini-generatecontent` upstream with no system prompt at all, and
+logged nothing beyond the ignored cache hint. Both declared forms are projected now, with the
+blocks concatenated exactly: no separator is inserted, so the prompt the model sees is the one the
+client wrote. A non-text block is refused by index and type rather than dropped — Claude's `system`
+declares text blocks only, and a silently shortened system prompt changes the answer (rule #8).
+
+**2. `structured-outputs-2025-11-13` bypassed the configured beta map.**
+`ensureStructuredOutputsBetaHeader` ran *after* `before_upstream` at all three `anthropic-messages`
+egresses, so `filter_anthropic_beta` never saw the entry being injected: a gateway configured to
+drop this legacy flag still received it, and could fail with "invalid beta flag". The header is now
+paired with the body *before* the hook runs — `forwardCompletionsAsAnthropicMessages`,
+`handleAsAnthropicMessages`, and the converted branch in `chat-completions.ts`. With no
+`anthropic_beta_map` the builtin passes the header through unchanged, so only routes that configure
+a map change behaviour. `chat-completions.ts`'s branch also gains the `before_upstream` run on its
+converted Claude body that the file's `openai-responses` branch already had: the transforms saw a
+Completions-shaped body this route never sends, and the per-entry `maxTokens` cap never clamped the
+4096 default `completionsToClaudeBody` supplies.
+
+**Verification**: `claude-to-gemini.test.ts` gains two cases — the array form concatenated exactly,
+and a non-text block refused by index — both of which fail against the previous converter.
+`chat-completions-anthropic-streaming.test.ts` gains two — the flag dropped when the map omits it,
+and renamed when the map allows it — both of which fail if the injection returns to its old position
+after the hook (checked by moving the call back and re-running). `npm run typecheck`, `npm run build`
+and `npm run test:unit` pass (2996/2996).
+
 ### fix(handlers): three streaming-egress defects on the converted routes
 
 Three silent failures at two seams, none of them covered by a test.

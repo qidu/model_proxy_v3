@@ -144,6 +144,43 @@ describe('convertClaudeToGeminiRequest', async () => {
     assert.deepEqual(out.system_instruction, { parts: [{ text: 'be terse' }] });
   });
 
+  it('emits system_instruction from an array system prompt, concatenated exactly', async () => {
+    // The array form is the canonical shape for a client that marks a cache
+    // breakpoint (`{type:'text', text, cache_control}`). It used to be dropped
+    // whole, so the upstream answered a conversation with no system prompt.
+    const req = {
+      model: 'gemini',
+      system: [
+        { type: 'text', text: 'be ', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: 'terse' },
+      ],
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    // Concatenated with no separator: the exact prompt the client wrote, not one
+    // with a newline the model never saw.
+    assert.deepEqual(out.system_instruction, { parts: [{ text: 'be terse' }] });
+    assert.equal(JSON.stringify(out.system_instruction).includes('cache_control'), false);
+  });
+
+  it('refuses a non-text system block instead of dropping it', async () => {
+    // Claude's `system` declares text blocks only, so this body is malformed —
+    // and a silently shortened system prompt changes the answer (rule #8).
+    const req = {
+      model: 'gemini',
+      system: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }],
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    await assert.rejects(
+      async () => await convertClaudeToGeminiRequest(req),
+      /system\[0\] of type "image"/,
+    );
+  });
+
   it('maps temperature and max_tokens into generation_config', async () => {
     const req = {
       model: 'gemini',

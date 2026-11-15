@@ -102,12 +102,37 @@ export async function handleChatCompletionsPassthrough(
     // Use the model name from the (already alias-rewritten) request body, falling back to modelId.
     // modelId carries the original alias name; parsedBody.model carries the rewritten target name.
     const model = (parsedBody.model as string || modelId || 'unknown');
-    const claudeBody = await completionsToClaudeBody(parsedBody, model);
+    let claudeBody = await completionsToClaudeBody(parsedBody, model);
     logger.debug(requestId, `${path} converted to anthropic-messages body`);
+
+    // Paired before the transforms run, not after (see the same call in
+    // `handlers/openai.ts`): a configured `anthropic_beta_map` is what drops or
+    // renames beta entries through `filter_anthropic_beta`, and a header added past
+    // it defeats the configuration. With no map the builtin passes it through.
+    ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
+
+    // The converted body gets the hook as well, as this file's `openai-responses`
+    // branch below already does and as every other converted egress does. Only the
+    // Completions-shaped body was hooked here, so a declared transform saw a shape
+    // this route never sends — and the per-entry maxTokens cap was applied only to
+    // `max_tokens` on the way in, leaving the 4096 default `completionsToClaudeBody`
+    // supplies unclamped.
+    if (route) {
+      const hookCtxAnthropic: HookContext = {
+        hook: 'before_upstream',
+        route,
+        upstreamMode: 'anthropic-messages',
+        clientModel: model,
+        requestId,
+        streaming: isStreaming,
+        logger,
+      };
+      ({ body: claudeBody, headers: authHeaders } = runHook('before_upstream', { body: claudeBody, headers: authHeaders }, hookCtxAnthropic));
+    }
+
     logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
 
     const anthropicHeaders: Record<string, string> = { ...authHeaders };
-    ensureStructuredOutputsBetaHeader(anthropicHeaders, claudeBody);
     repackBearerCredential(anthropicHeaders, 'x-api-key');
 
     const anthropicFetchHeaders = {
