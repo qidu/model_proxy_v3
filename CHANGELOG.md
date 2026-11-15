@@ -5,6 +5,27 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): preserve thought signatures across Gemini, Completions, and Anthropic hops
+
+Finding #13 had three independent losses. A generateContent turn now carries a `functionCall` part's
+`thoughtSignature` into the Completions intermediate even without thinking text, and an Interactions
+`thought.signature` survives the same hop. When one turn contains several signatures, the first thought-part
+signature wins over function-call and later-thought signatures; every differing signature that cannot fit the
+intermediate's single `reasoning_signature` field is reported. A signature without reasoning text is still carried,
+while the Claude and Responses hops warn when their target schemas give it no position rather than dropping it
+silently or inventing an empty Claude thinking block.
+
+Anthropic streaming `signature_delta` events now reach both Gemini egresses. GenerateContent emits the signature on
+the thought part, including a text-less thought; Interactions emits the SDK's `thought_signature` step delta and
+includes the signature on the closing thought step. Completed Anthropic thinking blocks retain separate step
+boundaries, so adjacent signatures cannot be merged or assigned to the wrong block.
+
+Regression coverage exercises the precedence and text-less cases in `handlers.test.ts` and
+`gemini-interactions-to-openai.test.ts`, dedicated and inline reasoning in `openai-to-gemini.test.ts`, and the full
+Anthropic SSE routes in `anthropic-to-gemini-stream-parts.test.ts` and
+`interactions-over-anthropic-stream.test.ts`. The five focused files pass 212/212; `npm run typecheck`,
+`npm run build`, and the full `npm run test:unit` suite pass (3077/3077).
+
 ### fix(converters): a PDF is a `document`, and audio or video is dropped by name, instead of every file arriving as an image
 
 One finding, three media kinds, two halves that fail differently.
