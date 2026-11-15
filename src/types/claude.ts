@@ -134,6 +134,15 @@ export interface ClaudeMessagesRequest {
         user_id?: string;
     };
     cached_content?: string;
+    /**
+     * Request-level cache breakpoint: "automatically applies a cache_control
+     * marker to the last cacheable block in the request"
+     * (`documentation: messages-create.md:2372`).
+     */
+    cache_control?: {
+        type: "ephemeral";
+        ttl?: "5m" | "1h";
+    };
 }
 
 export interface ClaudeTokenCountingRequest {

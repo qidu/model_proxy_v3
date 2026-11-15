@@ -291,6 +291,91 @@ describe('convertClaudeToGeminiRequest', async () => {
     assert.match(warnings[0], /messages\[0\]\.content\[0\]/);
   });
 
+  it('counts the top-level cache_control, which marks the last cacheable block', async () => {
+    // review_fixes.md #25: the request-level field (`messages-create.md:2372`) applies
+    // a marker to the last cacheable block, and the sweep looked only at tools,
+    // system blocks and message content — so it was dropped without a mention.
+    const { logger, warnings } = recordingLogger();
+    const req = {
+      model: 'gemini',
+      cache_control: { type: 'ephemeral' },
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    await convertClaudeToGeminiRequest(req, undefined, { logger, requestId: 'rid' });
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /ignored 1 cache hint\(s\) at top-level cache_control/);
+  });
+
+  it('counts and strips the cache markers nested inside a tool_result', async () => {
+    // review_fixes.md #25: `ToolResultBlockParam.content` is an array of blocks, each
+    // with its own marker (`messages-create.md:771-779`). The sweep did not descend,
+    // and the blocks were stringified into `functionResponse` as they stood — so a
+    // marker the log called "ignored" reached the upstream.
+    const { logger, warnings } = recordingLogger();
+    const req = {
+      model: 'gemini',
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: {} }] },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_1',
+            content: [
+              { type: 'text', text: 'sunny', cache_control: { type: 'ephemeral' } },
+              { type: 'text', text: '22C', cache_control: { type: 'ephemeral' } },
+            ],
+          }],
+        },
+      ],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req, undefined, { logger, requestId: 'rid' }) as any;
+
+    const serialized = out.contents[1].parts[0].functionResponse.response.content;
+    assert.deepEqual(JSON.parse(serialized), [{ type: 'text', text: 'sunny' }, { type: 'text', text: '22C' }],
+      'the result text must survive the marker strip');
+    assert.equal(serialized.includes('cache_control'), false,
+      'a marker the log calls "ignored" must not reach the upstream');
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /ignored 2 cache hint\(s\)/);
+    assert.match(warnings[0], /messages\[1\]\.content\[0\]\.content\[0\]/);
+    assert.match(warnings[0], /messages\[1\]\.content\[0\]\.content\[1\]/);
+  });
+
+  it('does not report a custom client tool as a server tool', async () => {
+    // review_fixes.md #25: `Tool.type` is `optional "custom"` on an ordinary client
+    // tool (`messages-create.md:2823`), so the "declares a `type` and no
+    // input_schema" test caught every tool the spec lets a client declare that way
+    // and told the operator a loss had occurred where there is none.
+    const { logger, warnings } = recordingLogger();
+    const req = {
+      model: 'gemini',
+      tools: [{
+        type: 'custom',
+        name: 'get_weather',
+        description: 'weather',
+        input_schema: { type: 'object', properties: { city: { type: 'string' } } },
+      }],
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req, undefined, { logger, requestId: 'rid' }) as any;
+
+    assert.deepEqual(out.tools[0].functionDeclarations[0], {
+      name: 'get_weather',
+      description: 'weather',
+      parameters: { type: 'object', properties: { city: { type: 'string' } } },
+    });
+    assert.deepEqual(warnings, [], 'a custom client tool is a plain function here — nothing was lost');
+  });
+
   it('passes through cached_content as cachedContent', async () => {
     const req = {
       model: 'gemini',

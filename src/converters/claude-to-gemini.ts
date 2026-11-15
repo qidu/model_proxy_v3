@@ -50,6 +50,29 @@ function formatDroppedKinds(kinds: Array<string>): string {
     return [...counts.entries()].map(([kind, count]) => `${kind} ×${count}`).join(', ');
 }
 
+/** Whether a content block carries a Claude cache breakpoint. */
+function hasCacheControl(value: unknown): boolean {
+    return typeof value === 'object' && value !== null &&
+        (value as Record<string, unknown>).cache_control !== undefined;
+}
+
+/**
+ * A tool result's content, serialized with the cache markers nested in it removed.
+ *
+ * `cache_control` is Claude's alone; this converter reports it as ignored, so
+ * stringifying it into `functionResponse.response.content` forwarded a marker the
+ * log said it dropped.
+ */
+function toolResultContentText(content: unknown): string {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return stringify(content);
+    return stringify(content.map(block => {
+        if (!hasCacheControl(block)) return block;
+        const { cache_control: _dropped, ...rest } = block as Record<string, unknown>;
+        return rest;
+    }));
+}
+
 /**
  * Convert Claude request to Gemini generateContent format
  *
@@ -144,9 +167,7 @@ export async function convertClaudeToGeminiRequest(
                             ...(typeof toolResult.tool_use_id === 'string' && toolResult.tool_use_id !== '' ? { id: toolResult.tool_use_id } : {}),
                             name,
                             response: {
-                                content: typeof toolResult.content === 'string'
-                                    ? toolResult.content
-                                    : stringify(toolResult.content),
+                                content: toolResultContentText(toolResult.content),
                             },
                         },
                     });
@@ -264,12 +285,18 @@ export async function convertClaudeToGeminiRequest(
             );
         }
         // Rule #8: a Claude *server* tool (`web_search_20250305`,
-        // `computer_20250124`, `bash_20250124`, …) declares a `type` and no
+        // `computer_20250124`, `bash_20250124`, …) declares a versioned `type` and no
         // `input_schema`. It passes the name check and reaches the upstream as an
         // ordinary function with an empty parameter object, which invites the
         // model to call something this proxy has no way to execute.
-        const serverTools = claudeRequest.tools.filter(t =>
-            typeof (t as unknown as Record<string, unknown>).type === 'string');
+        //
+        // `custom` is excluded: an ordinary client tool may declare it
+        // (`messages-create.md:2823`), and such a tool is exactly the plain function
+        // this hop translates — reporting it would claim a loss that did not happen.
+        const serverTools = claudeRequest.tools.filter(t => {
+            const type = (t as unknown as Record<string, unknown>).type;
+            return typeof type === 'string' && type !== 'custom';
+        });
         if (serverTools.length > 0) {
             warn(
                 `Claude server tool(s) have no generateContent equivalent and were declared as plain functions: ` +
@@ -325,10 +352,11 @@ export async function convertClaudeToGeminiRequest(
         }
     }
 
-    const hasCacheControl = (value: unknown): boolean =>
-        typeof value === 'object' && value !== null &&
-        (value as Record<string, unknown>).cache_control !== undefined;
     const cacheControlLocations: string[] = [];
+    // The request-level field marks the last cacheable block wherever it is
+    // (`messages-create.md:2372`), so there is no block to name — the location is
+    // the field itself.
+    if (claudeRequest.cache_control !== undefined) cacheControlLocations.push('top-level cache_control');
     claudeRequest.tools?.forEach((tool, index) => {
         if (hasCacheControl(tool)) cacheControlLocations.push(`tools[${index}]`);
     });
@@ -342,6 +370,19 @@ export async function convertClaudeToGeminiRequest(
         message.content.forEach((block, blockIndex) => {
             if (hasCacheControl(block)) {
                 cacheControlLocations.push(`messages[${messageIndex}].content[${blockIndex}]`);
+            }
+            // A `tool_result` carries its own content list, whose blocks each hold a
+            // marker of their own (`messages-create.md:771-779`) — one level the
+            // sweep used not to reach, and the level `toolResultContentText` strips.
+            const nested = (block as unknown as Record<string, unknown>)?.content;
+            if ((block as unknown as Record<string, unknown>)?.type === 'tool_result' && Array.isArray(nested)) {
+                nested.forEach((inner, innerIndex) => {
+                    if (hasCacheControl(inner)) {
+                        cacheControlLocations.push(
+                            `messages[${messageIndex}].content[${blockIndex}].content[${innerIndex}]`
+                        );
+                    }
+                });
             }
         });
     });

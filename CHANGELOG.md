@@ -5,6 +5,36 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): complete the Claude cache_control report, and stop calling a custom tool a server tool
+
+Three defects in one report, all on `/v1/messages` → `gemini-generatecontent`:
+
+- **The request-level marker was not counted.** `MessageCreateParams.cache_control`
+  (`messages-create.md:2372`) "automatically applies a `cache_control` marker to the last cacheable
+  block in the request". The sweep looked at tools, system blocks and message content only, so a
+  client that used the request-level form got no report at all.
+- **Markers nested in a `tool_result` were neither counted nor stripped.** `ToolResultBlockParam.content`
+  is an array of blocks, each with its own marker (`messages-create.md:771-779`). The sweep stopped one
+  level short of them, *and* the blocks were `stringify`d into `functionResponse.response.content` as
+  they stood — so a marker the log called "ignored" was forwarded to the upstream inside the tool
+  result. Both halves are fixed: the sweep descends and names each nested position, and
+  `toolResultContentText` serializes the content with the markers removed.
+- **A `custom` client tool was reported as a server tool.** `Tool.type` is `optional "custom"` on an
+  ordinary client tool (`messages-create.md:2823`), and the server-tool test was "declares any string
+  `type`", so every tool a client declared that way was reported as a loss when it is exactly the
+  plain function this hop translates. `custom` is now excluded; the versioned server families
+  (`web_search_20250305`, …) are still reported.
+
+`ClaudeMessagesRequest` gained the declared `cache_control` field rather than reading it off an
+untyped record.
+
+**Verification**: three cases in `claude-to-gemini.test.ts`, all failing against the previous code —
+the request-level marker counted and named, a two-block `tool_result` whose markers are counted at
+`messages[1].content[0].content[0..1]`, survive-free in the serialized `functionResponse`, and keep
+their text; and a `custom` tool producing no warning while its parameters still reach the
+`functionDeclarations`. `npm run typecheck`, `npm run build` and `npm run test:unit` pass
+(3021/3021).
+
 ### fix(converters): derive the Interactions status and error from one classification of the finish reason
 
 `convertGenerateContentToInteraction` decided `status` from two hand-maintained sets of finish reasons
