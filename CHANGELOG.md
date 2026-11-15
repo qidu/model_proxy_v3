@@ -5,6 +5,69 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): read an Interactions `input` array element by element, the same way on both doors
+
+The array's *first* element used to decide how the whole array was read: a `role` meant Turns, a step
+`type` meant steps, anything else meant one part list. `docs/api/interactions.md:22` declares `input` as
+`Content | Content[] | Turn[] | string`, so conforming bodies became unreadable — and the two front
+doors did not even read them the same way (finding #5):
+
+| `input` | openai door, before | gemini door, before | both doors, now |
+|---|---|---|---|
+| `[{text}, {function_call}]` | 400 "needs a message of its own" | accepted, call filed in the **user** turn | user text, then a model/assistant call |
+| `[{thought}, {text}]` | 400 naming the `text` as a step with no Completions equivalent | accepted, both parts in one user turn | the thought's own turn, then the client's text |
+| `[{user_input}, {text}]` | 400 naming the `text` | 400 on `.content` | user, then user |
+
+Both doors now share one classifier (`classifyInteractionsInput`, in `interactions-to-gemini.ts` and
+imported by `gemini-to-openai.ts` the way it already imports `functionArgs` from there). Each element
+is classified on its own: a `role` is a turn, a step `type` is a step, anything else is a part that
+merges with the parts beside it — a run of bare parts is *one* turn, closed by any element that is not
+a part, and it is the `user` turn because a bare Content declares no role and the API declares `input`
+as the client's own. Each door then renders the same classification in its own dialect, so the reading
+and the rendering are separate concerns and only the reading is shared.
+
+The `INTERACTIONS_STEP_TYPES` set moved with the classifier, from `gemini-to-openai.ts` to
+`interactions-to-gemini.ts`. It is no longer consulted to guess an array's shape — it is the
+predicate for "this element is a step", which is what its fourteen unexpressible members were always
+for.
+
+Unchanged on purpose: a message-level part inside a *declared Turn's* `content`
+(`{role:'user', content:[{type:'function_call'}]}`) is still refused. That body states a role the call
+contradicts, which is a different thing from an element of an array that declares nothing.
+
+**Verification**: a new cross-door file, `tests/unit/interactions-input-reading.test.ts`, runs seven
+declared shapes through both converters and asserts they produce the same turns — count, order, role
+and text — plus a shape neither can express, refused by name on both. Both converters' suites gained
+the shape cases and the merge case, and `gemini-interactions-input.test.ts`'s `function_call` pin
+flipped from `user` to `model` (the one visible behaviour change on that door).
+`npm run typecheck`, `npm run build` and `npm run test:unit` pass (3044/3044).
+
+### fix(converters): project a Claude `document` block instead of counting it as a drop
+
+`/v1/messages` → `gemini-generatecontent` counted every `document` block in its drop report and could
+omit a turn whose only content was a PDF. Finding #7b called the projection decision: generateContent's
+own document form *is* `inline_data` with the file's MIME type
+(`docs/api/list_of_api_and_schema.md:230`: `{inlineData: {mimeType: "application/pdf", data}}`), so
+three of the API's four declared sources project exactly, and only the fourth has no position here.
+
+| Claude `document.source` | projection |
+|---|---|
+| `base64` (a PDF) | `inline_data` with its `media_type`, a §5.4 ref kept at the position the egress expands |
+| `text` | `text` — the native part for a plain-text document, not a file |
+| `url` | fetched server-side through the same SSRF-guarded helper the image branch uses |
+| `content` (a document composed from blocks) | **refused by name**: it is not a file, and flattening it into its parts would send something the client did not ask for |
+
+A source the API does not declare is refused naming its `type`. `ClaudeDocumentBlock.source` in
+`types/claude.ts` is now the four-member union the API declares rather than a two-member one, so the
+branch is exhaustive by type.
+
+**Verification**: six cases in `claude-to-gemini.test.ts` — base64 with its MIME type, the §5.4 ref
+kept, text, the URL fetch (with the fetch asserted), and both refusals. The three #7 report pins moved
+to kinds that are still unprojectable (`search_result`, `thinking`) so they keep pinning the report
+rather than the document. The §10 matrix's two `messages→gemini` rows moved the PDF payload from
+`dropped` to `carried`, which is the change itself. `npm run typecheck`, `npm run build` and
+`npm run test:unit` pass (3044/3044).
+
 ### fix(converters): complete the Claude cache_control report, and stop calling a custom tool a server tool
 
 Three defects in one report, all on `/v1/messages` → `gemini-generatecontent`:

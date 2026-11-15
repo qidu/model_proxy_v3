@@ -689,8 +689,8 @@ describe('convertClaudeToGeminiRequest — tools', async () => {
           role: 'user',
           content: [
             { type: 'text', text: 'summarise this' },
-            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
-            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+            { type: 'search_result', source: 'a', title: 'A', content: [] },
+            { type: 'search_result', source: 'b', title: 'B', content: [] },
           ],
         },
         { role: 'assistant', content: [{ type: 'thinking', thinking: 'weighing it up', signature: 'sig' }] },
@@ -705,7 +705,7 @@ describe('convertClaudeToGeminiRequest — tools', async () => {
 
     const report = warnings.find(w => /no generateContent equivalent/.test(w));
     assert.ok(report, `expected a drop report, got: ${JSON.stringify(warnings)}`);
-    assert.match(report!, /document ×2/);
+    assert.match(report!, /search_result ×2/);
     assert.match(report!, /thinking ×1/);
     // And a second line for the turn that could not be sent at all.
     assert.match(warnings.join('\n'), /messages\[1\] would carry nothing \(thinking ×1\)/);
@@ -719,7 +719,7 @@ describe('convertClaudeToGeminiRequest — tools', async () => {
         role: 'user',
         content: [
           { type: 'text', text: 'summarise this' },
-          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+          { type: 'thinking', thinking: 'weighing it up', signature: 'sig' },
         ],
       }],
       max_tokens: 10,
@@ -727,7 +727,7 @@ describe('convertClaudeToGeminiRequest — tools', async () => {
 
     const out = await convertClaudeToGeminiRequest(req, undefined, { logger, requestId: 'rid' }) as any;
     assert.deepEqual(out.contents, [{ role: 'user', parts: [{ text: 'summarise this' }] }]);
-    assert.match(warnings.join('\n'), /document ×1/);
+    assert.match(warnings.join('\n'), /thinking ×1/);
   });
 
   it('reports a turn it has to omit, naming the index and the kinds it lost', async () => {
@@ -742,10 +742,7 @@ describe('convertClaudeToGeminiRequest — tools', async () => {
       messages: [
         { role: 'user', content: 'hi' },
         { role: 'assistant', content: 'answer' },
-        {
-          role: 'user',
-          content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } }],
-        },
+        { role: 'assistant', content: [{ type: 'thinking', thinking: 'hmm', signature: 'sig' }] },
         { role: 'user', content: 'still here' },
       ],
     } as unknown as ClaudeMessagesRequest;
@@ -754,7 +751,134 @@ describe('convertClaudeToGeminiRequest — tools', async () => {
     assert.deepEqual(out.contents.map((c: any) => c.parts[0]), [{ text: 'hi' }, { text: 'answer' }, { text: 'still here' }],
       'the three turns that can be projected are still sent, in order');
 
-    assert.match(warnings.join('\n'), /messages\[2\] would carry nothing \(document ×1\) — the turn is omitted/,
+    assert.match(warnings.join('\n'), /messages\[2\] would carry nothing \(thinking ×1\) — the turn is omitted/,
       'the omitted turn must be reported by index and by kind');
+  });
+
+  /**
+   * Finding #7b: a `document` block was one of the kinds the report above counted,
+   * and it was the wrong call — generateContent's own document form *is*
+   * `inline_data` with the file's MIME type (`list_of_api_and_schema.md:230`), so
+   * three of the API's four sources project exactly.
+   */
+  it('projects a base64 document as inline_data, the shape generateContent declares', async () => {
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } }],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    // The turn whose only block this was used to be omitted entirely.
+    assert.deepEqual(out.contents, [{
+      role: 'user',
+      parts: [{ inline_data: { mime_type: 'application/pdf', data: 'JVBERi0=' } }],
+    }]);
+  });
+
+  it('keeps a §5.4 ref at the inline_data position rather than reading it as base64', async () => {
+    const ref = {
+      $spoolBlob: true,
+      kind: 'claude-source-data',
+      hash: 'a'.repeat(64),
+      size: 8,
+      prefix: '',
+    };
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: ref } }],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    const data = out.contents[0].parts[0].inline_data.data;
+    assert.equal(data.hash, ref.hash, 'the payload must not be expanded here');
+    assert.equal(data.kind, 'gemini-inline-data', 'the ref is rebound to the position it now occupies');
+  });
+
+  it('projects a text document as a text part, not as a file', async () => {
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'the whole report' } }],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.contents, [{ role: 'user', parts: [{ text: 'the whole report' }] }]);
+  });
+
+  it('fetches a document URL through the same SSRF-guarded fetch the image path uses', async () => {
+    const requested: string[] = [];
+    globalThis.fetch = (async (input: any) => {
+      requested.push(String(input));
+      return new Response(new Uint8Array([37, 80, 68, 70]), {
+        status: 200,
+        headers: { 'content-type': 'application/pdf' },
+      });
+    }) as typeof fetch;
+
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'document', source: { type: 'url', url: 'https://example.com/report.pdf' } }],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(requested, ['https://example.com/report.pdf'], 'the URL is fetched server-side');
+    assert.deepEqual(out.contents, [{
+      role: 'user',
+      parts: [{ inline_data: { mime_type: 'application/pdf', data: Buffer.from('%PDF').toString('base64') } }],
+    }]);
+  });
+
+  it('refuses a document composed from content blocks, which has no position here', async () => {
+    // The fourth source form. Unlike the other three it is not a file at all — it is
+    // a document the client assembled — and generateContent has no part that means
+    // "a document made of these blocks", so flattening it into its parts would send
+    // something the client did not ask for.
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'document',
+          source: { type: 'content', content: [{ type: 'text', text: 'assembled' }] },
+        }],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    await assert.rejects(
+      async () => await convertClaudeToGeminiRequest(req),
+      /ContentBlockSource source.*no position for a document composed from other content blocks/,
+    );
+  });
+
+  it('refuses a document source the API does not declare, naming it', async () => {
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'document', source: { type: 'ftp', url: 'ftp://x/y.pdf' } }],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    await assert.rejects(
+      async () => await convertClaudeToGeminiRequest(req),
+      /source\.type "ftp"/,
+    );
   });
 });

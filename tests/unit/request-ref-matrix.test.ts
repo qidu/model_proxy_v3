@@ -261,7 +261,10 @@ const ROWS: Row[] = [
     refs: 2, carried: ALL_CLAUDE, dropped: [], streamed: true,
     call: (r) => handleClaudeRequest(r, TARGET, {}, 'r1', 'claude-test', ENV, LOGGER) },
   { name: 'messages→gemini-generatecontent', clientPath: '/v1/messages', body: CLAUDE_BODY, upstreamUrl: TARGET_GEMINI,
-    refs: 2, carried: [CLAUDE_IMAGE], dropped: [CLAUDE_PDF], streamed: true,
+    // The PDF's turn was the documented drop here (finding #7 counted it, #7b
+    // projects it): generateContent's document form is `inline_data`, so both of
+    // the client's payloads reach this upstream.
+    refs: 2, carried: ALL_CLAUDE, dropped: [], streamed: true,
     call: (r) => handleGeminiRequestForMessages(r, TARGET, {}, 'r2', 'gemini-test', ENV, LOGGER) },
   { name: 'messages→openai-completions', clientPath: '/v1/messages', body: CLAUDE_BODY, upstreamUrl: TARGET,
     refs: 2, carried: [CLAUDE_IMAGE], dropped: [CLAUDE_PDF], streamed: true,
@@ -329,7 +332,7 @@ const ROWS: Row[] = [
     call: (r) => handleResponsesInputTokensRequest(r, TARGET, AUTH, 'r22', 'gpt-test', ENV, LOGGER) },
 
   { name: 'messages→gemini `:streamGenerateContent`', clientPath: '/v1/messages', body: CLAUDE_BODY, upstreamUrl: TARGET_STREAM,
-    refs: 2, carried: [CLAUDE_IMAGE], dropped: [CLAUDE_PDF], streamed: true, sse: true,
+    refs: 2, carried: ALL_CLAUDE, dropped: [], streamed: true, sse: true,
     call: (r) => handleGeminiRequestForMessages(r, TARGET_STREAM, {}, 'r23', 'gemini-test', ENV, LOGGER) },
   { name: 'chat-completions→gemini `:streamGenerateContent`', clientPath: '/v1/chat/completions', body: () => ({ ...CHAT_BODY(), stream: true }), upstreamUrl: TARGET_STREAM,
     refs: 3, carried: [CHAT_IMAGE], dropped: [CHAT_AUDIO, CHAT_FILE], streamed: true, sse: true,

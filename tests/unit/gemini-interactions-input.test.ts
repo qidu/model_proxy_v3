@@ -161,9 +161,26 @@ describe('/v1/interactions input shapes → generateContent contents', () => {
     ]);
 
     assert.deepEqual(contents, [{
-      role: 'user',
+      // A model turn, not the user's: a `functionCall` is the model's own output,
+      // and finding #5's per-element reading is what puts it there — the array's
+      // first element used to decide the whole array's role.
+      role: 'model',
       parts: [{ functionCall: { id: 'call_1', name: 'get_weather', args: { location: 'Boston' } } }],
     }]);
+  });
+
+  it('reads a mixed part list element by element', async () => {
+    const contents = await contentsFor([
+      { type: 'text', text: 'weather?' },
+      { type: 'function_call', id: 'call_1', name: 'get_weather', arguments: { location: 'Boston' } },
+      { type: 'function_result', call_id: 'call_1', name: 'get_weather', result: '72F' },
+    ]);
+
+    assert.deepEqual(contents, [
+      { role: 'user', parts: [{ text: 'weather?' }] },
+      { role: 'model', parts: [{ functionCall: { id: 'call_1', name: 'get_weather', args: { location: 'Boston' } } }] },
+      { role: 'user', parts: [{ functionResponse: { id: 'call_1', name: 'get_weather', response: { content: '72F' } } }] },
+    ]);
   });
 
   it('refuses an input array that carries no content', async () => {

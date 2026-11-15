@@ -568,6 +568,68 @@ describe('convertGeminiInteractionsToOpenAI — steps that carry no content of t
     ]);
   });
 
+  it('gives a part list\'s function_call the message of its own, not a refusal', () => {
+    // finding #5: an array whose *first* element is a bare Content was read as one
+    // part list, and a `function_call` inside a part list was refused ("needs a
+    // message of its own") even though the element is exactly what this door knows
+    // how to express. Each element is now classified on its own, so the call is
+    // split out and the text before it stays the user's turn.
+    const messages = one([
+      { type: 'text', text: 'weather?' },
+      { type: 'function_call', id: 'c1', name: 'get_weather', arguments: { city: 'SF' } },
+    ]);
+
+    assert.deepEqual(messages, [
+      { role: 'user', content: 'weather?' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'c1',
+          type: 'function',
+          function: { name: 'get_weather', arguments: '{"city":"SF"}' },
+        }],
+      },
+    ]);
+  });
+
+  it('reads the part after a thought as the client\'s own turn', () => {
+    // finding #5, the other direction: an array whose first element is a `thought`
+    // was read as a *step* list, so the bare `text` after it was refused as a step
+    // with no Completions equivalent — a message naming the wrong element, since
+    // the text is a Content part. It is now the user turn it declares itself to be
+    // (a bare Content carries no role; the API declares `input` as the client's),
+    // and the thought keeps the message of its own.
+    const messages = one([
+      { type: 'thought', summary: { content: { type: 'text', text: 'why' } } },
+      { type: 'text', text: 'stray' },
+    ]);
+
+    assert.deepEqual(messages, [
+      { role: 'assistant', content: '', reasoning_content: 'why' },
+      { role: 'user', content: 'stray' },
+    ]);
+  });
+
+  it('keeps a run of parts one message when a step interrupts it', () => {
+    // The merge the per-element reading must not lose: two `text` parts are one
+    // user turn, and a run is closed by the step that follows it — not by every
+    // element.
+    const messages = one([
+      { type: 'text', text: 'a' },
+      { type: 'text', text: 'b' },
+      { type: 'user_input', content: 'c' },
+      { type: 'text', text: 'd' },
+      { type: 'text', text: 'e' },
+    ]);
+
+    assert.deepEqual(messages, [
+      { role: 'user', content: 'ab' },
+      { role: 'user', content: 'c' },
+      { role: 'user', content: 'de' },
+    ]);
+  });
+
   it('refuses a step with no Completions equivalent, naming it', () => {
     // Each of these was read as a *part list*, matched no part, and reached the
     // upstream as `content: ''` with the step's payload gone (rule #8).

@@ -94,6 +94,84 @@ describe('convertInteractionsToGenerateContent — input → contents', () => {
     assert.deepEqual(out.contents, [{ role: 'model', parts: [{ text: 'hello' }] }]);
   });
 
+  it('splits a part list at the kinds that belong to the model, one turn each', () => {
+    // finding #5: this array used to be read as one part list and reach the
+    // upstream as a single *user* turn holding the model's own call. Each element
+    // is now classified on its own, so the call sits in a model turn — the role
+    // generateContent's own transcripts give a `functionCall`.
+    const out = body({
+      input: [
+        { type: 'text', text: 'weather?' },
+        { type: 'function_call', id: 'c1', name: 'get_weather', arguments: { city: 'SF' } },
+      ],
+    }).body as any;
+
+    assert.deepEqual(out.contents, [
+      { role: 'user', parts: [{ text: 'weather?' }] },
+      { role: 'model', parts: [{ functionCall: { id: 'c1', name: 'get_weather', args: { city: 'SF' } } }] },
+    ]);
+  });
+
+  it('gives a function_result the user turn that answers its call', () => {
+    const out = body({
+      input: [
+        { type: 'function_call', id: 'c1', name: 'get_weather', arguments: {} },
+        { type: 'function_result', call_id: 'c1', name: 'get_weather', result: '72F' },
+      ],
+    }).body as any;
+
+    assert.deepEqual(out.contents, [
+      { role: 'model', parts: [{ functionCall: { id: 'c1', name: 'get_weather', args: {} } }] },
+      { role: 'user', parts: [{ functionResponse: { id: 'c1', name: 'get_weather', response: { content: '72F' } } }] },
+    ]);
+  });
+
+  it('reads the part after a thought as the client\'s own turn', () => {
+    // The array used to be read as one part list, putting the model's thought and
+    // the client's text in a single user turn. A bare Content carries no role, and
+    // the API declares `input` as the client's own turn — so the thought keeps a
+    // model turn of its own and the text is the user's.
+    const out = body({
+      input: [
+        { type: 'thought', summary: { content: { type: 'text', text: 'why' } } },
+        { type: 'text', text: 'stray' },
+      ],
+    }).body as any;
+
+    assert.deepEqual(out.contents, [
+      { role: 'model', parts: [{ thought: true, text: 'why' }] },
+      { role: 'user', parts: [{ text: 'stray' }] },
+    ]);
+  });
+
+  it('keeps a run of parts one turn when a step interrupts it', () => {
+    const out = body({
+      input: [
+        { type: 'text', text: 'a' },
+        { type: 'text', text: 'b' },
+        { type: 'user_input', content: 'c' },
+        { type: 'text', text: 'd' },
+        { type: 'text', text: 'e' },
+      ],
+    }).body as any;
+
+    assert.deepEqual(out.contents, [
+      { role: 'user', parts: [{ text: 'a' }, { text: 'b' }] },
+      { role: 'user', parts: [{ text: 'c' }] },
+      { role: 'user', parts: [{ text: 'd' }, { text: 'e' }] },
+    ]);
+  });
+
+  it('refuses a step this hop has no generateContent reading for, naming it', () => {
+    // `google_maps_call` is in neither this converter's Content vocabulary nor
+    // generateContent's tool list, and the refusal names the step rather than
+    // reporting that it "is not a Content part".
+    assertRefused(
+      { input: [{ type: 'google_maps_call', id: 'x', arguments: {} }] },
+      /input step "google_maps_call" has no generateContent equivalent/,
+    );
+  });
+
   it('reads the system prompt in the spellings this front door is served', () => {
     const wrapper = body({ system_instruction: { parts: [{ text: 'be ' }, { text: 'terse' }] }, ...userTurn }).body as any;
     assert.deepEqual(wrapper.systemInstruction, { parts: [{ text: 'be terse' }] });

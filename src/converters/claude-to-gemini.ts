@@ -3,7 +3,7 @@
  * Converts Claude API requests to Gemini Interactions API format
  */
 
-import { ClaudeMessagesRequest, ClaudeTextBlock, ClaudeImageBlock, ClaudeToolUseBlock, ClaudeToolResultBlock } from '../types/claude.js';
+import { ClaudeMessagesRequest, ClaudeTextBlock, ClaudeImageBlock, ClaudeDocumentBlock, ClaudeToolUseBlock, ClaudeToolResultBlock } from '../types/claude.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
 import { recursivelyCleanSchema } from './claude-to-openai.js';
@@ -74,6 +74,62 @@ function toolResultContentText(content: unknown): string {
 }
 
 /**
+ * A Claude `document` block as a generateContent part.
+ *
+ * generateContent's own document form *is* `inline_data` carrying the file's MIME
+ * type (`docs/api/list_of_api_and_schema.md:230`: `{inlineData: {mimeType:
+ * "application/pdf", data}}`), so the API's base64-PDF and URL sources project
+ * exactly, and a text document is a `text` part — the native part for it, not a
+ * file. The remaining source form, a document the client composed from content
+ * blocks, is refused by name: it is not a file, and flattening it into its parts
+ * would send something the client did not ask for.
+ *
+ * Refused rather than reported for the same reason: a `document` reaching the
+ * upstream as nothing is the silent loss rule #8 forbids.
+ */
+async function documentPart(block: ClaudeDocumentBlock): Promise<Record<string, unknown>> {
+    const source = block.source as { type?: unknown; media_type?: unknown; data?: unknown; url?: unknown };
+
+    // Kept at the position the egress expands in place, as the image branch does:
+    // a §5.4 ref is a payload, and reading it as base64 would expand it here.
+    const inline = (data: unknown): Record<string, unknown> => ({
+        inline_data: {
+            mime_type: typeof source.media_type === 'string' && source.media_type !== ''
+                ? source.media_type
+                : 'application/pdf',
+            data: isBlobRef(data) ? rebindBlobRef(data, 'gemini-inline-data', '') : data,
+        },
+    });
+
+    switch (source.type) {
+        case 'base64':
+            return inline(source.data);
+        case 'text':
+            return { text: typeof source.data === 'string' ? source.data : stringify(source.data) };
+        case 'url': {
+            if (typeof source.url !== 'string' || source.url === '') {
+                throw new Error('Cannot convert a Claude document block with source.type "url": no source.url');
+            }
+            // The same SSRF-guarded fetch the image branch uses: a generateContent
+            // part carries bytes, and `file_data.file_uri` only addresses Files API
+            // URIs.
+            const fetched = await fetchImageAsInlineData(source.url);
+            return { inline_data: fetched };
+        }
+        case 'content':
+            throw new Error(
+                'Cannot convert a Claude document block with a ContentBlockSource source: generateContent has no ' +
+                'position for a document composed from other content blocks'
+            );
+        default:
+            throw new Error(
+                `Cannot convert a Claude document block with source.type ${JSON.stringify(source.type)}: ` +
+                'the API declares base64, text, url and content'
+            );
+    }
+}
+
+/**
  * Convert Claude request to Gemini generateContent format
  *
  * Async because an `image` block with a `source.type: 'url'` has no
@@ -141,6 +197,8 @@ export async function convertClaudeToGeminiRequest(
                             }
                         });
                     }
+                } else if (block.type === 'document') {
+                    parts.push(await documentPart(block as ClaudeDocumentBlock));
                 } else if (block.type === 'tool_use') {
                     const toolUse = block as ClaudeToolUseBlock;
                     toolNamesById.set(toolUse.id, toolUse.name);

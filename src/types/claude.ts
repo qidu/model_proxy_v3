@@ -76,13 +76,21 @@ export interface ClaudeImageBlock {
     };
 }
 
+/**
+ * A `document` block's source, in the four forms the API declares
+ * (`messages-create.md:250`): a base64 PDF, plain text, a URL to a PDF, or a
+ * document composed from other content blocks. Anything else is not a shape this
+ * type should let through.
+ */
+export type ClaudeDocumentSource =
+    | { type: "base64"; media_type: "application/pdf"; data: string }
+    | { type: "text"; media_type: "text/plain"; data: string }
+    | { type: "url"; url: string }
+    | { type: "content"; content: string | ClaudeContentBlock[] };
+
 export interface ClaudeDocumentBlock {
     type: "document";
-    source: {
-        type: "base64" | "text";
-        media_type: string;
-        data: string;
-    };
+    source: ClaudeDocumentSource;
     title?: string;
 }
 

@@ -171,20 +171,7 @@ function buildContents(input: unknown): { contents: Array<Record<string, unknown
         if (input.length === 0) {
             throw new ValidationError('Interactions request `input` array must carry at least one content');
         }
-        const first = asRecord(input[0]);
-
-        if (first && 'role' in first) {
-            return { contents: input.map(item => turnToContent(asRecord(item), 'input[]')), systemTexts };
-        }
-        if (first && (first.type === 'user_input' || first.type === 'model_output')) {
-            return { contents: input.map(item => stepToContent(asRecord(item))), systemTexts };
-        }
-        // An Interactions `Content[]` is one user turn's part list, not one content
-        // per part — the shape the spec's own examples use.
-        return {
-            contents: [{ role: 'user', parts: input.map((part, i) => toGeminiPart(asRecord(part), `input[${i}]`)) }],
-            systemTexts,
-        };
+        return { contents: inputEntriesToContents(input, 'input'), systemTexts };
     }
 
     const record = asRecord(input);
@@ -216,12 +203,10 @@ function buildContents(input: unknown): { contents: Array<Record<string, unknown
         if ('role' in record) {
             return { contents: [turnToContent(record, 'input')], systemTexts };
         }
-        if (record.type === 'user_input' || record.type === 'model_output') {
-            // The scalar form of an input step, which the array branch above reads.
-            return { contents: [stepToContent(record)], systemTexts };
-        }
+        // A lone step or a lone Content: the same element-by-element reading the
+        // array form uses, so the two shapes cannot drift.
         if (typeof record.type === 'string') {
-            return { contents: [{ role: 'user', parts: [toGeminiPart(record, 'input')] }], systemTexts };
+            return { contents: inputEntriesToContents([record], 'input'), systemTexts };
         }
     }
 
@@ -231,6 +216,10 @@ function buildContents(input: unknown): { contents: Array<Record<string, unknown
     );
 }
 
+/**
+ * An input *Turn*: a `role` and the content under it. Served the `model` spelling
+ * as well as Claude's `assistant`, which `contentRole` folds onto `model`.
+ */
 function turnToContent(turn: Record<string, unknown> | undefined, where: string): Record<string, unknown> {
     if (!turn) throw new ValidationError(`Interactions ${where} entry must be an object`);
     return {
@@ -240,14 +229,167 @@ function turnToContent(turn: Record<string, unknown> | undefined, where: string)
 }
 
 /**
- * An input *step*: a Turn whose `type` stands in for its `role`. `user_input` is
- * the client's turn, `model_output` the model's own earlier turn.
+ * The `input` *step* vocabulary: the `type` discriminator of every member of the
+ * SDK's `Step` union, which is the `Array<Step>` arm of `InteractionsInput`
+ * (`@google/genai` `genai.d.ts`). `function_call`, `function_result` and
+ * `thought` are also Content part types, so an element carrying one of them is
+ * ambiguous between a step and a part — both readings mean the same thing, and
+ * the step reading is the one that gives a tool call or a thought the turn of its
+ * own that both target wires need.
+ *
+ * Fourteen of these are recognized for that decision alone: they have no
+ * generateContent part and no Completions position, so reading one as a part would
+ * either match nothing and drop the element or reach the upstream under a field
+ * name it does not declare. Each door refuses them by name instead (rule #8).
+ *
+ * Shared with `gemini-to-openai.ts`, which imports the classifier below.
+ */
+export const INTERACTIONS_STEP_TYPES = new Set([
+    'user_input', 'model_output',
+    'function_call', 'function_result', 'thought',
+    'code_execution_call', 'code_execution_result',
+    'file_search_call', 'file_search_result',
+    'google_maps_call', 'google_maps_result',
+    'google_search_call', 'google_search_result',
+    'mcp_server_tool_call', 'mcp_server_tool_result',
+    'processing_call', 'processing_result',
+    'url_context_call', 'url_context_result',
+]);
+
+/**
+ * One `input` element, classified for the door that will render it.
+ *
+ * `turn` carries its own `role` and is rendered by each door's own role handling;
+ * `step` is an element of the step vocabulary, which both wires need as a message
+ * or turn of its own; `parts` is a run of bare Content elements that become *one*
+ * message or turn.
+ */
+export type InteractionsInputEntry =
+    | { kind: 'turn'; element: Record<string, unknown>; index: number }
+    | { kind: 'step'; step: Record<string, unknown>; index: number }
+    | { kind: 'parts'; parts: Array<Record<string, unknown>>; start: number };
+
+/**
+ * Read an `input` array element by element — the classification both Interactions
+ * front doors share, imported by `gemini-to-openai.ts` the way it already imports
+ * `functionArgs` from here.
+ *
+ * The array's *first* element used to decide how the whole array was read: a
+ * `role` meant Turns, a step `type` meant steps, anything else meant one part
+ * list. That made conforming bodies unreadable (`interactions.md:22` declares
+ * `input` as `Content | Content[] | Turn[] | string`) — a part list whose second
+ * element is a `function_call` was read as parts and refused, and a list headed by
+ * a `thought` was read as steps, so the `text` after it was refused as a step and
+ * the message named the wrong element. The two doors did not even agree on it: the
+ * Gemini door read the first shape as parts and filed the model's call in the
+ * *user* turn.
+ *
+ * Each element is now classified on its own:
+ *
+ *   - a `role`                  → a turn, validated by the door that renders it
+ *   - a step `type`             → a step, which is a message/turn of its own
+ *   - anything else             → a part, merged with the parts beside it
+ *
+ * The merge is what the `parts` entries are for: a bare Content declares no role,
+ * and the API declares `input` as the client's own turn, so a run of them is one
+ * `user` turn — two `text` parts are one turn, not two. A run is closed by any
+ * element that is not a part, so only adjacency merges.
+ */
+export function classifyInteractionsInput(
+    input: Array<unknown>,
+    where: string
+): InteractionsInputEntry[] {
+    const entries: InteractionsInputEntry[] = [];
+    let run: Array<Record<string, unknown>> | undefined;
+    let runStart = 0;
+
+    const closeRun = (): void => {
+        if (run) {
+            entries.push({ kind: 'parts', parts: run, start: runStart });
+            run = undefined;
+        }
+    };
+
+    for (let index = 0; index < input.length; index++) {
+        const element = asRecord(input[index]);
+        if (!element) {
+            throw new ValidationError(`Interactions ${where}[${index}] must be an object`);
+        }
+
+        if ('role' in element) {
+            closeRun();
+            entries.push({ kind: 'turn', element, index });
+            continue;
+        }
+        if (typeof element.type === 'string' && INTERACTIONS_STEP_TYPES.has(element.type)) {
+            closeRun();
+            entries.push({ kind: 'step', step: element, index });
+            continue;
+        }
+        if (!run) {
+            run = [];
+            runStart = index;
+        }
+        run.push(element);
+    }
+
+    closeRun();
+    return entries;
+}
+
+/** One content per turn, one per step, and one per run of bare parts. */
+function inputEntriesToContents(input: Array<unknown>, where: string): Array<Record<string, unknown>> {
+    const contents: Array<Record<string, unknown>> = [];
+
+    for (const entry of classifyInteractionsInput(input, where)) {
+        if (entry.kind === 'turn') {
+            contents.push(turnToContent(entry.element, `${where}[${entry.index}]`));
+        } else if (entry.kind === 'step') {
+            contents.push(stepToContent(entry.step));
+        } else {
+            contents.push({
+                role: 'user',
+                parts: entry.parts.map((part, i) => toGeminiPart(part, `${where}[${entry.start + i}]`)),
+            });
+        }
+    }
+
+    return contents;
+}
+
+/**
+ * An input *step* as a generateContent content.
+ *
+ * `user_input` and `model_output` stand in for a Turn's `role` and carry their
+ * content under `content`. The other steps carry the Content fields *themselves*,
+ * so each is one part, read by `toGeminiPart`, in the turn that part belongs to:
+ * the model's own output in a `model` turn, a result handed back to it in the
+ * `user` one.
  */
 function stepToContent(step: Record<string, unknown> | undefined): Record<string, unknown> {
     if (!step) throw new ValidationError('Interactions input step must be an object');
+    const type = typeof step.type === 'string' ? step.type : '';
+    const where = `input step ${stringify(step.type)}`;
+
+    if (type === 'user_input' || type === 'model_output') {
+        return {
+            role: type === 'model_output' ? 'model' : 'user',
+            parts: contentToParts(step.content, where),
+        };
+    }
+    if (!INTERACTIONS_PART_TYPES.has(type)) {
+        // A step whose own fields spell no Content this API declares —
+        // `google_maps_call` and `processing_call` are the two in the SDK's `Step`
+        // union. Refused by name rather than reported as "not a Content part",
+        // which would tell a client sending a documented step that its request is
+        // nonsense.
+        throw new ValidationError(
+            `Interactions ${where} has no generateContent equivalent; this route cannot replay it`
+        );
+    }
     return {
-        role: step.type === 'model_output' ? 'model' : 'user',
-        parts: contentToParts(step.content, `input step ${stringify(step.type)}`),
+        role: type === 'function_result' ? 'user' : 'model',
+        parts: [toGeminiPart(step, where)],
     };
 }
 

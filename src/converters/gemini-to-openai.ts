@@ -15,7 +15,7 @@
 import type { Logger } from '../types/shared.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { ValidationError } from '../utils/errors.js';
-import { functionArgs } from './interactions-to-gemini.js';
+import { classifyInteractionsInput, functionArgs, type InteractionsInputEntry } from './interactions-to-gemini.js';
 
 /**
  * Check if request is in Gemini Interactions format
@@ -30,32 +30,6 @@ export function isGeminiInteractionsRequest(body: Record<string, unknown>): bool
  * generateContent's `inline_data`. The media kinds `interactions.md` declares.
  */
 const INTERACTIONS_MEDIA_PART_TYPES = new Set(['image', 'audio', 'video', 'document']);
-
-/**
- * The `input` *step* vocabulary: the `type` discriminator of every member of the
- * SDK's `Step` union, which is the `Array<Step>` arm of `InteractionsInput`
- * (`@google/genai` `genai.d.ts`). `function_call`, `function_result` and
- * `thought` are also Content part types, so an array headed by one is ambiguous
- * between a step list and a part list — both readings mean the same thing, and
- * the step reading is the one that gives a tool call or a thought the message of
- * its own that Completions needs.
- *
- * The last fourteen are recognized so that an array headed by one is read as a
- * step list, where the step can be refused by name. None has a Completions
- * spelling; read as a part list instead they matched nothing and the whole array
- * became an empty `content`, with no warning (rule #8).
- */
-const INTERACTIONS_STEP_TYPES = new Set([
-  'user_input', 'model_output',
-  'function_call', 'function_result', 'thought',
-  'code_execution_call', 'code_execution_result',
-  'file_search_call', 'file_search_result',
-  'google_maps_call', 'google_maps_result',
-  'google_search_call', 'google_search_result',
-  'mcp_server_tool_call', 'mcp_server_tool_result',
-  'processing_call', 'processing_result',
-  'url_context_call', 'url_context_result',
-]);
 
 /**
  * Convert Gemini parts into an OpenAI Completions `content` value:
@@ -89,13 +63,16 @@ const INTERACTIONS_STEP_TYPES = new Set([
 function geminiPartsToOpenAIContent(
   parts: any[] | undefined,
   where: string,
+  startIndex = 0,
 ): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string | BlobRef } }> {
   if (!Array.isArray(parts)) return '';
   const textParts: string[] = [];
   const imageParts: Array<{ type: 'image_url'; image_url: { url: string | BlobRef } }> = [];
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i] as any;
-    const at = `${where}[${i}]`;
+    // `startIndex` keeps a refusal naming the position the part holds in the
+    // client's `input`, not its position in the run of parts being rendered.
+    const at = `${where}[${startIndex + i}]`;
     let claimed = false;
     if (p && typeof p.text === 'string') {
       claimed = true;
@@ -245,19 +222,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * send in place of Turns (`type: 'user_input'` / `'model_output'` standing in
  * for a Turn's `role`, and the tool and thought steps beside them).
  *
- * The discrimination mirrors `converters/interactions-to-gemini.ts`'s
- * `buildContents` — the same front door served by a native Gemini upstream — so
- * one body is read the same way on both routes. It matters most for the bare
- * `Content[]` form (the shape `interactions.md`'s own multimodal example uses),
- * which is *one* turn's part list, not one message per part: read as Turns it
- * produced a message whose role and content had both been dropped.
- *
- * The array's first entry decides how the whole array is read, as in
- * `buildContents`: a Turn carries `role`, a step carries one of the step `type`s,
- * anything else is a part list. A *step* list is read by `stepsToMessages`, which
- * gives a tool call and a thought the message of its own this wire needs — before
- * that, an array headed by anything but `user_input` / `model_output` was read as
- * a part list, matched no part, and became a single empty `content` (rule #8).
+ * An array is read element by element by `classifyInteractionsInput`, which the
+ * Gemini door imports too — the same front door served by a native Gemini
+ * upstream — so one body is read the same way on both routes. That shared reading
+ * is what keeps the bare `Content[]` form (the shape `interactions.md`'s own
+ * multimodal example uses) *one* turn's part list rather than one message per
+ * part, and what stops a `function_call` or a `thought` among those parts from
+ * being refused for the accident of not being first (finding #5).
  *
  * A shape that yields no message is refused rather than half-read. That is what
  * the last branch protects: an unrecognized scalar used to fall through to
@@ -273,14 +244,7 @@ function interactionsInputToMessages(input: unknown): Array<Record<string, unkno
     if (input.length === 0) {
       throw new ValidationError('Interactions request `input` array must carry at least one content');
     }
-    const first = asRecord(input[0]);
-    if (first && 'role' in first) {
-      return input.map(entry => turnToMessage(asRecord(entry), 'input[]'));
-    }
-    if (first && typeof first.type === 'string' && INTERACTIONS_STEP_TYPES.has(first.type)) {
-      return stepsToMessages(input);
-    }
-    return [{ role: 'user', content: geminiPartsToOpenAIContent(input, '`input`') }];
+    return inputEntriesToMessages(classifyInteractionsInput(input, '`input`'));
   }
 
   const record = asRecord(input);
@@ -299,12 +263,10 @@ function interactionsInputToMessages(input: unknown): Array<Record<string, unkno
     if ('role' in record) {
       return [turnToMessage(record, 'input')];
     }
-    if (typeof record.type === 'string' && INTERACTIONS_STEP_TYPES.has(record.type)) {
-      return stepsToMessages([record]);
-    }
-    // A lone Content: one part, so one message holding it.
+    // A lone step or a lone Content: the same element-by-element reading the array
+    // form uses, so the two shapes cannot drift.
     if (typeof record.type === 'string') {
-      return [{ role: 'user', content: geminiPartsToOpenAIContent([record], '`input`') }];
+      return inputEntriesToMessages(classifyInteractionsInput([record], '`input`'));
     }
   }
 
@@ -419,6 +381,46 @@ function stepsToMessages(steps: unknown[]): Array<Record<string, unknown>> {
   }
 
   flushReasoning();
+  return messages;
+}
+
+/**
+ * The classified `input` entries as Completions messages.
+ *
+ * Steps are buffered and handed to `stepsToMessages` in one call, because a
+ * `thought` is folded into the turn it introduces and that folding only happens
+ * when the thought and the turn are read together — flushing per entry would give
+ * every thought a message of its own. The buffer is closed by anything that is not
+ * a step.
+ *
+ * A run of bare parts is one `user` message: the API declares `input` as the
+ * client's own turn and a bare Content carries no role of its own, so two `text`
+ * parts are one turn rather than two. A Turn is rendered by `turnToMessage`, which
+ * keeps whatever role the client wrote — including the ones this door cannot
+ * classify, which `completionsToClaudeBody` is the layer that judges.
+ */
+function inputEntriesToMessages(entries: InteractionsInputEntry[]): Array<Record<string, unknown>> {
+  const messages: Array<Record<string, unknown>> = [];
+  let steps: Array<Record<string, unknown>> = [];
+
+  const flushSteps = (): void => {
+    if (steps.length === 0) return;
+    messages.push(...stepsToMessages(steps));
+    steps = [];
+  };
+
+  for (const entry of entries) {
+    if (entry.kind === 'step') {
+      steps.push(entry.step);
+      continue;
+    }
+    flushSteps();
+    messages.push(entry.kind === 'turn'
+      ? turnToMessage(entry.element, `\`input\`[${entry.index}]`)
+      : { role: 'user', content: geminiPartsToOpenAIContent(entry.parts, '`input`', entry.start) });
+  }
+
+  flushSteps();
   return messages;
 }
 
