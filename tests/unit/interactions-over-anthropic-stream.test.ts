@@ -25,7 +25,7 @@ import { describe, it, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { handleOpenAIRequest } from '../../src/handlers/openai.js';
-import { createLogger } from '../../src/utils/logger.js';
+import { createLogger, type Logger } from '../../src/utils/logger.js';
 
 const LOGGER = createLogger({});
 const ENV = {} as any;
@@ -96,10 +96,13 @@ describe('/v1/interactions ← anthropic-messages: the SSE egress', () => {
   after(() => { globalThis.fetch = realFetch; });
   afterEach(() => { globalThis.fetch = realFetch; });
 
-  async function run(events: Array<Record<string, unknown>>): Promise<Array<Record<string, any>>> {
+  async function run(
+    events: Array<Record<string, unknown>>,
+    logger: Logger = LOGGER,
+  ): Promise<Array<Record<string, any>>> {
     globalThis.fetch = (async () => anthropicStream(events)) as typeof fetch;
     const response = await handleOpenAIRequest(
-      interactionsRequest(), TARGET, AUTH, 'r-interactions', MODEL, ENV, LOGGER,
+      interactionsRequest(), TARGET, AUTH, 'r-interactions', MODEL, ENV, logger,
       undefined, undefined, 'anthropic-messages',
     );
     assert.equal(response.headers.get('content-type'), 'text/event-stream');
@@ -181,5 +184,40 @@ describe('/v1/interactions ← anthropic-messages: the SSE egress', () => {
 
     assert.equal(seen.includes('interaction.completed'), false);
     assert.equal(seen.includes('"status":"completed"'), false);
+  });
+
+  it('reports a tool call the upstream sent without a name, and still closes the interaction', async () => {
+    // #17: the nameless call was skipped with no log, so this dialect sent the
+    // client nothing at all — HTTP 200, a clean close, and no way to tell the model
+    // had asked for a tool.
+    const warnings: string[] = [];
+    const noop = (): void => {};
+    const logger: Logger = {
+      traceEnabled: false,
+      trace: noop, debug: noop, info: noop, error: noop,
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    };
+
+    const frames = await run([
+      { type: 'message_start', message: { id: 'msg_1', usage: { input_tokens: 5, output_tokens: 0 } } },
+      {
+        type: 'content_block_start', index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_9', name: '', input: {} },
+      },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 3 } },
+      { type: 'message_stop' },
+    ], logger);
+
+    // No call is announced — a `function_call` step needs a name (the SDK declares
+    // it Required) — and the stream is not left empty: it closes the interaction.
+    assert.equal(frames.some(frame => frame.step?.type === 'function_call'), false);
+    assert.equal(frames.some(frame => frame.delta?.type === 'function_call'), false);
+    assert.equal(frames.at(-1)?.event_type, 'interaction.completed',
+      'the client must still get a terminal frame, not an empty stream');
+    assert.equal(frames.at(-1)?.interaction?.status, 'completed');
+
+    assert.match(warnings.join('\n'), /toolu_9/, 'the dropped call must be reported by id');
   });
 });

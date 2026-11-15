@@ -637,7 +637,7 @@ async function handleOpenAIStreamingResponse(
                 logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', rawChunk);
 
                 // Process complete SSE events
-                const { processed, remaining } = processSSEBuffer(buffer, modelId, requestId, isInteractionsRequest, isGenerateContentRequest);
+                const { processed, remaining } = processSSEBuffer(buffer, modelId, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
                 buffer = remaining;
 
                 if (processed) {
@@ -648,7 +648,7 @@ async function handleOpenAIStreamingResponse(
 
             // Process any remaining buffer
             if (buffer.trim()) {
-                const { processed } = processSSEBuffer(buffer + '\n\n', modelId, requestId, isInteractionsRequest, isGenerateContentRequest);
+                const { processed } = processSSEBuffer(buffer + '\n\n', modelId, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
                 if (processed) {
                     logPipelineStage(logger, requestId, 'outbound', 'stream (final)', processed);
                     await writer.write(encoder.encode(processed));

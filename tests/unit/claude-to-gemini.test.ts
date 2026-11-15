@@ -588,4 +588,88 @@ describe('convertClaudeToGeminiRequest — tools', async () => {
       'Rule #8 — Gemini rejects a nameless functionResponse anyway',
     );
   });
+
+  /**
+   * Findings #7 of `review_fixes.md`: every Content block outside
+   * text/image/tool_use/tool_result fell into `// Skip other block types`, with no
+   * count and no log — and when a turn was made only of those, the turn itself
+   * disappeared, so the upstream answered a conversation the client never sent.
+   */
+  it('reports the blocks it cannot project, by kind and count', async () => {
+    const { logger, warnings } = recordingLogger();
+    const req = {
+      model: 'gemini',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'summarise this' },
+            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+          ],
+        },
+        { role: 'assistant', content: [{ type: 'thinking', thinking: 'weighing it up', signature: 'sig' }] },
+      ],
+    } as unknown as ClaudeMessagesRequest;
+
+    // The thinking-only turn has nothing left, so it cannot be sent. That is
+    // reported rather than refused — see the case below — and the report must name
+    // what went, per kind and per turn.
+    const out = await convertClaudeToGeminiRequest(req, undefined, { logger, requestId: 'rid' }) as any;
+    assert.deepEqual(out.contents, [{ role: 'user', parts: [{ text: 'summarise this' }] }]);
+
+    const report = warnings.find(w => /no generateContent equivalent/.test(w));
+    assert.ok(report, `expected a drop report, got: ${JSON.stringify(warnings)}`);
+    assert.match(report!, /document ×2/);
+    assert.match(report!, /thinking ×1/);
+    // And a second line for the turn that could not be sent at all.
+    assert.match(warnings.join('\n'), /messages\[1\] would carry nothing \(thinking ×1\)/);
+  });
+
+  it('keeps the parts it can project when a turn mixes known and unknown blocks', async () => {
+    const { logger, warnings } = recordingLogger();
+    const req = {
+      model: 'gemini',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'summarise this' },
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+        ],
+      }],
+      max_tokens: 10,
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req, undefined, { logger, requestId: 'rid' }) as any;
+    assert.deepEqual(out.contents, [{ role: 'user', parts: [{ text: 'summarise this' }] }]);
+    assert.match(warnings.join('\n'), /document ×1/);
+  });
+
+  it('reports a turn it has to omit, naming the index and the kinds it lost', async () => {
+    // The turn used to disappear with nothing said. It still cannot be sent — but
+    // the omission is now recorded, so a shorter conversation than the client wrote
+    // is visible in the log (rule #8). Reported rather than refused: a
+    // thinking-only turn contributes nothing visible, and failing the whole request
+    // over one would turn a degradation into a 400 on live Claude Code traffic.
+    const { logger, warnings } = recordingLogger();
+    const req = {
+      model: 'gemini',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'answer' },
+        {
+          role: 'user',
+          content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } }],
+        },
+        { role: 'user', content: 'still here' },
+      ],
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req, undefined, { logger, requestId: 'rid' }) as any;
+    assert.deepEqual(out.contents.map((c: any) => c.parts[0]), [{ text: 'hi' }, { text: 'answer' }, { text: 'still here' }],
+      'the three turns that can be projected are still sent, in order');
+
+    assert.match(warnings.join('\n'), /messages\[2\] would carry nothing \(document ×1\) — the turn is omitted/,
+      'the omitted turn must be reported by index and by kind');
+  });
 });

@@ -41,6 +41,16 @@ function claudeSystemInstructionText(system: string | ClaudeTextBlock[]): string
 }
 
 /**
+ * `document ×2, thinking ×1` — one entry per kind, in first-seen order, for the
+ * drop report.
+ */
+function formatDroppedKinds(kinds: Array<string>): string {
+    const counts = new Map<string, number>();
+    for (const kind of kinds) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    return [...counts.entries()].map(([kind, count]) => `${kind} ×${count}`).join(', ');
+}
+
+/**
  * Convert Claude request to Gemini generateContent format
  *
  * Async because an `image` block with a `source.type: 'url'` has no
@@ -62,9 +72,17 @@ export async function convertClaudeToGeminiRequest(
     // Gemini's functionResponse carries a tool *name*, Claude's tool_result only
     // a tool_use_id — so remember the name of every tool_use seen so far.
     const toolNamesById = new Map<string, string>();
+    // Content block kinds this hop has no generateContent part for, across the whole
+    // request, so the loss is reported once rather than per block (rule #8).
+    const droppedKinds: string[] = [];
+    /** Turns that lost every block they held, so they cannot be sent at all. */
+    const emptiedTurns: Array<{ index: number; kinds: string[] }> = [];
 
-    for (const msg of claudeRequest.messages) {
+    for (let msgIndex = 0; msgIndex < claudeRequest.messages.length; msgIndex++) {
+        const msg = claudeRequest.messages[msgIndex];
         const parts: Array<Record<string, unknown>> = [];
+        // Kinds this turn lost, so a turn left with nothing can be named.
+        const messageDropped: string[] = [];
 
         if (typeof msg.content === 'string') {
             parts.push({ text: msg.content });
@@ -133,16 +151,52 @@ export async function convertClaudeToGeminiRequest(
                         },
                     });
                 }
-                // Skip other block types for now
+                // Every other Content block type has no generateContent part. A
+                // `document` would be `inline_data` and is a projection decision of
+                // its own (review_fixes.md #7b); `thinking`, `server_tool_use` and
+                // the tool-result families have no counterpart to project to at all.
+                // Counted here and reported after the loop, so the counts survive a
+                // refusal below (rule #8).
+                else {
+                    const kind = typeof (block as { type?: unknown }).type === 'string'
+                        ? (block as { type: string }).type
+                        : '(no type)';
+                    messageDropped.push(kind);
+                    droppedKinds.push(kind);
+                }
             }
         }
-        
+
         if (parts.length > 0) {
             contents.push({
                 role: msg.role === 'user' ? 'user' : 'model',
                 parts
             });
+        } else if (messageDropped.length > 0) {
+            // Every block this turn held was unprojectable, so the turn cannot be
+            // sent — the upstream answers a conversation the client never wrote.
+            // Reported below, not refused: `thinking` is the common case here (a
+            // turn that thought but produced no text and no call), and failing the
+            // whole request over a turn that contributed nothing visible would turn
+            // a graceful degradation into a 400 on every Claude Code replay that
+            // carries one. `tests/unit/claude-to-gemini.test.ts` pins that shape.
+            emptiedTurns.push({ index: msgIndex, kinds: messageDropped });
         }
+    }
+
+    // One report per request, ahead of any refusal (rule #8): a conversion that
+    // skips data says what it skipped and how much.
+    if (droppedKinds.length > 0) {
+        warn(
+            `Claude content block(s) with no generateContent equivalent: ` +
+            `${formatDroppedKinds(droppedKinds)} — dropped`
+        );
+    }
+    for (const turn of emptiedTurns) {
+        warn(
+            `Claude messages[${turn.index}] would carry nothing ` +
+            `(${formatDroppedKinds(turn.kinds)}) — the turn is omitted`
+        );
     }
 
     const request: Record<string, unknown> = {

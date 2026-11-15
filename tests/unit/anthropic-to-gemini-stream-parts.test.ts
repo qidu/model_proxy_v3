@@ -20,7 +20,7 @@ import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { handleOpenAIRequest } from '../../src/handlers/openai.js';
-import { createLogger } from '../../src/utils/logger.js';
+import { createLogger, type Logger } from '../../src/utils/logger.js';
 
 const ENV = { LOG_LEVEL: 'error' } as any;
 const LOGGER = createLogger({});
@@ -83,7 +83,7 @@ interface GeminiChunk {
 }
 
 /** Run the handler for one canned upstream stream; return the Gemini chunks the client sees. */
-async function convert(writes: string[], clientPath = '/v1beta/models/claude-model:streamGenerateContent?alt=sse'): Promise<GeminiChunk[]> {
+async function convert(writes: string[], clientPath = '/v1beta/models/claude-model:streamGenerateContent?alt=sse', logger: Logger = LOGGER): Promise<GeminiChunk[]> {
   stubUpstream(writes);
   const response = await handleOpenAIRequest(
     new Request(`http://proxy.test${clientPath}`, {
@@ -91,13 +91,27 @@ async function convert(writes: string[], clientPath = '/v1beta/models/claude-mod
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'say hi' }] }] }),
     }),
-    UPSTREAM, AUTH, 'r-stream', 'claude-sonnet-4-6', ENV, LOGGER, true, undefined, 'anthropic-messages',
+    UPSTREAM, AUTH, 'r-stream', 'claude-sonnet-4-6', ENV, logger, true, undefined, 'anthropic-messages',
   );
   assert.equal(response.status, 200, 'the egress must answer 200');
   const text = await response.text();
   return text.split('\n\n')
     .filter(frame => frame.startsWith('data: '))
     .map(frame => JSON.parse(frame.slice(6)) as GeminiChunk);
+}
+
+/** A logger whose warnings are collected, for the drop reports. */
+function capturingLogger(): { logger: Logger; warnings: string[] } {
+  const warnings: string[] = [];
+  const noop = (): void => {};
+  return {
+    warnings,
+    logger: {
+      traceEnabled: false,
+      trace: noop, debug: noop, info: noop, error: noop,
+      warn: (_requestId: string, message: string) => { warnings.push(message); },
+    },
+  };
 }
 
 /** Every text a client would assemble from the stream, in order. */
@@ -244,5 +258,62 @@ describe('anthropic-messages → :streamGenerateContent: usageMetadata carries t
       MESSAGE_STOP,
     ]);
     assert.deepEqual(chunks.at(-1)?.usageMetadata, { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 });
+  });
+});
+
+/**
+ * Findings #16 and #17 of `review_fixes.md`, both in the tool-call path of this
+ * egress.
+ */
+describe('anthropic-messages → :streamGenerateContent: the tool-call path', () => {
+  it('keeps the turn\'s usage on the terminal chunk when the turn ends in a tool call', async () => {
+    // #16: the flush replaced the driver's finish chunk — the one frame that
+    // carries the counts — with a synthetic built from the buffered calls, so the
+    // terminal frame reported three zeros even though the turn had usage.
+    const chunks = await convert([
+      messageStart([], { input_tokens: 31, output_tokens: 0 }),
+      event('content_block_start', {
+        type: 'content_block_start', index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: {} },
+      }),
+      event('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"city":"sf"}' } }),
+      event('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      messageDelta({ input_tokens: 31, output_tokens: 9 }, 'tool_use'),
+      MESSAGE_STOP,
+    ]);
+
+    const terminal = chunks.at(-1)!;
+    assert.notEqual(terminal.candidates?.[0]?.finishReason, undefined, 'the turn must end on a terminal chunk');
+    assert.deepEqual(terminal.usageMetadata,
+      { promptTokenCount: 31, candidatesTokenCount: 9, totalTokenCount: 40 },
+      'the terminal frame must carry the turn\'s real counts, not the three zeros a synthetic chunk reports');
+  });
+
+  it('drops a tool call the upstream sent without a name, and says so', async () => {
+    // #17: `filter(a => a.name)` discarded it with no log, so the part the model
+    // asked for simply never reached the client and nothing recorded the loss.
+    const { logger, warnings } = capturingLogger();
+    const chunks = await convert([
+      messageStart([], { input_tokens: 12, output_tokens: 0 }),
+      event('content_block_start', {
+        type: 'content_block_start', index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_9', name: '', input: {} },
+      }),
+      event('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } }),
+      event('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      messageDelta({ input_tokens: 12, output_tokens: 3 }, 'tool_use'),
+      MESSAGE_STOP,
+    ], undefined, logger);
+
+    const calls = chunks.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).filter(p => p.functionCall !== undefined);
+    assert.deepEqual(calls, [], 'a nameless call cannot be projected — Gemini requires the name');
+
+    const report = warnings.find(w => /no name/i.test(w));
+    assert.ok(report, `expected a report naming the dropped call, got: ${JSON.stringify(warnings)}`);
+    assert.match(report!, /toolu_9/, 'the report must name the call so it can be traced upstream');
+
+    // The stream still ends cleanly: the drop is reported, not turned into a
+    // broken stream the client cannot interpret.
+    assert.notEqual(chunks.at(-1)?.candidates?.[0]?.finishReason, undefined);
   });
 });

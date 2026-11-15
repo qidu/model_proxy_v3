@@ -5,6 +5,42 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters, handlers): report what the conversion drops, and keep a tool-ending turn's usage
+
+Three reporting gaps from the review of the last 25 commits (`review_fixes.md` #7, #16, #17).
+
+**1. Content blocks with no generateContent part were dropped in silence.**
+`convertClaudeToGeminiRequest`'s block loop covered text/image/tool_use/tool_result and let
+everything else fall into `// Skip other block types`. A `document`, `thinking`, `server_tool_use`
+or any of the tool-result families left the request with no trace at all. One report per request now
+names each kind and its count, and a turn that lost *every* block it held — which cannot be sent —
+gets its own line with its message index.
+
+That second case is **reported rather than refused**, which is narrower than this change was first
+proposed as. `thinking` is the common case there (a turn that thought but produced no text and no
+call), and `tests/unit/claude-to-gemini.test.ts` already pins it as a skipped turn; failing the whole
+request over a turn that contributes nothing visible would turn a graceful degradation into a 400 on
+every Claude Code replay that carries one. Projecting the block instead is the real fix and stays
+open with #7b — `document` as Gemini `inline_data`, `thinking` as a `thought` part.
+
+**2. The terminal frame reported zero usage whenever a turn ended in a tool call.** The
+`:generateContent` tool flush replaced the driver's finish chunk — the only frame carrying the turn's
+counts — with a synthetic built from the buffered calls, and that synthetic carried no `usage`. The
+counts ride on it now, so `usageMetadata` on the terminal frame is the turn's real usage rather than
+three zeros.
+
+**3. A tool call with no name was dropped in silence.** Both dialects skipped it
+(`if (!call.name) continue`, `filter(a => a.name)`) with no log, so on `/v1/interactions` the client
+received an *empty stream*: HTTP 200, a clean close, and no way to tell the model had asked for a
+tool. Both now warn with the call's upstream id, and the stream still terminates normally — the drop
+is reported, not turned into a stream the client cannot interpret. The logger is threaded to the drop
+sites through `processSSEBuffer` / `processAnthropicSSEBuffer` / `processResponsesSSEBuffer` /
+`interactionsFramesForChunk`, all as optional parameters so their signatures stay source-compatible.
+
+**Verification**: six cases across `claude-to-gemini.test.ts` (three), `anthropic-to-gemini-stream-parts.test.ts`
+(two) and `interactions-over-anthropic-stream.test.ts` (one); all six fail against the previous code.
+`npm run typecheck`, `npm run build` and `npm run test:unit` pass (3002/3002).
+
 ### fix(converters, handlers): keep the array-form system prompt, and pair the beta header before the transforms run
 
 Two defects from the review of the last 25 commits (`review_fixes.md` #1 and #20).

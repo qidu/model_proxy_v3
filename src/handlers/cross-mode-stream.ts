@@ -128,6 +128,7 @@ function processAnthropicSSEBuffer(
   isInteractionsRequest: boolean,
   isGenerateContentRequest: boolean,
   usageAccum: AnthropicUsageAccumulator,
+  logger?: Logger,
 ): { processed: string; remaining: string } {
   let result = '';
   const events = buffer.split('\n\n');
@@ -149,7 +150,7 @@ function processAnthropicSSEBuffer(
       const emitText = (text: string): void => {
         if (text === '') return;
         const chunk = openAIChunk(text, model, anthropicUsageToCompletionUsage(usageAccum));
-        const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
+        const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
         result += processed;
       };
 
@@ -235,7 +236,7 @@ function processAnthropicSSEBuffer(
             }],
             ...(toolUsage ? { usage: toolUsage } : {}),
           };
-          const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
+          const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
           result += processed;
         } else if (thinkingBuffers?.has(parsed.index as number)) {
           // Emit the completed thinking block as a <think>…</think>-wrapped text so
@@ -264,7 +265,7 @@ function processAnthropicSSEBuffer(
           choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
           ...(finishUsage ? { usage: finishUsage } : {}),
         };
-        const { processed } = processSSEBuffer(`data: ${JSON.stringify(syntheticFinish)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
+        const { processed } = processSSEBuffer(`data: ${JSON.stringify(syntheticFinish)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
         result += processed;
       }
       // `message_stop` frees nothing. The Gemini dialects end naturally, and the
@@ -313,6 +314,7 @@ function processResponsesSSEBuffer(
   isInteractionsRequest: boolean,
   isGenerateContentRequest: boolean,
   state: ResponsesChatStreamState,
+  logger?: Logger,
 ): { processed: string; remaining: string } {
   // The terminal event already ended the answer: whatever is still buffered came
   // after it, and converting it would either repeat the ending or — for a partial
@@ -350,7 +352,7 @@ function processResponsesSSEBuffer(
       if (choice && choice.finish_reason != null && state.usage) {
         chunk.usage = state.usage;
       }
-      const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest);
+      const { processed } = processSSEBuffer(`data: ${JSON.stringify(chunk)}\n\n`, model, requestId, isInteractionsRequest, isGenerateContentRequest, logger);
       result += processed;
     }
     if (isInteractionsRequest && parsed.type === 'response.incomplete') {
@@ -400,8 +402,8 @@ export async function handleCrossModeStreamingResponse(
         buffer += rawChunk;
         logPipelineStage(logger, requestId, 'upstream-response', response.url || `(upstream SSE, ${source})`, rawChunk);
         const converted = source === 'anthropic-messages'
-          ? processAnthropicSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum)
-          : processResponsesSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest, responsesState);
+          ? processAnthropicSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum, logger)
+          : processResponsesSSEBuffer(buffer, model, requestId, isInteractionsRequest, isGenerateContentRequest, responsesState, logger);
         buffer = converted.remaining;
         if (converted.processed) {
           logPipelineStage(logger, requestId, 'outbound', 'stream', converted.processed);
@@ -410,8 +412,8 @@ export async function handleCrossModeStreamingResponse(
       }
       if (buffer.trim()) {
         const converted = source === 'anthropic-messages'
-          ? processAnthropicSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum)
-          : processResponsesSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest, responsesState);
+          ? processAnthropicSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest, usageAccum, logger)
+          : processResponsesSSEBuffer(buffer + '\n\n', model, requestId, isInteractionsRequest, isGenerateContentRequest, responsesState, logger);
         if (converted.processed) {
           logPipelineStage(logger, requestId, 'outbound', 'stream (final)', converted.processed);
           await writer.write(encoder.encode(converted.processed));
@@ -516,6 +518,7 @@ function interactionsFramesForChunk(
   requestId: string,
   model: string,
   toolCallBuffer: Map<number, GeminiToolCallAccum> | undefined,
+  logger?: Logger,
 ): string {
   const state = interactionStateFor(requestId, model);
   const choice = parsed?.choices?.[0];
@@ -541,7 +544,14 @@ function interactionsFramesForChunk(
   // fragment would announce a call with no name and no arguments.
   if (choice?.finish_reason) {
     for (const call of toolCallBuffer?.values() ?? []) {
-      if (!call.name) continue;
+      if (!call.name) {
+        // A `function_call` step needs a name — the SDK declares it Required — so
+        // this cannot be announced. Skipping it silently left a client with an
+        // empty stream and no way to tell the model had asked for a tool (rule #8).
+        logger?.warn(requestId,
+          `[gemini-stream] tool call ${JSON.stringify(call.id)} has no name; dropped rather than announced as a function_call step`);
+        continue;
+      }
       events = [...events, ...interactionStreamWholeStep(state, {
         type: 'function_call',
         id: call.id,
@@ -601,7 +611,7 @@ export function clearGeminiSSEState(requestId: string): void {
 /**
  * Process SSE buffer and extract complete events
  */
-export function processSSEBuffer(buffer: string, modelId: string, requestId: string, isInteractionsRequest: boolean = false, isGenerateContentRequest: boolean = false): { processed: string; remaining: string } {
+export function processSSEBuffer(buffer: string, modelId: string, requestId: string, isInteractionsRequest: boolean = false, isGenerateContentRequest: boolean = false, logger?: Logger): { processed: string; remaining: string } {
     let result = '';
     let remaining = buffer;
     
@@ -682,7 +692,7 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
                         // The Interactions dialect has no converted intermediate chunk
                         // to render and filter: the chunk's own fields become events.
                         if (isInteractionsRequest) {
-                            const frames = interactionsFramesForChunk(parsed, requestId, modelId, toolCallBuffer);
+                            const frames = interactionsFramesForChunk(parsed, requestId, modelId, toolCallBuffer, logger);
                             if (frames) result += frames;
                             continue;
                         }
@@ -701,7 +711,16 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
                         // them as complete functionCall parts into the converted chunk.
                         const finishReason = parsed?.choices?.[0]?.finish_reason;
                         if (isGenerateContentRequest && finishReason && toolCallBuffer && toolCallBuffer.size > 0) {
-                            const accumulated = Array.from(toolCallBuffer.values()).filter(a => a.name);
+                            const buffered = Array.from(toolCallBuffer.values());
+                            const accumulated = buffered.filter(a => a.name);
+                            // #17: a nameless call cannot become a functionCall part —
+                            // Gemini requires the name — so it is dropped, but not in
+                            // silence: the client sees a turn with no call and the log
+                            // is the only place that says one existed (rule #8).
+                            for (const nameless of buffered.filter(a => !a.name)) {
+                                logger?.warn(requestId,
+                                    `[gemini-stream] tool call ${JSON.stringify(nameless.id)} has no name; dropped rather than emitted as a functionCall part`);
+                            }
                             toolCallBuffer.clear();
                             geminiToolCallBuffers.delete(requestId);
                             const synthetic = {
@@ -718,6 +737,12 @@ export function processSSEBuffer(buffer: string, modelId: string, requestId: str
                                     },
                                     finish_reason: finishReason,
                                 }],
+                                // #16: this synthetic replaces the driver's finish
+                                // chunk — the one frame that carried the turn's usage —
+                                // so the counts have to ride along or the terminal
+                                // `usageMetadata` reports three zeros for a turn that
+                                // billed tokens.
+                                ...(parsed?.usage ? { usage: parsed.usage } : {}),
                             };
                             convertedChunk = convertOpenAIToGeminiGenerateContent(synthetic, modelId, requestId);
                         }
