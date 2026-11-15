@@ -993,6 +993,7 @@ function responsesChatChunk(
  *
  *   response.created                          → adopt the response id/created time
  *   response.output_text.delta                → delta.content
+ *   response.refusal.delta                    → delta.refusal
  *   response.reasoning_summary_text.delta
  *   response.reasoning_text.delta             → delta.reasoning_content
  *   response.output_item.added (function_call)→ delta.tool_calls (id, name, "")
@@ -1028,6 +1029,15 @@ function responsesEventToChatChunks(
     const delta = event.delta;
     if (typeof delta !== 'string' || delta === '') return [];
     return [responsesChatChunk(state, { content: delta }, null)];
+  }
+
+  if (type === 'response.refusal.delta') {
+    // A refused turn is an answer, not silence: without this the client gets a
+    // clean finish_reason "stop" and no text at all. The non-streaming converter
+    // keeps the same refusal in `message.refusal`.
+    const delta = event.delta;
+    if (typeof delta !== 'string' || delta === '') return [];
+    return [responsesChatChunk(state, { refusal: delta }, null)];
   }
 
   if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') {

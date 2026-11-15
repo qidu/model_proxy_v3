@@ -79,11 +79,11 @@ declared by **both** OpenAI APIs and by neither `anthropic-messages` nor a free-
 | target | outcome |
 |---|---|
 | `openai-completions` | receives `metadata` — the field it already has |
-| `openai-responses` | **dropped**: `completionsToResponsesBody` maps no `metadata`, though the Responses API declares it. A direct converter would close this one — the field is present at the target, only the hop-2 mapping is missing |
+| `openai-responses` | receives `metadata` — **fixed** (2026-11-15, review_fixes.md #21): `completionsToResponsesBody` maps the field, the only gap having been the hop-2 mapping |
 | `anthropic-messages` | **dropped**: Claude's `metadata` accepts only `user_id`, which no free-form map can fill at any architecture — so this loss is not attributable to the intermediate |
 
-`src/handlers/openai.ts` warns at both dropping hops rather than dropping in silence (rule #8), and
-`tests/unit/gemini-interactions-to-openai.test.ts` pins each landing.
+`src/handlers/openai.ts` warns at the one remaining dropping hop rather than dropping in silence
+(rule #8), and `tests/unit/gemini-interactions-to-openai.test.ts` pins each landing.
 
 ## Correction: `store` was never blocked by the intermediate
 

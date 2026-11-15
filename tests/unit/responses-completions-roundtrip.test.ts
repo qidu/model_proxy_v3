@@ -1153,6 +1153,29 @@ describe('responsesStreamEventToChatChunks', () => {
     ]);
   });
 
+  it('carries a refusal as delta.refusal instead of dropping the answer', () => {
+    // review_fixes.md #22: the non-streaming converter keeps `message.refusal`, but
+    // the streaming mapper had no branch for `response.refusal.delta`, so a refusal
+    // reached a Chat Completions client as an empty answer with finish_reason "stop".
+    const { chunks, state } = run([
+      { type: 'response.refusal.delta', delta: 'I can' },
+      { type: 'response.refusal.delta', delta: 'not help.' },
+      { type: 'response.refusal.done', refusal: 'I cannot help.' },
+      { type: 'response.completed', response: {} },
+    ]);
+
+    // Both fragments reach the client, in order. `refusal.done` adds no chunk of its
+    // own, the same way `output_text.done` does not: it only restates what streamed.
+    assert.deepEqual(
+      chunks.map(c => c.choices[0].delta).filter(delta => 'refusal' in delta),
+      [{ refusal: 'I can' }, { refusal: 'not help.' }],
+    );
+    assert.equal(chunks.some(c => 'content' in c.choices[0].delta && c.choices[0].delta.content !== ''), false,
+      'a refusal is not answer text — it must not be folded into content');
+    assert.equal(chunks.at(-1).choices[0].finish_reason, 'stop');
+    assert.equal(state.finished, true);
+  });
+
   it('gives tool calls dense indexes even when output_index counts other items', () => {
     const { chunks } = run([
       { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning' } },

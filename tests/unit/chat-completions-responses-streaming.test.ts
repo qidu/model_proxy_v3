@@ -22,6 +22,18 @@ const env = {} as any;
 
 const RESPONSES_URL = 'https://upstream/v1/responses';
 
+/**
+ * The request bodies the mock upstream received, so a case can assert on what
+ * actually crossed the hop rather than on the converter's return value.
+ */
+let upstreamBodies: string[] = [];
+
+/** Read one upstream send's body into `upstreamBodies`. */
+async function recordUpstreamBody(init?: RequestInit): Promise<void> {
+  const sent = init?.body;
+  upstreamBodies.push(typeof sent === 'string' ? sent : await new Response(sent as ReadableStream).text());
+}
+
 function makeRequest(body: Record<string, unknown>, stream = true): Request {
   return new Request('https://proxy.test/v1/chat/completions', {
     method: 'POST',
@@ -73,7 +85,11 @@ describe('handleChatCompletionsPassthrough — openai-responses streaming conver
   afterEach(() => { globalThis.fetch = realFetch; });
 
   async function run(events: Array<Record<string, unknown>>, body: Record<string, unknown> = {}, splitAt?: number): Promise<{ response: Response; chunks: any[] }> {
-    globalThis.fetch = (async () => responsesStreamResponse(events, splitAt)) as typeof fetch;
+    upstreamBodies = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      await recordUpstreamBody(init);
+      return responsesStreamResponse(events, splitAt);
+    }) as typeof fetch;
     const response = await handleChatCompletionsPassthrough(
       makeRequest(body), RESPONSES_URL, { Authorization: 'Bearer k' }, 'rid', testLogger, env, 'gpt-test', 'openai-responses',
     );
@@ -172,6 +188,44 @@ describe('handleChatCompletionsPassthrough — openai-responses streaming conver
     assert.equal(toolDeltas.slice(1).map(t => t.function.arguments).join(''), '{"city":"SF"}');
     assert.equal(chunks.some(c => c.choices[0].delta.content), false, 'no empty-string content frames');
     assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, 'tool_calls');
+  });
+
+  it('carries metadata and parallel_tool_calls to the openai-responses upstream', async () => {
+    // review_fixes.md #21: both are Responses create fields the front door's own API
+    // also declares, and both were dropped at this hop with no warning — while the
+    // reverse hop maps them, so a client's values survived one direction only.
+    await run(textAnswer('ok'), { metadata: { team: 'qa' }, parallel_tool_calls: false });
+
+    assert.equal(upstreamBodies.length, 1, 'the handler must have made exactly one upstream call');
+    const sent = JSON.parse(upstreamBodies[0]);
+    assert.deepEqual(sent.metadata, { team: 'qa' });
+    assert.equal(sent.parallel_tool_calls, false);
+  });
+
+  it('carries a refused answer to the client as delta.refusal, not as an empty answer', async () => {
+    // review_fixes.md #22, at the seam the client sees: the upstream refused the
+    // turn, and before the fix every event of this stream was dropped — the client
+    // got a well-formed finish_reason "stop" with no text and no reason why.
+    const { chunks } = await run([
+      { type: 'response.created', response: { id: 'resp_refusal', created_at: 1700000123, model: 'gpt-upstream' } },
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_1' } },
+      { type: 'response.refusal.delta', output_index: 0, content_index: 0, delta: 'I can' },
+      { type: 'response.refusal.delta', output_index: 0, content_index: 0, delta: ' not help.' },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: 'msg_1' } },
+      {
+        type: 'response.completed',
+        response: { id: 'resp_refusal', usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 } },
+      },
+    ]);
+
+    assert.equal(
+      chunks.flatMap(c => c.choices[0].delta.refusal ?? []).join(''),
+      'I can not help.',
+      'the refusal text must reach the client',
+    );
+    assert.equal(chunks.some(c => c.choices[0].delta.content), false,
+      'the refusal must not be passed off as answer text');
+    assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, 'stop');
   });
 
   it('aborts the client stream on response.failed instead of closing it as a success', async () => {

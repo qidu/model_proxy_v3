@@ -810,7 +810,7 @@ describe('convertGeminiInteractionsToOpenAI — labels', () => {
     }
   });
 
-  it('is dropped by both second hops, though only one of them lacks the field', async () => {
+  it('is carried by the Responses hop, and dropped only by the one that lacks the field', async () => {
     const intermediate = convertGeminiInteractionsToOpenAI(
       body({ labels: { team: 'qa' } }),
     ) as any;
@@ -818,10 +818,10 @@ describe('convertGeminiInteractionsToOpenAI — labels', () => {
     // The native hop forwards the intermediate as-is, so this is what an
     // openai-completions upstream receives.
     assert.deepEqual(intermediate.metadata, { team: 'qa' });
-    // Pinned, not fixed: the Responses API declares `metadata` but
-    // `completionsToResponsesBody` maps none, and Claude's `metadata` accepts only
-    // `user_id`. `src/handlers/openai.ts` warns at both hops (rule #8).
-    assert.equal('metadata' in (completionsToResponsesBody(intermediate, 'responses-target') as any), false);
+    // The Responses hop re-emits it as `metadata`, the field its own API declares
+    // (review_fixes.md #21); Claude's `metadata` accepts only `user_id`, so that one
+    // still drops it and `src/handlers/openai.ts` still warns (rule #8).
+    assert.deepEqual((completionsToResponsesBody(intermediate, 'responses-target') as any).metadata, { team: 'qa' });
     assert.equal('metadata' in (await completionsToClaudeBody(intermediate, 'claude-target') as any), false);
   });
 });

@@ -566,12 +566,11 @@ function systemInstructionToText(declared: unknown): string {
  * `completionsToResponsesBody` — and whatever this hop drops is unreachable at every
  * one of them.
  *
- * `labels` is the one field that rides the intermediate and then stops: the
- * openai-completions target receives `metadata` natively, while both second hops drop
- * it — `completionsToClaudeBody` maps no metadata and Claude's `metadata` accepts only
- * `user_id`, and `completionsToResponsesBody` maps none either even though the
- * Responses API declares the field. `src/handlers/openai.ts` warns at those two hops
- * rather than dropping it in silence (rule #8).
+ * `labels` rides the intermediate as `metadata`, and the openai-completions and
+ * openai-responses targets both receive it — the latter via `completionsToResponsesBody`,
+ * which re-emits the field the Responses API declares. Only `completionsToClaudeBody`
+ * drops it, because Claude's `metadata` accepts only `user_id`; `src/handlers/openai.ts`
+ * warns at that hop rather than dropping it in silence (rule #8).
  *
  * Still dropped here, as on the generateContent path: `seed` and the rest of
  * `generation_config` (`thinking_summaries`, `speech_config`), `background`,

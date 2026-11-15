@@ -132,18 +132,13 @@ describe('/v1/interactions → openai-responses: request fields reach the upstre
     assert.equal('labels' in upstream, false, 'the Interactions spelling must not reach the upstream');
   });
 
-  it('stops labels at the openai-responses hop, and says so', async () => {
-    // Pinned, not fixed: the Responses API does declare `metadata`, but
-    // `completionsToResponsesBody` re-emits none, so the field stops at this hop. The
-    // handler warns instead of dropping it in silence (rule #8).
-    const warnings: string[] = [];
-    const logger = { ...LOGGER, warn: (_id: string, message: string) => { warnings.push(message); } };
-    const upstream = await send(minimalBody({ labels: { team: 'qa' } }), 'openai-responses', '/v1/interactions', logger);
+  it('carries labels through the openai-responses hop as metadata', async () => {
+    // The field stops nowhere: the Responses API declares `metadata`, so
+    // `completionsToResponsesBody` re-emits it (review_fixes.md #21) and the handler
+    // no longer needs to warn. Asserted on the bytes the upstream fetch received.
+    const upstream = await send(minimalBody({ labels: { team: 'qa' } }), 'openai-responses');
 
-    assert.equal('metadata' in upstream, false);
-    // Filtered rather than counted: the response-side converters on this path have
-    // warnings of their own, and this case is about the request-side one.
-    assert.equal(warnings.filter(w => /labels not carried to the openai-responses upstream/.test(w)).length, 1);
+    assert.deepEqual(upstream.metadata, { team: 'qa' });
   });
 
   it('stops labels at the anthropic-messages hop, and says so', async () => {

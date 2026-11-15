@@ -246,15 +246,10 @@ async function forwardCompletionsAsOpenAIResponses(
 ): Promise<Response> {
   let responsesBody: Record<string, unknown> = completionsToResponsesBody(openaiRequest, model);
 
-  // Rule #8: the Interactions `labels` map reaches this hop as `metadata`, and
-  // `completionsToResponsesBody` maps no such field. The Responses API does declare
-  // `metadata`, so this is an unmapped hop rather than an impossible one — reported
-  // now rather than dropped in silence. See the `anthropic-messages` twin above for
-  // why `metadata` here can only be the client's labels.
-  if (openaiRequest.metadata !== undefined) {
-    logger.warn(requestId,
-      'labels not carried to the openai-responses upstream: completionsToResponsesBody does not map metadata; dropped');
-  }
+  // No warning for the Interactions `labels` map here: it rides the intermediate as
+  // `metadata`, which `completionsToResponsesBody` re-emits into a field the Responses
+  // API declares. The `anthropic-messages` twin above still warns — Claude's
+  // `metadata` accepts only `user_id`, so that loss is real.
 
   logger.debug(requestId, `Interactions/generateContent -> openai-responses body: ${JSON.stringify(responsesBody).substring(0, 500)}`);
 

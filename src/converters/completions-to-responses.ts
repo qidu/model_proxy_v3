@@ -508,6 +508,17 @@ export function completionsToResponsesBody(completions: Record<string, unknown>,
   // Both are set by `convertGeminiInteractionsToOpenAI` for an Interactions client,
   // and either may already be on the body from a Completions client.
   if (completions.store !== undefined) responsesBody.store = completions.store;
+  // Both are Responses create fields spelled the same way on both sides
+  // (`openai-response-methods-create.md:4369` for `metadata`, `:4629` for
+  // `parallel_tool_calls`), and the reverse hop maps both — so leaving them out here
+  // dropped a client's values on this direction only. `metadata` is also where an
+  // Interactions client's `labels` rides the intermediate.
+  if (completions.metadata !== undefined) {
+    responsesBody.metadata = completions.metadata as Record<string, string>;
+  }
+  if (completions.parallel_tool_calls !== undefined) {
+    responsesBody.parallel_tool_calls = completions.parallel_tool_calls as boolean;
+  }
   if (completions.reasoning_effort !== undefined) {
     responsesBody.reasoning = { effort: completions.reasoning_effort };
   }

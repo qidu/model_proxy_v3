@@ -497,6 +497,25 @@ describe('completionsToResponsesBody', () => {
     assert.equal(body.prompt_cache_key, 'cache-1');
   });
 
+  it('maps metadata and parallel_tool_calls, both declared by the Responses create request', () => {
+    // review_fixes.md #21: both are Responses `CreateParams` fields
+    // (`openai-response-methods-create.md:4629`, `:4369`) and both are mapped in the
+    // reverse hop, so leaving them out made the pair asymmetric.
+    const body = completionsToResponsesBody({
+      messages: [{ role: 'user', content: 'x' }],
+      metadata: { team: 'qa', round: 'r32' },
+      parallel_tool_calls: false,
+    } as any, 'm');
+
+    assert.deepEqual(body.metadata, { team: 'qa', round: 'r32' });
+    assert.equal(body.parallel_tool_calls, false);
+
+    // Absent from the request, absent from the body: neither field may be invented.
+    const bare = completionsToResponsesBody({ messages: [{ role: 'user', content: 'x' }] } as any, 'm');
+    assert.equal('metadata' in bare, false);
+    assert.equal('parallel_tool_calls' in bare, false);
+  });
+
   it('maps a tool_calls turn in the order the /v1/messages converter used', () => {
     // `reasoning_content` is the turn's preamble and comes before the tool calls; a
     // `thinking` content part travels with the message, so it comes after them.
