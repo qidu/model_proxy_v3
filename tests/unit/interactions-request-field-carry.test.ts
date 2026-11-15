@@ -265,3 +265,34 @@ describe('/v1/interactions → openai-responses: the steps that carry no content
     ]);
   });
 });
+
+/**
+ * Finding #18 of `review_fixes.md`: `defaultMissingOpenAIMessageRoles` was gated on
+ * `openai-completions`, so a role-less `input.messages` entry rode the intermediate
+ * untouched and reached the two converted hops as it was — Claude requires a `role`
+ * on every message, and a Responses message item declares one, so both rejected it.
+ */
+describe('a role-less input message is filled in on every upstream mode', () => {
+  const roleLessInput = (): Record<string, unknown> => ({
+    model: 'gemini-test',
+    input: { messages: [{ content: 'hi' }] },
+  });
+
+  it('fills the role before the anthropic-messages hop', async () => {
+    const upstream = await send(roleLessInput(), 'anthropic-messages');
+    assert.equal((upstream.messages as Array<Record<string, unknown>>)[0].role, 'user',
+      'Claude rejects a message with no role');
+  });
+
+  it('fills the role before the openai-responses hop', async () => {
+    const upstream = await send(roleLessInput(), 'openai-responses');
+    assert.equal((upstream.input as Array<Record<string, unknown>>)[0].role, 'user',
+      'a Responses message item declares a role');
+  });
+
+  it('still fills the role on the openai-completions path, which already did', async () => {
+    // The control: the un-gating must not disturb the path the helper was written for.
+    const upstream = await send(roleLessInput(), 'openai-completions');
+    assert.equal((upstream.messages as Array<Record<string, unknown>>)[0].role, 'user');
+  });
+});

@@ -5,6 +5,22 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): fill a missing message role on every upstream mode, not only openai-completions
+
+A Gemini front door forwards `input.messages` verbatim, and nothing requires the client to put a
+`role` on every entry. `defaultMissingOpenAIMessageRoles` ran only on the `openai-completions` path,
+so a role-less entry rode the intermediate untouched and reached the converted hops exactly as the
+client wrote it: Claude rejects a message with no `role`, and a Responses message item declares one.
+Measured before the fix — `{"content":"hi"}` at the `anthropic-messages` hop and
+`{"type":"message","content":[…]}` at the `openai-responses` hop. The call is now gated on the front
+door alone, so both hops receive a message they can send.
+
+**Verification**: `interactions-request-field-carry.test.ts` gains three cases — the role filled
+before the `anthropic-messages` hop, before the `openai-responses` hop, and on the
+`openai-completions` path as the control. The first two fail against the previous gate; the third
+pins that the path the helper was written for is undisturbed. `npm run typecheck`, `npm run build`
+and `npm run test:unit` pass (3005/3005).
+
 ### fix(converters, handlers): report what the conversion drops, and keep a tool-ending turn's usage
 
 Three reporting gaps from the review of the last 25 commits (`review_fixes.md` #7, #16, #17).

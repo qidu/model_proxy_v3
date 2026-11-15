@@ -476,7 +476,14 @@ export async function handleOpenAIRequest(
       isStreaming = true;
     }
 
-    if (isGeminiEndpoint && (!upstreamMode || upstreamMode === 'openai-completions')) {
+    // A Gemini front door is the one that forwards `input.messages` verbatim
+    // (`convertGeminiInteractionsToOpenAI`), and nothing requires the client to put
+    // a role on every entry. Fill it for every upstream mode rather than only
+    // `openai-completions`: the converted hops need it just as much — a Claude
+    // message requires a `role`, and a Responses message item declares one — so the
+    // old gate let a role-less entry through to be rejected upstream, with the
+    // proxy having done nothing to it.
+    if (isGeminiEndpoint) {
       defaultMissingOpenAIMessageRoles(openaiRequest);
     }
 
