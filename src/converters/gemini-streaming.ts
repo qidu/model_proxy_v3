@@ -6,7 +6,7 @@
 import { GeminiSSEEvent, GeminiContent } from '../types/gemini.js';
 import { stringify } from '../utils/stringify.js';
 import type { Logger } from '../utils/logger.js';
-import { convertGenerateContentToInteraction, blockedPromptReason } from './gemini-to-interactions.js';
+import { convertGenerateContentToInteraction, blockedPromptReason, BLOCKING_FINISH_REASONS } from './gemini-to-interactions.js';
 import {
     createInteractionStreamState,
     interactionStepFromContent,
@@ -347,7 +347,13 @@ function handleNativeGeminiChunk(
     }
 
     const usage = convertGeminiUsageToClaudeUsage(chunk.usageMetadata as Record<string, unknown> | undefined);
-    if (candidate?.finishReason || usage) {
+    // A blocked prompt is terminal and carries no `finishReason` and no usage: the
+    // upstream ends the stream right after the `promptFeedback` chunk. Without this
+    // the mapper emitted the `message_start` and then nothing at all — an
+    // unterminated Claude stream (finding #6).
+    const blockReason = blockedPromptReason(chunk.promptFeedback);
+    const blocked = blockReason !== undefined;
+    if (candidate?.finishReason || usage || blocked) {
         closeOpenBlock();
         if (
             candidate?.finishReason === 'STOP' &&
@@ -364,16 +370,41 @@ function handleNativeGeminiChunk(
         }
         sendClaudeEvent(controller, 'message_delta', {
             type: 'message_delta',
-            delta: {
-                stop_reason: state.hasToolUse
-                    ? 'tool_use'
-                    : candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn',
-            },
+            delta: { stop_reason: nativeStopReason(candidate?.finishReason, state, blocked) },
             ...(usage ? { usage } : {}),
         });
         sendClaudeEvent(controller, 'message_stop', { type: 'message_stop' });
         state.hasEnded = true;
     }
+    if (blocked) {
+        state.logger?.warn(
+            requestId,
+            `[gemini->claude] the upstream blocked the prompt (${blockReason}); returning stop_reason "refusal"`,
+        );
+    }
+}
+
+/**
+ * The Claude `stop_reason` for a native Gemini turn, from the same vocabulary the
+ * non-streaming egress uses so one upstream answer cannot be described two ways.
+ *
+ * A withheld answer is `refusal` — the member the API declares for a policy block
+ * (`messages-create.md:4521`) — and it wins over a tool call, which is only the
+ * turn's outcome when the upstream stopped *for* it (Gemini reports a completed
+ * call as `STOP`). Reporting `tool_use` for every reason erased a truncation: a
+ * turn cut off at the token limit looked like a finished call (finding #15).
+ */
+function nativeStopReason(
+    finishReason: string | undefined,
+    state: StreamingState,
+    blocked: boolean,
+): string {
+    if (blocked || (finishReason !== undefined && BLOCKING_FINISH_REASONS.has(finishReason))) {
+        return 'refusal';
+    }
+    if (finishReason === 'MAX_TOKENS') return 'max_tokens';
+    if (state.hasToolUse && (finishReason === 'STOP' || finishReason === undefined)) return 'tool_use';
+    return 'end_turn';
 }
 
 function handleGeminiEvent(

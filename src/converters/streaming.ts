@@ -298,7 +298,9 @@ export function createStreamTransformer(
                     let finalStopReason = "end_turn";
                     if (upstreamFinishReason === 'tool_calls' || upstreamFinishReason === 'tool_use') finalStopReason = 'tool_use';
                     else if (upstreamFinishReason === 'length') finalStopReason = 'max_tokens';
-                    else if (upstreamFinishReason === 'content_filter') finalStopReason = 'content_filter';
+                    // Completions' spelling of a policy block, in the Claude dialect's
+                    // member for it (`messages-create.md:4521`).
+                    else if (upstreamFinishReason === 'content_filter') finalStopReason = 'refusal';
                     else if ((!upstreamFinishReason || upstreamFinishReason === 'stop') && hasToolCalls) finalStopReason = 'tool_use';
 
                     // Send message_delta with final token counts

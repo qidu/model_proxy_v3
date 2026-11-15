@@ -211,6 +211,39 @@ describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode
     assert.equal(chunks[chunks.length - 1], '[DONE]');
   });
 
+  it('streaming: a withheld answer reaches a Completions client as content_filter', async () => {
+    // The Completions member for a policy block is `content_filter`
+    // (`openai-api-reference.md:92`), and this egress already used it for the two
+    // reasons it happened to recognize — so the other six of the set Gemini
+    // withholds an answer with (`PROHIBITED_CONTENT`, `BLOCKLIST`, `SPII`, the image
+    // ones) arrived as a clean `stop` with a generic "unmapped finishReason"
+    // warning. The non-streaming shape of this same route says `content_filter` for
+    // all of them (via the Claude `refusal`), so the two shapes disagreed.
+    const encoder = new TextEncoder();
+    globalThis.fetch = (async () =>
+      new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({
+              candidates: [{ content: { role: 'model', parts: [] }, finishReason: 'PROHIBITED_CONTENT' }],
+            })}\n\n`,
+          ));
+          controller.close();
+        },
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } })) as typeof fetch;
+
+    const res = await handleChatCompletionsPassthrough(
+      makeRequest({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }, true),
+      'https://upstream/v1beta/models/g:streamGenerateContent',
+      { Authorization: 'Bearer k' }, 'rid-blocked', testLogger, env, 'g', 'gemini-generatecontent',
+    );
+
+    const chunks = (await res.text()).split('\n\n').filter(s => s.startsWith('data: ')).map(s => s.slice(6));
+    const parsed = chunks.filter(s => s !== '[DONE]').map(s => JSON.parse(s));
+    const finish = parsed.find((c: any) => c.choices[0]?.finish_reason);
+    assert.equal(finish.choices[0].finish_reason, 'content_filter');
+  });
+
   it('streaming: a functionCall becomes an OpenAI tool_calls delta with finish_reason tool_calls', async () => {
     globalThis.fetch = (async () => geminiToolCallStreamResponse()) as typeof fetch;
 

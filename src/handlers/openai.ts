@@ -206,7 +206,16 @@ export function claudeJsonToSyntheticCompletions(claudeJson: Record<string, unkn
         } : {}),
         ...(thinkingText ? { reasoning_content: thinkingText } : {}),
       },
-      finish_reason: toolUseBlocks.length > 0 ? 'tool_calls' : (claudeJson.stop_reason === 'max_tokens' ? 'length' : 'stop'),
+      // `refusal` is the Claude dialect's member for a withheld answer and
+      // `content_filter` its Completions counterpart (`openai-api-reference.md:92`),
+      // so a block survives this last hop instead of reading as a clean `stop`. The
+      // Claude `refusal` reaches here from either upstream dialect: the Gemini
+      // egresses report it directly, and a Claude upstream carries it natively.
+      finish_reason: toolUseBlocks.length > 0
+        ? 'tool_calls'
+        : claudeJson.stop_reason === 'max_tokens' ? 'length'
+        : claudeJson.stop_reason === 'refusal' ? 'content_filter'
+        : 'stop',
     }],
     usage: (() => {
       const u = claudeJson.usage as Record<string, unknown> | undefined;

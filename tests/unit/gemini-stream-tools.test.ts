@@ -180,4 +180,49 @@ describe('createGeminiStreamTransformer — native functionCall', () => {
     const messageDelta = events.find(e => e.event === 'message_delta')!;
     assert.equal(messageDelta.data.delta.stop_reason, 'max_tokens');
   });
+
+  it('keeps the truncation when the truncated turn also carried a tool call', async () => {
+    // finding #15: the tool call overrode every finish reason, so a turn cut off
+    // mid-call reported tool_use — the truncation erased, and the client left
+    // believing the model had finished the call it was still writing.
+    const events = await convert([
+      {
+        candidates: [{
+          content: { parts: [{ functionCall: { name: 'get_weather', args: { city: 'SF' } } }] },
+          finishReason: 'MAX_TOKENS',
+        }],
+      },
+    ]);
+
+    const messageDelta = events.find(e => e.event === 'message_delta')!;
+    assert.equal(messageDelta.data.delta.stop_reason, 'max_tokens');
+  });
+
+  it('ends the stream on a withheld answer instead of leaving it unterminated', async () => {
+    // finding #6's streaming half: a blocked prompt arrives as a chunk carrying
+    // `promptFeedback` and *no* `finishReason`, and this mapper emitted the
+    // `message_start` and then nothing — an unterminated Claude stream, with no
+    // terminal event and no way for the client to tell the prompt never ran.
+    const events = await convert([
+      { promptFeedback: { blockReason: 'SAFETY' } },
+    ]);
+
+    const messageDelta = events.find(e => e.event === 'message_delta')!;
+    assert.ok(messageDelta, 'a blocked prompt must still close the message');
+    assert.equal(messageDelta.data.delta.stop_reason, 'refusal');
+    assert.ok(events.some(e => e.event === 'message_stop'), 'and terminate the stream');
+  });
+
+  it('reports a withheld answer that did carry a finishReason the same way', async () => {
+    // The same answer as the non-streaming egress gives it: `refusal`, whatever the
+    // upstream spelled the block as. Streaming used to call all of these `end_turn`.
+    for (const finishReason of ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT', 'BLOCKLIST']) {
+      const events = await convert([
+        { candidates: [{ content: { parts: [{ text: '' }] }, finishReason }] },
+      ]);
+
+      const messageDelta = events.find(e => e.event === 'message_delta')!;
+      assert.equal(messageDelta.data.delta.stop_reason, 'refusal', `${finishReason} withheld the answer`);
+    }
+  });
 });

@@ -274,22 +274,74 @@ describe('convertGeminiGenerateContentToClaude', () => {
     assert.equal(resp.stop_reason, 'max_tokens');
   });
 
-  it('maps SAFETY and RECITATION -> stop_sequence', () => {
+  it('maps a withheld answer to refusal, the member the API declares for one', () => {
+    // finding #15: SAFETY and RECITATION were mapped to `stop_sequence` — "one of
+    // your provided custom `stop_sequences` was generated" (`messages-create.md`)
+    // — which is a reason the client's own stop string matched, and it was reported
+    // without the non-null `stop_sequence` that reason requires. `refusal` is the
+    // member the API declares for a policy block, so the answer is no longer
+    // indistinguishable from a clean empty one (finding #6).
+    const { logger, warnings } = recordingLogger();
     const safety = convertGeminiGenerateContentToClaude(
       { candidates: [{ content: { parts: [{ text: 'x' }] }, finishReason: 'SAFETY' }] },
       'm',
       'r',
+      { logger, stopSequences: [] },
     );
-    const recitation = convertGeminiGenerateContentToClaude(
-      { candidates: [{ content: { parts: [{ text: 'x' }] }, finishReason: 'RECITATION' }] },
+    assert.equal(safety.stop_reason, 'refusal');
+    assert.match(warnings.join('\n'), /SAFETY/, 'the reason the upstream gave must be reported');
+
+    // The same answer for the rest of the withholding set, which used to reach the
+    // client as a null stop_reason.
+    for (const finishReason of ['RECITATION', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'IMAGE_SAFETY']) {
+      const resp = convertGeminiGenerateContentToClaude(
+        { candidates: [{ content: { parts: [{ text: 'x' }] }, finishReason }] },
+        'm',
+        'r',
+      );
+      assert.equal(resp.stop_reason, 'refusal', `${finishReason} withheld the answer`);
+    }
+  });
+
+  it('maps a blocked prompt with no candidate at all to refusal, not to a clean empty answer', () => {
+    // finding #6: `{"promptFeedback":{"blockReason":"SAFETY"}}` produced
+    // `{"content":[],"stop_reason":null}` and zero warnings — a 200 the client cannot
+    // tell from an empty answer, with no way to know the prompt never ran.
+    const { logger, warnings } = recordingLogger();
+    const resp = convertGeminiGenerateContentToClaude(
+      { promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } },
+      'm',
+      'r',
+      { logger },
+    );
+
+    assert.deepEqual(resp.content, []);
+    assert.equal(resp.stop_reason, 'refusal');
+    assert.match(warnings.join('\n'), /PROHIBITED_CONTENT/, 'the block reason must be reported');
+  });
+
+  it('keeps a truncation when the truncated turn also carried a tool call', () => {
+    // finding #15: `hasToolUse` overrode every finish reason, so a turn cut off at
+    // the token limit reported `tool_use` and the truncation was erased — the client
+    // believes the model finished the call it was still writing. The comment
+    // justifying the override names only STOP, which is the case Gemini really does
+    // report for a completed call.
+    const truncated = convertGeminiGenerateContentToClaude(
+      {
+        candidates: [{
+          content: { parts: [{ functionCall: { name: 'get_weather', args: { city: 'SF' } } }] },
+          finishReason: 'MAX_TOKENS',
+        }],
+      },
       'm',
       'r',
     );
-    assert.equal(safety.stop_reason, 'stop_sequence');
-    assert.equal(recitation.stop_reason, 'stop_sequence');
+    assert.equal(truncated.stop_reason, 'max_tokens');
   });
 
   it('returns empty content, null stop_reason and zeroed usage with no candidates', () => {
+    // Unchanged by the refusal mapping: an absent `promptFeedback` is not a block,
+    // so a body with neither candidates nor a block still reports nothing.
     const resp = convertGeminiGenerateContentToClaude({}, 'm', 'r');
     assert.deepEqual(resp.content, []);
     assert.equal(resp.stop_reason, null);

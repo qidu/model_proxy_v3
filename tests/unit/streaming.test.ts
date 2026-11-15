@@ -137,6 +137,15 @@ describe('createStreamTransformer — text content', () => {
     assert.equal(md!.data.delta.stop_reason, 'end_turn');
   });
 
+  it('maps finish_reason=content_filter to refusal, the member the API declares', async () => {
+    // The Completions spelling of a policy block, translated into the Claude one
+    // (`messages-create.md:4521`) rather than passed through as a value Anthropic's
+    // own enum does not declare.
+    const events = await runTransformer([oa({ content: '' }), finalThenDone('content_filter')]);
+    const md = events.find(e => e.event === 'message_delta');
+    assert.equal(md!.data.delta.stop_reason, 'refusal');
+  });
+
   it('maps finish_reason=length to max_tokens', async () => {
     const events = await runTransformer([oa({ content: 'x' }), finalThenDone('length')]);
     const md = events.find(e => e.event === 'message_delta');

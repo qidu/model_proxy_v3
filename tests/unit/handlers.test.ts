@@ -289,6 +289,57 @@ describe('completionsToClaudeBody', () => {
     );
   });
 
+  it('carries reasoning_effort as the declared output_config.effort', async () => {
+    // finding #14: `output_config.effort` is declared (`messages-create.md:2417`) and
+    // the reverse hop maps it (`claude-to-openai.ts`), so a value that only travelled
+    // one way left a Completions client at the upstream's default effort — a
+    // different answer at a different cost, with nothing said.
+    for (const effort of ['low', 'medium', 'high', 'max']) {
+      const body = await completionsToClaudeBody({
+        messages: [{ role: 'user', content: 'x' }], reasoning_effort: effort,
+      } as any, 'm');
+      assert.deepEqual(body.output_config, { effort }, `${effort} must survive`);
+    }
+  });
+
+  it('folds the two efforts Claude has no member for onto its nearest', async () => {
+    // `minimal` is the Interactions `thinking_level` floor and rides this hop as
+    // `reasoning_effort` (`gemini-to-openai.ts`); Claude's enum starts at `low`.
+    // `xhigh` is the same fold the reverse hop applies. `normalizeEffort` is shared
+    // between the two directions so they cannot disagree about the four values.
+    const minimal = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'minimal',
+    } as any, 'm');
+    assert.deepEqual(minimal.output_config, { effort: 'low' });
+
+    const xhigh = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'xhigh',
+    } as any, 'm');
+    assert.deepEqual(xhigh.output_config, { effort: 'max' });
+  });
+
+  it('merges effort into an output_config that already carries a format', async () => {
+    // Both knobs live under `output_config`, and the format block assigns the object
+    // wholesale — so the order they are applied in decides whether one clobbers the
+    // other.
+    const body = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }],
+      response_format: { type: 'json_object' },
+      reasoning_effort: 'high',
+    } as any, 'm');
+    assert.deepEqual(body.output_config, {
+      format: { type: 'json_schema', schema: { type: 'object' } },
+      effort: 'high',
+    });
+  });
+
+  it('emits no effort for a value Claude has no member for', async () => {
+    const body = await completionsToClaudeBody({
+      messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'turbo',
+    } as any, 'm');
+    assert.equal('output_config' in body, false);
+  });
+
   it('emits no output_config for response_format text or an unknown type', async () => {
     const text = await completionsToClaudeBody({
       messages: [{ role: 'user', content: 'x' }], response_format: { type: 'text' },
@@ -692,6 +743,20 @@ describe('claudeJsonToSyntheticCompletions', () => {
     assert.equal((out.choices as any[])[0].finish_reason, 'tool_calls');
     // content null when only tool_calls + empty text
     assert.equal(msg.content, null);
+  });
+
+  it('maps stop_reason=refusal to finish_reason=content_filter', () => {
+    // The Claude dialect's member for a withheld answer is `refusal` — what both
+    // Gemini egresses now report (findings #6/#15) — and its Completions counterpart
+    // is `content_filter`, "content was omitted due to a flag from our content
+    // filters" (`openai-api-reference.md:92`). Mapping it to `stop` here made this
+    // route lose the block that its own streaming egress reports
+    // (`chat-completions.ts` maps a Gemini safety block to `content_filter`).
+    const out = claudeJsonToSyntheticCompletions({
+      content: [],
+      stop_reason: 'refusal',
+    }, 'm');
+    assert.equal((out.choices as any[])[0].finish_reason, 'content_filter');
   });
 
   it('maps stop_reason=max_tokens to finish_reason=length', () => {

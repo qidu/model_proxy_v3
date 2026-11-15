@@ -34,8 +34,12 @@ import { stringify } from '../utils/stringify.js';
 /**
  * Finish reasons that mean the model did not answer at all: a safety or
  * provenance filter stopped it, and `outputs` is empty or partial by policy.
+ *
+ * Exported because every egress that has to say *why* an answer is empty needs the
+ * same vocabulary — the Claude egresses map this set onto `stop_reason: "refusal"`,
+ * the member the Messages API declares for a policy block.
  */
-const BLOCKING_FINISH_REASONS = new Set([
+export const BLOCKING_FINISH_REASONS = new Set([
     'SAFETY', 'RECITATION', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII',
     'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_RECITATION',
 ]);

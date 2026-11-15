@@ -127,9 +127,19 @@ function convertClaudeToolChoiceToOpenAI(toolChoice: ClaudeMessagesRequest['tool
 }
 
 /**
- * Normalize effort value, mapping non-standard values like "xhigh" to valid ones
+ * Any effort spelling onto Claude's four members — the vocabulary both directions
+ * of this hop need, since `output_config.effort` is declared on the Messages API
+ * (`messages-create.md:2417`) and mapped from here.
+ *
+ * Two values fold onto their nearest member: `xhigh`, a spelling some OpenAI
+ * routing layers use for above-`high`, and `minimal`, the Interactions
+ * `thinking_level` floor, which rides a Completions body as `reasoning_effort`
+ * (`gemini-to-openai.ts`) and has no member below Claude's `low`. A value with no
+ * member at all returns undefined and is left unmapped.
+ *
+ * Exported for `completions-to-claude.ts`, the other direction of the same hop.
  */
-function normalizeEffort(effort: string | undefined): "low" | "medium" | "high" | "max" | undefined {
+export function normalizeEffort(effort: string | undefined): "low" | "medium" | "high" | "max" | undefined {
     if (!effort) return undefined;
     switch (effort) {
         case "low": return "low";
@@ -137,6 +147,7 @@ function normalizeEffort(effort: string | undefined): "low" | "medium" | "high" 
         case "high": return "high";
         case "max": return "max";
         case "xhigh": return "max";
+        case "minimal": return "low";
         default: return undefined;
     }
 }

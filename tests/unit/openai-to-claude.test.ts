@@ -183,6 +183,19 @@ describe('convertOpenAIToClaudeResponse', () => {
     assert.equal(out.stop_reason, 'max_tokens');
   });
 
+  it('maps finish_reason=content_filter → refusal, the member the API declares', async () => {
+    // `refusal` is the Messages API's member for a policy block
+    // (`messages-create.md:4521`); `content_filter` is the Completions spelling of
+    // the same fact and appears nowhere in the Anthropic enum. Passing it through
+    // gave a Claude client a stop_reason its own SDK does not declare — and one that
+    // disagreed with the `refusal` the Gemini egresses report for the same block.
+    const out = await convertOpenAIToClaudeResponse(
+      resp({ message: { role: 'assistant', content: '' }, finish_reason: 'content_filter' }),
+      'model-a', 'req-1',
+    );
+    assert.equal(out.stop_reason, 'refusal');
+  });
+
   it('uses a response-level signature for extracted thinking when available', async () => {
     const out = await convertOpenAIToClaudeResponse(
       resp(

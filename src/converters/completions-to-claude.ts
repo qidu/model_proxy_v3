@@ -14,6 +14,7 @@
 import { OpenAIContent, OpenAIMessage } from '../types/openai.js';
 import { ValidationError } from '../utils/errors.js';
 import { decodeDataUriOrRef } from './claude-to-gemini.js';
+import { normalizeEffort } from './claude-to-openai.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
 import { isBlobRef, rebindBlobRef } from '../utils/blob-refs.js';
 import { openAIContentToText, completionsForcedToolName } from './completions-to-responses.js';
@@ -204,6 +205,23 @@ export async function completionsToClaudeBody(completions: Record<string, unknow
       }
       claudeBody.output_config = { format: { type: 'json_schema', schema } };
     }
+  }
+
+  // Effort: the Completions scalar `reasoning_effort` is the Messages API's
+  // `output_config.effort`, which the API declares (`messages-create.md:2417`) and
+  // the reverse hop already maps (`claude-to-openai.ts`). An Interactions client's
+  // `thinking_level` rides the same field by the time it reaches here
+  // (`gemini-to-openai.ts`), so this one mapping carries both. `normalizeEffort` is
+  // the shared fold onto Claude's four members — including `minimal` to `low`, the
+  // nearest member below which the API declares none — and a value with no member
+  // at all is left unmapped rather than guessed at.
+  const effort = normalizeEffort(
+    typeof completions.reasoning_effort === 'string' ? completions.reasoning_effort : undefined,
+  );
+  if (effort) {
+    // Merged rather than assigned: `output_config.format` may already be set above,
+    // and the two knobs share the object.
+    claudeBody.output_config = { ...(claudeBody.output_config as Record<string, unknown> ?? {}), effort };
   }
 
   if (completions.tools && Array.isArray(completions.tools) && (completions.tools as unknown[]).length > 0) {

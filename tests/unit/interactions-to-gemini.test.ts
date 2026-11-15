@@ -451,6 +451,30 @@ describe('convertInteractionsToGenerateContent — generation_config', () => {
     assert.deepEqual(listed.toolConfig, { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['f', 'g'] } });
   });
 
+  it('keeps the mode the client declared beside an allow-list', () => {
+    // finding #9: `{mode:'none', tools:['f']}` was sent as ANY + allowedFunctionNames,
+    // which is the opposite of what the client asked — "never call a tool" became
+    // "you must call one of these". `AllowedTools` declares `mode` and `tools` as
+    // peers, and generateContent keeps `allowedFunctionNames` only under ANY
+    // (`@google/genai`: "Only set when the Mode is ANY"), so the mode decides and
+    // the list follows it.
+    const none = body({ ...userTurn, generation_config: { tool_choice: { mode: 'none', tools: ['f'] } } }).body as any;
+    assert.deepEqual(none.toolConfig, { functionCallingConfig: { mode: 'NONE' } });
+
+    const auto = body({ ...userTurn, generation_config: { tool_choice: { mode: 'auto', tools: ['f'] } } }).body as any;
+    assert.deepEqual(auto.toolConfig, { functionCallingConfig: { mode: 'AUTO' } });
+  });
+
+  it('reports the allow-list it dropped to honour the mode', () => {
+    const out = body({ ...userTurn, generation_config: { tool_choice: { mode: 'none', tools: ['f'] } } });
+    assert.deepEqual(out.dropped, ['generation_config.tool_choice.tools']);
+  });
+
+  it('keeps an allow-list with no mode as ANY, the only mode that reads it', () => {
+    const out = body({ ...userTurn, generation_config: { tool_choice: { tools: ['f'] } } }).body as any;
+    assert.deepEqual(out.toolConfig, { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['f'] } });
+  });
+
   it('refuses a tool_choice it cannot honour instead of letting the model choose freely', () => {
     assertRefused({ ...userTurn, generation_config: { tool_choice: 'sometimes' } }, /has no generateContent mode/);
   });

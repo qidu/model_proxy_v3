@@ -727,7 +727,7 @@ function buildConfig(request: Record<string, unknown>): {
     // rather than guessed at.
     if (config.speech_config !== undefined) dropped.push('generation_config.speech_config');
 
-    const toolConfig = buildToolConfig(config.tool_choice);
+    const toolConfig = buildToolConfig(config.tool_choice, dropped);
 
     return {
         ...(Object.keys(out).length > 0 ? { generationConfig: out } : {}),
@@ -760,9 +760,11 @@ function buildThinkingConfig(config: Record<string, unknown>): Record<string, un
  * `generation_config.tool_choice` -> `toolConfig.functionCallingConfig`. Accepts
  * the bare enum and the object form, both of which the Interactions spec allows.
  * An unrecognized value is refused rather than dropped: a client that forced a
- * tool would otherwise get a free-choice turn with no way to tell.
+ * tool would otherwise get a free-choice turn with no way to tell. A *declared*
+ * mode is authoritative — see the allow-list handling below — and an allow-list
+ * the mode cannot carry is reported through `dropped`.
  */
-function buildToolConfig(toolChoice: unknown): Record<string, unknown> | undefined {
+function buildToolConfig(toolChoice: unknown, dropped: string[]): Record<string, unknown> | undefined {
     if (toolChoice === undefined || toolChoice === null) return undefined;
 
     if (typeof toolChoice === 'string') {
@@ -787,11 +789,22 @@ function buildToolConfig(toolChoice: unknown): Record<string, unknown> | undefin
     const allowed = Array.isArray(choice.tools)
         ? choice.tools.filter((n): n is string => typeof n === 'string' && n !== '')
         : [];
+    const mode = callingMode(choice.type ?? choice.mode);
+
+    // The mode decides, and the allow-list follows it: generateContent reads
+    // `allowedFunctionNames` only under ANY ("Only set when the Mode is ANY",
+    // `@google/genai`: FunctionCallingConfig), while `AllowedTools` declares `mode`
+    // and `tools` as peers. A list standing beside `none` or `auto` is therefore
+    // dropped — and reported — rather than promoted to ANY, which is what turned
+    // "never call a tool" into "you must call one of these" (finding #9).
+    if (mode && mode !== 'ANY') {
+        if (allowed.length > 0) dropped.push('generation_config.tool_choice.tools');
+        return { functionCallingConfig: { mode } };
+    }
+    // No mode, or ANY: the list is honored, ANY being the only mode that can read it.
     if (allowed.length > 0) {
         return { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: allowed } };
     }
-
-    const mode = callingMode(choice.type ?? choice.mode);
     if (!mode) {
         throw new ValidationError(`Interactions tool_choice ${stringify(toolChoice)} has no generateContent mode`);
     }

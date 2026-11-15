@@ -24,6 +24,7 @@ import {
 } from '../converters/responses-to-completions.js';
 import { convertCompletionsToGeminiGenerateContentBody } from '../converters/claude-to-gemini.js';
 import { convertGeminiGenerateContentToClaude } from '../converters/gemini-to-claude.js';
+import { BLOCKING_FINISH_REASONS } from '../converters/gemini-to-interactions.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { collectBlobRefs } from '../utils/blob-refs.js';
@@ -670,7 +671,12 @@ export async function handleChatCompletionsPassthrough(
                   if (sawToolCall) mapped = 'tool_calls';
                   else if (finishReason === 'STOP') mapped = 'stop';
                   else if (finishReason === 'MAX_TOKENS') mapped = 'length';
-                  else if (finishReason === 'SAFETY' || finishReason === 'RECITATION') mapped = 'content_filter';
+                  // The whole withholding set, not the two reasons that happened to
+                  // be listed: `content_filter` is Completions' member for a policy
+                  // block (`openai-api-reference.md:92`), and the non-streaming shape
+                  // of this route reports all of them too (through the Claude
+                  // `refusal`, `claudeJsonToSyntheticCompletions`).
+                  else if (BLOCKING_FINISH_REASONS.has(finishReason)) mapped = 'content_filter';
                   else {
                     // Rule #8: report the raw value rather than let it read as a clean stop.
                     logger.warn(requestId, `${path} gemini-generatecontent stream: unmapped finishReason ${JSON.stringify(finishReason)}, reported as "stop"`);

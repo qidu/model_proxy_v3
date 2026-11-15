@@ -34,7 +34,11 @@ function convertFinishReasonToStopReason(finishReason: string | null): string | 
         length: "max_tokens",
         tool_calls: "tool_use",
         "stop_sequence": "end_turn",
-        "content_filter": "content_filter",
+        // `content_filter` is Completions' member for a policy block; the Messages
+        // API's is `refusal` (`messages-create.md:4521`), and `content_filter` is not
+        // a member of its eum at all — passing it through handed a Claude client a
+        // stop_reason its own SDK does not declare.
+        "content_filter": "refusal",
     };
 
     return stopReasonMap[finishReason] || "end_turn";

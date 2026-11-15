@@ -8,6 +8,7 @@ import { GeminiInteractionResponse, GeminiContent, GeminiUsage } from '../types/
 import { stringify } from '../utils/stringify.js';
 import { Logger } from '../utils/logger.js';
 import { SYNTHETIC_THINKING_SIGNATURE } from './openai-to-claude.js';
+import { BLOCKING_FINISH_REASONS, blockedPromptReason } from './gemini-to-interactions.js';
 
 /**
  * Convert Gemini interaction response to Claude format
@@ -185,7 +186,7 @@ export function convertGeminiGenerateContentToClaude(
     const usageMetadata = geminiResponse.usageMetadata as Record<string, number> | undefined;
     
     let content: ClaudeContentBlock[] = [];
-    let stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence' | 'timeout' | null = null;
+    let stopReason: 'end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence' | 'timeout' | 'refusal' | null = null;
     let hasToolUse = false;
 
     if (candidates && candidates.length > 0) {
@@ -297,15 +298,26 @@ export function convertGeminiGenerateContentToClaude(
             case 'MAX_TOKENS':
                 stopReason = 'max_tokens';
                 break;
-            case 'SAFETY':
-            case 'RECITATION':
-                stopReason = 'stop_sequence';
-                break;
             default:
-                // Rule #8: an unmapped raw value must not read as a clean stop when
-                // it reaches the client. `undefined`/`null`/`FINISH_REASON_UNSPECIFIED`
-                // mean "no reason given", which is nothing to report.
-                if (finishReason && finishReason !== 'FINISH_REASON_UNSPECIFIED') {
+                // A withheld answer is `refusal` — "when streaming classifiers
+                // intervene to handle potential policy violations"
+                // (`messages-create.md:4521`). It used to be `stop_sequence`, which
+                // the API defines as a *client's own* stop string having been
+                // generated (and requires a non-null `stop_sequence` for), so a
+                // blocked turn was reported as something the client asked for; the
+                // rest of the withholding set reached the client as a null
+                // `stop_reason` with only a generic "unmapped" warning.
+                if (finishReason !== undefined && BLOCKING_FINISH_REASONS.has(finishReason)) {
+                    stopReason = 'refusal';
+                    options?.logger?.warn(
+                        requestId,
+                        `[gemini->claude] the upstream withheld the answer (finishReason ${finishReason}); ` +
+                        'returning stop_reason "refusal"',
+                    );
+                } else if (finishReason && finishReason !== 'FINISH_REASON_UNSPECIFIED') {
+                    // Rule #8: an unmapped raw value must not read as a clean stop when
+                    // it reaches the client. `undefined`/`null`/`FINISH_REASON_UNSPECIFIED`
+                    // mean "no reason given", which is nothing to report.
                     options?.logger?.warn(
                         requestId,
                         `[gemini->claude] unmapped Gemini finishReason ${JSON.stringify(finishReason)}; ` +
@@ -314,13 +326,32 @@ export function convertGeminiGenerateContentToClaude(
                 }
         }
 
-        // Gemini reports a tool call as finishReason STOP; the block itself
-        // is what makes this turn a tool turn.
-        if (hasToolUse) {
+        // A tool call is the turn's outcome only when the upstream ended the turn
+        // for that reason. Gemini reports a *completed* call as `STOP`, which the
+        // block then speaks for; every other reason is the more informative fact.
+        // Overriding them all erased a truncation — a turn cut off mid-call reported
+        // `tool_use`, and the client acted on a call the model was still writing
+        // (`review_fixes.md` finding #15).
+        if (hasToolUse && (finishReason === 'STOP' || finishReason === '')) {
             stopReason = 'tool_use';
         }
     }
-    
+
+    // A blocked prompt comes back with no candidate at all, so the mapping above
+    // never ran: the answer was `content: []` with a null `stop_reason`, which a
+    // client cannot tell from an empty answer, and nothing was logged (finding #6).
+    // `refusal` is the member the API declares for a policy block
+    // (`messages-create.md:4521`), and the block reason is reported to the operator.
+    const blockReason = blockedPromptReason(geminiResponse.promptFeedback);
+    if (blockReason !== undefined) {
+        stopReason = 'refusal';
+        options?.logger?.warn(
+            requestId,
+            `[gemini->claude] the upstream blocked the prompt (${blockReason}) and returned no candidate; ` +
+            'returning stop_reason "refusal"',
+        );
+    }
+
     return {
         id: `msg_${Date.now()}_${requestId.slice(-8)}`,
         type: 'message',

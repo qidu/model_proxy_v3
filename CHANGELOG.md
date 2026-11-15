@@ -5,6 +5,76 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): a withheld answer and a blocked prompt are `refusal`, not a clean empty answer
+
+Two findings that turn out to be one: what a policy block looks like on the Claude dialect.
+
+- `hasToolUse` overrode **every** finish reason, so a turn cut off at the token limit reported
+  `tool_use` and the truncation was erased — a client acted on a call the model was still writing. The
+  comment justifying the override names only `STOP`, which is the case Gemini really does report for a
+  completed call. A tool call is now the turn's outcome only when the upstream stopped *for* it.
+- `SAFETY` and `RECITATION` were mapped to `stop_sequence`, which the API defines as *the client's own*
+  stop string having been generated (and requires a non-null `stop_sequence` for), so a blocked turn was
+  reported as something the client asked for. The rest of the withholding set (`PROHIBITED_CONTENT`,
+  `BLOCKLIST`, `SPII`, the image-safety reasons) reached the client as a null `stop_reason` with a
+  generic "unmapped" warning.
+- A **blocked prompt** arrives with no candidate at all and no `finishReason`, so the mapping never ran:
+  non-streaming gave `content: []` with a null `stop_reason`, streaming emitted a `message_start` and
+  then nothing — an unterminated Claude stream. Both egresses now treat `promptFeedback.blockReason` as
+  terminal and report the reason.
+
+The member both egresses use is `refusal` — "when streaming classifiers intervene to handle potential
+policy violations" (`messages-create.md:4521`). `BLOCKING_FINISH_REASONS` is now exported from
+`gemini-to-interactions.ts`, whose Interactions egress already used the full set: the Claude egresses
+listed two of its eight reasons and the streaming Completions egress two others, so a block was reported
+as `refusal`, as `stop_sequence`, as `content_filter` or as a null `stop_reason` depending on the route.
+
+**Carrying the value to the end of the chain.** A new `refusal` is only useful if the last hop keeps it,
+so three more sites were aligned (this is the scope beyond the two findings, and it is what makes the
+Completions front door behave like the streaming shape of the same route):
+
+| hop | before | now |
+|---|---|---|
+| `claudeJsonToSyntheticCompletions` (non-streaming Completions client, e.g. a Gemini upstream) | `refusal` → `stop` | `refusal` → `content_filter` |
+| `chat-completions.ts` streaming (Gemini upstream) | two reasons → `content_filter`, the rest `stop` + warn | the whole withholding set → `content_filter` |
+| `openai-to-claude.ts` / `streaming.ts` (Completions upstream) | `content_filter` → `content_filter`, a value Anthropic's enum does not declare | `content_filter` → `refusal` |
+
+**Verification**: ten new or rewritten cases, each red before its fix — non-streaming (`refusal` for the
+whole withholding set, a blocked prompt with no candidate, a truncation beside a tool call) and
+streaming (a `promptFeedback`-only stream now terminates, the same withholding set, a truncation beside
+a tool call) for the Gemini egresses, plus the four cross-dialect cases above. `npm run typecheck`,
+`npm run build` and `npm run test:unit` pass (3060/3060).
+
+### fix(converters): keep the tool_choice mode the client declared beside an allow-list
+
+`{mode:'none', tools:['f']}` was sent as `ANY` with `allowedFunctionNames`, which is the opposite of what
+the client asked: "never call a tool" became "you must call one of these". `AllowedTools` declares `mode`
+and `tools` as peers, and generateContent reads `allowedFunctionNames` only under `ANY` ("Only set when
+the Mode is ANY", `@google/genai`), so the mode now decides and the list follows it — kept for `any` and
+`validated`, and reported through the converter's `dropped` list for `none` and `auto`, where it cannot be
+honored. A list with no mode at all stays `ANY`, the only mode that can read it.
+
+**Verification**: three cases in `interactions-to-gemini.test.ts`, two failing against the previous code
+(the mode kept, the drop reported) and one pinning the no-mode default that must not change.
+`npm run typecheck`, `npm run build` and `npm run test:unit` pass (3060/3060).
+
+### fix(converters): carry reasoning_effort to the Claude egress as output_config.effort
+
+`output_config.effort` is declared (`messages-create.md:2417`) and the reverse hop mapped it, while this
+direction mapped nothing: a Completions client's `reasoning_effort` — which is also where an Interactions
+`thinking_level` rides by the time it arrives (`gemini-to-openai.ts`) — reached a Claude upstream as the
+default effort, a different answer at a different cost with nothing said.
+
+The mapping reuses `normalizeEffort` (`claude-to-openai.ts`, now exported), so both directions fold onto
+Claude's four members through one table. Two values fold onto their nearest: `xhigh` → `max`, and
+`minimal` — the Interactions floor, with no member below Claude's `low` — → `low`. A value with no member
+(`turbo`) stays unmapped. The assignment merges into `output_config`, which `response_format` may already
+carry, so the two knobs cannot clobber each other.
+
+**Verification**: four cases in `handlers.test.ts`, three failing against the previous code (the four
+direct values, the two folds, the merge with a format) and one pinning that an unmappable value stays
+unmapped. `npm run typecheck`, `npm run build` and `npm run test:unit` pass (3060/3060).
+
 ### fix(converters): read an Interactions `input` array element by element, the same way on both doors
 
 The array's *first* element used to decide how the whole array was read: a `role` meant Turns, a step
