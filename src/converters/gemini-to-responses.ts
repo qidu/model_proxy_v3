@@ -82,7 +82,7 @@ function contentPartToResponses(
   return undefined;
 }
 
-function systemInstructionText(value: unknown): string {
+export function systemInstructionText(value: unknown): string {
   if (value === undefined || value === null) return '';
   if (typeof value === 'string') return value;
   const record = asRecord(value);
@@ -105,7 +105,7 @@ interface LastCall {
   name: string;
 }
 
-function functionResponseOutput(value: unknown): string {
+export function functionResponseOutput(value: unknown): string {
   return typeof value === 'string' ? value : stringify(value ?? {});
 }
 

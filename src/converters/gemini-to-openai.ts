@@ -1,9 +1,9 @@
 /**
  * Gemini request → OpenAI Chat Completions conversion.
  *
- * The ingress half of the remaining Completions bridge: a client speaking
- * generateContent or Interactions is converted for an openai-completions or
- * anthropic-messages upstream. The Responses routes use their direct converters. The
+ * The ingress half of the remaining Completions bridge. GenerateContent uses this
+ * for an openai-completions upstream; Interactions also uses it for Claude. Responses
+ * and generateContent → Claude routes use their direct converters. The
  * egress halves live in `openai-to-gemini.ts` (Completions → Gemini) and
  * `handlers/cross-mode-stream.ts` (upstream SSE → Completions chunks).
  *

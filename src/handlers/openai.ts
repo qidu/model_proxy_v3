@@ -38,16 +38,17 @@ import {
   responsesEventToGeminiChunks,
   responsesToGeminiResponse,
 } from '../converters/responses-to-gemini.js';
+import { extractGeminiAllowedTools, geminiToClaudeBody } from '../converters/gemini-to-claude-request.js';
+import {
+  claudeEventToGeminiChunks,
+  claudeToGeminiResponse,
+  createClaudeGeminiStreamState,
+} from '../converters/claude-to-gemini-response.js';
 
 /**
- * Forward an OpenAI Chat Completions body as a Claude Messages request to an
- * anthropic-messages upstream. Used when the inbound endpoint is
- * /v1/interactions or :generateContent and the route is anthropic-messages.
- *
- * The body has already been converted from Gemini/Claude to OpenAI Completions
- * by handleOpenAIRequest; we run a second conversion to Claude Messages format
- * and call the upstream directly. The response is converted from Claude
- * format back to the Gemini endpoint shape (Interactions or generateContent).
+ * Remaining Interactions → Claude bridge. GenerateContent uses the direct R7
+ * converter before this legacy dispatch. The response returns in the client's
+ * Gemini dialect.
  */
 async function forwardCompletionsAsAnthropicMessages(
   openaiRequest: Record<string, unknown>,
@@ -361,6 +362,134 @@ async function forwardCompletionsAsOpenAIResponses(
   const fallbackHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
   logPipelineHeaders(logger, requestId, 'outbound', '(fallback responses passthrough)', fallbackHeaders);
   return new Response(JSON.stringify(responsesJson), { headers: fallbackHeaders });
+}
+
+async function forwardGenerateContentAsAnthropicMessages(
+  requestBody: Record<string, unknown>,
+  targetUrl: string,
+  authHeaders: Record<string, string>,
+  requestId: string,
+  model: string,
+  logger: Logger,
+  originalRequest: Request,
+  forceStreaming: boolean,
+  env?: Env,
+  route?: ModelRouteConfig,
+): Promise<Response> {
+  let claudeBody = await geminiToClaudeBody(requestBody, model, { logger, requestId });
+  if (forceStreaming) claudeBody.stream = true;
+  const isStreaming = claudeBody.stream === true;
+  const allowedTools = extractGeminiAllowedTools(requestBody);
+  ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_upstream', route, upstreamMode: 'anthropic-messages',
+      clientModel: model, requestId, streaming: isStreaming, logger,
+    };
+    ({ body: claudeBody, headers: authHeaders } = runHook('before_upstream', { body: claudeBody, headers: authHeaders }, hookCtx));
+  }
+
+  const anthropicHeaders = { ...authHeaders };
+  if (anthropicHeaders['x-api-key']) delete anthropicHeaders.Authorization;
+  const headers = {
+    'Content-Type': 'application/json',
+    ...addForwardedHeaders(anthropicHeaders, originalRequest),
+  };
+  logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
+  logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, headers);
+  let response = await postJsonWithSpool(targetUrl, claudeBody, {
+    headers,
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+  });
+  if (route) {
+    response = await applyAfterUpstream(response, {
+      hook: 'after_upstream', route, upstreamMode: 'anthropic-messages',
+      clientModel: model, requestId, streaming: isStreaming, logger, signal: originalRequest.signal,
+    });
+  }
+  logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
+  recordResponseStatusCodeFromUpstream(response.status);
+  recordUpstreamResponseToolCount('anthropic-messages', 0);
+  recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+  if (!response.ok) {
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, text => text, originalRequest.signal);
+    handleTargetApiError(response, 'generateContent (direct anthropic-messages)', { url: targetUrl, upstreamBody });
+  }
+
+  if (isStreaming) return handleClaudeStreamAsGemini(response, model, requestId, logger, allowedTools);
+  const claudeJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, originalRequest.signal,
+  );
+  const geminiResponse = claudeToGeminiResponse(claudeJson, model, { logger, requestId, allowedTools });
+  logPipelineStage(logger, requestId, 'outbound', ':generateContent', geminiResponse);
+  return new Response(JSON.stringify(geminiResponse), {
+    headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+  });
+}
+
+function handleClaudeStreamAsGemini(
+  response: Response,
+  model: string,
+  requestId: string,
+  logger: Logger,
+  allowedTools: Set<string> | null,
+): Response {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    throw new Error(`Claude upstream answered a streaming request with '${contentType || '(no content-type)'}' instead of text/event-stream`);
+  }
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const state = createClaudeGeminiStreamState(model);
+
+  const processEvent = async (rawEvent: string): Promise<void> => {
+    if (state.finished) return;
+    const data = rawEvent.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n');
+    if (!data || data === '[DONE]') return;
+    const event = JSON.parse(data) as Record<string, unknown>;
+    if (event.type === 'error') throw new Error(`Claude stream failed: ${JSON.stringify(event.error ?? event)}`);
+    for (const chunk of claudeEventToGeminiChunks(state, event, { logger, requestId, allowedTools })) {
+      logPipelineStage(logger, requestId, 'outbound', 'stream', chunk);
+      await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+    }
+  };
+
+  (async () => {
+    try {
+      if (!response.body) throw new Error('Claude upstream returned an empty stream');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const rawChunk = decoder.decode(value, { stream: true });
+        logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', rawChunk);
+        buffer += rawChunk;
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || '';
+        for (const event of events) await processEvent(event);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) await processEvent(buffer);
+      if (!state.finished) throw new Error(`Claude stream ended before a terminal stop_reason (request ${requestId})`);
+      await writer.close();
+    } catch (error) {
+      logger.error(requestId, `generateContent direct Claude streaming error: ${(error as Error).message}`);
+      await writer.abort();
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive', 'x-request-id': requestId,
+    },
+  });
 }
 
 async function forwardGenerateContentAsOpenAIResponses(
@@ -690,6 +819,13 @@ export async function handleOpenAIRequest(
       return forwardInteractionsAsOpenAIResponses(
         requestBody, targetUrl, authHeaders, requestId,
         (requestBody.model as string) || modelId || 'unknown', activeLogger, request, env, route,
+      );
+    }
+    if (isGenerateContentRequest && upstreamMode === 'anthropic-messages' && Array.isArray(requestBody.contents)) {
+      return forwardGenerateContentAsAnthropicMessages(
+        requestBody, targetUrl, authHeaders, requestId,
+        modelId || (requestBody.model as string) || 'unknown', activeLogger, request,
+        forceStreaming === true || isStreamRequest, env, route,
       );
     }
     if (isGenerateContentRequest && upstreamMode === 'openai-responses' && Array.isArray(requestBody.contents)) {

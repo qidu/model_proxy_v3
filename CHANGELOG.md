@@ -5,6 +5,19 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refact(gemini): direct generateContent ↔ Claude Messages conversion
+
+`:generateContent` with `anthropic-messages` no longer routes through Chat Completions. The direct request converter
+carries function declarations, Google Search, code execution, generation controls, thinking, documents, structured
+output, and ordered tool history. Claude JSON and SSE convert directly back to generateContent with signed thoughts,
+complete function calls, cache-aware usage, refusals, and terminal states. Multi-function allow-lists are enforced on
+converted responses because Claude cannot express the set directly.
+
+The route preserves hooks, blob-ref streaming, bounded responses, error envelopes, and the existing DeepSeek thinking
+compatibility block. Thought signatures retain the route's existing opaque round-trip behavior; this does not claim
+cross-provider signature validity. Routed coverage is in `tests/unit/gemini-claude-direct.test.ts`, with the existing
+Anthropic/Gemini stream tests and request-ref matrix.
+
 ### refact(gemini): direct generateContent ↔ OpenAI Responses conversion
 
 `:generateContent` with `openai-responses` and `/v1/responses` with either Gemini mode no longer bridge through Chat

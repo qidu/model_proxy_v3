@@ -1,7 +1,6 @@
 /**
- * `anthropic-messages` upstream → Gemini `:streamGenerateContent` egress: the
- * answer text and the usage both have to survive `processAnthropicSSEBuffer`
- * (`src/handlers/openai.ts`).
+ * `anthropic-messages` upstream → Gemini `:streamGenerateContent` egress. R7 now
+ * consumes Claude SSE directly in `claude-to-gemini-response.ts`.
  *
  * Before this file's change, the converter recognized text in exactly one shape
  * — `content_block_delta` with `delta.type === 'text_delta'` — so an upstream
@@ -279,7 +278,9 @@ describe('anthropic-messages → :streamGenerateContent: usageMetadata carries t
       messageDelta({ output_tokens: 5 }),
       MESSAGE_STOP,
     ]);
-    assert.deepEqual(chunks.at(-1)?.usageMetadata, { promptTokenCount: 150, candidatesTokenCount: 5, totalTokenCount: 155 });
+    assert.deepEqual(chunks.at(-1)?.usageMetadata, {
+      promptTokenCount: 150, candidatesTokenCount: 5, totalTokenCount: 155, cachedContentTokenCount: 40,
+    });
   });
 
   it('reports no usage it was not given, rather than a guess', async () => {
