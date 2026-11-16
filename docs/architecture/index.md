@@ -31,6 +31,7 @@ Design documents, architectural decisions, and planning documents for Model Prox
 ## Routing Architecture
 
 - [Routing Review](./routing-review.md) — Transform route tradeoffs and recommendations
+- [Indirect vs Direct Transforms](./review-indirect-vs-direct-transforms.md) — Audit of the cross-mode matrix against the code, and which bridged routes are worth a direct converter (advisory, no code changed)
 - [Routing Refactor](./routing_refactor.md) — Routing refactoring notes
 - [Routing Config Revision](./routing_config_revision.md) — Configuration revision for routing
 

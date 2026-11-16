@@ -590,9 +590,9 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
       return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/messages'), handlerType: 'chat-completions', upstreamMode: 'anthropic-messages' };
     }
     if (!fixed && isGemini) {
-      // The chat-completions handler handles non-streaming (:generateContent);
-      // streaming lands in Phase 3.
-      return { kind: 'chat-completions', targetUrl: geminiModelUrl('generateContent'), handlerType: 'chat-completions', upstreamMode };
+      return upstreamMode === 'gemini-interactions'
+        ? { kind: 'chat-completions', targetUrl: upstreamUrl('v1beta/interactions'), handlerType: 'chat-completions', upstreamMode }
+        : { kind: 'chat-completions', targetUrl: geminiModelUrl('generateContent'), handlerType: 'chat-completions', upstreamMode };
     }
     return { kind: 'chat-completions', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'chat-completions', upstreamMode: 'openai-completions' };
   }

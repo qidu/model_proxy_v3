@@ -23,8 +23,15 @@ import {
   responsesStreamEventToChatChunks,
 } from '../converters/responses-to-completions.js';
 import { convertCompletionsToGeminiGenerateContentBody } from '../converters/claude-to-gemini.js';
+import { completionsToInteractionsBody } from '../converters/completions-to-interactions.js';
 import { convertGeminiGenerateContentToClaude } from '../converters/gemini-to-claude.js';
 import { BLOCKING_FINISH_REASONS } from '../converters/gemini-to-interactions.js';
+import {
+  convertInteractionToChatCompletion,
+  createInteractionChatStreamState,
+  interactionEventToChatChunks,
+  interactionStreamUsageChunk,
+} from '../converters/interactions-to-completions.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { collectBlobRefs } from '../utils/blob-refs.js';
@@ -495,10 +502,16 @@ export async function handleChatCompletionsPassthrough(
     return new Response(JSON.stringify(answer.completions), { status: 200, headers: responsesOutHeaders });
   }
 
+  if (upstreamMode === 'gemini-interactions') {
+    return handleAsGeminiInteractions(
+      request, targetUrl, authHeaders, requestId, logger, env, modelId, route,
+      parsedBody, isStreaming, streamRefs,
+    );
+  }
+
   // When the upstream is gemini-generatecontent, convert the OpenAI completions
   // body to a Gemini generateContent body, forward it, then convert the native
-  // Gemini response back to OpenAI completions JSON. Non-streaming only in
-  // Phase 2; streaming lands in Phase 3.
+  // Gemini response back to OpenAI completions JSON.
   if (upstreamMode === 'gemini-generatecontent') {
     const model = (parsedBody.model as string || modelId || 'unknown');
 
@@ -807,5 +820,162 @@ export async function handleChatCompletionsPassthrough(
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,
     headers: responseHeaders,
+  });
+}
+
+async function handleAsGeminiInteractions(
+  request: Request,
+  targetUrl: string,
+  authHeaders: Record<string, string>,
+  requestId: string,
+  logger: Logger,
+  env: Env,
+  modelId: string | undefined,
+  route: ModelRouteConfig | undefined,
+  parsedBody: Record<string, unknown>,
+  isStreaming: boolean,
+  streamRefs: boolean,
+): Promise<Response> {
+  const path = '/v1/chat/completions';
+  const model = (parsedBody.model as string || modelId || 'unknown');
+  let interactionsBody = completionsToInteractionsBody(parsedBody, model);
+  logger.debug(requestId, `${path} converted to gemini-interactions body`);
+
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_upstream',
+      route,
+      upstreamMode: 'gemini-interactions',
+      clientModel: model,
+      requestId,
+      streaming: isStreaming,
+      logger,
+    };
+    ({ body: interactionsBody, headers: authHeaders } = runHook('before_upstream', { body: interactionsBody, headers: authHeaders }, hookCtx));
+  }
+
+  const interactionsHeaders: Record<string, string> = { ...authHeaders };
+  repackBearerCredential(interactionsHeaders, 'x-goog-api-key');
+  const streamed = streamRefs ? createRefAwareJsonBody(interactionsBody) : undefined;
+  const fetchHeaders = {
+    'Content-Type': 'application/json',
+    ...addForwardedHeaders(interactionsHeaders, request),
+    ...(streamed ? { 'Content-Length': String(streamed.contentLength) } : {}),
+  };
+  logPipelineStage(logger, requestId, 'upstream-request', targetUrl, interactionsBody);
+  logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, fetchHeaders);
+  let upstreamResponse = streamed
+    ? await fetch(targetUrl, {
+      method: 'POST',
+      headers: fetchHeaders,
+      body: streamed.body,
+      duplex: 'half',
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+    } as RequestInit)
+    : await postJsonWithSpool(targetUrl, interactionsBody, {
+      headers: fetchHeaders,
+      signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env as Record<string, unknown>)),
+    });
+
+  if (route) {
+    upstreamResponse = await applyAfterUpstream(upstreamResponse, {
+      hook: 'after_upstream', route, upstreamMode: 'gemini-interactions',
+      clientModel: model, requestId, streaming: isStreaming, logger, signal: request.signal,
+    });
+  }
+
+  logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, upstreamResponse.headers);
+  recordResponseStatusCodeFromUpstream(upstreamResponse.status);
+  recordUpstreamRateLimit(model, name => upstreamResponse.headers.get(name), targetUrl);
+  if (!upstreamResponse.ok) {
+    const errText = await withResponseText(upstreamResponse, requestId, logger, targetUrl, text => text, request.signal);
+    return new Response(errText, {
+      status: upstreamResponse.status,
+      headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+    });
+  }
+
+  if (isStreaming) {
+    return handleInteractionsStreamAsChat(upstreamResponse, parsedBody, model, requestId, logger);
+  }
+
+  const interaction = await receiveJsonResponse<Record<string, unknown>>(
+    upstreamResponse, requestId, logger, upstreamResponse.url || targetUrl, request.signal,
+  );
+  const completion = convertInteractionToChatCompletion(interaction, model, requestId, { logger, requestId });
+  logPipelineStage(logger, requestId, 'outbound', path, completion);
+  return new Response(JSON.stringify(completion), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+  });
+}
+
+function handleInteractionsStreamAsChat(
+  response: Response,
+  requestBody: Record<string, unknown>,
+  model: string,
+  requestId: string,
+  logger: Logger,
+): Response {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const state = createInteractionChatStreamState(model, requestId);
+  const includeUsage = (requestBody.stream_options as Record<string, unknown> | undefined)?.include_usage === true;
+
+  const writeChunks = async (chunks: Array<Record<string, unknown>>): Promise<void> => {
+    for (const chunk of chunks) {
+      logPipelineStage(logger, requestId, 'outbound', 'stream', chunk);
+      await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+    }
+  };
+  const processEvent = async (rawEvent: string): Promise<void> => {
+    const data = rawEvent.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n');
+    if (!data) return;
+    const event = JSON.parse(data) as Record<string, unknown>;
+    await writeChunks(interactionEventToChatChunks(state, event, { logger, requestId }));
+  };
+
+  (async () => {
+    try {
+      if (!response.body) throw new Error('Interactions upstream returned an empty stream');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const rawChunk = decoder.decode(value, { stream: true });
+        logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', rawChunk);
+        buffer += rawChunk;
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || '';
+        for (const event of events) await processEvent(event);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) await processEvent(buffer);
+      if (!state.finished) throw new Error(`Interactions stream ended before interaction.completed (request ${requestId})`);
+      if (includeUsage) {
+        const usageChunk = interactionStreamUsageChunk(state);
+        if (usageChunk) await writeChunks([usageChunk]);
+      }
+      await writer.write(encoder.encode('data: [DONE]\n\n'));
+      await writer.close();
+    } catch (error) {
+      logger.error(requestId, `gemini-interactions streaming error: ${(error as Error).message}`);
+      await writer.abort();
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'x-request-id': requestId,
+    },
   });
 }

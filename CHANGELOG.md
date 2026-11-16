@@ -5,6 +5,18 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(handlers): route Chat Completions to native Gemini Interactions
+
+`gemini-interactions` now explicitly means the native Interactions API. The `/v1/chat/completions` cell posts converted
+requests to `/v1beta/interactions` instead of falling through with an unconverted Chat Completions body to a
+`:generateContent` URL. The direct converter pair carries function declarations, tool calls and results, text,
+reasoning, images, generation options, structured output, and usage; native Interactions JSON and SSE responses are
+converted back to Chat Completions, and truncated streams abort without a false terminal frame.
+
+The README and API-schema matrices now use Native passthrough, Direct, and Bridged labels with request hop counts.
+They also identify the other `gemini-interactions` cells that still target generateContent rather than claiming those
+cells use native Interactions.
+
 ### fix(handlers): preserve terminal failures and signed text parts across cross-mode hops
 
 Three follow-up review findings are fixed:

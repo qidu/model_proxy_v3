@@ -132,20 +132,18 @@ is selected by the route's `defaultMode` / model config.
 
 | Client endpoint | `anthropic-messages` | `openai-completions` | `openai-responses` | `gemini-generatecontent` | `gemini-interactions` |
 |---|---|---|---|---|---|
-| `POST /v1/messages` | Native passthrough | Direct transform (via Chat Completions) | Indirect transform via `openai-completions` | Direct transform | Direct transform |
-| `POST /v1/responses` | Direct transform | Direct transform | Native passthrough | Direct transform via Claude Messages | Direct transform via Claude Messages |
-| `POST /v1/chat/completions` | Convert passthrough | Native passthrough | Transform passthrough | Transform passthrough | Same as `gemini-generatecontent` (not wired today) |
-| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Indirect transform via `openai-completions` | Direct transform | Indirect transform via `openai-completions` | Native passthrough | Native Gemini-family |
-| `POST /v1/interactions` | Indirect transform via `openai-completions` | Direct transform | Indirect transform via `openai-completions` | Native Gemini-family | Native Gemini-family |
+| `POST /v1/messages` | Native passthrough | Direct | Bridged via `openai-completions` (2 request hops) | Direct | Direct to generateContent (1 request hop); native Interactions not wired |
+| `POST /v1/responses` | Bridged via `openai-completions` (2 request hops) | Direct | Native passthrough | Bridged via `openai-completions` → `anthropic-messages` (3 request hops) | Bridged via `openai-completions` → `anthropic-messages` (3 request hops), ending at generateContent |
+| `POST /v1/chat/completions` | Direct | Native passthrough | Direct | Direct | Direct to native Interactions at `/v1beta/interactions` |
+| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Bridged via `openai-completions` (2 request hops) | Direct | Bridged via `openai-completions` (2 request hops) | Native passthrough | Not wired to native Interactions; body is forwarded unchanged to generateContent |
+| `POST /v1/interactions` | Bridged via `openai-completions` (2 request hops) | Direct | Bridged via `openai-completions` (2 request hops) | Direct: Interactions → generateContent | Direct to generateContent (1 request hop); native Interactions not wired |
 | `GET /v1/models` | Passthrough | Passthrough | Passthrough | Passthrough | Passthrough |
 | `POST /v1/embeddings` | Not supported | Default embedding mode (`ollama-embed` also accepted) | Not supported | Not supported | Not supported |
 
 **Mode semantics:**
-- **Native passthrough** — client endpoint and upstream family match; body is not converted.
-- **Direct transform** — request body is converted directly to the upstream family and response directly back.
-- **Direct transform via Claude Messages** — Responses → Claude Messages → Gemini → Claude Messages → Responses.
-- **Indirect transform via `openai-completions`** — body routes through Chat Completions as an intermediate shape.
-- **Convert passthrough** — Chat Completions is converted to Claude Messages format, forwarded, then converted back.
+- **Native passthrough** — 0 conversions; client endpoint and upstream family match.
+- **Direct** — exactly 1 request conversion, with the response converted back to the client shape.
+- **Bridged via X** — at least 2 request conversions; the cell names every intermediate.
 
 ---
 
