@@ -5,6 +5,42 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refact(messages): direct Claude Messages ↔ OpenAI Responses conversion
+
+`/v1/messages` with `openai-responses` no longer reaches the Responses API through Chat Completions. The new
+`src/converters/claude-to-responses.ts` builds the Responses body straight from the Claude request, and
+`src/converters/responses-to-claude.ts` converts the response straight back. The SSE egress
+(`handleResponsesStreamAsClaude`) gained the reasoning events, so a Responses `reasoning` item now arrives as a Claude
+`thinking` block instead of being dropped.
+
+Fields this recovers, each lost by the old bridge by construction:
+
+- Claude `mcp_servers` → Responses `mcp` tools (`name` → `server_label`, `url` → `server_url`,
+  `authorization_token` → `headers.Authorization`, `tool_configuration.allowed_tools` → `allowed_tools`).
+  `ClaudeTool` and `ClaudeMessagesRequest` gained the types for it.
+- Claude `document` blocks → `input_file` items. `claude-to-openai.ts` skipped document blocks outright, so a
+  client's PDF never left the proxy. `tests/unit/request-ref-matrix.test.ts` pinned that drop; it now pins the payload
+  as carried (five drop rows remain, down from six).
+- `tools[].strict` — declared by both target formats, dropped at both hops of the bridge.
+- Assistant `thinking` text → a `reasoning` item, in the input-replay spelling the repo already uses
+  (`content: [{ type: 'reasoning_text' }]`).
+- `metadata.user_id` → `metadata`, and `output_config.format` → `text.format`.
+
+Deliberately **not** mapped: `thinking.signature` ↔ `reasoning.encrypted_content`. Both are opaque, but Anthropic
+verifies its signature while the Responses upstream issues its own ciphertext, and no validation exists for
+interchanging them — so a signature the client sent is reported as dropped, and a thinking block synthesized on the
+egress carries the shared placeholder. This is the same rule the Interactions ↔ Responses pair applies.
+`service_tier: "auto"` is carried; `standard_only` is reported because Responses has no exact value. Also reported
+as dropped for having no Responses field: `stop_sequences`, `top_k`, `cached_content`, `cache_control`, and
+`output_config.task_budget` (rule #8).
+
+The README and API-schema matrices label this route **Direct** and it no longer appears in the note's list of bridged
+routes.
+
+Measured: `npm run typecheck` clean, `npm run build` passes, and 3107/3107 unit tests pass. Two pre-existing pins moved as a direct consequence of
+the change and were re-pinned rather than worked around — the reasoning-item spelling in `messages-handler.test.ts`
+(the bridge emitted `content`/`reasoning_text`, which this converter now matches) and the ref-matrix row above.
+
 ### feat(interactions): native Gemini passthrough and direct Responses conversion
 
 `/v1/interactions` with `gemini-interactions` now posts the Interactions-shaped body to `/v1beta/interactions` and relays

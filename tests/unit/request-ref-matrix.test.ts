@@ -23,13 +23,17 @@
  * Fixtures carry small payloads on purpose; the §10 dimension of "a payload above
  * the spill threshold" is covered for all twelve positions by
  * `tests/unit/blob-refs.test.ts`'s allowlist matrix, and end to end above the
- * threshold by the final case here. Six rows are `dropped` — payloads a converter
- * throws away before any send, identically with spooling off (Claude `document`
- * blocks, Chat `input_audio`/`file`, Responses `input_file` on some targets, and
- * the Interactions parts on the two OpenAI-family targets). Those are asserted to
- * be absent in *both* runs, so the drop is pinned as the converter's behaviour and
- * cannot start hiding behind the spool — but they are not this change's to fix
- * (repo rule #8: reported, not silently skipped).
+ * threshold by the final case here. Five rows are `dropped` — payloads a converter
+ * throws away before any send, identically with spooling off (Chat `input_audio`/`file`,
+ * Responses `input_file` on some targets, and the Interactions parts on the two
+ * OpenAI-family targets). Those are asserted to be absent in *both* runs, so the
+ * drop is pinned as the converter's behaviour and cannot start hiding behind the
+ * spool — but they are not this change's to fix (repo rule #8: reported, not
+ * silently skipped).
+ *
+ * Claude `document` blocks were a sixth drop and no longer are: the direct
+ * `claude-to-responses.ts` carries them as `input_file` items, so the
+ * `messages→openai-responses` row asserts the payload is now *carried*.
  *
  * Coverage: Claude image + base64 PDF, Chat image + audio + file, Gemini
  * `inline_data` + `inlineData` (image and audio MIME — the predicate is
@@ -270,7 +274,7 @@ const ROWS: Row[] = [
     refs: 2, carried: [CLAUDE_IMAGE], dropped: [CLAUDE_PDF], streamed: true,
     call: (r) => handleMessagesRequest(r, TARGET, AUTH, 'r3', 'gpt-test', ENV, LOGGER, undefined, 'openai-completions') },
   { name: 'messages→openai-responses', clientPath: '/v1/messages', body: CLAUDE_BODY, upstreamUrl: TARGET,
-    refs: 2, carried: [CLAUDE_IMAGE], dropped: [CLAUDE_PDF], streamed: true,
+    refs: 2, carried: [CLAUDE_IMAGE, CLAUDE_PDF], dropped: [], streamed: true,
     call: (r) => handleMessagesRequest(r, TARGET, AUTH, 'r4', 'gpt-test', ENV, LOGGER, undefined, 'openai-responses') },
 
   { name: 'chat-completions→openai-completions', clientPath: '/v1/chat/completions', body: CHAT_BODY, upstreamUrl: TARGET,

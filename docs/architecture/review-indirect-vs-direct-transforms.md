@@ -1,8 +1,8 @@
 # Review: indirect ("bridged") transforms vs direct transforms
 
-**Status: updated after the native-Interactions and direct-Responses changes.** F5, R1, and the `/v1/interactions` half
-of R2 described in the original review are implemented. The current matrices use **Native passthrough**, **Direct**, and
-**Bridged via …** labels. Typecheck, build, and the full unit suite pass (3091/3091) after those changes.
+**Status: updated after the native-Interactions and direct-Responses changes.** F5, R1, R2, and R3 described in the
+original review are implemented. The current matrices use **Native passthrough**, **Direct**, and **Bridged via …**
+labels. Typecheck, build, and the full unit suite pass (3107/3107) after those changes.
 
 Scope: the cross-mode matrix in [`README.md` § Supported `upstream_mode`](../../README.md#supported-upstream_mode)
 (and its copy in [`docs/api/list_of_api_and_schema.md`](../api/list_of_api_and_schema.md) §2), audited against the
@@ -21,13 +21,16 @@ Companion notes:
 
 1. **"Indirect" remains two independent mechanisms**: a request/response body hub through Chat Completions and, on
    routes that still use it, a stream pivot through `chat.completion.chunk`. A refactor must say which it replaces.
-2. **The first native/direct tranche is complete.** `/v1/chat/completions` → `gemini-interactions` no longer forwards
-   an invalid Chat body to generateContent; `/v1/interactions` → `gemini-interactions` is native passthrough; and
-   `/v1/interactions` → `openai-responses` is direct in both directions, including SSE.
-3. **Do not infer the next converter from hop count alone.** `/v1/messages` → `openai-responses` (R3) is a candidate,
-   but its reasoning-signature mapping needs upstream proof. The three-hop Responses → Gemini routes (R4) and the
-   generateContent → Responses route (R6) also need field-level measurements. The earlier claim that every other route
-   had zero recoverable margin was too strong, especially for built-in tools with Claude receptors.
+2. **Two tranches are complete.** `/v1/chat/completions` → `gemini-interactions` no longer forwards an invalid Chat
+   body to generateContent; `/v1/interactions` → `gemini-interactions` is native passthrough; `/v1/interactions` →
+   `openai-responses` is direct in both directions, including SSE; and `/v1/messages` → `openai-responses` is direct,
+   carrying `mcp_servers`, `document` blocks and `tools[].strict`, with a Responses `reasoning` item arriving as a
+   Claude `thinking` block.
+3. **Do not infer the next converter from hop count alone.** R3 is the precedent: most of its apparent margin turned
+   out to be two-line hop fixes, and only the MCP family plus two real losses (`document` blocks, reasoning items)
+   justified the pair. The remaining candidates — the three-hop `/v1/responses` → Gemini cells (R4),
+   `:generateContent` → `openai-responses` (R6), and the Claude-target routes (R5/R7, whose "zero margin" was never
+   established) — each need the same field-survival measurement before anything is built.
 4. **`gemini-interactions` means native Interactions.** It is wired natively for `/v1/interactions` and
    `/v1/chat/completions`. The `/v1/messages`, `/v1/responses`, and generateContent cells still have their documented
    generateContent behavior; they must not be described as native Interactions.
@@ -43,7 +46,7 @@ stream conversion must be checked separately; a one-hop request does not prove a
 
 | Client endpoint | `anthropic-messages` | `openai-completions` | `openai-responses` | `gemini-generatecontent` | `gemini-interactions` |
 |---|---|---|---|---|---|
-| `/v1/messages` | 0 ✅ | 1 ✅ | 2 ✅ | 1 ✅ | 1 ⚠️ generateContent |
+| `/v1/messages` | 0 ✅ | 1 ✅ | 1 ✅ direct Responses | 1 ✅ | 1 ⚠️ generateContent |
 | `/v1/responses` | 2 ✅ | 1 ✅ | 0 ✅ | 3 ✅ | 3 ⚠️ generateContent |
 | `/v1/chat/completions` | 1 ✅ | 0 ✅ | 1 ✅ | 1 ✅ | 1 ✅ native Interactions |
 | `/v1beta/models/<model>:generateContent` | 2 ✅ | 1 ✅ | 2 ✅ | 0 ✅ | 0 ⚠️ forwards to generateContent |
@@ -58,7 +61,7 @@ for that cell. The original F1/F2/F4 label errors and F5 dispatch mismatch are f
 |---|---|---|
 | `/v1/messages` | `anthropic-messages` | Native Claude passthrough (`claude.ts`) |
 | `/v1/messages` | `openai-completions` | Claude → Completions (`messages.ts:533`) |
-| `/v1/messages` | `openai-responses` | Claude → Completions → Responses (`messages.ts:533`, `:546`) |
+| `/v1/messages` | `openai-responses` | Claude → Responses (`claude-to-responses.ts`) |
 | `/v1/messages` | either Gemini mode | Claude → generateContent (`handleGeminiRequestForMessages`) |
 | `/v1/responses` | `anthropic-messages` | Responses → Completions → Claude (`responses.ts:666-668`) |
 | `/v1/responses` | `openai-completions` | Responses → Completions |
@@ -111,6 +114,7 @@ Direct exceptions now include:
 Interactions ⇄ native Interactions             (native passthrough on /v1/interactions)
 Completions ⇄ native Interactions             (Chat Completions front door)
 Interactions → Responses                       (request; Responses → Interactions is direct too)
+Claude → Responses                             (request; /v1/messages front door)
 ```
 
 The hub still reduces converter count and centralizes existing hook, spool, and response behavior. Those benefits do not
@@ -129,7 +133,9 @@ Direct streamers now bypass it for:
 
 - Gemini upstream → native Gemini, Claude, or Interactions clients (`gemini-streaming.ts`);
 - native Interactions upstream → Chat Completions (`interactions-to-completions.ts`);
-- Responses upstream → Interactions (`responses-to-interactions.ts`).
+- Responses upstream → Interactions (`responses-to-interactions.ts`);
+- Responses upstream → Claude (`messages.ts` `handleResponsesStreamAsClaude`, which emits Claude SSE events directly
+  and now maps `reasoning` items to thinking blocks with their `signature_delta`).
 
 The last mapper consumes Responses events directly, buffers function-call argument deltas, and emits SDK-compatible
 Interactions steps. It does not create a `chat.completion.chunk`. This is the required pattern when a direct request
@@ -213,14 +219,32 @@ Not claimed as recovered:
 - stop sequences, seed, response modalities, cached content, agent configuration, URL context, computer-use settings,
   and Gemini file-store IDs without faithful Responses equivalents.
 
-### R3 — `/v1/messages` → `openai-responses`: next candidate, not pre-approved
+### R3 — `/v1/messages` → `openai-responses`: implemented
 
-The route remains Claude → Completions → Responses. A direct Claude ↔ Responses pair could address MCP/server-tool
-mappings and other Claude-only fields. It would also require a direct Responses → Claude streamer.
+The route is direct now: `claude-to-responses.ts` builds the Responses body from the Claude request, and
+`responses-to-claude.ts` converts the response back. `messages.ts` no longer builds a synthetic Completions
+response, and the SSE egress gained the reasoning events.
 
-The headline reasoning-signature case still needs proof. Do not implement `thinking.signature` → `encrypted_content`
-merely because both are opaque strings. First test a real Responses upstream or choose an explicitly proxy-managed state
-format. Compare that direct pair with targeted hop fixes before choosing.
+Recovered, each lost by the bridge by construction:
+
+- `mcp_servers` → Responses `mcp` tools, the reason this pair was worth building;
+- `document` blocks → `input_file` items (`claude-to-openai.ts` skipped them outright, so a PDF never left the proxy);
+- `tools[].strict`, declared by both formats and dropped at both hops;
+- assistant `thinking` text → a `reasoning` item, and, in the other direction, a `reasoning` summary → a `thinking`
+  block, which the synthetic-Completions egress had no position for at all;
+- `metadata.user_id` → `metadata`, `output_config.format` → `text.format`.
+
+The comparison the earlier draft of this section asked for, before implementing: most of R3's apparent margin was
+**not** architecture. `text.format` already rode the bridge, and `tools[].strict` is a two-line hop fix. What the pair
+actually bought is the MCP family plus the `document`/reasoning losses. `service_tier: "auto"` is carried, while
+`standard_only` is reported as having no exact Responses value. The other reported drops are `stop_sequences`, `top_k`,
+`cached_content`, `cache_control`, and `output_config.task_budget`.
+
+The reasoning-signature case was settled **against** mapping, and against assumption: `openai-to-claude.ts:10-17`
+already treats `thinking.signature` as non-load-bearing (it synthesizes a placeholder), and the Interactions ↔
+Responses pair refuses the same mapping in both directions. So a client's signature is reported as dropped, and a
+thinking block synthesized on the egress carries the shared placeholder. A Responses `reasoning` item carrying only
+`encrypted_content` produces no thinking block rather than invented text.
 
 ### R4 — `/v1/responses` → either Gemini mode: measure, do not dismiss or assume
 
@@ -252,8 +276,8 @@ must be replaced by measurement.
 
 ## 5. Cost model
 
-The current off-diagonal inventory is twelve 1-hop cells, six 2-hop cells, two 3-hop cells, and two 0-hop Gemini-family
-cells that do not wire native Interactions. This is not an argument to make every cell direct.
+The current off-diagonal inventory is thirteen 1-hop cells, five 2-hop cells, two 3-hop cells, and two 0-hop
+Gemini-family cells that do not wire native Interactions. This is not an argument to make every cell direct.
 
 A direct pair must account for more than request field mapping:
 

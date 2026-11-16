@@ -12,7 +12,9 @@ import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStre
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
 import { convertClaudeToOpenAIRequest, ThinkingConversionOptions, budgetToReasoningEffort } from '../converters/claude-to-openai.js';
-import { convertOpenAIToClaudeResponse, TokenCountingConfig } from '../converters/openai-to-claude.js';
+import { claudeToResponsesBody } from '../converters/claude-to-responses.js';
+import { responsesReasoningText, responsesToClaudeResponse } from '../converters/responses-to-claude.js';
+import { convertOpenAIToClaudeResponse, SYNTHETIC_THINKING_SIGNATURE, TokenCountingConfig } from '../converters/openai-to-claude.js';
 import { createStreamTransformer } from '../converters/streaming.js';
 import { validateClaudeMessagesRequest } from '../utils/validation.js';
 import { handleTargetApiError } from '../utils/errors.js';
@@ -79,16 +81,16 @@ function normalizeOpenAICompletionsBody(requestBody: Record<string, unknown>): R
 
 /**
  * The `/v1/messages` → `openai-responses` hop used to carry private copies of the three
- * Completions→Responses request conversions that live here. They had drifted from the
- * shared `completionsToResponsesBody` (`src/converters/completions-to-responses.ts`), which the
- * `/v1/interactions` and `/v1/chat/completions` hops use, in four ways: the system
- * prompt was emitted as a `system` item in `input[]` instead of the canonical
- * `instructions`; `input_image.image_url` was built from the client's object rather than
- * the string the Responses API declares; the assistant reasoning round-trip
- * (`reasoning_content`, `thinking` parts) existed here and not there; and
- * `store` / `response_format` / `reasoning_effort` / `prompt_cache_key` were carried
- * there and not here. Both hops now call the one converter, so a fix to either lands on
- * both. See `docs/api/review-interactions-to-openai-responses-hops.md`.
+ * Completions→Responses request conversions. Those copies were folded into the shared
+ * `completionsToResponsesBody` (`src/converters/completions-to-responses.ts`), and the hop
+ * now builds its body with the direct `claudeToResponsesBody`
+ * (`src/converters/claude-to-responses.ts`) instead — the Completions intermediate had no
+ * field for `mcp_servers`, skipped `document` blocks, and dropped `tools[].strict`.
+ * `completionsToResponsesBody` is still the converter for a client that sends an
+ * already-OpenAI-shaped body to `/v1/messages` (the branch below), which is a different
+ * input format and keeps the shared converter. See
+ * `docs/api/review-interactions-to-openai-responses-hops.md` and
+ * `docs/architecture/review-indirect-vs-direct-transforms.md`.
  */
 
 /**
@@ -541,17 +543,20 @@ export async function handleMessagesRequest(
     delete openaiRequest.thinking;
   }
 
-  // OpenAI Responses API upstream: convert Completions request → Responses request,
+  // OpenAI Responses API upstream: convert Claude Messages → Responses directly,
   // POST to /v1/responses, then convert the Responses response back to Claude format.
   if (upstreamMode === 'openai-responses') {
     activeLogger.info(requestId, `Upstream (stream=${isStreaming}): /v1/responses → ${targetModelId}`);
 
-    // Build Responses API request body from the converted Completions request.
-    // The Responses API uses `input` (array of message items) instead of `messages`.
-    const responsesBody: Record<string, unknown> = completionsToResponsesBody(
-      openaiRequest as unknown as Record<string, unknown>,
-      openaiRequest.model,
-      { logger: activeLogger, requestId },
+    // A direct Claude → Responses body. This hop used to reach the Responses API
+    // through Chat Completions (`convertClaudeToOpenAIRequest` →
+    // `completionsToResponsesBody`), which had no field for the client's
+    // `mcp_servers`, skipped its `document` blocks outright, and dropped
+    // `tools[].strict` twice. See `src/converters/claude-to-responses.ts`.
+    const responsesBody: Record<string, unknown> = claudeToResponsesBody(
+      claudeRequest,
+      targetModelId,
+      { logger: activeLogger, requestId, conversion: conversionOptions },
     );
     responsesBody.stream = isStreaming;
 
@@ -627,40 +632,18 @@ export async function handleMessagesRequest(
       responsesResponse, requestId, activeLogger, targetUrl, request.signal,
     );
 
-    // Synthesise an OpenAI Completions-style response so we can reuse the existing converter.
-    const outputItem = responsesJson.output?.find(o => o.type === 'message');
-    const textPart = outputItem?.content?.find(c => c.type === 'output_text');
-    const toolCallItems = responsesJson.output?.filter(o => o.type === 'function_call') ?? [];
-
-    const syntheticCompletions: OpenAIResponse = {
-      id: responsesJson.id ?? 'resp_unknown',
-      object: 'chat.completion',
-      created: responsesJson.created_at ?? Math.floor(Date.now() / 1000),
-      model: responsesJson.model ?? targetModelId,
-      choices: [{
-        index: 0,
-        message: {
-          role: 'assistant',
-          content: textPart?.text ?? '',
-          tool_calls: toolCallItems.length > 0
-            ? toolCallItems.map(tc => ({
-                id: tc.call_id ?? tc.id ?? `call_${Date.now()}`,
-                type: 'function' as const,
-                function: { name: tc.name ?? '', arguments: tc.arguments ?? '' },
-              }))
-            : undefined,
-        },
-        finish_reason: toolCallItems.length > 0 ? 'tool_calls' : 'stop',
-        logprobs: null,
-      }],
-      usage: responsesJson.usage ? {
-        prompt_tokens: responsesJson.usage.input_tokens,
-        completion_tokens: responsesJson.usage.output_tokens,
-        total_tokens: responsesJson.usage.total_tokens,
-      } : undefined,
-    };
-
-    const claudeResponse = await convertOpenAIToClaudeResponse(syntheticCompletions, targetModelId, requestId, requestBody, tokenCountingConfig);
+    // Direct Responses → Claude conversion. It used to build a synthetic Chat
+    // Completions response first, which had no position for a `reasoning` item —
+    // thinking arrived as nothing — and passed a `refusal` part through as answer
+    // text. See `src/converters/responses-to-claude.ts`.
+    const claudeResponse = await responsesToClaudeResponse(
+      responsesJson as unknown as Record<string, unknown>,
+      targetModelId,
+      requestId,
+      requestBody,
+      tokenCountingConfig,
+      { logger: activeLogger, requestId },
+    );
     logPipelineStage(activeLogger, requestId, 'outbound', '/v1/messages', claudeResponse);
     return new Response(JSON.stringify(claudeResponse), {
       status: 200,
@@ -965,6 +948,11 @@ async function handleStreamingResponse(
  *   response.created                    → emit message_start
  *   response.output_text.delta          → emit content_block_delta
  *   response.output_text.done           → emit content_block_stop
+ *   response.output_item.added          → open a `tool_use` block (function_call)
+ *   response.reasoning_summary_text.delta
+ *   response.reasoning_text.delta       → open/fill a thinking block
+ *   response.output_item.done           → close the item; a complete reasoning item
+ *                                         supplies text when no deltas arrived
  *   response.completed                  → emit message_delta (stop) + message_stop
  *   response.incomplete                 → emit message_delta (stop_reason
  *                                         `max_tokens`) + message_stop
@@ -974,6 +962,12 @@ async function handleStreamingResponse(
  *
  * Tool-call events (response.output_item.added with function_call type) are
  * mapped to Claude tool_use content blocks.
+ *
+ * A thinking block closes with a `signature_delta` carrying the shared synthetic
+ * placeholder: Anthropic marks `signature` required, and a Responses upstream
+ * issues no Anthropic signature — its own `reasoning.encrypted_content` is
+ * provider-specific ciphertext and is deliberately not mapped onto this field
+ * (the same rule the Gemini→Claude streamer applies, `gemini-streaming.ts:237`).
  */
 function handleResponsesStreamAsClaude(
   upstreamResponse: Response,
@@ -1028,6 +1022,10 @@ function handleResponsesStreamAsClaude(
       let textBlockIndex = -1;
       // Map from function_call output_index → Claude content block index
       const toolBlockIndex = new Map<number, number>();
+      // Map from reasoning output_index → Claude thinking-block index, so a
+      // reasoning delta knows which block it extends.
+      const thinkingBlockIndex = new Map<number, number>();
+      const thinkingTextSeen = new Set<number>();
       /** Blocks a `content_block_stop` was already written for. */
       const closedBlocks = new Set<number>();
       let nextBlockIndex = 0;
@@ -1042,6 +1040,34 @@ function handleResponsesStreamAsClaude(
           type: 'content_block_stop',
           index,
         }));
+      };
+
+      // A thinking block needs its `signature_delta` before it stops; closing it
+      // through `closeBlock` alone would hand a Claude client a block whose
+      // required `signature` never arrived.
+      const closeThinkingBlock = async (index: number): Promise<void> => {
+        if (closedBlocks.has(index)) return;
+        closedBlocks.add(index);
+        await writer.write(claudeEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'signature_delta', signature: SYNTHETIC_THINKING_SIGNATURE },
+        }));
+        await writer.write(claudeEvent('content_block_stop', {
+          type: 'content_block_stop',
+          index,
+        }));
+      };
+
+      const openThinkingBlock = async (outputIndex: number): Promise<number> => {
+        const blockIdx = nextBlockIndex++;
+        thinkingBlockIndex.set(outputIndex, blockIdx);
+        await writer.write(claudeEvent('content_block_start', {
+          type: 'content_block_start',
+          index: blockIdx,
+          content_block: { type: 'thinking', thinking: '' },
+        }));
+        return blockIdx;
       };
 
       // Same trace the Completions SSE path carries (`handleStreamingResponse`):
@@ -1091,6 +1117,17 @@ function handleResponsesStreamAsClaude(
                 },
               }));
             }
+          } else if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') {
+            const outputIndex = evt.output_index as number ?? 0;
+            const text = evt.delta;
+            if (typeof text !== 'string' || text === '') continue;
+            thinkingTextSeen.add(outputIndex);
+            const blockIdx = thinkingBlockIndex.get(outputIndex) ?? await openThinkingBlock(outputIndex);
+            await writer.write(claudeEvent('content_block_delta', {
+              type: 'content_block_delta',
+              index: blockIdx,
+              delta: { type: 'thinking_delta', thinking: text },
+            }));
           } else if (type === 'response.output_text.delta') {
             if (textBlockIndex === -1) {
               textBlockIndex = nextBlockIndex++;
@@ -1127,6 +1164,21 @@ function handleResponsesStreamAsClaude(
               if (blockIdx !== undefined) {
                 await closeBlock(blockIdx);
               }
+            } else if (item?.type === 'reasoning') {
+              const outputIndex = evt.output_index as number ?? 0;
+              let blockIdx = thinkingBlockIndex.get(outputIndex);
+              if (!thinkingTextSeen.has(outputIndex)) {
+                const text = responsesReasoningText(item);
+                if (text !== '') {
+                  blockIdx ??= await openThinkingBlock(outputIndex);
+                  await writer.write(claudeEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: blockIdx,
+                    delta: { type: 'thinking_delta', thinking: text },
+                  }));
+                }
+              }
+              if (blockIdx !== undefined) await closeThinkingBlock(blockIdx);
             }
           } else if (type === 'response.failed') {
             throw new Error(`Responses stream failed before response.completed (request ${requestId})`);
@@ -1152,12 +1204,18 @@ function handleResponsesStreamAsClaude(
             // truncated turn, whose items upstream never finalizes. Nothing may
             // follow `message_stop` and every block stops before `message_delta`,
             // so the blocks left open are closed here, in block order. A block
-            // upstream already closed is not written twice.
+            // upstream already closed is not written twice, and a thinking block
+            // closes through `closeThinkingBlock` so its signature arrives first.
+            const openThinking = new Set(thinkingBlockIndex.values());
             const openBlocks = [
               ...(textBlockIndex !== -1 ? [textBlockIndex] : []),
               ...toolBlockIndex.values(),
+              ...openThinking,
             ].filter((index) => !closedBlocks.has(index)).sort((a, b) => a - b);
-            for (const index of openBlocks) await closeBlock(index);
+            for (const index of openBlocks) {
+              if (openThinking.has(index)) await closeThinkingBlock(index);
+              else await closeBlock(index);
+            }
             await writer.write(claudeEvent('message_delta', {
               type: 'message_delta',
               delta: {

@@ -132,7 +132,7 @@ is selected by the route's `defaultMode` / model config.
 
 | Client endpoint | `anthropic-messages` | `openai-completions` | `openai-responses` | `gemini-generatecontent` | `gemini-interactions` |
 |---|---|---|---|---|---|
-| `POST /v1/messages` | Native passthrough | Direct | Bridged via `openai-completions` (2 request hops) | Direct | Direct to generateContent (1 request hop); native Interactions not wired |
+| `POST /v1/messages` | Native passthrough | Direct | Direct | Direct | Direct to generateContent (1 request hop); native Interactions not wired |
 | `POST /v1/responses` | Bridged via `openai-completions` (2 request hops) | Direct | Native passthrough | Bridged via `openai-completions` → `anthropic-messages` (3 request hops) | Bridged via `openai-completions` → `anthropic-messages` (3 request hops), ending at generateContent |
 | `POST /v1/chat/completions` | Direct | Native passthrough | Direct | Direct | Direct to native Interactions at `/v1beta/interactions` |
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Bridged via `openai-completions` (2 request hops) | Direct | Bridged via `openai-completions` (2 request hops) | Native passthrough | Not wired to native Interactions; body is forwarded unchanged to generateContent |

@@ -9,6 +9,40 @@ export interface ClaudeTool {
     name: string;
     description?: string;
     input_schema: any;
+    /**
+     * "When true, guarantees schema validation on tool names and inputs"
+     * (`messages-create.md:2819`). Declared here because the direct
+     * Claude → Responses converter carries it; the Completions bridge dropped it.
+     */
+    strict?: boolean;
+}
+
+/**
+ * A Claude `redacted_thinking` block: encrypted reasoning the API returns instead
+ * of plaintext when its safety system redacts it. The payload is not readable by
+ * anyone but the issuing provider, so no other wire format's field can hold it.
+ */
+export interface ClaudeRedactedThinkingBlock {
+    type: "redacted_thinking";
+    data: string;
+}
+
+/**
+ * One server-side MCP connector, as the Messages API declares it under the
+ * `mcp-client-2025-04-04` / `mcp-client-2025-11-20` betas
+ * (`claude_api_docs/models-api.md:40`). The Responses API's `mcp` tool declares a
+ * faithful equivalent, which is why the direct Claude → Responses converter can
+ * carry this where the Completions bridge cannot.
+ */
+export interface ClaudeMcpServer {
+    type: "url";
+    url: string;
+    name: string;
+    authorization_token?: string;
+    tool_configuration?: {
+        enabled?: boolean;
+        allowed_tools?: string[];
+    };
 }
 
 export type ThinkingConfigParam = {
@@ -45,7 +79,8 @@ export type ClaudeContentBlock =
     | ClaudeToolUseBlock
     | ClaudeToolResultBlock
     | WebSearchToolResultBlock
-    | ThinkingBlock;
+    | ThinkingBlock
+    | ClaudeRedactedThinkingBlock;
 
 export interface Citation {
     type: "char_location";
@@ -127,11 +162,26 @@ export interface ClaudeMessagesRequest {
     top_p?: number;
     top_k?: number;
     tools?: ClaudeTool[];
-    tool_choice?: { type: "auto" | "any" | "tool"; name?: string } | { type: "none" };
+    /**
+     * Server-side MCP connectors (beta). Only the direct Claude → Responses
+     * converter reads these; `ensureStructuredOutputsBetaHeader` handles the
+     * header pairing, and the Completions bridge has no field to carry them.
+     */
+    mcp_servers?: ClaudeMcpServer[];
+    tool_choice?: { type: "auto" | "any" | "tool"; name?: string; disable_parallel_tool_use?: boolean } | { type: "none" };
     thinking?: ThinkingConfigParam;
     reasoning_effort?: "low" | "medium" | "high" | "max";
     output_config?: {
         effort?: "low" | "medium" | "high" | "max";
+        /**
+         * Structured outputs. `ensureStructuredOutputsBetaHeader` reads this field
+         * out of the *body* (`utils/auth-headers.ts:80`), so the converter that
+         * builds the body is what has to keep it.
+         */
+        format?: {
+            type: "json_schema";
+            schema: Record<string, unknown>;
+        };
         task_budget?: {
             type: "tokens";
             total: number;
