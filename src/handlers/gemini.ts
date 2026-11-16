@@ -24,6 +24,10 @@ import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
 import { createConvertedResponseBody, receiveJsonResponse, receiveResponseBody, withResponseText, type ConvertedResponseBody } from '../utils/spool-response.js';
 import { admitResponseMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { repackBearerCredential } from '../utils/auth-headers.js';
+import { collectBlobRefs } from '../utils/blob-refs.js';
+import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
+import { getSpoolConfig } from '../utils/spool.js';
 
 /**
  * Check if request is in native Gemini format
@@ -91,6 +95,91 @@ export async function handleGeminiRequest(
             request, targetUrl, authHeaders, requestId, modelId, env, logger, 'native-gemini', route
         );
     }
+}
+
+export async function handleNativeInteractionsRequest(
+    request: Request,
+    targetUrl: string,
+    authHeaders: Record<string, string>,
+    requestId: string,
+    modelId?: string,
+    env?: Env,
+    logger?: Logger,
+    route?: ModelRouteConfig,
+): Promise<Response> {
+    const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
+    let requestBody = await request.json() as Record<string, unknown>;
+    const model = (requestBody.model as string) || modelId || 'unknown';
+    const isStreaming = requestBody.stream === true;
+    const streamRefs = getSpoolConfig().enabled && collectBlobRefs(requestBody).length > 0;
+    logPipelineStage(activeLogger, requestId, 'inbound', '/v1/interactions', requestBody);
+    logPipelineHeaders(activeLogger, requestId, 'inbound', '/v1/interactions', request.headers);
+
+    if (route) {
+        const beforeConversion = runHook('before_conversion', { body: requestBody, headers: authHeaders }, {
+            hook: 'before_conversion', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger,
+        });
+        requestBody = beforeConversion.body;
+        authHeaders = beforeConversion.headers;
+    }
+
+    let upstreamBody = requestBody;
+    if (route) {
+        const beforeUpstream = runHook('before_upstream', { body: upstreamBody, headers: authHeaders }, {
+            hook: 'before_upstream', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger,
+        });
+        upstreamBody = beforeUpstream.body;
+        authHeaders = beforeUpstream.headers;
+    }
+
+    const nativeHeaders: Record<string, string> = { ...authHeaders };
+    repackBearerCredential(nativeHeaders, 'x-goog-api-key');
+    const streamed = streamRefs ? createRefAwareJsonBody(upstreamBody) : undefined;
+    const fetchHeaders = {
+        'Content-Type': 'application/json',
+        ...addForwardedHeaders(nativeHeaders, request),
+        ...(streamed ? { 'Content-Length': String(streamed.contentLength) } : {}),
+    };
+    logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, upstreamBody);
+    logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, fetchHeaders);
+    let response = await fetch(targetUrl, {
+        method: 'POST',
+        headers: fetchHeaders,
+        body: streamed ? streamed.body : JSON.stringify(upstreamBody),
+        ...(streamed ? { duplex: 'half' } : {}),
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+    } as RequestInit);
+
+    if (route) {
+        response = await applyAfterUpstream(response, {
+            hook: 'after_upstream', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger, signal: request.signal,
+        });
+    }
+
+    logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
+    recordResponseStatusCodeFromUpstream(response.status);
+    recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+    if (!response.ok) {
+        const upstreamErrorBody = await withResponseText(response, requestId, activeLogger, targetUrl, text => text, request.signal);
+        handleTargetApiError(response, 'Gemini Interactions API', {
+            url: targetUrl, body: JSON.stringify(upstreamBody), upstreamBody: upstreamErrorBody,
+        });
+    }
+
+    if (isStreaming) {
+        if (!response.body) throw new Error('Native Interactions upstream returned an empty stream');
+        const headers = {
+            'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive', 'x-request-id': requestId,
+        };
+        return new Response(response.body.pipeThrough(
+            observeStream(activeLogger, requestId, 'upstream-response', response.url || targetUrl, 'chunks'),
+        ), { status: 200, headers });
+    }
+    return relayNativeGeminiResponse(response, requestId, activeLogger, request.signal, '/v1/interactions (native)');
 }
 
 /**
@@ -617,7 +706,8 @@ async function relayNativeGeminiResponse(
     response: Response,
     requestId: string,
     logger: Logger,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    clientPath = ':generateContent (native)'
 ): Promise<Response> {
     const nativeOutHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
     logger.debug(requestId, 'Gemini response received');
@@ -640,7 +730,7 @@ async function relayNativeGeminiResponse(
         try {
             const traced = await received.readText();
             logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream)', traced);
-            logPipelineStage(logger, requestId, 'outbound', ':generateContent (native)', traced);
+            logPipelineStage(logger, requestId, 'outbound', clientPath, traced);
         } finally {
             // The trace text is unreachable here and the client's body has not
             // been handed out yet, so §5.9's "release before network streaming"
@@ -650,7 +740,7 @@ async function relayNativeGeminiResponse(
         }
     }
 
-    logPipelineHeaders(logger, requestId, 'outbound', ':generateContent (native)', nativeOutHeaders);
+    logPipelineHeaders(logger, requestId, 'outbound', clientPath, nativeOutHeaders);
     return new Response(received.readStream(), { status: response.status, headers: nativeOutHeaders });
 }
 

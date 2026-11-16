@@ -26,6 +26,12 @@ import {
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
 import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
 import { convertResponsesToChatCompletionsAnswer } from '../converters/responses-to-completions.js';
+import { interactionsToResponsesBody } from '../converters/interactions-to-responses.js';
+import {
+  createResponsesInteractionStreamState,
+  responsesEventToInteractionEvents,
+  responsesToInteraction,
+} from '../converters/responses-to-interactions.js';
 
 /**
  * Forward an OpenAI Chat Completions body as a Claude Messages request to an
@@ -352,6 +358,128 @@ async function forwardCompletionsAsOpenAIResponses(
   return new Response(JSON.stringify(responsesJson), { headers: fallbackHeaders });
 }
 
+async function forwardInteractionsAsOpenAIResponses(
+  requestBody: Record<string, unknown>,
+  targetUrl: string,
+  authHeaders: Record<string, string>,
+  requestId: string,
+  model: string,
+  logger: Logger,
+  originalRequest: Request,
+  env?: Env,
+  route?: ModelRouteConfig,
+): Promise<Response> {
+  let responsesBody = interactionsToResponsesBody(requestBody, model, { logger, requestId });
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_upstream', route, upstreamMode: 'openai-responses',
+      clientModel: model, requestId, streaming: requestBody.stream === true, logger,
+    };
+    ({ body: responsesBody, headers: authHeaders } = runHook('before_upstream', { body: responsesBody, headers: authHeaders }, hookCtx));
+  }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), originalRequest),
+  };
+  logPipelineStage(logger, requestId, 'upstream-request', targetUrl, responsesBody);
+  logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, headers);
+  let response = await postJsonWithSpool(targetUrl, responsesBody, {
+    headers,
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+  });
+  if (route) {
+    response = await applyAfterUpstream(response, {
+      hook: 'after_upstream', route, upstreamMode: 'openai-responses',
+      clientModel: model, requestId, streaming: requestBody.stream === true, logger, signal: originalRequest.signal,
+    });
+  }
+
+  logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
+  recordResponseStatusCodeFromUpstream(response.status);
+  recordUpstreamResponseToolCount('openai-responses', 0);
+  recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+  if (!response.ok) {
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, text => text, originalRequest.signal);
+    handleTargetApiError(response, 'Interactions (direct openai-responses)', { url: targetUrl, upstreamBody });
+  }
+
+  if (requestBody.stream === true) {
+    return handleResponsesStreamAsInteractions(response, model, requestId, logger);
+  }
+  const responsesJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, originalRequest.signal,
+  );
+  const interaction = responsesToInteraction(responsesJson, model, requestId, { logger, requestId });
+  logPipelineStage(logger, requestId, 'outbound', '/v1/interactions', interaction);
+  return new Response(JSON.stringify(interaction), {
+    headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+  });
+}
+
+function handleResponsesStreamAsInteractions(
+  response: Response,
+  model: string,
+  requestId: string,
+  logger: Logger,
+): Response {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const state = createResponsesInteractionStreamState(model, requestId);
+
+  const writeEvents = async (events: Array<Record<string, unknown>>): Promise<void> => {
+    for (const event of events) {
+      const eventType = event.event_type as string;
+      const framed = `event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`;
+      logPipelineStage(logger, requestId, 'outbound', 'stream', event);
+      await writer.write(encoder.encode(framed));
+    }
+  };
+  const processEvent = async (rawEvent: string): Promise<void> => {
+    const data = rawEvent.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n');
+    if (!data || data === '[DONE]') return;
+    const event = JSON.parse(data) as Record<string, unknown>;
+    await writeEvents(responsesEventToInteractionEvents(state, event, { logger, requestId }));
+  };
+
+  (async () => {
+    try {
+      if (!response.body) throw new Error('Responses upstream returned an empty stream');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const rawChunk = decoder.decode(value, { stream: true });
+        logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', rawChunk);
+        buffer += rawChunk;
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || '';
+        for (const event of events) await processEvent(event);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) await processEvent(buffer);
+      if (!state.interaction.finished) throw new Error(`Responses stream ended before a terminal event (request ${requestId})`);
+      await writer.close();
+    } catch (error) {
+      logger.error(requestId, `Interactions direct Responses streaming error: ${(error as Error).message}`);
+      await writer.abort();
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive', 'x-request-id': requestId,
+    },
+  });
+}
+
 /**
  * Handle OpenAI-compatible API request
  */
@@ -429,6 +557,13 @@ export async function handleOpenAIRequest(
         logger: activeLogger,
       };
       ({ body: requestBody } = runHook('before_conversion', { body: requestBody, headers: authHeaders }, hookCtxConv));
+    }
+
+    if (isInteractionsRequest && upstreamMode === 'openai-responses' && requestBody.input !== undefined) {
+      return forwardInteractionsAsOpenAIResponses(
+        requestBody, targetUrl, authHeaders, requestId,
+        (requestBody.model as string) || modelId || 'unknown', activeLogger, request, env, route,
+      );
     }
 
     // Detect input format and convert to OpenAI

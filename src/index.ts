@@ -17,7 +17,7 @@ import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isA
 import { handleTokenCountingRequest } from './handlers/token-counting.js';
 import { handleMessagesRequest } from './handlers/messages.js';
 import { handleResponsesRequest, handleResponsesCompactRequest, handleResponsesInputTokensRequest, handleResponsesRetrievalRequest } from './handlers/responses.js';
-import { handleGeminiRequest, handleGeminiRequestForMessages } from './handlers/gemini.js';
+import { handleGeminiRequest, handleGeminiRequestForMessages, handleNativeInteractionsRequest } from './handlers/gemini.js';
 import { handleOpenAIRequest } from './handlers/openai.js';
 import { handleClaudeRequest } from './handlers/claude.js';
 import { handleEmbeddingsRequest } from './handlers/embeddings.js';
@@ -519,11 +519,11 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
   // 2. /v1/interactions → multiple upstream modes
   if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
     if (isGemini) {
-      // Native Gemini API
-      // Dialect difference: a fixed route forwards to the API version root.
       return {
         kind: 'interactions',
-        targetUrl: fixed ? upstreamUrl(geminiApiVersion) : geminiModelUrl(geminiStreamingAction),
+        targetUrl: upstreamMode === 'gemini-interactions'
+          ? upstreamUrl(`${fixed ? geminiApiVersion : 'v1beta'}/interactions`)
+          : fixed ? upstreamUrl(geminiApiVersion) : geminiModelUrl(geminiStreamingAction),
         handlerType: 'interactions',
         upstreamMode,
       };
@@ -2685,7 +2685,9 @@ export default {
             break;
 
           case 'interactions':
-            if (attemptUpstreamMode === 'gemini-generatecontent' || attemptUpstreamMode === 'gemini-interactions') {
+            if (attemptUpstreamMode === 'gemini-interactions') {
+              response = await handleNativeInteractionsRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptRoute);
+            } else if (attemptUpstreamMode === 'gemini-generatecontent') {
               response = await handleGeminiRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptRoute);
             } else {
               response = await handleOpenAIRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptForceStreaming, conversionOptions, attemptUpstreamMode, attemptRoute);

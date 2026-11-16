@@ -28,6 +28,13 @@ function installMockFetch() {
     if (url.includes(':countTokens')) {
       return new Response(JSON.stringify({ totalTokens: 2 }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
+    if (url.endsWith('/v1beta/interactions')) {
+      return new Response(JSON.stringify({
+        id: 'int_1', model: 'gemini-pro', status: 'completed', object: 'interaction',
+        created: '2026-01-01T00:00:00.000Z', updated: '2026-01-01T00:00:00.000Z',
+        role: 'model', outputs: [{ type: 'text', text: 'ok' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
     // The streaming action frames its answer as SSE — the only content type the
     // proxy's streaming egress accepts, and what the real upstream sends for this
     // URL. Answering JSON here would make the four `:streamGenerateContent` cases
@@ -118,7 +125,9 @@ describe('Gemini native upstream URL construction', () => {
         const resp = await sendInteractionsRequest();
 
         assert.equal(resp.status, 200);
-        assert.deepEqual(upstreamUrls, ['https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
+        assert.deepEqual(upstreamUrls, [upstreamMode === 'gemini-interactions'
+          ? 'https://generativelanguage.googleapis.com/v1beta/interactions'
+          : 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
       });
 
       it(`builds the correct generateContent Gemini URL from ${baseUrl} in ${upstreamMode} mode`, async () => {

@@ -228,7 +228,7 @@ describe('/v1/interactions → openai-responses: the steps that carry no content
 
     assert.deepEqual(upstream.input, [
       { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
-      { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'weighing it up' }] },
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'weighing it up' }] },
       { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
     ]);
   });

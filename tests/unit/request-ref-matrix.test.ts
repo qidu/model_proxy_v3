@@ -313,7 +313,7 @@ const ROWS: Row[] = [
     refs: 2, carried: [], dropped: ALL_GEMINI, streamed: false,
     call: (r) => handleOpenAIRequest(r, TARGET, AUTH, 'r15', 'gemini-test', ENV, LOGGER, false, undefined, 'anthropic-messages') },
   { name: 'interactions→openai-responses', clientPath: '/v1/interactions', body: INTERACTIONS_BODY, upstreamUrl: TARGET,
-    refs: 2, carried: [], dropped: ALL_GEMINI, streamed: false,
+    refs: 2, carried: [GEM_SNAKE], dropped: [GEM_CAMEL], streamed: true,
     call: (r) => handleOpenAIRequest(r, TARGET, AUTH, 'r16', 'gemini-test', ENV, LOGGER, false, undefined, 'openai-responses') },
 
   { name: 'responses→passthrough', clientPath: '/v1/responses', body: RESPONSES_BODY, upstreamUrl: TARGET,

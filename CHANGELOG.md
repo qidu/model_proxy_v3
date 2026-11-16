@@ -5,6 +5,19 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(interactions): native Gemini passthrough and direct Responses conversion
+
+`/v1/interactions` with `gemini-interactions` now posts the Interactions-shaped body to `/v1beta/interactions` and relays
+native JSON or SSE without a generateContent conversion. Route hooks, authentication, bounded response handling, and
+request blob streaming remain active.
+
+`/v1/interactions` with `openai-responses` now uses a direct Interactions → Responses converter before the legacy
+Gemini → Completions dispatch, and converts Responses JSON/SSE directly back to Interactions. The direct request mapping
+preserves function allow-lists, web search, code interpreter, MCP, background execution, reasoning configuration,
+metadata, and structured output. Provider-specific interaction IDs, thought signatures, stop sequences, seed, and other
+fields without a faithful Responses equivalent are reported rather than renamed speculatively. Direct streaming buffers
+function arguments into complete Interactions function-call steps and aborts truncated upstream streams.
+
 ### fix(handlers): route Chat Completions to native Gemini Interactions
 
 `gemini-interactions` now explicitly means the native Interactions API. The `/v1/chat/completions` cell posts converted
