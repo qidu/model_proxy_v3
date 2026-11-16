@@ -133,9 +133,9 @@ is selected by the route's `defaultMode` / model config.
 | Client endpoint | `anthropic-messages` | `openai-completions` | `openai-responses` | `gemini-generatecontent` | `gemini-interactions` |
 |---|---|---|---|---|---|
 | `POST /v1/messages` | Native passthrough | Direct | Direct | Direct | Direct to generateContent (1 request hop); native Interactions not wired |
-| `POST /v1/responses` | Direct: Responses → Claude Messages, including direct JSON/SSE response conversion | Direct | Native passthrough | Bridged via `openai-completions` → `anthropic-messages` (3 request hops) | Bridged via `openai-completions` → `anthropic-messages` (3 request hops), ending at generateContent |
+| `POST /v1/responses` | Direct: Responses → Claude Messages, including direct JSON/SSE response conversion | Direct | Native passthrough | Direct: Responses → generateContent, including direct JSON/SSE response conversion | Direct to generateContent (1 request hop); native Interactions not wired |
 | `POST /v1/chat/completions` | Direct | Native passthrough | Direct | Direct | Direct to native Interactions at `/v1beta/interactions` |
-| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Bridged via `openai-completions` (2 request hops) | Direct | Bridged via `openai-completions` (2 request hops) | Native passthrough | Not wired to native Interactions; body is forwarded unchanged to generateContent |
+| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Bridged via `openai-completions` (2 request hops) | Direct | Direct: generateContent → Responses, including direct JSON/SSE response conversion | Native passthrough | Not wired to native Interactions; body is forwarded unchanged to generateContent |
 | `POST /v1/interactions` | Bridged via `openai-completions` (2 request hops) | Direct | Direct: Interactions → Responses, including direct JSON/SSE response conversion | Direct: Interactions → generateContent | Native passthrough to `/v1beta/interactions` |
 | `GET /v1/models` | Passthrough | Passthrough | Passthrough | Passthrough | Passthrough |
 | `POST /v1/embeddings` | Not supported | Default embedding mode (`ollama-embed` also accepted) | Not supported | Not supported | Not supported |

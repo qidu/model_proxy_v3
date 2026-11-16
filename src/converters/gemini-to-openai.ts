@@ -1,10 +1,9 @@
 /**
  * Gemini request → OpenAI Chat Completions conversion.
  *
- * The ingress half of the cross-mode bridge: a client speaking the generateContent
- * or Interactions protocol is converted to a Completions body here, so that a
- * non-Gemini upstream — openai-completions natively, anthropic-messages and
- * openai-responses through a second hop — receives one intermediate shape. The
+ * The ingress half of the remaining Completions bridge: a client speaking
+ * generateContent or Interactions is converted for an openai-completions or
+ * anthropic-messages upstream. The Responses routes use their direct converters. The
  * egress halves live in `openai-to-gemini.ts` (Completions → Gemini) and
  * `handlers/cross-mode-stream.ts` (upstream SSE → Completions chunks).
  *
@@ -629,30 +628,10 @@ function systemInstructionToText(declared: unknown): string {
 /**
  * Convert Gemini Interactions request to OpenAI format
  *
- * Carries every request-level field the Interactions body declares that has a
- * Completions spelling: the system prompt, the tool declarations, `stop_sequences`,
- * `tool_choice`, the `generation_config` sampling knobs (`temperature`, `top_p`,
- * `max_output_tokens`, `thinking_level`), `store`, `labels` (as `metadata`), and
- * `response_format` / `response_mime_type`. This matters because the body is
- * re-targeted to three upstream families — openai-completions natively,
- * anthropic-messages via `completionsToClaudeBody`, openai-responses via
- * `completionsToResponsesBody` — and whatever this hop drops is unreachable at every
- * one of them.
- *
- * `labels` rides the intermediate as `metadata`, and the openai-completions and
- * openai-responses targets both receive it — the latter via `completionsToResponsesBody`,
- * which re-emits the field the Responses API declares. Only `completionsToClaudeBody`
- * drops it, because Claude's `metadata` accepts only `user_id`; `src/handlers/openai.ts`
- * warns at that hop rather than dropping it in silence (rule #8).
- *
- * Still dropped here, as on the generateContent path: `seed` and the rest of
- * `generation_config` (`thinking_summaries`, `speech_config`), `background`,
- * `previous_interaction_id`, `response_modalities`, `cached_content`, `agent` /
- * `agent_config`, and the non-function tool families. `thinking_summaries` and the
- * tool families are expressible in the Responses API but have no Completions
- * spelling, so only a direct Interactions→Responses converter could reach them;
- * `seed` and `stop_sequences` are unreachable at a Responses target under either
- * design. See `docs/api/review-interactions-to-openai-responses-hops.md`.
+ * Carries Interactions fields with a Completions spelling for the remaining
+ * Completions and Claude routes. The Responses route uses interactions-to-responses.ts
+ * directly, so its native tools and generation settings do not pass through here.
+ * Claude metadata accepts only user_id, so labels are reported as dropped on that hop.
  *
  * `options.logger` is optional and carries warnings only: rule #8 requires a
  * `labels` map that breaks its declared type to be reported rather than dropped in
@@ -725,26 +704,16 @@ export function convertGeminiInteractionsToOpenAI(
   }
   if (tools.length > 0) result.tools = tools;
 
-  // `generation_config.stop_sequences` is the one generation knob with a
-  // Completions equivalent here too. Snake_case is the Interactions spelling,
-  // camelCase the generateContent one; both are read. Same trade-off as the
-  // generateContent path: an openai-completions upstream takes `stop` natively
-  // and anthropic-messages receives it as `stop_sequences`, while the
-  // openai-responses hop still drops it (the Responses API has no such field).
+  // Completions carries stop sequences natively and the Claude hop maps them to
+  // stop_sequences. The direct Responses route reports that Responses has no equivalent.
   const config = (geminiRequest.generation_config ?? geminiRequest.generationConfig) as
     Record<string, unknown> | undefined;
   const stopSequences = config?.stop_sequences ?? config?.stopSequences;
   const stop = Array.isArray(stopSequences)
     ? stopSequences
     : typeof stopSequences === 'string' ? [stopSequences] : [];
-  // An empty list means "no stop sequences"; emitting `stop: []` would be a new
-  // wire value for an upstream that never saw the field.
   if (stop.length > 0) result.stop = stop;
 
-  // `tool_choice` (Interactions) / `toolConfig.functionCallingConfig`
-  // (generateContent shape). Only emitted when a tool survived the conversion:
-  // a tool_choice naming no declared function is an upstream error, and one
-  // sent alongside an empty tools list would be a new wire value for nothing.
   const toolChoice = geminiToolChoiceToOpenAI(
     config?.tool_choice
       ?? config?.toolChoice
@@ -752,29 +721,15 @@ export function convertGeminiInteractionsToOpenAI(
   );
   if (tools.length > 0 && toolChoice !== undefined) result.tool_choice = toolChoice;
 
-  // Sampling and budget knobs. Unlike `stop_sequences`, each of these has a
-  // Completions spelling, so they ride the intermediate and the openai-responses
-  // hop re-targets them (`completionsToResponsesBody`).
   if (typeof config?.temperature === 'number') result.temperature = config.temperature;
   if (typeof config?.top_p === 'number') result.top_p = config.top_p;
-  // `max_tokens` is the spelling `convertClaudeToOpenAIRequest` already emits, and
-  // the one both the per-route cap and the openai-responses hop read.
   if (typeof config?.max_output_tokens === 'number') result.max_tokens = config.max_output_tokens;
 
-  // `thinking_level` (`minimal` | `low` | `medium` | `high`) is the same four values
-  // as the Responses `reasoning.effort` enum, and a subset of what a Completions
-  // upstream accepts as `reasoning_effort`, so it passes through verbatim. The
-  // `OpenAIRequest` union under-declares it (`low` | `medium` | `high` | `max`) —
-  // as it does `store` below — so the schema dump, not the TS type, is the authority.
   const thinkingLevel = config?.thinking_level ?? config?.thinkingLevel;
   if (typeof thinkingLevel === 'string') result.reasoning_effort = thinkingLevel;
 
-  // `store` is the Interactions input-only retention flag ("whether to store the
-  // response and request for later retrieval"). Chat Completions spells it the same
-  // way (`docs/api/list_of_api_and_schema.md:203`), so it needs no side channel: an
-  // openai-completions upstream receives a field it already has, and the
-  // openai-responses hop re-emits it under the same name. Omitted when the client
-  // did not send it, so an upstream's own default still applies.
+  // Chat Completions declares the same retention field. The direct Responses
+  // converter handles it without this intermediate.
   if (typeof geminiRequest.store === 'boolean') result.store = geminiRequest.store;
 
   // `labels` is the Interactions request's user-defined metadata map
@@ -832,7 +787,7 @@ export function convertGeminiInteractionsToOpenAI(
  * (lowercase) so OpenAI-compatible upstreams accept the function parameters.
  * e.g. "STRING" → "string", "OBJECT" → "object"
  */
-function normalizeGeminiSchema(schema: any): any {
+export function normalizeGeminiSchema(schema: any): any {
   if (!schema || typeof schema !== 'object') return schema;
   if (Array.isArray(schema)) return schema.map(normalizeGeminiSchema);
   const out: Record<string, any> = {};
@@ -1045,12 +1000,9 @@ export function convertGeminiGenerateContentToOpenAI(
     const result: Record<string, unknown> = { model, messages, stream };
     if (tools.length > 0) result.tools = tools;
 
-    // `generationConfig.stopSequences` is the one generation knob with a
-    // Completions equivalent, and the two cross-mode targets this body gets
-    // re-targeted to can carry it: an openai-completions upstream takes `stop`
-    // natively, and an anthropic-messages upstream receives it as `stop_sequences`
-    // via `completionsToClaudeBody`. The openai-responses hop still drops it — the
-    // Responses API has no stop-sequence field (`completionsToResponsesBody`).
+    // Both remaining cross-mode targets can carry stop sequences: Completions
+    // takes `stop`, and Claude receives `stop_sequences` via completionsToClaudeBody.
+    // The direct Responses converter reports that Responses has no such field.
     const stopSequences = config?.stopSequences;
     const stop = Array.isArray(stopSequences)
       ? stopSequences

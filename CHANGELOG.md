@@ -5,6 +5,20 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refact(gemini): direct generateContent ↔ OpenAI Responses conversion
+
+`:generateContent` with `openai-responses` and `/v1/responses` with either Gemini mode no longer bridge through Chat
+Completions and Claude Messages. The direct request/response pair preserves generateContent tool history, function
+allow-lists, Google Search, code execution, reasoning, media/documents, structured output, usage, and terminal states.
+Responses → generateContent also carries namespaced functions and enforces `allowed_tools` on converted responses.
+Both JSON and SSE egresses are direct; truncated streams cannot be reported as successful terminal answers.
+
+`gemini-interactions` on `/v1/responses` retains its documented compatibility behavior: the direct target is
+generateContent, not native Interactions. Provider-specific thought signatures and fields without a faithful target
+equivalent are reported rather than renamed speculatively. Routed coverage includes
+`tests/unit/gemini-responses-direct.test.ts`, the existing Gemini/Responses stream suite, URL tests, and the request-ref
+matrix, which now proves the recovered audio and document payloads survive ref-streamed sends.
+
 ### refact(responses): direct OpenAI Responses → Claude Messages conversion
 
 `/v1/responses` with `anthropic-messages` no longer routes requests through Chat Completions. The direct

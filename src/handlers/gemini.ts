@@ -593,7 +593,7 @@ function determineGeminiEndpoint(request: Request, geminiRequest: Record<string,
 /**
  * Construct full Gemini API URL, handling v1beta vs v1 path differences
  */
-function constructGeminiUrl(targetUrl: string, request: Request, geminiRequest: Record<string, unknown>, effectiveModelId?: string): string {
+export function constructGeminiUrl(targetUrl: string, request: Request, geminiRequest: Record<string, unknown>, effectiveModelId?: string): string {
     // Extract model from targetUrl if it contains :generateContent
     const urlMatch = targetUrl.match(/\/(v1beta|v1)\/models\/([^:?]+):(stream)?[Gg]enerateContent/);
     if (urlMatch) {

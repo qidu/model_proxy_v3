@@ -1,17 +1,7 @@
 /**
- * The Gemini front doors on an `openai-responses` upstream — `handleOpenAIRequest`'s
- * `forwardCompletionsAsOpenAIResponses` stream egress.
- *
- * `processResponsesSSEBuffer` used to hand-map `response.output_text.delta` and
- * nothing else, so a Gemini client on this route got text deltas and then a plain
- * end of stream: no `finishReason` (it lives on `response.completed` /
- * `response.incomplete`, which were dropped), no `functionCall` parts, no thought
- * parts, and `usageMetadata` of three zeros on every frame. It now defers the whole
- * Responses event vocabulary to `responsesStreamEventToChatChunks` — the converter
- * the `/v1/chat/completions` egress uses — whose mapping is unit-tested in
- * `responses-completions-roundtrip.test.ts`. What is pinned here is the wiring:
- * what actually reaches a Gemini client, and what happens when the upstream stream
- * is broken, failed, or truncated.
+ * Gemini front doors on an `openai-responses` upstream. GenerateContent and
+ * Interactions now use their direct Response event converters. This suite pins the
+ * routed JSON/SSE wiring, including broken, failed, and truncated upstream streams.
  */
 
 import { describe, it, after, afterEach } from 'node:test';
@@ -421,13 +411,7 @@ describe('Gemini front door → openai-responses: the SSE egress', () => {
   });
 });
 
-/**
- * The same route without streaming (`:generateContent`). The answer is converted by
- * `convertResponsesToChatCompletionsAnswer` — the function the `/v1/chat/completions`
- * egress uses — where a hand-built substitute used to read `output_text` and
- * `function_call` items and then report `finish_reason: 'stop'` for every answer
- * that called no tool, so a truncated turn arrived as STOP.
- */
+/** The direct Responses JSON → generateContent response conversion. */
 describe('Gemini front door → openai-responses: the non-streaming egress', () => {
   const realFetch = globalThis.fetch;
   after(() => { globalThis.fetch = realFetch; });

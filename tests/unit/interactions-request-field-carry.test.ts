@@ -168,9 +168,7 @@ describe('/v1/interactions → openai-responses: request fields reach the upstre
     assert.equal(upstream.temperature, 0.3);
   });
 
-  it('still does not carry them from a :generateContent body, which never declared them', async () => {
-    // Pinned, not fixed: the generateContent converter has the same gap and is out of
-    // this change's scope. `store` is not a generateContent field in the first place.
+  it('carries generateContent generation config directly but not an undeclared store field', async () => {
     const upstream = await send(
       {
         model: 'gemini-test',
@@ -183,7 +181,7 @@ describe('/v1/interactions → openai-responses: request fields reach the upstre
     );
 
     assert.equal('store' in upstream, false);
-    assert.equal('temperature' in upstream, false);
+    assert.equal(upstream.temperature, 0.3);
   });
 });
 

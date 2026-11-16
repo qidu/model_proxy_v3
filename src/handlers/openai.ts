@@ -32,6 +32,12 @@ import {
   responsesEventToInteractionEvents,
   responsesToInteraction,
 } from '../converters/responses-to-interactions.js';
+import { geminiToResponsesBody } from '../converters/gemini-to-responses.js';
+import {
+  createResponsesGeminiStreamState,
+  responsesEventToGeminiChunks,
+  responsesToGeminiResponse,
+} from '../converters/responses-to-gemini.js';
 
 /**
  * Forward an OpenAI Chat Completions body as a Claude Messages request to an
@@ -237,9 +243,8 @@ export function claudeJsonToSyntheticCompletions(claudeJson: Record<string, unkn
 }
 
 /**
- * Forward an OpenAI Chat Completions body as an OpenAI Responses body to an
- * openai-responses upstream. Used when the inbound endpoint is
- * /v1/interactions or :generateContent and the route is openai-responses.
+ * Legacy Responses fallback for a Gemini-shaped body that did not match either
+ * direct Interactions or generateContent dispatch above.
  *
  * The body has already been converted from Gemini/Claude to OpenAI Completions
  * by handleOpenAIRequest; we run a second conversion to Responses `input`
@@ -356,6 +361,128 @@ async function forwardCompletionsAsOpenAIResponses(
   const fallbackHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
   logPipelineHeaders(logger, requestId, 'outbound', '(fallback responses passthrough)', fallbackHeaders);
   return new Response(JSON.stringify(responsesJson), { headers: fallbackHeaders });
+}
+
+async function forwardGenerateContentAsOpenAIResponses(
+  requestBody: Record<string, unknown>,
+  targetUrl: string,
+  authHeaders: Record<string, string>,
+  requestId: string,
+  model: string,
+  logger: Logger,
+  originalRequest: Request,
+  forceStreaming: boolean,
+  env?: Env,
+  route?: ModelRouteConfig,
+): Promise<Response> {
+  let responsesBody = geminiToResponsesBody(requestBody, model, { logger, requestId });
+  if (forceStreaming) responsesBody.stream = true;
+  const isStreaming = responsesBody.stream === true;
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_upstream', route, upstreamMode: 'openai-responses',
+      clientModel: model, requestId, streaming: isStreaming, logger,
+    };
+    ({ body: responsesBody, headers: authHeaders } = runHook('before_upstream', { body: responsesBody, headers: authHeaders }, hookCtx));
+  }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    ...addForwardedHeaders(normalizeOpenAIAuthHeaders(authHeaders, targetUrl), originalRequest),
+  };
+  logPipelineStage(logger, requestId, 'upstream-request', targetUrl, responsesBody);
+  logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, headers);
+  let response = await postJsonWithSpool(targetUrl, responsesBody, {
+    headers,
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+  });
+  if (route) {
+    response = await applyAfterUpstream(response, {
+      hook: 'after_upstream', route, upstreamMode: 'openai-responses',
+      clientModel: model, requestId, streaming: isStreaming, logger, signal: originalRequest.signal,
+    });
+  }
+
+  logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
+  recordResponseStatusCodeFromUpstream(response.status);
+  recordUpstreamResponseToolCount('openai-responses', 0);
+  recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+  if (!response.ok) {
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, text => text, originalRequest.signal);
+    handleTargetApiError(response, 'generateContent (direct openai-responses)', { url: targetUrl, upstreamBody });
+  }
+
+  if (isStreaming) return handleResponsesStreamAsGemini(response, model, requestId, logger);
+  const responsesJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, originalRequest.signal,
+  );
+  const answer = responsesToGeminiResponse(responsesJson, model, { logger, requestId });
+  warnDroppedOutputItems(logger, requestId, new URL(originalRequest.url).pathname, answer.dropped);
+  logPipelineStage(logger, requestId, 'outbound', ':generateContent', answer.response);
+  return new Response(JSON.stringify(answer.response), {
+    headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+  });
+}
+
+function handleResponsesStreamAsGemini(
+  response: Response,
+  model: string,
+  requestId: string,
+  logger: Logger,
+): Response {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const state = createResponsesGeminiStreamState(model);
+
+  const processEvent = async (rawEvent: string): Promise<void> => {
+    if (state.finished) return;
+    const data = rawEvent.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n');
+    if (!data || data === '[DONE]') return;
+    const event = JSON.parse(data) as Record<string, unknown>;
+    if (event.type === 'response.failed') throw new Error(`Responses stream failed (request ${requestId})`);
+    for (const chunk of responsesEventToGeminiChunks(state, event)) {
+      logPipelineStage(logger, requestId, 'outbound', 'stream', chunk);
+      await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+    }
+  };
+
+  (async () => {
+    try {
+      if (!response.body) throw new Error('Responses upstream returned an empty stream');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const rawChunk = decoder.decode(value, { stream: true });
+        logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', rawChunk);
+        buffer += rawChunk;
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || '';
+        for (const event of events) await processEvent(event);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) await processEvent(buffer);
+      if (!state.finished) throw new Error(`Responses stream ended before a terminal event (request ${requestId})`);
+      warnDroppedOutputItems(logger, requestId, ':generateContent', state.dropped);
+      await writer.close();
+    } catch (error) {
+      logger.error(requestId, `generateContent direct Responses streaming error: ${(error as Error).message}`);
+      await writer.abort();
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive', 'x-request-id': requestId,
+    },
+  });
 }
 
 async function forwardInteractionsAsOpenAIResponses(
@@ -563,6 +690,13 @@ export async function handleOpenAIRequest(
       return forwardInteractionsAsOpenAIResponses(
         requestBody, targetUrl, authHeaders, requestId,
         (requestBody.model as string) || modelId || 'unknown', activeLogger, request, env, route,
+      );
+    }
+    if (isGenerateContentRequest && upstreamMode === 'openai-responses' && Array.isArray(requestBody.contents)) {
+      return forwardGenerateContentAsOpenAIResponses(
+        requestBody, targetUrl, authHeaders, requestId,
+        modelId || (requestBody.model as string) || 'unknown', activeLogger, request,
+        forceStreaming === true || isStreamRequest, env, route,
       );
     }
 

@@ -7,9 +7,8 @@
  *   - Completions **response** → Responses response: `convertCompletionsToResponses`
  *     and `convertCompletionsToCompactedResponse`. What an `openai-completions`
  *     upstream answered, re-rendered for a `/v1/responses` client.
- *   - Completions **request body** → Responses request body: `completionsToResponsesBody`.
- *     The second hop every client format takes before an `openai-responses` upstream
- *     (`handleOpenAIRequest`, `chat-completions.ts`, `messages.ts`).
+ *   - Completions **request body** → Responses request body: `completionsToResponsesBody`,
+ *     used by the Chat Completions front door.
  *
  * The first half also owns the two Completions-side readers the Messages hop shares
  * with it — `openAIContentToText` and `completionsForcedToolName` — which is why

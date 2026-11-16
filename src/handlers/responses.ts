@@ -19,10 +19,17 @@ import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } 
 import { getConversation, saveConversation, normalizeInputToItems, getConversationThreadItems, appendConversationThreadItems } from '../utils/conversation-store.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
-import { handleGeminiRequestForMessages } from './gemini.js';
-import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
+import { constructGeminiUrl } from './gemini.js';
 import { responsesToClaudeBody } from '../converters/responses-to-claude-request.js';
-import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
+import { responsesToGeminiBody } from '../converters/responses-to-gemini-request.js';
+import {
+  createGeminiResponsesStreamState,
+  geminiChunkToResponsesEvents,
+  geminiResponsesCreatedEvent,
+  geminiResponsesFailedEvent,
+  geminiToResponsesResponse,
+} from '../converters/gemini-to-responses.js';
+import { postJsonWithSpool } from '../utils/spool-json.js';
 import { collectBlobRefs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
 import { receiveResponseBody, receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
@@ -110,7 +117,7 @@ export async function handleResponsesRequest(
   }
 
   if (upstreamMode === 'gemini-generatecontent' || upstreamMode === 'gemini-interactions') {
-    return handleAsGemini(request, targetUrl, authHeaders, requestId, model, activeLogger, requestBody, isStreaming, env, upstreamMode);
+    return handleAsGemini(request, targetUrl, authHeaders, requestId, model, activeLogger, requestBody, isStreaming, env, route, upstreamMode);
   }
 
   // Default: Pass through to OpenAI Responses API upstream
@@ -171,27 +178,8 @@ export function handleResponsesRetrievalRequest(
  * Convert a Chat Completions body to Claude Messages body.
  * Extracts the system message from the messages array and maps the rest.
  *
- * NOTE: Kept for reference only — the call sites in `handleAsAnthropicMessages`
- * and `handleAsGemini` now reuse the more complete `completionsToClaudeBody`
- * imported from `../converters/completions-to-claude.js`. That version additionally
- * handles consecutive tool-result grouping, `reasoning_content` → `thinking`
- * blocks, and array `content` with `image_url` parts. This local copy is
- * intentionally retained as a reference for the simpler shape and as a fallback
- * if a future refactor re-decouples the responses handler from the shared
- * converter. Do not add new call sites here — use `completionsToClaudeBody` from
- * `../converters/completions-to-claude.js` instead.
- *
- * Historical callers (both internal to this file, both now using the shared
- * converter instead):
- *
- *   - handleAsAnthropicMessages  — `/v1/responses` → `anthropic-messages` upstream.
- *     Chain: Responses `input` → convertResponsesToChatCompletions → Completions
- *     `messages` → completionsBodyToClaudeBody → Claude body → fetch upstream.
- *
- *   - handleAsGemini             — `/v1/responses` → `gemini-generatecontent` /
- *     `gemini-interactions`. Same chain; handleGeminiRequestForMessages accepts
- *     Claude-format input, so the body still goes through Completions→Claude
- *     before being passed in.
+ * NOTE: Kept for reference only; there are no call sites. Converted routes use
+ * their direct request converters instead. Do not add new call sites here.
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function completionsBodyToClaudeBody(completions: OpenAIRequest, model: string): Record<string, unknown> {
@@ -762,10 +750,6 @@ async function handleAsAnthropicMessages(
   return new Response(JSON.stringify(responsesResponse), { status: 200, headers: outHeaders });
 }
 
-/**
- * Handle request by converting Responses API to Claude Messages format and forwarding to a Gemini upstream.
- * The Gemini handler (handleGeminiRequestForMessages) accepts Claude-format input and returns Claude-format output.
- */
 async function handleAsGemini(
   request: Request,
   targetUrl: string,
@@ -776,51 +760,152 @@ async function handleAsGemini(
   requestBody: Record<string, unknown>,
   isStreaming: boolean,
   env?: Env,
-  upstreamMode?: string
+  route?: ModelRouteConfig,
+  upstreamMode?: string,
 ): Promise<Response> {
   const conversationEnabled = env?.CONVERSATION_STATE === 'true' || env?.CONVERSATION_STATE === '1';
   const stateResult = applyConversationState(requestBody, conversationEnabled, logger, requestId);
   if ('error' in stateResult) return stateResult.error;
-  const completionsRequest = convertResponsesToChatCompletions(stateResult.body, model, { logger, requestId });
-  const allowedTools = extractAllowedTools(stateResult.body);
-  const claudeBody = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model, { logger, requestId });
-
-  logger.debug(requestId, `Responses->${upstreamMode}: ${JSON.stringify(claudeBody).substring(0, 500)}`);
-
-  // Build a synthetic request with Claude-format body so handleGeminiRequestForMessages can process it
-  const claudeAttempt = await createJsonEgressBody(claudeBody, 'att-');
-  const claudeRequest = new Request(request.url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...Object.fromEntries(request.headers),
-    },
-    body: claudeAttempt.body,
-    ...(claudeAttempt.spilled ? { duplex: 'half' } : {}),
-  } as RequestInit);
-
-  const claudeResponse = await handleGeminiRequestForMessages(claudeRequest, targetUrl, authHeaders, requestId, model, env, logger);
-
-  if (!claudeResponse.ok) {
-    // The Gemini handler produced an Anthropic-shaped error; re-throw it in the
-    // Responses envelope so /v1/responses clients get the spec's shape.
-    const upstreamErrorBody = await withResponseText(claudeResponse, requestId, logger, targetUrl, (text) => text, request.signal);
-    handleResponsesApiError(claudeResponse, 'Responses API (via gemini)', { url: targetUrl, upstreamBody: upstreamErrorBody });
+  let effectiveBody = stateResult.body;
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_conversion', route, upstreamMode: upstreamMode || 'gemini-generatecontent',
+      clientModel: model, requestId, streaming: isStreaming, logger,
+    };
+    ({ body: effectiveBody } = runHook('before_conversion', { body: effectiveBody, headers: authHeaders }, hookCtx));
   }
-
+  const allowedTools = extractAllowedTools(effectiveBody);
+  let geminiBody = await responsesToGeminiBody(effectiveBody, model, { logger, requestId });
+  const namespaceMap = getNamespaceMap(geminiBody as unknown as OpenAIRequest);
+  let fullTargetUrl = constructGeminiUrl(targetUrl, request, geminiBody, model);
   if (isStreaming) {
-    // claudeResponse is Claude SSE; convert to Responses SSE
-    return streamClaudeAsResponses(claudeResponse, model, requestId, logger, allowedTools);
+    fullTargetUrl = fullTargetUrl.replace(/:generateContent(\?|$)/, ':streamGenerateContent$1');
+    if (!fullTargetUrl.includes('alt=sse')) fullTargetUrl += (fullTargetUrl.includes('?') ? '&' : '?') + 'alt=sse';
   }
 
-  const claudeJson = await claudeResponse.json() as Record<string, unknown>;
-  logger.debug(requestId, `Upstream gemini claude response: ${JSON.stringify(claudeJson).substring(0, 500)}`);
-  const responsesResponse = claudeResponseToResponses(claudeJson, model, allowedTools, logger, requestId);
-  logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
+  let headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...addForwardedHeaders(authHeaders, request),
+  };
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_upstream', route, upstreamMode: upstreamMode || 'gemini-generatecontent',
+      clientModel: model, requestId, streaming: isStreaming, logger,
+    };
+    ({ body: geminiBody, headers } = runHook('before_upstream', { body: geminiBody, headers }, hookCtx));
+  }
+  logPipelineStage(logger, requestId, 'upstream-request', fullTargetUrl, geminiBody);
+  logPipelineHeaders(logger, requestId, 'upstream-request', fullTargetUrl, headers);
+  let response = await postJsonWithSpool(fullTargetUrl, geminiBody, {
+    headers,
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+  });
+  if (route) {
+    response = await applyAfterUpstream(response, {
+      hook: 'after_upstream', route, upstreamMode: upstreamMode || 'gemini-generatecontent',
+      clientModel: model, requestId, streaming: isStreaming, logger, signal: request.signal,
+    });
+  }
+  logPipelineHeaders(logger, requestId, 'upstream-response', fullTargetUrl, response.headers);
+  recordResponseStatusCodeFromUpstream(response.status);
+  recordUpstreamResponseToolCount(upstreamMode || 'gemini-generatecontent', 0);
+  recordUpstreamRateLimit(model, name => response.headers.get(name), fullTargetUrl);
+  if (!response.ok) {
+    const upstreamBody = await withResponseText(response, requestId, logger, fullTargetUrl, text => text, request.signal);
+    handleResponsesApiError(response, 'Responses API (direct gemini)', { url: fullTargetUrl, upstreamBody });
+  }
 
-  const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
-  logPipelineHeaders(logger, requestId, 'outbound', '/v1/responses', outHeaders);
-  return new Response(JSON.stringify(responsesResponse), { status: 200, headers: outHeaders });
+  if (isStreaming) return streamGeminiAsResponses(response, model, requestId, logger, allowedTools, namespaceMap);
+  const geminiJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, fullTargetUrl, request.signal,
+  );
+  const responsesResponse = geminiToResponsesResponse(geminiJson, model, requestId, { logger, requestId, allowedTools, namespaceMap });
+  logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
+  return new Response(JSON.stringify(responsesResponse), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+  });
+}
+
+function streamGeminiAsResponses(
+  upstream: Response,
+  model: string,
+  requestId: string,
+  logger: Logger,
+  allowedTools: Set<string> | null,
+  namespaceMap?: NamespaceMap,
+): Response {
+  const contentType = upstream.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    throw new Error(`Gemini upstream answered a streaming request with '${contentType || '(no content-type)'}' instead of text/event-stream`);
+  }
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const state = createGeminiResponsesStreamState(model);
+
+  const writeEvent = async (event: Record<string, unknown>): Promise<void> => {
+    logPipelineStage(logger, requestId, 'outbound', '/v1/responses (SSE)', event);
+    await writer.write(encoder.encode(`event: ${event.type as string}\ndata: ${JSON.stringify(event)}\n\n`));
+  };
+  const processEvent = async (rawEvent: string): Promise<void> => {
+    if (state.finished) return;
+    const data = rawEvent.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n');
+    if (!data || data === '[DONE]') return;
+    const chunk = JSON.parse(data) as Record<string, unknown>;
+    for (const event of geminiChunkToResponsesEvents(state, chunk, { logger, requestId, allowedTools, namespaceMap })) {
+      await writeEvent(event);
+    }
+  };
+
+  (async () => {
+    try {
+      if (!upstream.body) throw new Error('Gemini upstream returned an empty stream');
+      await writeEvent(geminiResponsesCreatedEvent(state));
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const rawChunk = decoder.decode(value, { stream: true });
+        logPipelineStage(logger, requestId, 'upstream-response', upstream.url || '(upstream SSE)', rawChunk);
+        buffer += rawChunk;
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || '';
+        for (const event of events) await processEvent(event);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) await processEvent(buffer);
+      if (!state.finished) throw new Error(`Gemini stream ended before a finishReason (request ${requestId})`);
+      await writer.write(encoder.encode('data: [DONE]\n\n'));
+      await writer.close();
+    } catch (error) {
+      const message = (error as Error).message;
+      logger.error(requestId, `Responses direct Gemini streaming error: ${message}`);
+      if (!state.finished) {
+        try {
+          await writeEvent(geminiResponsesFailedEvent(state, message));
+          await writer.write(encoder.encode('data: [DONE]\n\n'));
+          await writer.close();
+        } catch {
+          await writer.abort();
+        }
+      } else {
+        await writer.abort();
+      }
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive', 'x-request-id': requestId,
+    },
+  });
 }
 
 /**
