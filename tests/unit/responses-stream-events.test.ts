@@ -111,6 +111,39 @@ afterEach(() => {
 });
 
 describe('Responses SSE event shape — completions upstream', () => {
+  it('requests usage and carries the separate upstream usage chunk into the terminal response (MOD-33)', async () => {
+    writeConfig('openai-completions');
+    let upstreamBody: Record<string, any> | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(init!.body as string);
+      const chunks = [
+        completionsChunk({ role: 'assistant', content: 'Pong!' }),
+        completionsChunk({}, 'stop'),
+      ];
+      // A compliant upstream sends aggregate usage only when requested, in a
+      // separate chunk after finish_reason with no choices.
+      if (upstreamBody!.stream_options?.include_usage === true) {
+        chunks.push(`data: ${JSON.stringify({
+          id: 'chatcmpl-1', object: 'chat.completion.chunk', model: 'm', choices: [],
+          usage: { prompt_tokens: 13, completion_tokens: 7, total_tokens: 20 },
+        })}\n\n`);
+      }
+      chunks.push('data: [DONE]\n\n');
+      return new Response(chunks.join(''), {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }) as typeof fetch;
+
+    const events = await readSse(await postResponses({ model: 'test', input: 'ping', stream: true }));
+    assert.deepEqual(upstreamBody?.stream_options, { include_usage: true });
+    const terminal = events.find((e) => e.event === 'response.completed');
+    const response = terminal?.data?.response as Record<string, unknown>;
+    assert.deepEqual(response.usage, {
+      input_tokens: 13, output_tokens: 7, total_tokens: 20,
+      input_tokens_details: { cached_tokens: 0 },
+    });
+  });
+
   it('emits the full content-part lifecycle and ends with response.completed', async () => {
     writeConfig('openai-completions');
     mockUpstreamSse([
