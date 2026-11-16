@@ -324,7 +324,7 @@ const ROWS: Row[] = [
     refs: 4, carried: ALL_RESPONSES, dropped: [], streamed: true,
     call: (r) => handleResponsesRequest(r, TARGET, AUTH, 'r17', 'gpt-test', ENV, LOGGER) },
   { name: 'responses→anthropic-messages', clientPath: '/v1/responses', body: RESPONSES_BODY, upstreamUrl: TARGET,
-    refs: 4, carried: [RESP_IMAGE, RESP_IMAGE_OBJ], dropped: [RESP_FILE, RESP_SKILL], streamed: true,
+    refs: 4, carried: [RESP_IMAGE, RESP_IMAGE_OBJ, RESP_FILE], dropped: [RESP_SKILL], streamed: true,
     call: (r) => handleResponsesRequest(r, TARGET, AUTH, 'r18', 'gpt-test', ENV, LOGGER, 'anthropic-messages') },
   { name: 'responses→openai-completions', clientPath: '/v1/responses', body: RESPONSES_BODY, upstreamUrl: TARGET,
     refs: 4, carried: [RESP_IMAGE, RESP_IMAGE_OBJ], dropped: [RESP_FILE, RESP_SKILL], streamed: true,

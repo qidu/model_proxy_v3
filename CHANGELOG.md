@@ -5,6 +5,18 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refact(responses): direct OpenAI Responses → Claude Messages conversion
+
+`/v1/responses` with `anthropic-messages` no longer routes requests through Chat Completions. The direct
+`responses-to-claude-request.ts` converter preserves function/custom tools, namespace metadata, web search, code
+execution, MCP connectors, reasoning text, structured output, media/document inputs, tool history, and generation
+options. MCP connectors add the client beta header, and `allowed_tools` remains enforced on the response side.
+
+The existing Claude JSON/SSE → Responses egress now restores namespace-qualified function names on the direct route.
+Conversation-state expansion, text-only message shape, response usage, terminal states, and request blob streaming are
+covered by existing and new routed tests, including `tests/unit/responses-claude-direct.test.ts` and the request-ref
+matrix.
+
 ### refact(messages): direct Claude Messages ↔ OpenAI Responses conversion
 
 `/v1/messages` with `openai-responses` no longer reaches the Responses API through Chat Completions. The new

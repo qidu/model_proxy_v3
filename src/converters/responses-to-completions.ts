@@ -89,7 +89,7 @@ function shortenFlatName(flatName: string, counter: { value: number }): string {
  * `MAX_FUNCTION_NAME_LENGTH` are shortened; `namespaceMap` records the
  * original `{ name, namespace }` under the final flat name either way.
  */
-function flattenNamespaces(
+export function flattenNamespaces(
   tools: Array<Record<string, unknown>>,
   namespaceMap: NamespaceMap,
   counter: { value: number },

@@ -71,6 +71,17 @@ export function normalizeOpenAIAuthHeaders(authHeaders: Record<string, string>, 
 }
 
 const STRUCTURED_OUTPUTS_BETA = 'structured-outputs-2025-11-13';
+const MCP_CLIENT_BETA = 'mcp-client-2025-04-04';
+
+export function ensureMcpClientBetaHeader(headers: Record<string, string>, body: Record<string, unknown>): void {
+  if (!Array.isArray(body.mcp_servers) || body.mcp_servers.length === 0) return;
+  const betas = (headers['anthropic-beta'] ?? '')
+    .split(',')
+    .map(beta => beta.trim())
+    .filter(beta => beta !== '');
+  if (!betas.includes(MCP_CLIENT_BETA)) betas.push(MCP_CLIENT_BETA);
+  headers['anthropic-beta'] = betas.join(',');
+}
 
 // Pair converted structured-output bodies with the legacy beta capability for
 // gateways that still require the header/body pair.

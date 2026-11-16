@@ -10,7 +10,7 @@ import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStre
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
 import { handleResponsesApiError, createResponsesErrorResponse, ResponsesApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
-import { normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader } from '../utils/auth-headers.js';
+import { normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader, ensureMcpClientBetaHeader } from '../utils/auth-headers.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
@@ -21,6 +21,7 @@ import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount }
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { handleGeminiRequestForMessages } from './gemini.js';
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
+import { responsesToClaudeBody } from '../converters/responses-to-claude-request.js';
 import { createJsonEgressBody, postJsonWithSpool } from '../utils/spool-json.js';
 import { collectBlobRefs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
@@ -244,6 +245,13 @@ function completionsBodyToClaudeBody(completions: OpenAIRequest, model: string):
   return claudeBody;
 }
 
+function restoreResponseToolName(
+  flatName: string,
+  namespaceMap?: NamespaceMap,
+): { name: string; namespace?: string } {
+  return namespaceMap?.get(flatName) ?? { name: flatName };
+}
+
 /**
  * Convert a Claude Messages JSON response to Responses API format.
  */
@@ -253,6 +261,7 @@ function claudeResponseToResponses(
   allowedTools?: Set<string> | null,
   logger?: Logger,
   requestId?: string,
+  namespaceMap?: NamespaceMap,
 ): Record<string, unknown> {
   const content = (claudeJson.content as Array<Record<string, unknown>>) ?? [];
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
@@ -281,7 +290,8 @@ function claudeResponseToResponses(
   let suppressedCalls = 0;
   for (const block of content) {
     if (block.type === 'tool_use') {
-      if (allowedTools != null && !allowedTools.has(block.name as string)) {
+      const toolName = restoreResponseToolName(block.name as string, namespaceMap);
+      if (allowedTools != null && !allowedTools.has(toolName.name)) {
         suppressedCalls++;
         continue;
       }
@@ -289,7 +299,8 @@ function claudeResponseToResponses(
         id: block.id ?? `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`,
         type: 'function_call',
         status: 'completed',
-        name: block.name,
+        name: toolName.name,
+        ...(toolName.namespace ? { namespace: toolName.namespace } : {}),
         arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input ?? {}),
         call_id: block.id ?? `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`,
       });
@@ -336,6 +347,7 @@ function streamClaudeAsResponses(
   requestId: string,
   logger?: Logger,
   allowedTools?: Set<string> | null,
+  namespaceMap?: NamespaceMap,
 ): Response {
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
   const itemId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -378,7 +390,7 @@ function streamClaudeAsResponses(
       let cachedTokens = 0;
       let buffer = '';
       // Map from Claude block index → whether it's a tool_use block
-      const toolBlocks = new Map<number, { id: string; name: string; arguments: string; outputIndex: number }>();
+      const toolBlocks = new Map<number, { id: string; name: string; namespace?: string; arguments: string; outputIndex: number }>();
       let suppressedToolCalls = 0; // tool_use blocks rejected by allowedTools
       let nextOutputIndex = 0;
 
@@ -432,21 +444,24 @@ function streamClaudeAsResponses(
                 textPartOpened = true;
               }
             } else if (block?.type === 'tool_use') {
-              const toolName = block.name as string ?? '';
+              const toolName = restoreResponseToolName(block.name as string ?? '', namespaceMap);
               // allowedTools is a hard constraint (spec): suppress calls to
               // tools outside the set — no lifecycle events, no output entry.
-              if (allowedTools != null && !allowedTools.has(toolName)) {
+              if (allowedTools != null && !allowedTools.has(toolName.name)) {
                 suppressedToolCalls++;
                 continue;
               }
               const outputIndex = nextOutputIndex++;
               const toolId = block.id as string ?? `call_${Date.now()}_${idx}`;
-              toolBlocks.set(idx, { id: toolId, name: toolName, arguments: '', outputIndex });
+              toolBlocks.set(idx, { id: toolId, name: toolName.name, namespace: toolName.namespace, arguments: '', outputIndex });
               await writer.write(encoder.encode(sseEvent('response.output_item.added', {
                 type: 'response.output_item.added',
                 sequence_number: nextSeq(),
                 output_index: outputIndex,
-                item: { id: toolId, type: 'function_call', status: 'in_progress', name: toolName, arguments: '', call_id: toolId },
+                item: {
+                  id: toolId, type: 'function_call', status: 'in_progress', name: toolName.name,
+                  ...(toolName.namespace ? { namespace: toolName.namespace } : {}), arguments: '', call_id: toolId,
+                },
               })));
             }
           } else if (type === 'content_block_delta') {
@@ -493,7 +508,10 @@ function streamClaudeAsResponses(
                 type: 'response.output_item.done',
                 sequence_number: nextSeq(),
                 output_index: tool.outputIndex,
-                item: { id: tool.id, type: 'function_call', status: 'completed', name: tool.name, arguments: tool.arguments, call_id: tool.id },
+                item: {
+                  id: tool.id, type: 'function_call', status: 'completed', name: tool.name,
+                  ...(tool.namespace ? { namespace: tool.namespace } : {}), arguments: tool.arguments, call_id: tool.id,
+                },
               })));
             }
           } else if (type === 'message_delta') {
@@ -541,7 +559,10 @@ function streamClaudeAsResponses(
         outputItems.push({ id: itemId, type: 'message', status: isIncomplete ? 'incomplete' : 'completed', role: 'assistant', content: [{ type: 'output_text', text: accumulatedText, annotations: [] }] });
       }
       for (const tool of toolBlocks.values()) {
-        outputItems.push({ id: tool.id, type: 'function_call', status: 'completed', name: tool.name, arguments: tool.arguments, call_id: tool.id });
+        outputItems.push({
+          id: tool.id, type: 'function_call', status: 'completed', name: tool.name,
+          ...(tool.namespace ? { namespace: tool.namespace } : {}), arguments: tool.arguments, call_id: tool.id,
+        });
       }
       if (suppressedToolCalls > 0) {
         activeLogger.warn(requestId, `[responses] suppressed ${suppressedToolCalls} tool call(s) outside allowed_tools`);
@@ -663,9 +684,9 @@ async function handleAsAnthropicMessages(
   const conversationEnabled = env?.CONVERSATION_STATE === 'true' || env?.CONVERSATION_STATE === '1';
   const stateResult = applyConversationState(requestBody, conversationEnabled, logger, requestId);
   if ('error' in stateResult) return stateResult.error;
-  const completionsRequest = convertResponsesToChatCompletions(stateResult.body, model, { logger, requestId });
   const allowedTools = extractAllowedTools(stateResult.body);
-  let claudeBody: Record<string, unknown> = await completionsToClaudeBody(completionsRequest as unknown as Record<string, unknown>, model, { logger, requestId });
+  let claudeBody: Record<string, unknown> = responsesToClaudeBody(stateResult.body, model, { logger, requestId });
+  const namespaceMap = getNamespaceMap(claudeBody as unknown as OpenAIRequest);
 
   // before_upstream: apply declared transforms to the upstream-format body.
   // Required for anthropic-messages routes so per-model quirks (e.g. inject
@@ -676,6 +697,7 @@ async function handleAsAnthropicMessages(
   // or renames beta entries, and a header added past it reaches a gateway that asked
   // for it to be gone (see the same call in `handlers/openai.ts`). With no map the
   // builtin passes the header through unchanged.
+  ensureMcpClientBetaHeader(authHeaders, claudeBody);
   ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
 
   if (route) {
@@ -718,7 +740,7 @@ async function handleAsAnthropicMessages(
   }
 
   if (isStreaming) {
-    return streamClaudeAsResponses(response, model, requestId, logger, allowedTools);
+    return streamClaudeAsResponses(response, model, requestId, logger, allowedTools, namespaceMap);
   }
 
   // §5.7: one bounded receive instead of `response.text()` — above
@@ -732,7 +754,7 @@ async function handleAsAnthropicMessages(
   const claudeJson = await receiveJsonResponse<Record<string, unknown>>(
     response, requestId, logger, targetUrl, request.signal,
   );
-  const responsesResponse = claudeResponseToResponses(claudeJson, model, allowedTools, logger, requestId);
+  const responsesResponse = claudeResponseToResponses(claudeJson, model, allowedTools, logger, requestId, namespaceMap);
   logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
 
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
