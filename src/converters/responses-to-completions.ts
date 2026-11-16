@@ -175,6 +175,12 @@ export function convertResponsesToChatCompletions(
     stream: responsesRequest.stream === true,
   };
 
+  // Responses terminal events carry usage; Chat Completions upstreams require
+  // this option to send the aggregate usage chunk before [DONE].
+  if (completionsRequest.stream) {
+    completionsRequest.stream_options = { include_usage: true };
+  }
+
   // Copy optional parameters
   if (responsesRequest.temperature !== undefined) {
     completionsRequest.temperature = responsesRequest.temperature as number;

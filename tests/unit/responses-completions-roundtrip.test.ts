@@ -218,6 +218,15 @@ describe('convertCompletionsToCompactedResponse', () => {
 // ─── responses → completions ───────────────────────────────────────────────
 
 describe('convertResponsesToChatCompletions', () => {
+  it('requests upstream usage only for streaming Responses requests (MOD-33)', () => {
+    const streaming = convertResponsesToChatCompletions({ input: 'ping', stream: true }, 'm');
+    assert.deepEqual(streaming.stream_options, { include_usage: true });
+    for (const stream of [undefined, false]) {
+      const nonStreaming = convertResponsesToChatCompletions({ input: 'ping', stream }, 'm');
+      assert.equal(Object.hasOwn(nonStreaming, 'stream_options'), false);
+    }
+  });
+
   it('converts a simple string input to a user message', () => {
     const out = convertResponsesToChatCompletions(
       { model: 'gpt-4o', input: 'hello' },

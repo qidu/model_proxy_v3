@@ -5,6 +5,14 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): request upstream streaming usage (MOD-33)
+
+Streaming `/v1/responses` requests converted to Chat Completions now request
+`stream_options.include_usage`, so upstreams that gate usage behind that option
+can supply token counts for the terminal Responses event. Non-streaming requests
+do not send streaming options. Regression coverage checks the request mapping and
+an upstream that sends its separate, empty-choices usage chunk only when requested.
+
 ### fix(handlers): preserve terminal failures and signed text parts across cross-mode hops
 
 Three follow-up review findings are fixed:
