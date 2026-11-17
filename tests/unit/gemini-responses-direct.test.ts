@@ -278,7 +278,7 @@ describe('R4/R6 routed direct conversion', () => {
         body: JSON.stringify({ model: 'client', input: 'hi', stream: true }),
       }),
       'https://upstream.test/v1beta', { 'x-goog-api-key': 'key' }, 'r4-stream', 'gemini-resolved',
-      ENV, LOGGER, 'gemini-interactions',
+      ENV, LOGGER, 'gemini-generatecontent',
     );
 
     assert.equal(upstreamUrl, 'https://upstream.test/v1beta/models/gemini-resolved:streamGenerateContent?alt=sse');

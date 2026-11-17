@@ -248,9 +248,9 @@ is selected by the route's `defaultMode` / model config.
 | Type | Shape |
 |---|---|
 | `GeminiUsage` | `{promptTokenCount, candidatesTokenCount?, totalTokenCount, cachedContentTokenCount?, thoughtsTokenCount?, toolUsePromptTokenCount?}` |
-| `GeminiInteractionRequest` | `{input, model, systemInstruction?, tools?, toolConfig?, generationConfig?, cachedContent?, agent?, previousInteractionId?, conversationId?, responseModalities?, safetySettings?, stream?}` |
+| `GeminiInteractionRequest` | `{input, model?, agent?, system_instruction?, tools?, response_format?, stream?, store?, background?, generation_config?, agent_config?, previous_interaction_id?, response_modalities?}` |
 | `GeminiInteractionStatus` | `"in_progress"\|"requires_action"\|"completed"\|"failed"\|"cancelled"\|"incomplete"` |
-| `GeminiInteractionResponse` | `{id, object: "interaction", status, model, outputs: GeminiContent[], usage, created, updated, previousInteractionId?, conversationId?, errors?: Error[]}` |
+| `GeminiInteractionResponse` | `{id, object: "interaction", status, model?, agent?, steps: GeminiStep[], usage?, created, updated, previous_interaction_id?, response_format?, response_modalities?, errors?: Error[]}` |
 | `GeminiSSEEvent` | union of `interaction.created`, `interaction.completed`, `interaction.status_update`, `step.start`, `step.delta`, `step.stop`, `error` |
 
 ### 5.4 Model & agent option enums

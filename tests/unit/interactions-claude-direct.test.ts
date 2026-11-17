@@ -72,7 +72,7 @@ describe('Interactions → Claude direct request conversion', () => {
         { type: 'code_execution' },
         {
           type: 'mcp_server', name: 'catalog', url: 'https://mcp.example', headers: { Authorization: 'Bearer token' },
-          allowed_tools: [{ name: 'search' }],
+          allowed_tools: { mode: 'any', tools: ['search'] },
         },
       ],
       generation_config: {
@@ -80,7 +80,7 @@ describe('Interactions → Claude direct request conversion', () => {
         thinking_level: 'high', thinking_summaries: 'auto',
         tool_choice: { allowed_tools: { mode: 'validated', tools: ['lookup'] } },
       },
-      response_format: { type: 'object', properties: { answer: { type: 'string' } } },
+      response_format: [{ type: 'object', properties: { answer: { type: 'string' } } }],
       labels: { user_id: 'user-1' },
     }, 'resolved-model');
 
@@ -161,6 +161,10 @@ describe('/v1/interactions ↔ anthropic-messages direct route', () => {
         id: 'msg_1', model: 'claude-upstream', stop_reason: 'tool_use',
         content: [
           { type: 'thinking', thinking: 'checking', signature: 'claude-sig' },
+          {
+            type: 'text', text: 'cited answer',
+            citations: [{ type: 'char_location', cited_text: 'answer', document_index: 0, document_title: 'notes', start_char_index: 0, end_char_index: 6 }],
+          },
           { type: 'server_tool_use', id: 'search_1', name: 'web_search', input: { queries: ['weather'] } },
           { type: 'mcp_tool_use', id: 'mcp_1', server_name: 'catalog', name: 'search', input: { q: 'x' } },
           { type: 'mcp_tool_result', tool_use_id: 'mcp_1', server_name: 'catalog', content: 'found' },
@@ -185,9 +189,16 @@ describe('/v1/interactions ↔ anthropic-messages direct route', () => {
     const answer = await response.json() as any;
     assert.match(answer.id, /^v1_\d+_int-claude-json$/);
     assert.equal(answer.status, 'requires_action');
-    assert.deepEqual(answer.outputs, [
-      { type: 'thought', summary: { content: { type: 'text', text: 'checking' } }, signature: 'claude-sig' },
-      { type: 'google_search_call', id: 'search_1', arguments: { queries: ['weather'] }, search_type: 'web_search' },
+    assert.deepEqual(answer.steps, [
+      { type: 'thought', summary: [{ type: 'text', text: 'checking' }], signature: 'claude-sig' },
+      {
+        type: 'model_output',
+        content: [{
+          type: 'text', text: 'cited answer',
+          annotations: [{ type: 'file_citation', start_index: 0, end_index: 6, source: 'notes', file_name: 'notes' }],
+        }],
+      },
+      { type: 'google_search_call', id: 'search_1', arguments: { queries: ['weather'], search_type: 'web_search' } },
       { type: 'mcp_server_tool_call', id: 'mcp_1', name: 'search', server_name: 'catalog', arguments: { q: 'x' } },
       { type: 'mcp_server_tool_result', call_id: 'mcp_1', result: 'found', server_name: 'catalog' },
       { type: 'function_call', id: 'call_1', name: 'lookup', arguments: { q: 'x' } },
@@ -262,7 +273,7 @@ describe('/v1/interactions ↔ anthropic-messages direct route', () => {
     const interaction = await response.json() as any;
 
     assert.equal(interaction.status, 'incomplete');
-    assert.equal(interaction.outputs[0].text, 'partial');
+    assert.equal(interaction.steps[0].content[0].text, 'partial');
     assert.equal('error' in interaction, false);
     assert.match(interaction.errors[0].message, /max_tokens/);
   });

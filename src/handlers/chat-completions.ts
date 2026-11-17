@@ -838,7 +838,7 @@ async function handleAsGeminiInteractions(
 ): Promise<Response> {
   const path = '/v1/chat/completions';
   const model = (parsedBody.model as string || modelId || 'unknown');
-  let interactionsBody = completionsToInteractionsBody(parsedBody, model);
+  let interactionsBody = completionsToInteractionsBody(parsedBody, model, { logger, requestId });
   logger.debug(requestId, `${path} converted to gemini-interactions body`);
 
   if (route) {

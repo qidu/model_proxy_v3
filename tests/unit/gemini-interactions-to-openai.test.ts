@@ -820,11 +820,12 @@ describe('convertGeminiInteractionsToOpenAI — sampling knobs, retention and st
 
   it('maps the generation_config sampling knobs to their Completions spellings', () => {
     const out = convertGeminiInteractionsToOpenAI(body({
-      generation_config: { temperature: 0.3, top_p: 0.9, max_output_tokens: 1234 },
+      generation_config: { temperature: 0.3, top_p: 0.9, seed: 7, max_output_tokens: 1234 },
     })) as any;
 
     assert.equal(out.temperature, 0.3);
     assert.equal(out.top_p, 0.9);
+    assert.equal(out.seed, 7);
     // Renamed across the hop: `max_output_tokens` is the Interactions spelling,
     // `max_tokens` the one the route cap and the Responses hop both read.
     assert.equal(out.max_tokens, 1234);

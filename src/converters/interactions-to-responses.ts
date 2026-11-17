@@ -2,7 +2,7 @@ import type { Logger } from '../types/shared.js';
 import { isBlobRef, rebindBlobRef } from '../utils/blob-refs.js';
 import { ValidationError } from '../utils/errors.js';
 import { stringify } from '../utils/stringify.js';
-import { classifyInteractionsInput, functionArgs, type InteractionsInputEntry } from './interactions-to-gemini.js';
+import { classifyInteractionsInput, functionArgs, interactionResponseSchema, type InteractionsInputEntry } from './interactions-to-gemini.js';
 
 interface ConversionOptions {
   logger?: Logger;
@@ -133,6 +133,7 @@ function appendStep(
     if (typeof callId !== 'string' || callId === '' || typeof step.name !== 'string' || step.name === '') {
       throw new ValidationError(`${where} function_call requires id/call_id and name`);
     }
+    if (step.signature !== undefined) warn(options, `${where}.signature has no Responses function_call equivalent; dropped`);
     input.push({
       type: 'function_call',
       call_id: callId,
@@ -145,10 +146,16 @@ function appendStep(
     if (typeof step.call_id !== 'string' || step.call_id === '') {
       throw new ValidationError(`${where} function_result requires call_id`);
     }
+    if (step.is_error !== undefined) warn(options, `${where}.is_error has no Responses function_call_output equivalent; dropped`);
+    if (step.signature !== undefined) warn(options, `${where}.signature has no Responses function_call_output equivalent; dropped`);
     input.push({
       type: 'function_call_output',
       call_id: step.call_id,
-      output: typeof step.result === 'string' ? step.result : stringify(step.result ?? ''),
+      output: typeof step.result === 'string'
+        ? step.result
+        : Array.isArray(step.result)
+          ? contentParts(step.result, 'user', `${where}.result`, options)
+          : stringify(step.result ?? ''),
     });
     return;
   }
@@ -231,20 +238,30 @@ function responseTools(
       converted.push(fn);
       functionsByName.set(tool.name, fn);
     } else if (type === 'google_search') {
-      converted.push({ type: 'web_search' });
+      const searchTypes = Array.isArray(tool.search_types) ? tool.search_types : [];
+      if (searchTypes.some(entry => !['web_search', 'image_search'].includes(String(entry)))) {
+        throw new ValidationError(`tools[${index}].search_types has no Responses web_search equivalent`);
+      }
+      const contentTypes = searchTypes.flatMap(entry => entry === 'web_search' ? ['text'] : entry === 'image_search' ? ['image'] : []);
+      converted.push({ type: 'web_search', ...(contentTypes.length > 0 ? { search_content_types: contentTypes } : {}) });
       if (tool.queries !== undefined) warn(options, `tools[${index}].queries has no Responses web_search equivalent; dropped`);
     } else if (type === 'code_execution') {
       converted.push({ type: 'code_interpreter', container: { type: 'auto' } });
     } else if (type === 'mcp_server') {
       if (typeof tool.url !== 'string' || tool.url === '') throw new ValidationError(`tools[${index}] mcp_server requires url for Responses MCP`);
+      const allowed = asRecord(tool.allowed_tools);
+      const allowedTools = Array.isArray(allowed?.tools)
+        ? allowed.tools.filter((name): name is string => typeof name === 'string')
+        : Array.isArray(tool.allowed_tools)
+          ? tool.allowed_tools.map(entry => asRecord(entry)?.name).filter((name): name is string => typeof name === 'string')
+          : [];
+      if (allowed?.mode !== undefined) warn(options, `tools[${index}].allowed_tools.mode has no Responses MCP equivalent; dropped`);
       converted.push({
         type: 'mcp',
         server_label: typeof tool.name === 'string' && tool.name !== '' ? tool.name : tool.url,
         server_url: tool.url,
         ...(tool.headers !== undefined ? { headers: tool.headers } : {}),
-        ...(Array.isArray(tool.allowed_tools)
-          ? { allowed_tools: tool.allowed_tools.map(entry => asRecord(entry)?.name).filter(name => typeof name === 'string') }
-          : {}),
+        ...(allowedTools.length > 0 ? { allowed_tools: allowedTools } : {}),
       });
     } else {
       warn(options, `tools[${index}] type ${stringify(type)} has no faithful Responses tool mapping; dropped`);
@@ -325,9 +342,8 @@ export function interactionsToResponsesBody(
   const toolChoice = responseToolChoice(config.tool_choice ?? config.toolChoice, functionsByName);
   if (toolChoice !== undefined) body.tool_choice = toolChoice;
 
-  const responseFormat = request.response_format ?? config.response_format;
+  const responseFormat = interactionResponseSchema(request.response_format ?? config.response_format);
   if (responseFormat !== undefined) {
-    if (!asRecord(responseFormat)) throw new ValidationError('Interactions response_format must be an object');
     body.text = { format: { type: 'json_schema', name: 'response', schema: responseFormat } };
   } else if ((request.response_mime_type ?? config.response_mime_type) === 'application/json') {
     body.text = { format: { type: 'json_object' } };
@@ -342,6 +358,7 @@ export function interactionsToResponsesBody(
     ['generation_config.stop_sequences', config.stop_sequences ?? config.stopSequences],
     ['generation_config.seed', config.seed],
     ['generation_config.speech_config', config.speech_config ?? config.speechConfig],
+    ['generation_config.image_config', config.image_config ?? config.imageConfig],
   ] as const;
   for (const [field, value] of unsupported) {
     if (value !== undefined) warn(options, `${field} has no faithful Responses equivalent; dropped`);

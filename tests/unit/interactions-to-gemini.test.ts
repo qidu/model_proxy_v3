@@ -133,7 +133,7 @@ describe('convertInteractionsToGenerateContent — input → contents', () => {
     // model turn of its own and the text is the user's.
     const out = body({
       input: [
-        { type: 'thought', summary: { content: { type: 'text', text: 'why' } } },
+        { type: 'thought', summary: [{ type: 'text', text: 'why' }] },
         { type: 'text', text: 'stray' },
       ],
     }).body as any;
@@ -279,7 +279,7 @@ describe('convertInteractionsToGenerateContent — parts', () => {
       prefix: '',
     };
     const out = body({
-      input: [{ type: 'image', data: ref, mime_type: 'image/png' }],
+      input: [{ type: 'image', data: ref, mime_type: 'image/png', resolution: 'high' }],
     }).body as any;
 
     assert.deepEqual(out.contents[0].parts, [{
@@ -287,6 +287,7 @@ describe('convertInteractionsToGenerateContent — parts', () => {
         mime_type: 'image/png',
         data: { ...ref, kind: 'gemini-inline-data' },
       },
+      mediaResolution: { level: 'MEDIA_RESOLUTION_HIGH' },
     }]);
   });
 
@@ -359,21 +360,29 @@ describe('convertInteractionsToGenerateContent — tools', () => {
     const out = body({
       ...userTurn,
       tools: [
-        { type: 'google_search' },
+        { type: 'google_search', search_types: ['web_search', 'image_search'] },
         { type: 'code_execution' },
         { type: 'url_context' },
-        { type: 'computer_use', environment: 'browser', excludedPredefinedFunctions: ['open_url'] },
+        { type: 'computer_use', environment: 'browser', excluded_predefined_functions: ['open_url'] },
+        { type: 'google_maps', enable_widget: true, latitude: 37.7, longitude: -122.4 },
+        {
+          type: 'retrieval', retrieval_types: ['vertex_ai_search'],
+          vertex_ai_search_config: { engine: 'projects/p/locations/l/engines/e', datastores: ['projects/p/dataStores/d'] },
+        },
         { type: 'file_search', file_search_store_names: ['s1'], top_k: 3, metadata_filter: 'a=b' },
       ],
     }).body as any;
 
     assert.deepEqual(out.tools, [
-      { googleSearch: {} },
+      { googleSearch: { searchTypes: { webSearch: {}, imageSearch: {} } } },
       { codeExecution: {} },
       { urlContext: {} },
       { computerUse: { environment: 'browser', excludedPredefinedFunctions: ['open_url'] } },
+      { googleMaps: { enableWidget: true } },
+      { retrieval: { vertexAiSearch: { engine: 'projects/p/locations/l/engines/e', dataStoreSpecs: [{ dataStore: 'projects/p/dataStores/d' }] } } },
       { fileSearch: { fileSearchStoreNames: ['s1'], topK: 3, metadataFilter: 'a=b' } },
     ]);
+    assert.deepEqual(out.toolConfig, { retrievalConfig: { latLng: { latitude: 37.7, longitude: -122.4 } } });
   });
 
   it('relays a tool already in the upstream dialect, functionDeclarations and all', () => {
@@ -493,6 +502,15 @@ describe('convertInteractionsToGenerateContent — generation_config', () => {
       properties: { a: { type: 'string' } },
     });
     assert.deepEqual(out.generationConfig.responseModalities, ['TEXT', 'IMAGE']);
+  });
+
+  it('accepts a one-schema response_format array and rejects formats this upstream cannot carry', () => {
+    const schema = { type: 'object', properties: { a: { type: 'string' } } };
+    const out = body({ ...userTurn, response_format: [schema] }).body as any;
+    assert.deepEqual(out.generationConfig.responseSchema, schema);
+
+    assertRefused({ ...userTurn, response_format: { type: 'video', duration: '8s' } }, /video output has no faithful equivalent/);
+    assertRefused({ ...userTurn, response_format: [schema, schema] }, /exactly one JSON schema/);
   });
 
   it('maps image_config to imageConfig', () => {

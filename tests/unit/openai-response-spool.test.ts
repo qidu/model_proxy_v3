@@ -221,8 +221,8 @@ function assertInteraction(body: Record<string, any>): void {
   assert.equal(body.object, 'interaction');
   assert.equal(body.status, 'completed');
   assert.equal(body.model, 'gemini-test');
-  assert.equal(body.role, 'model');
-  assert.deepEqual(body.outputs, [{ type: 'text', text: 'ok' }]);
+  assert.equal('role' in body, false);
+  assert.deepEqual(body.steps, [{ type: 'model_output', content: [{ type: 'text', text: 'ok' }] }]);
   assert.deepEqual(body.usage, { total_input_tokens: 3, total_output_tokens: 1, total_tokens: 4 });
   // Synthesized per request: `<prefix>_<epoch ms>_<request id>`.
   assert.match(body.id, /^v1_\d+_req-openai-response$/);
@@ -237,7 +237,7 @@ const SITES: Site[] = [
     target: 'https://upstream.example/v1/messages',
     upstreamMode: 'anthropic-messages',
     payload: claudeBody,
-    textOf: (body) => body.outputs[0].text,
+    textOf: (body) => body.steps[0].content[0].text,
     assertConverted: assertInteraction,
     stable: stableInteraction,
   },
@@ -247,7 +247,7 @@ const SITES: Site[] = [
     target: 'https://upstream.example/v1/responses',
     upstreamMode: 'openai-responses',
     payload: responsesBody,
-    textOf: (body) => body.outputs[0].text,
+    textOf: (body) => body.steps[0].content[0].text,
     assertConverted: assertInteraction,
     stable: stableInteraction,
   },

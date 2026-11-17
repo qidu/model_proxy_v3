@@ -17,7 +17,7 @@ import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isA
 import { handleTokenCountingRequest } from './handlers/token-counting.js';
 import { handleMessagesRequest } from './handlers/messages.js';
 import { handleResponsesRequest, handleResponsesCompactRequest, handleResponsesInputTokensRequest, handleResponsesRetrievalRequest } from './handlers/responses.js';
-import { handleGeminiRequest, handleGeminiRequestForMessages, handleNativeInteractionsRequest } from './handlers/gemini.js';
+import { handleGeminiRequest, handleGeminiRequestForMessages, handleGeminiInteractionsForMessages, handleGeminiInteractionsGenerateContentRequest, handleNativeInteractionsRequest } from './handlers/gemini.js';
 import { handleOpenAIRequest } from './handlers/openai.js';
 import { handleClaudeRequest } from './handlers/claude.js';
 import { handleEmbeddingsRequest } from './handlers/embeddings.js';
@@ -503,7 +503,9 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
       // addresses the Gemini collection endpoint instead of a model.
       return {
         kind: 'messages',
-        targetUrl: fixed ? upstreamUrl('v1beta/models') : geminiModelUrl(geminiStreamingAction),
+        targetUrl: upstreamMode === 'gemini-interactions'
+          ? upstreamUrl(`${fixed ? geminiApiVersion : 'v1beta'}/interactions`)
+          : fixed ? upstreamUrl('v1beta/models') : geminiModelUrl(geminiStreamingAction),
         handlerType: 'messages',
         upstreamMode,
       };
@@ -565,7 +567,14 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
       if (isStreamEndpoint && !queryString.includes('alt=sse')) {
         queryString = queryString ? `${queryString}&alt=sse` : '?alt=sse';
       }
-      return { kind: 'generate-content', targetUrl: geminiModelUrl(`${endpoint}${queryString}`), handlerType: 'generateContent', upstreamMode };
+      return {
+        kind: 'generate-content',
+        targetUrl: upstreamMode === 'gemini-interactions'
+          ? upstreamUrl(`${fixed ? geminiApiVersion : 'v1beta'}/interactions`)
+          : geminiModelUrl(`${endpoint}${queryString}`),
+        handlerType: 'generateContent',
+        upstreamMode,
+      };
     }
     // Through openai-completions transforming: the handler converts the
     // generateContent body → openai-completions → the configured mode.
@@ -624,8 +633,14 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
       return { kind: 'responses', targetUrl: upstreamUrl('v1/messages'), handlerType: 'responses', upstreamMode: 'anthropic-messages' };
     }
     if (isGemini) {
-      // Convert Responses API to Claude Messages and forward to Gemini upstream
-      return { kind: 'responses', targetUrl: upstreamUrl(geminiApiVersion), handlerType: 'responses', upstreamMode };
+      return {
+        kind: 'responses',
+        targetUrl: upstreamMode === 'gemini-interactions'
+          ? upstreamUrl(`${geminiApiVersion}/interactions`)
+          : upstreamUrl(geminiApiVersion),
+        handlerType: 'responses',
+        upstreamMode,
+      };
     }
     // Convert to OpenAI Chat Completions
     return { kind: 'responses', targetUrl: upstreamUrl('v1/chat/completions'), handlerType: 'responses', upstreamMode: 'openai-completions' };
@@ -2676,7 +2691,9 @@ export default {
           case 'messages':
             if (attemptUpstreamMode === 'anthropic-messages') {
               response = await handleClaudeRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptRoute);
-            } else if (attemptUpstreamMode === 'gemini-generatecontent' || attemptUpstreamMode === 'gemini-interactions') {
+            } else if (attemptUpstreamMode === 'gemini-interactions') {
+              response = await handleGeminiInteractionsForMessages(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptRoute);
+            } else if (attemptUpstreamMode === 'gemini-generatecontent') {
               response = await handleGeminiRequestForMessages(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptRoute);
             } else {
               // covers openai-completions and openai-responses
@@ -2695,7 +2712,9 @@ export default {
             break;
 
           case 'generateContent':
-            if (attemptUpstreamMode === 'gemini-generatecontent' || attemptUpstreamMode === 'gemini-interactions') {
+            if (attemptUpstreamMode === 'gemini-interactions') {
+              response = await handleGeminiInteractionsGenerateContentRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptRoute);
+            } else if (attemptUpstreamMode === 'gemini-generatecontent') {
               response = await handleGeminiRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptRoute);
             } else {
               response = await handleOpenAIRequest(attemptRequest, attemptTargetUrl, attemptAuthHeaders, requestId, attemptModelId, env, logger, attemptForceStreaming, conversionOptions, attemptUpstreamMode, attemptRoute);

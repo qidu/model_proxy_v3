@@ -56,7 +56,7 @@ describe('native and direct Responses Interactions routes', () => {
     upstreamResponse = () => jsonResponse({
       id: 'int_native', model: 'gemini-test', status: 'completed', object: 'interaction',
       created: '2026-01-01T00:00:00.000Z', updated: '2026-01-01T00:00:00.000Z',
-      role: 'model', outputs: [{ type: 'text', text: 'native answer' }],
+      steps: [{ type: 'model_output', content: [{ type: 'text', text: 'native answer' }] }],
     });
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       upstreamUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -76,7 +76,7 @@ describe('native and direct Responses Interactions routes', () => {
     const nativeResponse = {
       id: 'int_native', model: 'gemini-test', status: 'completed', object: 'interaction',
       created: '2026-01-01T00:00:00.000Z', updated: '2026-01-01T00:00:00.000Z',
-      role: 'model', outputs: [{ type: 'text', text: 'native answer' }],
+      steps: [{ type: 'model_output', content: [{ type: 'text', text: 'native answer' }] }],
       previous_interaction_id: 'int_previous', store: false,
     };
     upstreamResponse = () => jsonResponse(nativeResponse);
@@ -114,6 +114,7 @@ describe('native and direct Responses Interactions routes', () => {
     upstreamResponse = () => jsonResponse({
       id: 'resp_1', model: 'gpt-test', status: 'completed', created_at: 1767225600,
       output: [
+        { type: 'message', content: [{ type: 'output_text', text: 'Weather report', annotations: [{ type: 'url_citation', url: 'https://weather.example', title: 'Weather', start_index: 0, end_index: 7 }] }] },
         { type: 'reasoning', summary: [{ type: 'summary_text', text: 'checking weather' }] },
         { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"SF"}' },
       ],
@@ -135,9 +136,9 @@ describe('native and direct Responses Interactions routes', () => {
       tools: [
         { type: 'function', name: 'get_weather', parameters: { type: 'object' } },
         { type: 'function', name: 'get_time', parameters: { type: 'object' } },
-        { type: 'google_search' },
+        { type: 'google_search', search_types: ['web_search', 'image_search'] },
         { type: 'code_execution' },
-        { type: 'mcp_server', name: 'docs', url: 'https://mcp.example' },
+        { type: 'mcp_server', name: 'docs', url: 'https://mcp.example', allowed_tools: { mode: 'any', tools: ['search'] } },
       ],
     });
 
@@ -150,9 +151,9 @@ describe('native and direct Responses Interactions routes', () => {
     assert.deepEqual(upstreamBody?.tools, [
       { type: 'function', name: 'get_weather', parameters: { type: 'object' } },
       { type: 'function', name: 'get_time', parameters: { type: 'object' } },
-      { type: 'web_search' },
+      { type: 'web_search', search_content_types: ['text', 'image'] },
       { type: 'code_interpreter', container: { type: 'auto' } },
-      { type: 'mcp', server_label: 'docs', server_url: 'https://mcp.example' },
+      { type: 'mcp', server_label: 'docs', server_url: 'https://mcp.example', allowed_tools: ['search'] },
     ]);
     assert.equal(upstreamBody?.background, true);
     assert.deepEqual(upstreamBody?.metadata, { source: 'test' });
@@ -162,8 +163,15 @@ describe('native and direct Responses Interactions routes', () => {
     const interaction = await response.json() as any;
     assert.match(interaction.id, /^v1_\d+_/);
     assert.equal(interaction.status, 'requires_action');
-    assert.deepEqual(interaction.outputs, [
-      { type: 'thought', summary: { content: { type: 'text', text: 'checking weather' } } },
+    assert.deepEqual(interaction.steps, [
+      {
+        type: 'model_output',
+        content: [{
+          type: 'text', text: 'Weather report',
+          annotations: [{ type: 'url_citation', url: 'https://weather.example', title: 'Weather', start_index: 0, end_index: 7 }],
+        }],
+      },
+      { type: 'thought', summary: [{ type: 'text', text: 'checking weather' }] },
       { type: 'function_call', id: 'call_1', name: 'get_weather', arguments: { city: 'SF' } },
     ]);
     assert.deepEqual(interaction.usage, {
@@ -209,7 +217,7 @@ describe('native and direct Responses Interactions routes', () => {
     const interaction = await response.json() as any;
 
     assert.equal(interaction.status, 'incomplete');
-    assert.equal(interaction.outputs[0].text, 'partial');
+    assert.equal(interaction.steps[0].content[0].text, 'partial');
     assert.equal('error' in interaction, false);
     assert.match(interaction.errors[0].message, /max_output_tokens/);
   });

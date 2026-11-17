@@ -17,18 +17,17 @@
  * Three consequences of the dialect are worth stating, because each is easy to
  * get wrong:
  *
- *   - The lifecycle events carry an `InteractionSseEventInteraction`, whose answer
- *     field is `steps` — not the `outputs` a REST Interaction resource has. So a
- *     streamed answer accumulates `Step`s, closing each one as its deltas end.
+ *   - Lifecycle events and the REST Interaction resource both carry the answer
+ *     as `steps`. A streamed answer accumulates `Step`s, closing each one as its
+ *     deltas end.
  *   - A step is announced empty by `step.start` and its content is published only
  *     when it closes. A step object that deltas mutated in place would leak
  *     content into the `step.start` frame that preceded it, which is why the
  *     accumulation here is a string and the step is built at close.
- *   - `usage` has no frame of its own: the SDK carries it on `StepStop.usage` and
- *     on the completed interaction's `usage`. The cross-mode egress used to
- *     compute it and then lose the frame that held it (`processSSEBuffer` skipped
- *     a converted chunk whose only payload was the usage), so a streamed answer
- *     reported three zeros.
+ *   - `usage` has no frame of its own: the completed interaction carries it.
+ *     The cross-mode egress used to compute it and then lose the only payload
+ *     that held it (`processSSEBuffer` skipped a converted chunk whose only
+ *     payload was the usage), so a streamed answer reported three zeros.
  *
  * Everything here is pure: the caller frames each returned event with matching
  * SSE `event:` and payload `event_type` fields. The state is per-answer and owned
@@ -144,15 +143,10 @@ export function interactionStreamCreated(state: InteractionStreamState): Array<R
   }];
 }
 
-/**
- * Close the open step, publishing the content its deltas accumulated, optionally
- * reporting the answer's usage on it — the only frame the SDK gives a finished
- * step a `usage`.
- */
+/** Close the open step, publishing the content its deltas accumulated. */
 function closeStep(
   state: InteractionStreamState,
   events: Array<Record<string, unknown>>,
-  usage?: Record<string, unknown>,
 ): void {
   const open = state.open;
   if (!open) return;
@@ -164,11 +158,7 @@ function closeStep(
       ...(open.signature ? { signature: open.signature } : {}),
     }
     : { type: 'model_output', content: [{ type: 'text', text: open.text }] });
-  events.push({
-    event_type: 'step.stop',
-    index,
-    ...(usage ? { usage } : {}),
-  });
+  events.push({ event_type: 'step.stop', index });
   state.open = null;
 }
 
@@ -286,8 +276,8 @@ export function interactionStreamEnded(state: InteractionStreamState, usage?: Re
 }
 
 /**
- * The terminal frames: the open step closes (carrying the answer's usage), and
- * the interaction completes with the steps it announced and the same usage.
+ * The terminal frames: the open step closes, and the interaction completes with
+ * the steps it announced and the answer's usage.
  *
  * `interaction.created` is emitted first when the answer streamed no content at
  * all, so a client always reaches the terminal event through a `created`.
@@ -299,7 +289,7 @@ export function interactionStreamFinish(
   if (state.finished) return [];
   state.finished = true;
   const events = interactionStreamCreated(state);
-  closeStep(state, events, state.usage);
+  closeStep(state, events);
   events.push({
     event_type: 'interaction.completed',
     interaction: lifecycleInteraction(state, status, state.usage),
@@ -353,29 +343,24 @@ export function interactionStreamError(
 }
 
 /**
- * A `Content` as the `Step` this dialect carries it in.
- *
- * The REST Interaction resource lists an answer as `outputs` (a `Content[]`),
- * while a streamed one lists it as `steps` — the same information in the shape
- * the SDK declares for each. A `thought` needs the most work: its REST spelling
- * wraps the summary Content under `summary.content`, a `ThoughtStep` holds a
- * list. Everything else is the Content itself, held by a `model_output` step.
- *
- * The input is the shape `gemini-to-interactions.ts` produces, so a part has one
- * projection whichever egress carries it.
+ * A `Content` as the `Step` carried by both streamed and non-streaming
+ * interactions. Text and media belong to a `model_output`; thoughts and tool
+ * activity are steps of their own.
  */
 export function interactionStepFromContent(content: Record<string, unknown>): Record<string, unknown> {
   if (content.type === 'thought') {
-    const summary = (content.summary as Record<string, unknown> | undefined)?.content;
+    const legacySummary = (content.summary as Record<string, unknown> | undefined)?.content;
+    const summary = Array.isArray(content.summary)
+      ? content.summary
+      : legacySummary ? [legacySummary] : [];
     return {
       type: 'thought',
-      summary: summary ? [summary] : [],
+      summary,
       ...(content.signature !== undefined ? { signature: content.signature } : {}),
     };
   }
-  if (content.type === 'function_call') {
-    return { type: 'function_call', id: content.id, name: content.name, arguments: content.arguments };
+  if (!['text', 'image', 'audio', 'video', 'document'].includes(String(content.type))) {
+    return { ...content };
   }
-  // text, image, audio, video, document: the Content is the step's own content.
   return { type: 'model_output', content: [content] };
 }

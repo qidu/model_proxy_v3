@@ -18,14 +18,19 @@ export function convertGeminiToClaudeResponse(
     model: string,
     requestId: string
 ): ClaudeMessagesResponse {
-    const role = geminiResponse.role === 'model' ? 'assistant' : geminiResponse.role;
+    const contents = geminiResponse.steps
+        ? geminiResponse.steps.flatMap(step => {
+            if (step.type === 'model_output') return step.content ?? [];
+            return [step as unknown as GeminiContent];
+        })
+        : geminiResponse.outputs;
 
     return {
         id: geminiResponse.id,
         type: 'message',
-        role: role,
+        role: 'assistant',
         model: model,
-        content: convertGeminiContentToClaude(geminiResponse.outputs),
+        content: convertGeminiContentToClaude(contents),
         stop_reason: mapGeminiStatusToStopReason(geminiResponse.status),
         usage: convertGeminiUsageToClaude(geminiResponse.usage),
     };
@@ -105,7 +110,9 @@ function convertGeminiContentToClaude(
                 const thoughtContent = output as any;
                 claudeBlocks.push({
                     type: 'thinking',
-                    thinking: thoughtContent.signature || thoughtContent.summary?.content?.text || '',
+                    thinking: Array.isArray(thoughtContent.summary)
+                        ? thoughtContent.summary.map((part: any) => part.type === 'text' ? part.text : '').join('')
+                        : thoughtContent.signature || '',
                     signature: thoughtContent.signature,
                 });
                 break;
@@ -142,8 +149,8 @@ function convertGeminiUsageToClaude(usage?: GeminiUsage): {
     }
 
     return {
-        input_tokens: usage.total_input_tokens,
-        output_tokens: usage.total_output_tokens,
+        input_tokens: usage.total_input_tokens ?? 0,
+        output_tokens: usage.total_output_tokens ?? 0,
     };
 }
 

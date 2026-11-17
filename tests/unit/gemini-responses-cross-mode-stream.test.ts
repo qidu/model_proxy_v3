@@ -317,7 +317,7 @@ describe('Gemini front door → openai-responses: the SSE egress', () => {
   it('reports the upstream usage on the terminal frames', async () => {
     // The defect this replaces: the usage was computed and then thrown away, because
     // the frame carrying it was the one payload `processSSEBuffer` did not recognise.
-    // The SDK gives `usage` two positions at the end of an answer and both are filled.
+    // Terminal usage is declared on the completed interaction, not on step.stop.
     const { frames } = await run([
       { type: 'response.created', response: { id: 'resp_usage' } },
       { type: 'response.output_text.delta', delta: 'hi' },
@@ -326,9 +326,9 @@ describe('Gemini front door → openai-responses: the SSE egress', () => {
 
     const expected = { total_input_tokens: 19, total_output_tokens: 7, total_tokens: 26 };
     const stop = frames.find(frame => frame.event_type === 'step.stop');
-    assert.deepEqual(stop?.usage, expected, 'the closing step carries the usage');
+    assert.equal(stop && 'usage' in stop, false, 'step.stop declares no usage field');
     const completed = frames.find(frame => frame.event_type === 'interaction.completed');
-    assert.deepEqual(completed?.interaction.usage, expected, 'so does the completed interaction');
+    assert.deepEqual(completed?.interaction.usage, expected, 'the completed interaction carries the usage');
   });
 
   it('carries a tool call as a function_call step and ends requires_action', async () => {

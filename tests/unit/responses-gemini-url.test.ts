@@ -22,17 +22,28 @@ let configPath = '';
 let upstreamUrls: string[] = [];
 
 function installMockFetch() {
-  globalThis.fetch = async (input: RequestInfo | URL): Promise<Response> => {
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
     upstreamUrls.push(url);
     if (url.includes(':countTokens')) {
       return new Response(JSON.stringify({ totalTokens: 2 }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     if (url.endsWith('/v1beta/interactions')) {
+      const body = init?.body ? JSON.parse(await new Response(init.body).text()) : {};
+      if (body.stream === true) {
+        const events = [
+          { event_type: 'interaction.created', interaction: { id: 'int_1', model: 'gemini-pro' } },
+          { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'ok' } },
+          { event_type: 'interaction.completed', interaction: { id: 'int_1', status: 'completed', usage: { total_input_tokens: 1, total_output_tokens: 1, total_tokens: 2 } } },
+        ];
+        return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+          status: 200, headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
       return new Response(JSON.stringify({
         id: 'int_1', model: 'gemini-pro', status: 'completed', object: 'interaction',
         created: '2026-01-01T00:00:00.000Z', updated: '2026-01-01T00:00:00.000Z',
-        role: 'model', outputs: [{ type: 'text', text: 'ok' }],
+        steps: [{ type: 'model_output', content: [{ type: 'text', text: 'ok' }] }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     // The streaming action frames its answer as SSE — the only content type the
@@ -109,7 +120,9 @@ describe('Gemini native upstream URL construction', () => {
         const resp = await sendResponsesRequest();
 
         assert.equal(resp.status, 200);
-        assert.deepEqual(upstreamUrls, ['https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
+        assert.deepEqual(upstreamUrls, [upstreamMode === 'gemini-interactions'
+          ? 'https://generativelanguage.googleapis.com/v1beta/interactions'
+          : 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
       });
 
       it(`builds the correct /v1/messages Gemini URL from ${baseUrl} in ${upstreamMode} mode`, async () => {
@@ -117,7 +130,9 @@ describe('Gemini native upstream URL construction', () => {
         const resp = await sendMessagesRequest();
 
         assert.equal(resp.status, 200);
-        assert.deepEqual(upstreamUrls, ['https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
+        assert.deepEqual(upstreamUrls, [upstreamMode === 'gemini-interactions'
+          ? 'https://generativelanguage.googleapis.com/v1beta/interactions'
+          : 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
       });
 
       it(`builds the correct /v1/interactions Gemini URL from ${baseUrl} in ${upstreamMode} mode`, async () => {
@@ -135,7 +150,9 @@ describe('Gemini native upstream URL construction', () => {
         const resp = await sendGenerateContentRequest('/v1beta/models/gemini-pro:generateContent');
 
         assert.equal(resp.status, 200);
-        assert.deepEqual(upstreamUrls, ['https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
+        assert.deepEqual(upstreamUrls, [upstreamMode === 'gemini-interactions'
+          ? 'https://generativelanguage.googleapis.com/v1beta/interactions'
+          : 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent']);
       });
 
       it(`builds the correct streamGenerateContent Gemini URL from ${baseUrl} in ${upstreamMode} mode`, async () => {
@@ -143,7 +160,9 @@ describe('Gemini native upstream URL construction', () => {
         const resp = await sendGenerateContentRequest('/v1beta/models/gemini-pro:streamGenerateContent');
 
         assert.equal(resp.status, 200);
-        assert.deepEqual(upstreamUrls, ['https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent?alt=sse']);
+        assert.deepEqual(upstreamUrls, [upstreamMode === 'gemini-interactions'
+          ? 'https://generativelanguage.googleapis.com/v1beta/interactions'
+          : 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent?alt=sse']);
       });
 
       it(`builds the correct countTokens Gemini URL from ${baseUrl} in ${upstreamMode} mode`, async () => {

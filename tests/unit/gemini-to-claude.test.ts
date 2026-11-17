@@ -40,10 +40,10 @@ function baseInteraction(
 }
 
 describe('convertGeminiToClaudeResponse', () => {
-  it('maps id, model, role and a text output', () => {
+  it('maps a new-format model_output step to assistant text', () => {
     const resp = convertGeminiToClaudeResponse(
       baseInteraction({
-        outputs: [{ type: 'text', text: 'hello' } as any],
+        steps: [{ type: 'model_output', content: [{ type: 'text', text: 'hello' }] }],
         usage: {
           total_input_tokens: 12,
           total_output_tokens: 7,

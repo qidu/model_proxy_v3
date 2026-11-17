@@ -3,6 +3,7 @@ import { stringify } from '../utils/stringify.js';
 import { parseToolArguments } from './openai-to-gemini.js';
 import {
   createInteractionStreamState,
+  interactionStepFromContent,
   interactionStreamCreated,
   interactionStreamCloseStep,
   interactionStreamEnded,
@@ -65,13 +66,17 @@ function nativeCall(block: Record<string, unknown>, index: number, options?: Con
       warn(options, `MCP call ${id} has no name; dropped`);
       return undefined;
     }
+    if (typeof block.server_name !== 'string' || block.server_name === '') {
+      warn(options, `MCP call ${id} has no server_name; dropped`);
+      return undefined;
+    }
     return {
       type: 'mcp_server_tool_call', id, name: block.name, arguments: input,
-      ...(typeof block.server_name === 'string' ? { server_name: block.server_name } : {}),
+      server_name: block.server_name,
     };
   }
   if (block.type === 'server_tool_use' && block.name === 'web_search') {
-    return { type: 'google_search_call', id, arguments: input, search_type: 'web_search' };
+    return { type: 'google_search_call', id, arguments: { ...input, search_type: 'web_search' } };
   }
   if (block.type === 'server_tool_use' && block.name === 'code_execution') {
     if (typeof input.code !== 'string') {
@@ -139,9 +144,11 @@ export function claudeToInteraction(
     }
     if (block.type === 'text' && typeof block.text === 'string') {
       const annotations = Array.isArray(block.citations) ? block.citations.map(asRecord).filter(Boolean).map(citation => ({
+        type: 'file_citation',
         start_index: citation!.start_char_index ?? 0,
         end_index: citation!.end_char_index ?? 0,
         source: citation!.document_title ?? '',
+        ...(typeof citation!.document_title === 'string' ? { file_name: citation!.document_title } : {}),
       })) : [];
       outputs.push({ type: 'text', text: block.text, ...(annotations.length > 0 ? { annotations } : {}) });
       continue;
@@ -151,7 +158,7 @@ export function claudeToInteraction(
       const signature = typeof block.signature === 'string' && block.signature !== '' ? block.signature : undefined;
       if (text !== '' || signature) outputs.push({
         type: 'thought',
-        ...(text !== '' ? { summary: { content: { type: 'text', text } } } : {}),
+        ...(text !== '' ? { summary: [{ type: 'text', text }] } : {}),
         ...(signature ? { signature } : {}),
       });
       continue;
@@ -175,8 +182,8 @@ export function claudeToInteraction(
     id: `v1_${Date.now()}_${requestId}`,
     model,
     status: incomplete ? 'incomplete' : failed ? 'failed' : requiresAction ? 'requires_action' : 'completed',
-    object: 'interaction', created: new Date().toISOString(), updated: new Date().toISOString(), role: 'model',
-    outputs,
+    object: 'interaction', created: new Date().toISOString(), updated: new Date().toISOString(),
+    steps: outputs.map(interactionStepFromContent),
     ...(claudeUsage(response.usage) ? { usage: claudeUsage(response.usage) } : {}),
     ...(incomplete || failed ? { errors: [interactionError(response.stop_reason)] } : {}),
   };
@@ -253,14 +260,18 @@ function flushCall(state: ClaudeInteractionStreamState, index: number, options?:
       warnStreamType(state, 'mcp_call_without_name', options);
       return [];
     }
+    if (!pending.serverName) {
+      warnStreamType(state, 'mcp_call_without_server_name', options);
+      return [];
+    }
     return interactionStreamWholeStep(state.interaction, {
       type: 'mcp_server_tool_call', id: pending.id, name: pending.name, arguments: args,
-      ...(pending.serverName ? { server_name: pending.serverName } : {}),
+      server_name: pending.serverName,
     });
   }
   if (pending.kind === 'search') {
     return interactionStreamWholeStep(state.interaction, {
-      type: 'google_search_call', id: pending.id, arguments: args, search_type: 'web_search',
+      type: 'google_search_call', id: pending.id, arguments: { ...args, search_type: 'web_search' },
     });
   }
   if (typeof args.code !== 'string') {

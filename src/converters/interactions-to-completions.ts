@@ -78,10 +78,24 @@ export function convertInteractionToChatCompletion(
   const reasoning: string[] = [];
   const toolCalls: Array<Record<string, unknown>> = [];
   let reasoningSignature: string | undefined;
-  for (const [index, value] of (Array.isArray(interaction.outputs) ? interaction.outputs : []).entries()) {
+  const outputs: unknown[] = [];
+  if (Array.isArray(interaction.steps)) {
+    for (const [index, value] of interaction.steps.entries()) {
+      const step = asRecord(value);
+      if (step?.type === 'model_output') {
+        if (Array.isArray(step.content)) outputs.push(...step.content);
+        else options?.logger?.warn(options.requestId ?? requestId, `[interactions->completions] dropped steps[${index}] with non-array content`);
+      } else {
+        outputs.push(value);
+      }
+    }
+  } else if (Array.isArray(interaction.outputs)) {
+    outputs.push(...interaction.outputs);
+  }
+  for (const [index, value] of outputs.entries()) {
     const output = asRecord(value);
     if (!output) {
-      options?.logger?.warn(options.requestId ?? requestId, `[interactions->completions] dropped non-object outputs[${index}]`);
+      options?.logger?.warn(options.requestId ?? requestId, `[interactions->completions] dropped non-object content[${index}]`);
       continue;
     }
     if (output.type === 'text' && typeof output.text === 'string') {
@@ -301,4 +315,53 @@ export function interactionEventToChatChunks(
 export function interactionStreamUsageChunk(state: InteractionChatStreamState): Record<string, unknown> | undefined {
   if (!state.usage) return undefined;
   return { ...streamChunk(state, {}, null, true), usage: state.usage };
+}
+
+export function interactionsAsCompletionsStream(
+  upstream: Response,
+  model: string,
+  requestId: string,
+  logger?: Logger,
+): Response {
+  const state = createInteractionChatStreamState(model, requestId);
+  const encoder = new TextEncoder();
+  const readable = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        if (!upstream.body) throw new Error('Interactions upstream returned an empty stream');
+        const reader = upstream.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        const processEvent = (rawEvent: string): void => {
+          const data = rawEvent.split(/\r?\n/)
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+            .join('\n');
+          if (!data || data === '[DONE]') return;
+          const event = JSON.parse(data) as Record<string, unknown>;
+          for (const chunk of interactionEventToChatChunks(state, event, { logger, requestId })) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          }
+        };
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split(/\r?\n\r?\n/);
+          buffer = events.pop() ?? '';
+          for (const event of events) processEvent(event);
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) processEvent(buffer);
+        if (!state.finished) throw new Error(`Interactions stream ended before interaction.completed (request ${requestId})`);
+        const usage = interactionStreamUsageChunk(state);
+        if (usage) controller.enqueue(encoder.encode(`data: ${JSON.stringify(usage)}\n\n`));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+  });
+  return new Response(readable, { headers: { 'Content-Type': 'text/event-stream' } });
 }

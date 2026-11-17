@@ -7,7 +7,7 @@
  *
  * 1. `finishReason` reached nothing. `status` was the literal `'completed'`, so a
  *    `MAX_TOKENS` answer claimed to be complete and a `SAFETY` block with no
- *    content claimed to be a completed answer with an empty `outputs`. A
+ *    content claimed to be a completed answer with an empty `steps`. A
  *    `MAX_TOKENS` answer is now `incomplete`; blocked and otherwise truncated
  *    answers are `failed` with the upstream's reason, while a cleanly stopped
  *    function call is `requires_action`.
@@ -69,7 +69,7 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
     const out = interaction(upstream([{ text: 'truncated…' }], 'MAX_TOKENS'));
 
     assert.equal(out.status, 'incomplete');
-    assert.equal(out.outputs[0].text, 'truncated…');
+    assert.equal(out.steps[0].content[0].text, 'truncated…');
     assert.match(out.errors[0].code, /#FinishReason\.MAX_TOKENS$/);
     assert.match(out.errors[0].message, /stopped the answer early/);
   });
@@ -78,7 +78,7 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
     const out = interaction(upstream([{ functionCall: { id: 'call_1', name: 'f', args: {} } }], 'STOP'));
 
     assert.equal(out.status, 'requires_action');
-    assert.equal(out.outputs[0].type, 'function_call');
+    assert.equal(out.steps[0].type, 'function_call');
     assert.equal('errors' in out, false);
   });
 
@@ -86,7 +86,7 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
     const out = interaction(upstream([], 'SAFETY'));
 
     assert.equal(out.status, 'failed');
-    assert.deepEqual(out.outputs, []);
+    assert.deepEqual(out.steps, []);
     assert.match(out.errors[0].code, /#FinishReason\.SAFETY$/);
     assert.match(out.errors[0].message, /withheld the answer/);
   });
@@ -144,7 +144,7 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
   });
 });
 
-describe('convertGenerateContentToInteraction — outputs', () => {
+describe('convertGenerateContentToInteraction — steps', () => {
   it('translates every part kind into the Interactions Content that expresses it', () => {
     const out = interaction(upstream([
       { text: 'look' },
@@ -157,15 +157,15 @@ describe('convertGenerateContentToInteraction — outputs', () => {
       { codeExecutionResult: { outcome: 'OUTCOME_OK', output: '1' } },
     ]));
 
-    assert.deepEqual(out.outputs, [
-      { type: 'text', text: 'look' },
-      { type: 'image', data: 'aW1n', mime_type: 'image/png' },
-      { type: 'audio', data: 'YXVk', mime_type: 'audio/mp3' },
-      { type: 'video', data: 'dmlk', mime_type: 'video/mp4' },
-      { type: 'document', data: 'cGRm', mime_type: 'application/pdf' },
+    assert.deepEqual(out.steps, [
+      { type: 'model_output', content: [{ type: 'text', text: 'look' }] },
+      { type: 'model_output', content: [{ type: 'image', data: 'aW1n', mime_type: 'image/png' }] },
+      { type: 'model_output', content: [{ type: 'audio', data: 'YXVk', mime_type: 'audio/mp3' }] },
+      { type: 'model_output', content: [{ type: 'video', data: 'dmlk', mime_type: 'video/mp4' }] },
+      { type: 'model_output', content: [{ type: 'document', data: 'cGRm', mime_type: 'application/pdf' }] },
       { type: 'function_call', name: 'get_weather', arguments: { location: 'Boston' }, id: 'call_1' },
-      { type: 'code_execution_call', arguments: { language: 'python', code: 'print(1)' } },
-      { type: 'code_execution_result', result: '1', is_error: false },
+      { type: 'code_execution_call', id: 'code_call_6', arguments: { language: 'python', code: 'print(1)' } },
+      { type: 'code_execution_result', call_id: 'code_call_6', result: '1', is_error: false },
     ]);
   });
 
@@ -175,7 +175,7 @@ describe('convertGenerateContentToInteraction — outputs', () => {
     // (`interactions.md:1006`), and the upstream spelling was forwarded as-is —
     // a value the Interactions enum does not declare.
     const language = (executableCode: Record<string, unknown>) =>
-      (interaction(upstream([{ executableCode }])).outputs[0] as any).arguments.language;
+      (interaction(upstream([{ executableCode }])).steps[0] as any).arguments.language;
 
     assert.equal(language({ language: 'PYTHON', code: 'print(1)' }), 'python');
     // An absent language keeps the default it had.
@@ -187,9 +187,9 @@ describe('convertGenerateContentToInteraction — outputs', () => {
     // as `{type:'text'}` — reasoning presented as the model's answer.
     const out = interaction(upstream([{ thought: true, text: 'reasoning…', thoughtSignature: 'sig' }]));
 
-    assert.deepEqual(out.outputs, [{
+    assert.deepEqual(out.steps, [{
       type: 'thought',
-      summary: { content: { type: 'text', text: 'reasoning…' } },
+      summary: [{ type: 'text', text: 'reasoning…' }],
       signature: 'sig',
     }]);
   });
@@ -197,7 +197,7 @@ describe('convertGenerateContentToInteraction — outputs', () => {
   it('mints a call id only when the upstream supplied none, since the schema requires one', () => {
     const out = interaction(upstream([{ functionCall: { name: 'f', args: {} } }]));
 
-    assert.equal(out.outputs[0].id, 'call_0');
+    assert.equal(out.steps[0].id, 'call_0');
   });
 
   it('reports a part with no Interactions projection instead of relaying it untyped', () => {
@@ -207,13 +207,13 @@ describe('convertGenerateContentToInteraction — outputs', () => {
     );
 
     assert.deepEqual(dropped, ['inlineData(application/x-unknown)']);
-    assert.deepEqual(out.outputs, [{ type: 'text', text: 'hi' }]);
+    assert.deepEqual(out.steps, [{ type: 'model_output', content: [{ type: 'text', text: 'hi' }] }]);
   });
 
   it('accepts a response with no candidate content at all', () => {
     const out = interaction({ responseId: 'r', candidates: [{ finishReason: 'STOP' }] });
 
-    assert.deepEqual(out.outputs, []);
+    assert.deepEqual(out.steps, []);
     assert.equal(out.status, 'completed');
   });
 });
@@ -225,6 +225,11 @@ describe('convertGenerateContentToInteraction — usage', () => {
       usageMetadata: {
         promptTokenCount: 7, candidatesTokenCount: 11, totalTokenCount: 20,
         cachedContentTokenCount: 4, thoughtsTokenCount: 9, toolUsePromptTokenCount: 2,
+        promptTokensDetails: [{ modality: 'TEXT', tokenCount: 5 }, { modality: 'IMAGE', tokenCount: 2 }],
+        candidatesTokensDetails: [{ modality: 'TEXT', tokenCount: 11 }],
+        cacheTokensDetails: [{ modality: 'TEXT', tokenCount: 4 }],
+        toolUsePromptTokensDetails: [{ modality: 'TEXT', tokenCount: 2 }],
+        grounding_tool_count: [{ type: 'google_search', count: 1 }],
       },
     });
 
@@ -235,6 +240,11 @@ describe('convertGenerateContentToInteraction — usage', () => {
       total_cached_tokens: 4,
       total_thought_tokens: 9,
       total_tool_use_tokens: 2,
+      input_tokens_by_modality: [{ modality: 'text', tokens: 5 }, { modality: 'image', tokens: 2 }],
+      output_tokens_by_modality: [{ modality: 'text', tokens: 11 }],
+      cached_tokens_by_modality: [{ modality: 'text', tokens: 4 }],
+      tool_use_tokens_by_modality: [{ modality: 'text', tokens: 2 }],
+      grounding_tool_count: [{ type: 'google_search', count: 1 }],
     });
   });
 
@@ -258,7 +268,7 @@ describe('convertGenerateContentToInteraction — usage', () => {
 describe('convertGenerateContentToInteraction — an unreadable upstream body', () => {
   it('fails loudly rather than reporting an empty interaction', () => {
     // A JSON array or scalar is a JSON body the route cannot read; defaulting to
-    // `completed` with no outputs is the silent success Rule #8 forbids.
+    // `completed` with no steps is the silent success Rule #8 forbids.
     assert.throws(
       () => convertGenerateContentToInteraction([], 'm', 'req-1'),
       (error: Error) => error.name === 'ProcessingError' && /not a JSON object/.test(error.message),

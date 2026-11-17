@@ -1,10 +1,16 @@
 import type { OpenAIContent, OpenAIMessage } from '../types/openai.js';
+import type { Logger } from '../types/shared.js';
 import { isBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { ValidationError } from '../utils/errors.js';
 import { stringify } from '../utils/stringify.js';
 import { decodeDataUriOrRef } from './claude-to-gemini.js';
 import { openAIContentToText } from './completions-to-responses.js';
 import { parseToolArguments } from './openai-to-gemini.js';
+
+interface ConversionOptions {
+  logger?: Logger;
+  requestId?: string;
+}
 
 function contentToInteractionParts(content: OpenAIContent | null | undefined, where: string): Array<Record<string, unknown>> {
   if (content === null || content === undefined) return [];
@@ -23,6 +29,24 @@ function contentToInteractionParts(content: OpenAIContent | null | undefined, wh
         return { type: 'image', mime_type: decoded.mime_type, data: decoded.data };
       }
       throw new ValidationError(`${at}.image_url.url must be a URL or data URI`);
+    }
+    const record = part as unknown as Record<string, unknown>;
+    if (record.type === 'input_audio') {
+      const audio = (record.input_audio ?? record) as Record<string, unknown>;
+      if (typeof audio.data !== 'string' || audio.data === '' || typeof audio.format !== 'string' || audio.format === '') {
+        throw new ValidationError(`${at}.input_audio requires data and format`);
+      }
+      return { type: 'audio', data: audio.data, mime_type: `audio/${audio.format}` };
+    }
+    if (record.type === 'file') {
+      const file = (record.file ?? record) as Record<string, unknown>;
+      const data = file.file_data ?? file.data;
+      if (typeof data !== 'string' && !isBlobRef(data)) throw new ValidationError(`${at}.file.file_data is required`);
+      const decoded = decodeDataUriOrRef(data);
+      if (decoded.mime_type !== 'application/pdf') {
+        throw new ValidationError(`${at}.file has mime type ${decoded.mime_type}; Interactions documents support application/pdf`);
+      }
+      return { type: 'document', mime_type: decoded.mime_type, data: decoded.data };
     }
     throw new ValidationError(`${at} type ${stringify(part.type)} has no Interactions Content equivalent`);
   });
@@ -51,6 +75,7 @@ function completionsToolChoiceToInteractions(toolChoice: unknown): unknown {
 export function completionsToInteractionsBody(
   completions: Record<string, unknown>,
   model: string,
+  options?: ConversionOptions,
 ): Record<string, unknown> {
   const messages = (completions.messages as OpenAIMessage[] | undefined) ?? [];
   const input: Array<Record<string, unknown>> = [];
@@ -128,6 +153,13 @@ export function completionsToInteractionsBody(
   if (typeof completions.reasoning_effort === 'string') {
     generationConfig.thinking_level = completions.reasoning_effort === 'max' ? 'high' : completions.reasoning_effort;
   }
+  const audio = completions.audio && typeof completions.audio === 'object' && !Array.isArray(completions.audio)
+    ? completions.audio as Record<string, unknown>
+    : undefined;
+  if (typeof audio?.voice === 'string' && audio.voice !== '') generationConfig.speech_config = { voice: audio.voice };
+  if (audio?.format !== undefined) {
+    options?.logger?.warn(options.requestId ?? '', '[completions->interactions] audio.format has no Interactions speech_config equivalent; dropped');
+  }
 
   const body: Record<string, unknown> = {
     model,
@@ -135,15 +167,24 @@ export function completionsToInteractionsBody(
     ...(instructions !== '' ? { system_instruction: instructions } : {}),
     ...(completions.stream === true ? { stream: true } : {}),
     ...(typeof completions.store === 'boolean' ? { store: completions.store } : {}),
+    ...(typeof completions.background === 'boolean' ? { background: completions.background } : {}),
+    ...(Array.isArray(completions.modalities) ? { response_modalities: completions.modalities } : {}),
   };
-  if (completions.metadata !== undefined) body.labels = completions.metadata;
-  if (Object.keys(generationConfig).length > 0) body.generation_config = generationConfig;
+  if (completions.metadata !== undefined) {
+    options?.logger?.warn(options.requestId ?? '', '[completions->interactions] metadata has no field in the new Interactions contract; dropped');
+  }
+  if (completions.parallel_tool_calls !== undefined) {
+    options?.logger?.warn(options.requestId ?? '', '[completions->interactions] parallel_tool_calls has no Interactions equivalent; dropped');
+  }
 
   if (Array.isArray(completions.tools)) {
     body.tools = completions.tools.map((tool, index) => {
       const fn = (tool as Record<string, unknown>).function as Record<string, unknown> | undefined;
       if ((tool as Record<string, unknown>).type !== 'function' || !fn || typeof fn.name !== 'string' || fn.name === '') {
         throw new ValidationError(`tools[${index}] must be a named function for an Interactions upstream`);
+      }
+      if (fn.strict !== undefined) {
+        options?.logger?.warn(options.requestId ?? '', `[completions->interactions] tools[${index}].function.strict has no Interactions equivalent; dropped`);
       }
       return {
         type: 'function',
@@ -163,13 +204,10 @@ export function completionsToInteractionsBody(
       throw new ValidationError('response_format.json_schema.schema is required for an Interactions upstream');
     }
     body.response_format = schema;
-    body.response_mime_type = 'application/json';
   } else if (responseFormat?.type === 'json_object') {
-    body.response_mime_type = 'application/json';
-  } else if (responseFormat?.type === 'text') {
-    body.response_mime_type = 'text/plain';
+    body.response_format = { type: 'object' };
   }
 
-  if (generationConfig.tool_choice !== undefined) body.generation_config = generationConfig;
+  if (Object.keys(generationConfig).length > 0) body.generation_config = generationConfig;
   return body;
 }

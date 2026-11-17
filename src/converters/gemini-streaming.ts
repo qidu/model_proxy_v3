@@ -419,7 +419,7 @@ function handleGeminiEvent(
             // Handle interaction start
             if (event.interaction) {
                 state.currentId = event.interaction.id;
-                state.currentRole = event.interaction.role || 'model';
+                state.currentRole = 'model';
                 // Send message start
                 const messageStart = {
                     type: 'message_start',
@@ -796,6 +796,10 @@ function convertPartForStream(
         'stream',
         position
     );
-    const outputs = interaction.outputs as Array<Record<string, unknown>> | undefined;
-    return { content: outputs?.[0], dropped };
+    const steps = interaction.steps as Array<Record<string, unknown>> | undefined;
+    const step = steps?.[0];
+    const content = step?.type === 'model_output' && Array.isArray(step.content)
+        ? step.content[0] as Record<string, unknown> | undefined
+        : step;
+    return { content, dropped };
 }

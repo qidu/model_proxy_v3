@@ -14,7 +14,7 @@ let upstreamBody: Record<string, unknown> | undefined;
 let upstreamHeaders: Headers | undefined;
 let upstreamResponse: () => Response;
 
-function interactionResponse(outputs: Array<Record<string, unknown>>, status = 'completed'): Response {
+function interactionResponse(steps: Array<Record<string, unknown>>, status = 'completed'): Response {
   return new Response(JSON.stringify({
     id: 'int_1',
     model: 'gemini-test',
@@ -22,8 +22,7 @@ function interactionResponse(outputs: Array<Record<string, unknown>>, status = '
     object: 'interaction',
     created: '2026-01-01T00:00:00.000Z',
     updated: '2026-01-01T00:00:01.000Z',
-    role: 'model',
-    outputs,
+    steps,
     usage: { total_input_tokens: 11, total_output_tokens: 5, total_cached_tokens: 3, total_tokens: 16 },
   }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
@@ -66,7 +65,7 @@ api_key = "upstream-key"
     upstreamUrl = '';
     upstreamBody = undefined;
     upstreamHeaders = undefined;
-    upstreamResponse = () => interactionResponse([{ type: 'text', text: 'hello' }]);
+    upstreamResponse = () => interactionResponse([{ type: 'model_output', content: [{ type: 'text', text: 'hello' }] }]);
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       upstreamUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       upstreamHeaders = new Headers(init?.headers);
@@ -140,6 +139,38 @@ api_key = "upstream-key"
     });
   });
 
+  it('carries audio, files, modalities and JSON mode without legacy Interactions fields', async () => {
+    const response = await sendChat({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'input_audio', input_audio: { data: 'YXVk', format: 'mp3' } },
+          { type: 'file', file: { file_data: 'data:application/pdf;base64,JVBERi0=', filename: 'notes.pdf' } },
+        ],
+      }],
+      modalities: ['text', 'audio'],
+      audio: { voice: 'Aoede', format: 'mp3' },
+      background: true,
+      metadata: { source: 'chat' },
+      response_format: { type: 'json_object' },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamBody?.input, [{
+      type: 'user_input',
+      content: [
+        { type: 'audio', data: 'YXVk', mime_type: 'audio/mp3' },
+        { type: 'document', data: 'JVBERi0=', mime_type: 'application/pdf' },
+      ],
+    }]);
+    assert.deepEqual(upstreamBody?.response_modalities, ['text', 'audio']);
+    assert.deepEqual(upstreamBody?.generation_config, { speech_config: { voice: 'Aoede' } });
+    assert.deepEqual(upstreamBody?.response_format, { type: 'object' });
+    assert.equal(upstreamBody?.background, true);
+    assert.equal('response_mime_type' in upstreamBody!, false);
+    assert.equal('labels' in upstreamBody!, false);
+  });
+
   it('converts native Interactions SSE to Chat Completions chunks with usage', async () => {
     upstreamResponse = () => interactionStream([
       { event_type: 'interaction.created', interaction: { id: 'int_stream', model: 'gemini-test', created: '2026-01-01T00:00:00.000Z' } },
@@ -167,7 +198,7 @@ api_key = "upstream-key"
   });
 
   it('maps an incomplete native JSON interaction to finish_reason length', async () => {
-    upstreamResponse = () => interactionResponse([{ type: 'text', text: 'partial' }], 'incomplete');
+    upstreamResponse = () => interactionResponse([{ type: 'model_output', content: [{ type: 'text', text: 'partial' }] }], 'incomplete');
     const response = await sendChat({});
     const completion = await response.json() as any;
 

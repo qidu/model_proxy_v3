@@ -421,9 +421,9 @@ describe('§5.9 byte admission in the request path', () => {
     assert.equal(upstreamCalls, 1);
     assert.equal(admittedAtSend, 0);
     assert.ok(upstreamText.includes(image), 'the binary reached the upstream from the ref-bearing body');
-    const payload = await response.json() as { object: string; outputs: Array<{ type: string; text: string }> };
+    const payload = await response.json() as { object: string; steps: Array<{ type: string; content: Array<{ type: string; text: string }> }> };
     assert.equal(payload.object, 'interaction');
-    assert.deepEqual(payload.outputs, [{ type: 'text', text: 'seen' }]);
+    assert.deepEqual(payload.steps, [{ type: 'model_output', content: [{ type: 'text', text: 'seen' }] }]);
     assert.equal(getAdmittedBytes(), 0, 'the response lease is returned before the client body streams');
     assert.equal(getAdmissionQueueDepth(), 0, 'nothing was left waiting on the ledger');
   });

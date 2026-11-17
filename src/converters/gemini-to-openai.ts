@@ -14,7 +14,7 @@
 import type { Logger } from '../types/shared.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { ValidationError } from '../utils/errors.js';
-import { classifyInteractionsInput, functionArgs, type InteractionsInputEntry } from './interactions-to-gemini.js';
+import { classifyInteractionsInput, functionArgs, interactionResponseSchema, type InteractionsInputEntry } from './interactions-to-gemini.js';
 
 /**
  * Check if request is in Gemini Interactions format
@@ -432,6 +432,12 @@ function stepsToMessages(
       }
 
       case 'function_result':
+        if (step.is_error !== undefined) {
+          options?.logger?.warn(options?.requestId ?? '', `[gemini->openai] ${where}.is_error has no Completions tool-message equivalent; dropped`);
+        }
+        if (step.signature !== undefined) {
+          options?.logger?.warn(options?.requestId ?? '', `[gemini->openai] ${where}.signature has no Completions tool-message equivalent; dropped`);
+        }
         messages.push({
           role: 'tool',
           tool_call_id: requireStepString(step.call_id, `${where}.call_id`),
@@ -686,10 +692,16 @@ export function convertGeminiInteractionsToOpenAI(
   // still dropped, as on the generateContent path.
   const tools: unknown[] = [];
   if (Array.isArray(geminiRequest.tools)) {
-    for (const tool of geminiRequest.tools as any[]) {
+    for (const [index, tool] of (geminiRequest.tools as any[]).entries()) {
       const decls: any[] = Array.isArray(tool?.functionDeclarations)
         ? tool.functionDeclarations
         : typeof tool?.name === 'string' && tool.name !== '' ? [tool] : [];
+      if (decls.length === 0) {
+        options?.logger?.warn(
+          options?.requestId ?? '',
+          `[gemini->openai] tools[${index}] type ${JSON.stringify(tool?.type)} has no Completions function-tool equivalent; dropped`,
+        );
+      }
       for (const fd of decls) {
         tools.push({
           type: 'function',
@@ -723,14 +735,30 @@ export function convertGeminiInteractionsToOpenAI(
 
   if (typeof config?.temperature === 'number') result.temperature = config.temperature;
   if (typeof config?.top_p === 'number') result.top_p = config.top_p;
+  if (typeof config?.seed === 'number') result.seed = config.seed;
   if (typeof config?.max_output_tokens === 'number') result.max_tokens = config.max_output_tokens;
 
   const thinkingLevel = config?.thinking_level ?? config?.thinkingLevel;
   if (typeof thinkingLevel === 'string') result.reasoning_effort = thinkingLevel;
 
-  // Chat Completions declares the same retention field. The direct Responses
-  // converter handles it without this intermediate.
+  // Chat Completions declares the same retention and response-modality fields.
   if (typeof geminiRequest.store === 'boolean') result.store = geminiRequest.store;
+  if (Array.isArray(geminiRequest.response_modalities)) result.modalities = geminiRequest.response_modalities;
+
+  const unsupported = [
+    ['agent', geminiRequest.agent],
+    ['agent_config', geminiRequest.agent_config],
+    ['background', geminiRequest.background],
+    ['previous_interaction_id', geminiRequest.previous_interaction_id],
+    ['generation_config.image_config', config?.image_config],
+    ['generation_config.speech_config', config?.speech_config],
+    ['generation_config.thinking_summaries', config?.thinking_summaries],
+  ] as const;
+  for (const [field, value] of unsupported) {
+    if (value !== undefined) {
+      options?.logger?.warn(options?.requestId ?? '', `[gemini->openai] ${field} has no faithful Completions equivalent; dropped`);
+    }
+  }
 
   // `labels` is the Interactions request's user-defined metadata map
   // (`@google/genai` declares it `labels?: {[k: string]: string}` on
@@ -769,8 +797,8 @@ export function convertGeminiInteractionsToOpenAI(
   // using the same default name `responses-to-completions.ts:203` uses in reverse.
   // `response_mime_type: 'application/json'` without a schema is the schema-less JSON
   // mode; any other mime type has no Completions equivalent and is left alone.
-  const responseFormat = geminiRequest.response_format;
-  if (responseFormat && typeof responseFormat === 'object' && !Array.isArray(responseFormat)) {
+  const responseFormat = interactionResponseSchema(geminiRequest.response_format);
+  if (responseFormat !== undefined) {
     result.response_format = {
       type: 'json_schema',
       json_schema: { name: 'response', schema: responseFormat },

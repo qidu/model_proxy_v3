@@ -121,7 +121,7 @@ describe('/v1/interactions streaming → Interactions events', () => {
     assert.equal(events[0].interaction.id, 'UPSTREAM-ID');
     assert.equal(complete.interaction.id, events[0].interaction.id);
     // The lifecycle event carries an `InteractionSseEventInteraction`, whose answer
-    // field is `steps` — not the `outputs` a REST Interaction resource has.
+    // field is `steps` — not the `steps` an Interaction resource has.
     assert.deepEqual(complete.interaction.steps, [
       { type: 'model_output', content: [{ type: 'text', text: 'Hi there' }] },
       { type: 'function_call', name: 'f', arguments: { a: 1 }, id: 'c1' },

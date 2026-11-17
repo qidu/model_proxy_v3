@@ -10,12 +10,17 @@ import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStre
 import { OpenAIRequest, OpenAIResponse } from '../types/openai.js';
 import { handleResponsesApiError, createResponsesErrorResponse, ResponsesApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
-import { normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader, ensureMcpClientBetaHeader } from '../utils/auth-headers.js';
+import { normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader, ensureMcpClientBetaHeader, repackBearerCredential } from '../utils/auth-headers.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { convertResponsesToChatCompletions, getNamespaceMap, extractAllowedTools, NamespaceMap } from '../converters/responses-to-completions.js';
 import { convertCompletionsToResponses, convertCompletionsToCompactedResponse } from '../converters/completions-to-responses.js';
+import { responsesToInteractionsBody } from '../converters/responses-to-interactions-request.js';
+import {
+  convertInteractionToChatCompletion,
+  interactionsAsCompletionsStream,
+} from '../converters/interactions-to-completions.js';
 import { getConversation, saveConversation, normalizeInputToItems, getConversationThreadItems, appendConversationThreadItems } from '../utils/conversation-store.js';
 import { recordResponseStatusCodeFromUpstream, recordUpstreamResponseToolCount } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
@@ -116,7 +121,11 @@ export async function handleResponsesRequest(
     return handleAsAnthropicMessages(request, targetUrl, authHeaders, requestId, model, activeLogger, requestBody, isStreaming, env, route, upstreamMode);
   }
 
-  if (upstreamMode === 'gemini-generatecontent' || upstreamMode === 'gemini-interactions') {
+  if (upstreamMode === 'gemini-interactions') {
+    return handleAsGeminiInteractions(request, targetUrl, authHeaders, requestId, model, activeLogger, requestBody, isStreaming, env, route);
+  }
+
+  if (upstreamMode === 'gemini-generatecontent') {
     return handleAsGemini(request, targetUrl, authHeaders, requestId, model, activeLogger, requestBody, isStreaming, env, route, upstreamMode);
   }
 
@@ -745,6 +754,81 @@ async function handleAsAnthropicMessages(
   const responsesResponse = claudeResponseToResponses(claudeJson, model, allowedTools, logger, requestId, namespaceMap);
   logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
 
+  const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+  logPipelineHeaders(logger, requestId, 'outbound', '/v1/responses', outHeaders);
+  return new Response(JSON.stringify(responsesResponse), { status: 200, headers: outHeaders });
+}
+
+async function handleAsGeminiInteractions(
+  request: Request,
+  targetUrl: string,
+  authHeaders: Record<string, string>,
+  requestId: string,
+  model: string,
+  logger: Logger,
+  requestBody: Record<string, unknown>,
+  isStreaming: boolean,
+  env?: Env,
+  route?: ModelRouteConfig,
+): Promise<Response> {
+  const conversationEnabled = env?.CONVERSATION_STATE === 'true' || env?.CONVERSATION_STATE === '1';
+  const stateResult = applyConversationState(requestBody, conversationEnabled, logger, requestId);
+  if ('error' in stateResult) return stateResult.error;
+  let effectiveBody = stateResult.body;
+  if (route) {
+    ({ body: effectiveBody } = runHook('before_conversion', { body: effectiveBody, headers: authHeaders }, {
+      hook: 'before_conversion', route, upstreamMode: 'gemini-interactions',
+      clientModel: model, requestId, streaming: isStreaming, logger,
+    }));
+  }
+  const allowedTools = extractAllowedTools(effectiveBody);
+  let interactionsBody = responsesToInteractionsBody(effectiveBody, model, { logger, requestId });
+  const namespaceMap = getNamespaceMap(interactionsBody as unknown as OpenAIRequest);
+  const headers = { ...authHeaders };
+  repackBearerCredential(headers, 'x-goog-api-key');
+  if (route) {
+    ({ body: interactionsBody, headers: authHeaders } = runHook('before_upstream', { body: interactionsBody, headers }, {
+      hook: 'before_upstream', route, upstreamMode: 'gemini-interactions',
+      clientModel: model, requestId, streaming: isStreaming, logger,
+    }));
+  } else {
+    authHeaders = headers;
+  }
+  const fetchHeaders = {
+    'Content-Type': 'application/json',
+    ...addForwardedHeaders(authHeaders, request),
+  };
+  logPipelineStage(logger, requestId, 'upstream-request', targetUrl, interactionsBody);
+  logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, fetchHeaders);
+  let response = await postJsonWithSpool(targetUrl, interactionsBody, {
+    headers: fetchHeaders,
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+  });
+  if (route) {
+    response = await applyAfterUpstream(response, {
+      hook: 'after_upstream', route, upstreamMode: 'gemini-interactions',
+      clientModel: model, requestId, streaming: isStreaming, logger, signal: request.signal,
+    });
+  }
+  logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
+  recordResponseStatusCodeFromUpstream(response.status);
+  recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+  if (!response.ok) {
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, text => text, request.signal);
+    handleResponsesApiError(response, 'Responses API (via gemini-interactions)', { url: targetUrl, upstreamBody });
+  }
+  if (isStreaming) {
+    const completions = interactionsAsCompletionsStream(response, model, requestId, logger);
+    return streamCompletionsAsResponses(completions, model, requestId, logger, undefined, undefined, namespaceMap, allowedTools);
+  }
+  const interaction = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, request.signal,
+  );
+  const completion = convertInteractionToChatCompletion(interaction, model, requestId, { logger, requestId });
+  const responsesResponse = convertCompletionsToResponses(
+    completion as unknown as OpenAIResponse, model, namespaceMap, { allowedTools, logger, requestId },
+  );
+  logPipelineStage(logger, requestId, 'outbound', '/v1/responses', responsesResponse);
   const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
   logPipelineHeaders(logger, requestId, 'outbound', '/v1/responses', outHeaders);
   return new Response(JSON.stringify(responsesResponse), { status: 200, headers: outHeaders });

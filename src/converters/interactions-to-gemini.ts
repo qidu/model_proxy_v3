@@ -94,7 +94,7 @@ const GENERATE_CONTENT_PART_KEYS = [
  */
 const GENERATE_CONTENT_TOOL_KEYS = [
     'functionDeclarations', 'googleSearch', 'codeExecution', 'urlContext',
-    'computerUse', 'fileSearch', 'mcpServer', 'mcpServers',
+    'computerUse', 'fileSearch', 'mcpServer', 'mcpServers', 'googleMaps', 'retrieval',
 ] as const;
 
 /**
@@ -429,34 +429,52 @@ function toGeminiPart(part: Record<string, unknown> | undefined, where: string):
 
             case 'function_call': {
                 const id = typeof part.id === 'string' && part.id !== '' ? { id: part.id } : {};
+                const signature = typeof part.signature === 'string' && part.signature !== ''
+                    ? { thoughtSignature: part.signature }
+                    : {};
                 return {
                     functionCall: {
                         ...id,
                         name: requireString(part.name, `${where}.name`),
                         args: functionArgs(part.arguments, `${where}.arguments`),
                     },
+                    ...signature,
                 };
             }
 
             case 'function_result': {
                 // generateContent matches a result to its call by `id` when one is
                 // present, and by name otherwise.
+                if (part.is_error === true) {
+                    throw new ValidationError(`Interactions ${where}.is_error has no generateContent functionResponse equivalent`);
+                }
                 const id = typeof part.call_id === 'string' && part.call_id !== '' ? { id: part.call_id } : {};
                 const result = part.result;
+                const signature = typeof part.signature === 'string' && part.signature !== ''
+                    ? { thoughtSignature: part.signature }
+                    : {};
                 return {
                     functionResponse: {
                         ...id,
                         name: requireString(part.name, `${where}.name`),
                         response: { content: typeof result === 'string' ? result : stringify(result) },
                     },
+                    ...signature,
                 };
             }
 
             case 'thought': {
                 // The Interactions thought carries a signature to replay and, at
                 // most, a summary of the reasoning — not the reasoning itself.
-                const summary = asRecord(asRecord(part.summary)?.content);
-                const text = typeof summary?.text === 'string' ? { text: summary.text } : {};
+                const summary = Array.isArray(part.summary)
+                    ? part.summary.map(asRecord).filter((entry): entry is Record<string, unknown> => entry !== undefined)
+                    : [asRecord(asRecord(part.summary)?.content)].filter((entry): entry is Record<string, unknown> => entry !== undefined);
+                if (summary.some(entry => entry.type !== 'text')) {
+                    throw new ValidationError(`Interactions ${where}.summary only text has a generateContent equivalent`);
+                }
+                const text = summary.length > 0
+                    ? { text: summary.map(entry => typeof entry.text === 'string' ? entry.text : '').join('') }
+                    : {};
                 const signature = typeof part.signature === 'string' && part.signature !== ''
                     ? { thoughtSignature: part.signature }
                     : {};
@@ -465,6 +483,9 @@ function toGeminiPart(part: Record<string, unknown> | undefined, where: string):
 
             case 'code_execution_call': {
                 const args = asRecord(part.arguments) ?? {};
+                const signature = typeof part.signature === 'string' && part.signature !== ''
+                    ? { thoughtSignature: part.signature }
+                    : {};
                 return {
                     executableCode: {
                         // Re-cased, like every other generateContent enum identifier this
@@ -476,6 +497,7 @@ function toGeminiPart(part: Record<string, unknown> | undefined, where: string):
                             : 'PYTHON',
                         code: requireString(args.code, `${where}.arguments.code`),
                     },
+                    ...signature,
                 };
             }
 
@@ -496,13 +518,18 @@ function toGeminiPart(part: Record<string, unknown> | undefined, where: string):
                     'equivalent; generateContent declares this family as a tool, not as a Content part'
                 );
 
-            case 'code_execution_result':
+            case 'code_execution_result': {
+                const signature = typeof part.signature === 'string' && part.signature !== ''
+                    ? { thoughtSignature: part.signature }
+                    : {};
                 return {
                     codeExecutionResult: {
                         outcome: part.is_error === true ? 'OUTCOME_FAILED' : 'OUTCOME_OK',
                         output: typeof part.result === 'string' ? part.result : stringify(part.result),
                     },
+                    ...signature,
                 };
+            }
 
             default:
                 // Unreachable while the set above and this switch agree; a type added
@@ -525,6 +552,12 @@ function toGeminiPart(part: Record<string, unknown> | undefined, where: string):
 /** An image/audio/video/document part, whichever of the spellings holds its bytes. */
 function mediaPart(part: Record<string, unknown>, where: string): Record<string, unknown> {
     const source = asRecord(part.source);
+    if (part.type === 'audio' && (part.channels !== undefined || part.sample_rate !== undefined)) {
+        throw new ValidationError(`Interactions ${where} audio channels/sample_rate have no generateContent inline-data equivalent`);
+    }
+    const resolution = typeof part.resolution === 'string' && part.resolution !== ''
+        ? { mediaResolution: { level: `MEDIA_RESOLUTION_${part.resolution.toUpperCase()}` } }
+        : {};
 
     // Claude's spelling: `{type:'image', source:{type:'base64', media_type, data}}`.
     if (source) {
@@ -539,17 +572,18 @@ function mediaPart(part: Record<string, unknown>, where: string): Record<string,
                 mime_type: mediaType(part, source, where),
                 data: keepRefInPlace(source.data),
             },
+            ...resolution,
         };
     }
 
     const mimeType = mediaType(part, undefined, where);
     if ((typeof part.data === 'string' && part.data !== '') || isBlobRef(part.data)) {
-        return { inline_data: { mime_type: mimeType, data: keepRefInPlace(part.data) } };
+        return { inline_data: { mime_type: mimeType, data: keepRefInPlace(part.data) }, ...resolution };
     }
     if (typeof part.uri === 'string' && part.uri !== '') {
         // A Files API URI. An http(s) URL would need a server-side fetch, which
         // this route does not do.
-        return { file_data: { file_uri: part.uri, mime_type: mimeType } };
+        return { file_data: { file_uri: part.uri, mime_type: mimeType }, ...resolution };
     }
     throw new ValidationError(`Interactions ${where} carries neither \`data\` nor \`uri\``);
 }
@@ -611,9 +645,19 @@ function buildTools(tools: unknown): Array<Record<string, unknown>> {
                 });
                 break;
 
-            case 'google_search':
-                predefined.push({ googleSearch: {} });
+            case 'google_search': {
+                const searchTypes = Array.isArray(tool.search_types)
+                    ? tool.search_types.filter((entry): entry is string => typeof entry === 'string')
+                    : [];
+                if (searchTypes.some(type => !['web_search', 'image_search'].includes(type))) {
+                    throw new ValidationError(`Interactions tools[${i}].search_types has no generateContent equivalent`);
+                }
+                const types: Record<string, unknown> = {};
+                if (searchTypes.includes('web_search')) types.webSearch = {};
+                if (searchTypes.includes('image_search')) types.imageSearch = {};
+                predefined.push({ googleSearch: Object.keys(types).length > 0 ? { searchTypes: types } : {} });
                 break;
+            }
 
             case 'code_execution':
                 predefined.push({ codeExecution: {} });
@@ -625,10 +669,43 @@ function buildTools(tools: unknown): Array<Record<string, unknown>> {
 
             case 'computer_use': {
                 const environment = typeof tool.environment === 'string' ? { environment: tool.environment } : {};
-                const excluded = Array.isArray(tool.excludedPredefinedFunctions)
-                    ? { excludedPredefinedFunctions: tool.excludedPredefinedFunctions }
+                const excludedFunctions = tool.excluded_predefined_functions ?? tool.excludedPredefinedFunctions;
+                const excluded = Array.isArray(excludedFunctions)
+                    ? { excludedPredefinedFunctions: excludedFunctions }
                     : {};
                 predefined.push({ computerUse: { ...environment, ...excluded } });
+                break;
+            }
+
+            case 'google_maps':
+                predefined.push({
+                    googleMaps: typeof tool.enable_widget === 'boolean' ? { enableWidget: tool.enable_widget } : {},
+                });
+                break;
+
+            case 'retrieval': {
+                const config = asRecord(tool.vertex_ai_search_config) ?? {};
+                const retrievalTypes = Array.isArray(tool.retrieval_types) ? tool.retrieval_types : [];
+                if (retrievalTypes.some(type => type !== 'vertex_ai_search')) {
+                    throw new ValidationError(`Interactions tools[${i}].retrieval_types has no generateContent equivalent`);
+                }
+                const engine = typeof config.engine === 'string' && config.engine !== '' ? config.engine : undefined;
+                const datastores = Array.isArray(config.datastores)
+                    ? config.datastores.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+                    : [];
+                if (!engine && datastores.length > 1) {
+                    throw new ValidationError(`Interactions tools[${i}] multiple datastores require vertex_ai_search_config.engine`);
+                }
+                predefined.push({
+                    retrieval: {
+                        vertexAiSearch: {
+                            ...(engine ? { engine } : {}),
+                            ...(engine && datastores.length > 0
+                                ? { dataStoreSpecs: datastores.map(dataStore => ({ dataStore })) }
+                                : datastores.length === 1 ? { datastore: datastores[0] } : {}),
+                        },
+                    },
+                });
                 break;
             }
 
@@ -664,6 +741,21 @@ function buildTools(tools: unknown): Array<Record<string, unknown>> {
 }
 
 // --- generation config -------------------------------------------------------
+
+/** Return the single JSON schema a non-Interactions upstream can carry. */
+export function interactionResponseSchema(value: unknown, where = 'response_format'): Record<string, unknown> | undefined {
+    if (value === undefined) return undefined;
+    const formats = Array.isArray(value) ? value : [value];
+    if (formats.length !== 1) {
+        throw new ValidationError(`Interactions ${where} must contain exactly one JSON schema for this upstream`);
+    }
+    const format = asRecord(formats[0]);
+    if (!format) throw new ValidationError(`Interactions ${where} must be an object or an array containing one object`);
+    if (format.type === 'video') {
+        throw new ValidationError(`Interactions ${where} video output has no faithful equivalent on this upstream`);
+    }
+    return format;
+}
 
 /**
  * `generation_config` (plus the knobs the Interactions API declares beside it)
@@ -705,11 +797,8 @@ function buildConfig(request: Record<string, unknown>): {
     copyString(request, out, 'response_mime_type', 'responseMimeType');
     copyString(config, out, 'response_mime_type', 'responseMimeType');
 
-    const responseFormat = request.response_format ?? config.response_format;
+    const responseFormat = interactionResponseSchema(request.response_format ?? config.response_format);
     if (responseFormat !== undefined) {
-        if (!isRecord(responseFormat)) {
-            throw new ValidationError('Interactions `response_format` must be an object (a JSON schema)');
-        }
         out.responseSchema = recursivelyCleanSchema(responseFormat);
     }
 
@@ -727,11 +816,23 @@ function buildConfig(request: Record<string, unknown>): {
     // rather than guessed at.
     if (config.speech_config !== undefined) dropped.push('generation_config.speech_config');
 
-    const toolConfig = buildToolConfig(config.tool_choice, dropped);
+    const toolConfig = buildToolConfig(config.tool_choice, dropped) ?? {};
+    const mapsTool = Array.isArray(request.tools)
+        ? request.tools.map(asRecord).find(tool => tool?.type === 'google_maps')
+        : undefined;
+    if (mapsTool && (typeof mapsTool.latitude === 'number' || typeof mapsTool.longitude === 'number')) {
+        toolConfig.retrievalConfig = {
+            ...asRecord(toolConfig.retrievalConfig),
+            latLng: {
+                ...(typeof mapsTool.latitude === 'number' ? { latitude: mapsTool.latitude } : {}),
+                ...(typeof mapsTool.longitude === 'number' ? { longitude: mapsTool.longitude } : {}),
+            },
+        };
+    }
 
     return {
         ...(Object.keys(out).length > 0 ? { generationConfig: out } : {}),
-        ...(toolConfig ? { toolConfig } : {}),
+        ...(Object.keys(toolConfig).length > 0 ? { toolConfig } : {}),
         dropped,
     };
 }

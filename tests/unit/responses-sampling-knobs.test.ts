@@ -13,7 +13,8 @@
  * Each row drives the real `/v1/responses` handler with one config, captures the
  * upstream request body, and asserts the *value* in that target's position. The
  * two OpenAI-Responses modes are verbatim passthroughs, so their row is what the
- * client sent; the Gemini rows read `generationConfig`'s camelCase spelling.
+ * client sent; generateContent reads `generationConfig`, while native Interactions
+ * reads `generation_config` and explicitly omits unsupported `top_k`.
  */
 
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -33,15 +34,16 @@ const TOP_P = 0.5;
 const TOP_K = 40;
 
 /**
- * One row per upstream mode: where its wire puts a generation knob (`body`, or
- * Gemini's `generationConfig`) and how that wire spells the two top-* knobs.
+ * One row per upstream mode: where its wire puts a generation knob and how that
+ * wire spells the two top-* knobs. Interactions declares no top_k field, so that
+ * row asserts the unsupported knob is not sent.
  */
 const MODES: Array<{
   mode: string;
   baseUrl: string;
-  container: 'body' | 'generationConfig';
+  container: 'body' | 'generationConfig' | 'generation_config';
   pKey: string;
-  kKey: string;
+  kKey?: string;
 }> = [
   { mode: 'openai-completions', baseUrl: 'https://api.example.com/v1', container: 'body', pKey: 'top_p', kKey: 'top_k' },
   { mode: 'anthropic-messages', baseUrl: 'https://api.example.com', container: 'body', pKey: 'top_p', kKey: 'top_k' },
@@ -53,7 +55,7 @@ const MODES: Array<{
   },
   {
     mode: 'gemini-interactions', baseUrl: 'https://generativelanguage.googleapis.com',
-    container: 'generationConfig', pKey: 'topP', kKey: 'topK',
+    container: 'generation_config', pKey: 'top_p',
   },
 ];
 
@@ -112,7 +114,7 @@ it('has a row for every accepted upstream mode', () => {
 });
 
 for (const { mode, baseUrl, container, pKey, kKey } of MODES) {
-  it(`${mode} receives temperature, ${pKey} and ${kKey}`, async () => {
+  it(`${mode} maps its supported sampling knobs`, async () => {
     configPath = writeConfig(mode, baseUrl);
 
     const response = await postResponses({
@@ -130,6 +132,7 @@ for (const { mode, baseUrl, container, pKey, kKey } of MODES) {
     assert.ok(knobs, `${container} must be present on the upstream request`);
     assert.equal(knobs.temperature, TEMPERATURE);
     assert.equal(knobs[pKey], TOP_P);
-    assert.equal(knobs[kKey], TOP_K);
+    if (kKey) assert.equal(knobs[kKey], TOP_K);
+    else assert.equal('top_k' in knobs, false);
   });
 }

@@ -3,7 +3,7 @@ import { isBlobRef, rebindBlobRef } from '../utils/blob-refs.js';
 import { ValidationError } from '../utils/errors.js';
 import { stringify } from '../utils/stringify.js';
 import { normalizeEffort, recursivelyCleanSchema } from './claude-to-openai.js';
-import { classifyInteractionsInput, functionArgs, type InteractionsInputEntry } from './interactions-to-gemini.js';
+import { classifyInteractionsInput, functionArgs, interactionResponseSchema, type InteractionsInputEntry } from './interactions-to-gemini.js';
 
 interface ConversionOptions {
   logger?: Logger;
@@ -157,6 +157,7 @@ function appendStep(
     if (typeof id !== 'string' || id === '' || typeof step.name !== 'string' || step.name === '') {
       throw new ValidationError(`${where} function_call requires id/call_id and name`);
     }
+    if (step.signature !== undefined) warn(options, `${where}.signature has no Claude tool_use equivalent; dropped`);
     appendMessage(messages, 'assistant', [{
       type: 'tool_use', id, name: step.name, input: functionArgs(step.arguments, `${where}.arguments`),
     }]);
@@ -164,9 +165,14 @@ function appendStep(
   }
   if (step.type === 'function_result') {
     if (typeof step.call_id !== 'string' || step.call_id === '') throw new ValidationError(`${where} function_result requires call_id`);
+    const content = typeof step.result === 'string'
+      ? step.result
+      : Array.isArray(step.result)
+        ? contentToClaudeBlocks(step.result, 'user', `${where}.result`, options)
+        : stringify(step.result ?? '');
     appendMessage(messages, 'user', [{
-      type: 'tool_result', tool_use_id: step.call_id,
-      content: typeof step.result === 'string' ? step.result : stringify(step.result ?? ''),
+      type: 'tool_result', tool_use_id: step.call_id, content,
+      ...(step.is_error !== undefined ? { is_error: step.is_error } : {}),
     }]);
     return;
   }
@@ -282,15 +288,20 @@ function claudeTools(
     } else if (tool.type === 'google_search') {
       tools.push({ type: 'web_search_20250305', name: 'web_search' });
       if (tool.queries !== undefined) warn(options, `tools[${index}].queries has no Claude web_search declaration equivalent; dropped`);
+      if (tool.search_types !== undefined) warn(options, `tools[${index}].search_types has no Claude web_search declaration equivalent; dropped`);
     } else if (tool.type === 'code_execution') {
       tools.push({ type: 'code_execution_20250522', name: 'code_execution' });
       if (tool.language !== undefined && tool.language !== 'python') warn(options, `tools[${index}].language ${stringify(tool.language)} has no Claude code_execution equivalent; dropped`);
     } else if (tool.type === 'mcp_server') {
       if (typeof tool.url !== 'string' || tool.url === '') throw new ValidationError(`tools[${index}] mcp_server requires url`);
       const headers = asRecord(tool.headers);
-      const allowed = Array.isArray(tool.allowed_tools)
-        ? tool.allowed_tools.map(entry => asRecord(entry)?.name).filter((name): name is string => typeof name === 'string')
-        : [];
+      const allowedConfig = asRecord(tool.allowed_tools);
+      const allowed = Array.isArray(allowedConfig?.tools)
+        ? allowedConfig.tools.filter((name): name is string => typeof name === 'string')
+        : Array.isArray(tool.allowed_tools)
+          ? tool.allowed_tools.map(entry => asRecord(entry)?.name).filter((name): name is string => typeof name === 'string')
+          : [];
+      if (allowedConfig?.mode !== undefined) warn(options, `tools[${index}].allowed_tools.mode has no Claude MCP equivalent; dropped`);
       if (headers && Object.keys(headers).some(name => name.toLowerCase() !== 'authorization')) {
         warn(options, `tools[${index}].headers has non-Authorization values with no Claude MCP equivalent; dropped`);
       }
@@ -379,9 +390,8 @@ export function interactionsToClaudeBody(
   const outputConfig: Record<string, unknown> = {};
   const effort = normalizeEffort(typeof config.thinking_level === 'string' ? config.thinking_level : undefined);
   if (effort) outputConfig.effort = effort;
-  const responseFormat = request.response_format ?? config.response_format;
+  const responseFormat = interactionResponseSchema(request.response_format ?? config.response_format);
   if (responseFormat !== undefined) {
-    if (!asRecord(responseFormat)) throw new ValidationError('Interactions response_format must be an object');
     outputConfig.format = { type: 'json_schema', schema: responseFormat };
   } else if ((request.response_mime_type ?? config.response_mime_type) === 'application/json') {
     outputConfig.format = { type: 'json_schema', schema: { type: 'object' } };
@@ -405,6 +415,7 @@ export function interactionsToClaudeBody(
     ['background', request.background],
     ['generation_config.seed', config.seed],
     ['generation_config.speech_config', config.speech_config ?? config.speechConfig],
+    ['generation_config.image_config', config.image_config ?? config.imageConfig],
   ] as const;
   for (const [field, value] of unsupported) {
     if (value !== undefined) warn(options, `${field} has no faithful Claude Messages equivalent; dropped`);

@@ -8,7 +8,7 @@
  * 1. `status` was the literal `'completed'`, and `candidates[0].finishReason`
  *    was never read. A `MAX_TOKENS` answer therefore told the client it had
  *    finished, and a `SAFETY` block with no candidate content told it there was
- *    a completed answer with an empty `outputs` array — the failure was invisible
+ *    a completed answer with an empty `steps` array — the failure was invisible
  *    (Rule #8).
  * 2. Non-text parts were relayed verbatim from the upstream's dialect:
  *    `{inlineData}` and `{functionCall}` reached the client with no `type`
@@ -29,10 +29,11 @@
 
 import { ProcessingError } from '../utils/errors.js';
 import { stringify } from '../utils/stringify.js';
+import { interactionStepFromContent } from './interactions-stream-events.js';
 
 /**
  * Finish reasons that mean the model did not answer at all: a safety or
- * provenance filter stopped it, and `outputs` is empty or partial by policy.
+ * provenance filter stopped it, and `steps` is empty or partial by policy.
  *
  * Exported because every egress that has to say *why* an answer is empty needs the
  * same vocabulary — the Claude egresses map this set onto `stop_reason: "refusal"`,
@@ -73,18 +74,20 @@ export function convertGenerateContentToInteraction(
 
     const dropped: string[] = [];
     const candidate = asRecord(Array.isArray(response.candidates) ? response.candidates[0] : undefined);
+    const codeExecution: { callId?: string } = {};
 
-    const outputs = partsOf(candidate).flatMap((part, index) => {
-        const converted = convertPart(part, index + partIndexBase, dropped);
+    const contents = partsOf(candidate).flatMap((part, index) => {
+        const converted = convertPart(part, index + partIndexBase, dropped, codeExecution);
         return converted ? [converted] : [];
     });
+    const steps = contents.map(interactionStepFromContent);
 
     const finishReason = typeof candidate?.finishReason === 'string' ? candidate.finishReason : '';
     const blockReason = blockedPromptReason(response.promptFeedback);
 
     const outcome = finishOutcome(finishReason, blockReason);
     const error = interactionError(outcome, finishReason, blockReason);
-    const requiresAction = outputs.some(output => output.type === 'function_call');
+    const requiresAction = steps.some(step => step.type === 'function_call');
     const status = outcome === 'incomplete'
         ? 'incomplete'
         : error !== undefined ? 'failed' : requiresAction ? 'requires_action' : 'completed';
@@ -102,8 +105,7 @@ export function convertGenerateContentToInteraction(
         object: 'interaction',
         created: now,
         updated: now,
-        role: 'model',
-        outputs,
+        steps,
         // Omitted when the upstream reported no count at all: `Usage` is optional on
         // the Interactions type, so an empty object is a claim where there is none.
         ...(Object.keys(usage).length > 0 ? { usage } : {}),
@@ -188,7 +190,8 @@ function partsOf(candidate: Record<string, unknown> | undefined): Array<Record<s
 function convertPart(
     part: Record<string, unknown>,
     index: number,
-    dropped: string[]
+    dropped: string[],
+    codeExecution: { callId?: string },
 ): Record<string, unknown> | undefined {
     if (part.thought === true) {
         return convertThought(part);
@@ -215,8 +218,11 @@ function convertPart(
 
     const executableCode = asRecord(part.executableCode ?? part.executable_code);
     if (executableCode) {
+        const id = `code_call_${index}`;
+        codeExecution.callId = id;
         return {
             type: 'code_execution_call',
+            id,
             arguments: {
                 // Re-cased: generateContent's `Language` enum is upper case, the
                 // Interactions one lower case (`interactions.md:1006`).
@@ -231,8 +237,11 @@ function convertPart(
     const codeResult = asRecord(part.codeExecutionResult ?? part.code_execution_result);
     if (codeResult) {
         const outcome = codeResult.outcome;
+        const callId = codeExecution.callId ?? `code_call_${Math.max(0, index - 1)}`;
+        codeExecution.callId = undefined;
         return {
             type: 'code_execution_result',
+            call_id: callId,
             result: typeof codeResult.output === 'string' ? codeResult.output : stringify(codeResult.output),
             is_error: typeof outcome === 'string' && outcome !== 'OUTCOME_OK',
         };
@@ -251,7 +260,7 @@ function convertPart(
  */
 function convertThought(part: Record<string, unknown>): Record<string, unknown> {
     const summary = typeof part.text === 'string' && part.text !== ''
-        ? { summary: { content: { type: 'text', text: part.text } } }
+        ? { summary: [{ type: 'text', text: part.text }] }
         : {};
     const signature = typeof part.thoughtSignature === 'string' && part.thoughtSignature !== ''
         ? { signature: part.thoughtSignature }
@@ -318,6 +327,23 @@ function convertUsage(metadata: Record<string, unknown> | undefined): Record<str
     ];
     for (const [target, source] of counts) {
         if (typeof metadata?.[source] === 'number') usage[target] = metadata[source];
+    }
+    const breakdowns: Array<[string, string]> = [
+        ['input_tokens_by_modality', 'promptTokensDetails'],
+        ['output_tokens_by_modality', 'candidatesTokensDetails'],
+        ['cached_tokens_by_modality', 'cacheTokensDetails'],
+        ['tool_use_tokens_by_modality', 'toolUsePromptTokensDetails'],
+    ];
+    for (const [target, source] of breakdowns) {
+        const details = Array.isArray(metadata?.[source]) ? metadata[source] as unknown[] : [];
+        const converted = details.map(asRecord).flatMap(detail => {
+            if (typeof detail?.modality !== 'string' || typeof detail.tokenCount !== 'number') return [];
+            return [{ modality: detail.modality.toLowerCase(), tokens: detail.tokenCount }];
+        });
+        if (converted.length > 0) usage[target] = converted;
+    }
+    if (Array.isArray(metadata?.grounding_tool_count)) {
+        usage.grounding_tool_count = metadata.grounding_tool_count;
     }
     return usage;
 }

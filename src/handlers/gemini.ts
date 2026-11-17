@@ -10,9 +10,16 @@ import { Logger, createLogger, logPipelineStage, logPipelineHeaders, observeStre
 import { ClaudeMessagesRequest, ClaudeMessagesResponse } from '../types/claude.js';
 import { GeminiInteractionRequest, GeminiInteractionResponse } from '../types/gemini.js';
 import { convertClaudeToGeminiRequest } from '../converters/claude-to-gemini.js';
+import { claudeToInteractionsBody } from '../converters/claude-to-interactions-request.js';
 import { convertInteractionsToGenerateContent } from '../converters/interactions-to-gemini.js';
 import { convertGenerateContentToInteraction } from '../converters/gemini-to-interactions.js';
 import { convertGeminiGenerateContentToClaude } from '../converters/gemini-to-claude.js';
+import { convertInteractionToChatCompletion, interactionsAsCompletionsStream } from '../converters/interactions-to-completions.js';
+import { convertOpenAIToClaudeResponse } from '../converters/openai-to-claude.js';
+import { convertOpenAIToGeminiGenerateContent } from '../converters/openai-to-gemini.js';
+import { generateContentToInteractionsBody } from '../converters/generatecontent-to-interactions-request.js';
+import { createStreamTransformer } from '../converters/streaming.js';
+import type { OpenAIResponse } from '../types/openai.js';
 import { createGeminiStreamTransformer, createNativeGeminiStreamTransformer, createInteractionsStreamTransformer } from '../converters/gemini-streaming.js';
 import { ClaudeProxyError, handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
@@ -37,6 +44,83 @@ function isNativeGeminiRequest(body: Record<string, unknown>): boolean {
     return ('input' in body || 'contents' in body) && !('messages' in body);
 }
 
+export async function handleGeminiInteractionsForMessages(
+    request: Request,
+    targetUrl: string,
+    authHeaders: Record<string, string>,
+    requestId: string,
+    modelId?: string,
+    env?: Env,
+    logger?: Logger,
+    route?: ModelRouteConfig,
+): Promise<Response> {
+    const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
+    let requestBody = await request.json() as Record<string, unknown>;
+    const model = modelId || (requestBody.model as string) || 'unknown';
+    const isStreaming = requestBody.stream === true;
+    logPipelineStage(activeLogger, requestId, 'inbound', '/v1/messages', requestBody);
+    logPipelineHeaders(activeLogger, requestId, 'inbound', '/v1/messages', request.headers);
+    if (route) {
+        ({ body: requestBody, headers: authHeaders } = runHook('before_conversion', { body: requestBody, headers: authHeaders }, {
+            hook: 'before_conversion', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger,
+        }));
+    }
+    let interactionsBody = claudeToInteractionsBody(requestBody as unknown as ClaudeMessagesRequest, model, {
+        logger: activeLogger, requestId,
+    });
+    if (route) {
+        ({ body: interactionsBody, headers: authHeaders } = runHook('before_upstream', { body: interactionsBody, headers: authHeaders }, {
+            hook: 'before_upstream', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger,
+        }));
+    }
+    const headers = { ...authHeaders };
+    repackBearerCredential(headers, 'x-goog-api-key');
+    const fetchHeaders = { 'Content-Type': 'application/json', ...addForwardedHeaders(headers, request) };
+    logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, interactionsBody);
+    logPipelineHeaders(activeLogger, requestId, 'upstream-request', targetUrl, fetchHeaders);
+    let response = await postJsonWithSpool(targetUrl, interactionsBody, {
+        headers: fetchHeaders,
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+    });
+    if (route) {
+        response = await applyAfterUpstream(response, {
+            hook: 'after_upstream', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger, signal: request.signal,
+        });
+    }
+    logPipelineHeaders(activeLogger, requestId, 'upstream-response', targetUrl, response.headers);
+    recordResponseStatusCodeFromUpstream(response.status);
+    recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+    if (!response.ok) {
+        const upstreamBody = await withResponseText(response, requestId, activeLogger, targetUrl, text => text, request.signal);
+        handleTargetApiError(response, 'Gemini Interactions API', { url: targetUrl, upstreamBody });
+    }
+    if (isStreaming) {
+        if (!response.body) throw new Error('Interactions upstream returned an empty stream');
+        const completions = interactionsAsCompletionsStream(response, model, requestId, activeLogger);
+        const transformed = completions.body!
+            .pipeThrough(new TransformStream<Uint8Array, Uint8Array>(createStreamTransformer(model, requestId)));
+        const outHeaders = {
+            'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+            Connection: 'keep-alive', 'x-request-id': requestId,
+        };
+        return new Response(transformed, { status: 200, headers: outHeaders });
+    }
+    const interaction = await receiveJsonResponse<Record<string, unknown>>(
+        response, requestId, activeLogger, targetUrl, request.signal,
+    );
+    const completion = convertInteractionToChatCompletion(interaction, model, requestId, { logger: activeLogger, requestId });
+    const claudeResponse = await convertOpenAIToClaudeResponse(
+        completion as unknown as OpenAIResponse, model, requestId, requestBody,
+    );
+    logPipelineStage(activeLogger, requestId, 'outbound', '/v1/messages', claudeResponse);
+    const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };
+    logPipelineHeaders(activeLogger, requestId, 'outbound', '/v1/messages', outHeaders);
+    return new Response(JSON.stringify(claudeResponse), { status: 200, headers: outHeaders });
+}
+
 /**
  * Handle Gemini API request for /v1/messages endpoint (returns Claude format)
  */
@@ -57,6 +141,118 @@ export async function handleGeminiRequestForMessages(
     return handleGeminiGenerateContentRequest(
         request, targetUrl, authHeaders, requestId, modelId, env, logger, 'claude-format', route
     );
+}
+
+function interactionsAsGenerateContentStream(
+    upstream: Response,
+    model: string,
+    requestId: string,
+    logger: Logger,
+): Response {
+    const completions = interactionsAsCompletionsStream(upstream, model, requestId, logger);
+    const encoder = new TextEncoder();
+    const readable = new ReadableStream<Uint8Array>({
+        async start(controller) {
+            try {
+                const reader = completions.body!.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                const processEvent = (rawEvent: string): void => {
+                    const data = rawEvent.split(/\r?\n/).find(line => line.startsWith('data:'))?.slice(5).trim();
+                    if (!data || data === '[DONE]') return;
+                    const chunk = JSON.parse(data) as Record<string, unknown>;
+                    const converted = convertOpenAIToGeminiGenerateContent(chunk, model, requestId);
+                    if (Array.isArray(converted.candidates) && converted.candidates.length > 0 || chunk.usage !== undefined) {
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(converted)}\n\n`));
+                    }
+                };
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const events = buffer.split(/\r?\n\r?\n/);
+                    buffer = events.pop() ?? '';
+                    for (const event of events) processEvent(event);
+                }
+                buffer += decoder.decode();
+                if (buffer.trim()) processEvent(buffer);
+                controller.close();
+            } catch (error) {
+                controller.error(error);
+            }
+        },
+    });
+    return new Response(readable, { headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+export async function handleGeminiInteractionsGenerateContentRequest(
+    request: Request,
+    targetUrl: string,
+    authHeaders: Record<string, string>,
+    requestId: string,
+    modelId?: string,
+    env?: Env,
+    logger?: Logger,
+    route?: ModelRouteConfig,
+): Promise<Response> {
+    const activeLogger = logger ?? createLogger((env ?? {}) as Record<string, unknown>);
+    let requestBody = await request.json() as Record<string, unknown>;
+    const model = modelId || (requestBody.model as string) || 'unknown';
+    const isStreaming = new URL(request.url).pathname.includes(':streamGenerateContent') || requestBody.stream === true;
+    logPipelineStage(activeLogger, requestId, 'inbound', ':generateContent', requestBody);
+    if (route) {
+        ({ body: requestBody, headers: authHeaders } = runHook('before_conversion', { body: requestBody, headers: authHeaders }, {
+            hook: 'before_conversion', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger,
+        }));
+    }
+    let interactionsBody = generateContentToInteractionsBody(requestBody, model, { logger: activeLogger, requestId });
+    if (isStreaming) interactionsBody.stream = true;
+    if (route) {
+        ({ body: interactionsBody, headers: authHeaders } = runHook('before_upstream', { body: interactionsBody, headers: authHeaders }, {
+            hook: 'before_upstream', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger,
+        }));
+    }
+    const headers = { ...authHeaders };
+    repackBearerCredential(headers, 'x-goog-api-key');
+    const fetchHeaders = { 'Content-Type': 'application/json', ...addForwardedHeaders(headers, request) };
+    logPipelineStage(activeLogger, requestId, 'upstream-request', targetUrl, interactionsBody);
+    let response = await postJsonWithSpool(targetUrl, interactionsBody, {
+        headers: fetchHeaders,
+        signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+    });
+    if (route) {
+        response = await applyAfterUpstream(response, {
+            hook: 'after_upstream', route, upstreamMode: 'gemini-interactions',
+            clientModel: model, requestId, streaming: isStreaming, logger: activeLogger, signal: request.signal,
+        });
+    }
+    recordResponseStatusCodeFromUpstream(response.status);
+    recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+    if (!response.ok) {
+        const upstreamBody = await withResponseText(response, requestId, activeLogger, targetUrl, text => text, request.signal);
+        handleTargetApiError(response, 'Gemini Interactions API', { url: targetUrl, upstreamBody });
+    }
+    if (isStreaming) {
+        const stream = interactionsAsGenerateContentStream(response, model, requestId, activeLogger);
+        return new Response(stream.body, {
+            status: 200,
+            headers: {
+                'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+                Connection: 'keep-alive', 'x-request-id': requestId,
+            },
+        });
+    }
+    const interaction = await receiveJsonResponse<Record<string, unknown>>(
+        response, requestId, activeLogger, targetUrl, request.signal,
+    );
+    const completion = convertInteractionToChatCompletion(interaction, model, requestId, { logger: activeLogger, requestId });
+    const geminiResponse = convertOpenAIToGeminiGenerateContent(completion, model, requestId);
+    logPipelineStage(activeLogger, requestId, 'outbound', ':generateContent', geminiResponse);
+    return new Response(JSON.stringify(geminiResponse), {
+        status: 200, headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+    });
 }
 
 /**

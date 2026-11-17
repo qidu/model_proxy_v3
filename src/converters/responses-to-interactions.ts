@@ -2,6 +2,7 @@ import type { Logger } from '../types/shared.js';
 import { stringify } from '../utils/stringify.js';
 import {
   createInteractionStreamState,
+  interactionStepFromContent,
   interactionStreamAdoptId,
   interactionStreamCreated,
   interactionStreamEnded,
@@ -59,6 +60,32 @@ function responsesUsage(value: unknown): Record<string, unknown> | undefined {
   };
 }
 
+function responseAnnotations(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  const annotations: Array<Record<string, unknown>> = [];
+  for (const entry of value) {
+    const annotation = asRecord(entry);
+    if (annotation?.type === 'url_citation') {
+      annotations.push({
+        type: 'url_citation',
+        ...(typeof annotation.url === 'string' ? { url: annotation.url } : {}),
+        ...(typeof annotation.title === 'string' ? { title: annotation.title } : {}),
+        ...(typeof annotation.start_index === 'number' ? { start_index: annotation.start_index } : {}),
+        ...(typeof annotation.end_index === 'number' ? { end_index: annotation.end_index } : {}),
+      });
+    } else if (annotation?.type === 'file_citation' || annotation?.type === 'container_file_citation') {
+      annotations.push({
+        type: 'file_citation',
+        ...(typeof annotation.filename === 'string' ? { file_name: annotation.filename } : {}),
+        ...(typeof annotation.file_id === 'string' ? { source: annotation.file_id } : {}),
+        ...(typeof annotation.start_index === 'number' ? { start_index: annotation.start_index } : {}),
+        ...(typeof annotation.end_index === 'number' ? { end_index: annotation.end_index } : {}),
+      });
+    }
+  }
+  return annotations;
+}
+
 function responseError(response: Record<string, unknown>, fallback: string): Record<string, unknown> {
   const error = asRecord(response.error);
   return {
@@ -89,13 +116,14 @@ export function responsesToInteraction(
       for (const partValue of Array.isArray(item.content) ? item.content : []) {
         const part = asRecord(partValue);
         if (part?.type === 'output_text' && typeof part.text === 'string') {
-          outputs.push({ type: 'text', text: part.text });
+          const annotations = responseAnnotations(part.annotations);
+          outputs.push({ type: 'text', text: part.text, ...(annotations.length > 0 ? { annotations } : {}) });
         }
         if (typeof part?.refusal === 'string') refusal += part.refusal;
       }
     } else if (item.type === 'reasoning') {
       const text = responsesReasoningText(item);
-      if (text) outputs.push({ type: 'thought', summary: { content: { type: 'text', text } } });
+      if (text) outputs.push({ type: 'thought', summary: [{ type: 'text', text }] });
       if (item.encrypted_content !== undefined && item.encrypted_content !== null) {
         options?.logger?.warn(options.requestId ?? requestId, '[responses->interactions] reasoning.encrypted_content is provider-specific; no Interactions thought signature was invented');
       }
@@ -122,8 +150,7 @@ export function responsesToInteraction(
     object: 'interaction',
     created: isoTime(response.created_at),
     updated: new Date().toISOString(),
-    role: 'model',
-    outputs,
+    steps: outputs.map(interactionStepFromContent),
     ...(usage ? { usage } : {}),
     ...(incomplete || failed ? { errors: [responseError(response, refusal || 'Responses request failed')] } : {}),
   };

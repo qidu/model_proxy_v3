@@ -2,6 +2,8 @@
  * Convert OpenAI response to Gemini generateContent format
  */
 
+import { interactionStepFromContent } from './interactions-stream-events.js';
+
 const THINK_REGEX = /<(?:thinking|think)>([\s\S]*?)<\/(?:thinking|think)>/g;
 
 /**
@@ -259,8 +261,7 @@ export function convertOpenAIToGeminiInteractions(
         object: 'interaction',
         created: new Date().toISOString(),
         updated: new Date().toISOString(),
-        role: 'model',
-        outputs: [] as any[],
+        steps: [] as any[],
         usage: {
             total_input_tokens: usage?.prompt_tokens || 0,
             total_output_tokens: usage?.completion_tokens || 0,
@@ -277,7 +278,7 @@ export function convertOpenAIToGeminiInteractions(
         if (content !== '') {
             const { reasoning, cleanText } = extractThinkContent(content);
             if (reasoning) {
-                outputs.push({ type: 'thought', text: reasoning });
+                outputs.push({ type: 'thought', summary: [{ type: 'text', text: reasoning }] });
             }
             if (cleanText) {
                 outputs.push({ type: 'text', text: cleanText });
@@ -288,7 +289,6 @@ export function convertOpenAIToGeminiInteractions(
             outputs.push({
                 type: 'function_call',
                 id: toolCall.id,
-                call_id: toolCall.id,
                 name: fn.name || '',
                 arguments: parseToolArguments(fn.arguments),
             });
@@ -308,14 +308,12 @@ export function convertOpenAIToGeminiInteractions(
             }];
         }
 
-        // Skip empty content chunks in streaming
         if (outputs.length === 0) {
-            // Return minimal response without outputs
-            delete interactionResponse.outputs;
+            delete interactionResponse.steps;
             return interactionResponse;
         }
 
-        interactionResponse.outputs = outputs;
+        interactionResponse.steps = outputs.map(interactionStepFromContent);
     }
 
     return interactionResponse;

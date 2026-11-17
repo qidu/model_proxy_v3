@@ -5,6 +5,26 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(interactions): adopt the new Step schema and native upstream conversions
+
+Interaction resources now follow `docs/api/interactions_new.md`: non-streaming answers use `steps` instead of legacy
+`outputs`/`role`, thought summaries are Content arrays, text citations use the typed annotation union, code-execution
+steps carry their required call identifiers, and usage includes modality breakdowns. Streamed answers keep terminal
+usage on `interaction.completed`; `step.stop` no longer carries an undeclared usage field. Chat Completions readers
+accept the new stepped responses while retaining a legacy `outputs` fallback.
+
+Request converters now handle the new response-format union without treating video output as a JSON schema, the
+`google_maps`/`retrieval` tool families, search types, MCP allow-list objects, media resolution/audio metadata, tool
+signatures, and function-result error/rich-content fields. Chat Completions conversion emits schema-only
+`response_format` instead of legacy `response_mime_type`/`labels`, and carries audio, PDF files, modalities, and
+speech voice configuration.
+
+`/v1/responses`, `/v1/messages`, `:generateContent`, and `:streamGenerateContent` configured with a
+`gemini-interactions` upstream now send actual Interactions request bodies to `/interactions` instead of incorrectly
+using generateContent wire format and URLs. Their native JSON and SSE responses are converted back to the client's
+endpoint dialect. New direct request converters and routed JSON/SSE tests cover Responses, Claude Messages, and
+generateContent, alongside updated converter, URL, usage, citation, tool, and streaming suites.
+
 ### fix(interactions): preserve incomplete outcomes and errors[] diagnostics
 
 `/v1/interactions` now maps token-limit truncation to `status: "incomplete"` across generateContent

@@ -301,10 +301,10 @@ describe('convertOpenAIToGeminiInteractions', () => {
     assert.equal(out.model, 'model-x');
     assert.equal(out.status, 'completed');
     assert.equal(out.object, 'interaction');
-    assert.equal(out.role, 'model');
+    assert.equal('role' in out, false);
     assert.ok(out.id.includes('req-42'), 'id must embed the requestId');
-    assert.equal(out.outputs.length, 1);
-    assert.deepEqual(out.outputs[0], { type: 'text', text: 'response text' });
+    assert.equal(out.steps.length, 1);
+    assert.deepEqual(out.steps[0], { type: 'model_output', content: [{ type: 'text', text: 'response text' }] });
     assert.deepEqual(out.usage, {
       total_input_tokens: 10,
       total_output_tokens: 5,
@@ -312,7 +312,7 @@ describe('convertOpenAIToGeminiInteractions', () => {
     });
   });
 
-  it('converts tool_calls into function_call outputs', () => {
+  it('converts tool_calls into function_call steps', () => {
     const out = convertOpenAIToGeminiInteractions(
       {
         choices: [
@@ -332,16 +332,16 @@ describe('convertOpenAIToGeminiInteractions', () => {
       'r',
     ) as any;
 
-    assert.equal(out.outputs.length, 1);
-    const fc = out.outputs[0];
+    assert.equal(out.steps.length, 1);
+    const fc = out.steps[0];
     assert.equal(fc.type, 'function_call');
     assert.equal(fc.id, 'call_A');
-    assert.equal(fc.call_id, 'call_A');
+    assert.equal('call_id' in fc, false);
     assert.equal(fc.name, 'run');
     assert.deepEqual(fc.arguments, { cmd: 'ls' });
   });
 
-  it('extracts <think> content into a thought output', () => {
+  it('extracts <think> content into a thought step', () => {
     const out = convertOpenAIToGeminiInteractions(
       {
         choices: [
@@ -352,9 +352,9 @@ describe('convertOpenAIToGeminiInteractions', () => {
       'r',
     ) as any;
 
-    assert.equal(out.outputs.length, 2);
-    assert.deepEqual(out.outputs[0], { type: 'thought', text: 'thinking...' });
-    assert.deepEqual(out.outputs[1], { type: 'text', text: 'final' });
+    assert.equal(out.steps.length, 2);
+    assert.deepEqual(out.steps[0], { type: 'thought', summary: [{ type: 'text', text: 'thinking...' }] });
+    assert.deepEqual(out.steps[1], { type: 'model_output', content: [{ type: 'text', text: 'final' }] });
   });
 
   it('maps length to incomplete and content_filter to failed with errors[] diagnostics', () => {
@@ -369,19 +369,19 @@ describe('convertOpenAIToGeminiInteractions', () => {
       ) as any;
 
       assert.equal(out.status, status);
-      assert.equal(out.outputs[0].text, 'partial');
+      assert.equal(out.steps[0].content[0].text, 'partial');
       assert.equal('error' in out, false);
       assert.match(out.errors[0].code, new RegExp(`#FinishReason\\.${geminiReason}$`));
     }
   });
 
-  it('strips outputs key for empty content chunks', () => {
+  it('strips steps key for empty content chunks', () => {
     const out = convertOpenAIToGeminiInteractions(
       { choices: [{ delta: { content: '' }, index: 0 }] },
       'm',
       'r',
     ) as any;
 
-    assert.equal(out.outputs, undefined);
+    assert.equal(out.steps, undefined);
   });
 });

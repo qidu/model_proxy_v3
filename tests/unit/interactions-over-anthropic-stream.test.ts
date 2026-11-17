@@ -131,7 +131,7 @@ describe('/v1/interactions ← anthropic-messages: the SSE egress', () => {
     return seen;
   }
 
-  it('closes the interaction: step.stop and interaction.completed, both carrying the usage', async () => {
+  it('closes the interaction: step.stop followed by interaction.completed carrying the usage', async () => {
     const frames = await run(textTurn());
 
     // The answer's two terminal frames, in order. Nothing may follow the completed
@@ -142,8 +142,8 @@ describe('/v1/interactions ← anthropic-messages: the SSE egress', () => {
     // Anthropic reports `input_tokens` with both cache fields excluded, so the
     // mapped total is the sum of the three; here there are no cache fields.
     const expectedUsage = { total_input_tokens: 5, total_output_tokens: 12, total_tokens: 17 };
-    assert.deepEqual(frames[frames.length - 2].usage, expectedUsage, 'the closing step carries the usage');
-    assert.deepEqual(frames[frames.length - 1].interaction.usage, expectedUsage, 'so does the completed interaction');
+    assert.equal('usage' in frames[frames.length - 2], false, 'step.stop declares no usage field');
+    assert.deepEqual(frames[frames.length - 1].interaction.usage, expectedUsage, 'the completed interaction carries the usage');
 
     // The step the deltas built is the one the closing interaction publishes.
     assert.equal(frames[frames.length - 1].interaction.status, 'completed');
