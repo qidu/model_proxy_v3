@@ -641,6 +641,13 @@ describe('validateOpenAICompletionsRequest', () => {
     expectValidationError(() => validateOpenAICompletionsRequest(baseOA({ max_tokens: 0 })), 'max_tokens must be a positive number');
   });
 
+  it('rejects invalid max_completion_tokens', () => {
+    expectValidationError(
+      () => validateOpenAICompletionsRequest(baseOA({ max_completion_tokens: 0 })),
+      'max_completion_tokens must be a positive number',
+    );
+  });
+
   it('rejects temperature out of [0,2]', () => {
     expectValidationError(() => validateOpenAICompletionsRequest(baseOA({ temperature: 3 })), 'temperature must be a number between 0 and 2');
   });

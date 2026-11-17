@@ -27,6 +27,21 @@ describe('convertCompletionsToGeminiGenerateContentBody', () => {
     assert.equal(out.contents[0].role, 'user');
   });
 
+  it('extracts array-form system content into systemInstruction', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g',
+        messages: [
+          { role: 'system', content: [{ type: 'text', text: 'Always answer ' }, { type: 'text', text: 'in French.' }] },
+          { role: 'user', content: 'Say hello.' },
+        ],
+      },
+      'g',
+    );
+    assert.deepEqual(out.systemInstruction, { parts: [{ text: 'Always answer in French.' }] });
+    assert.deepEqual(out.contents, [{ role: 'user', parts: [{ text: 'Say hello.' }] }]);
+  });
+
   it('converts image_url (data URI) to inline_data', async () => {
     const out = await convertCompletionsToGeminiGenerateContentBody(
       {
@@ -128,6 +143,20 @@ describe('convertCompletionsToGeminiGenerateContentBody', () => {
     assert.deepEqual(out.generationConfig, {
       max_output_tokens: 100, temperature: 0.5, top_p: 0.9, stopSequences: ['x'],
     });
+  });
+
+  it('prefers max_completion_tokens over legacy max_tokens', async () => {
+    const modernOnly = await convertCompletionsToGeminiGenerateContentBody(
+      { model: 'g', messages: [{ role: 'user', content: 'hi' }], max_completion_tokens: 700 },
+      'g',
+    );
+    assert.equal(modernOnly.generationConfig.max_output_tokens, 700);
+
+    const both = await convertCompletionsToGeminiGenerateContentBody(
+      { model: 'g', messages: [{ role: 'user', content: 'hi' }], max_tokens: 500, max_completion_tokens: 700 },
+      'g',
+    );
+    assert.equal(both.generationConfig.max_output_tokens, 700);
   });
 
   it('converts OpenAI tools[] to tools[].functionDeclarations[]', async () => {

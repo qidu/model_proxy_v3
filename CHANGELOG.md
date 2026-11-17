@@ -5,6 +5,21 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(completions): prefer max_completion_tokens over legacy max_tokens
+
+Chat Completions conversion to Claude Messages, OpenAI Responses, and Gemini generateContent now gives
+`max_completion_tokens` priority when both limits are present, while retaining `max_tokens` as the fallback. Gemini now
+honors the modern field instead of omitting the output limit. Both spellings receive positive-number validation, and
+Interactions already used the same precedence.
+
+### fix(chat-completions): send valid generateContent request bodies
+
+`/v1/chat/completions` with `gemini-generatecontent` no longer adds the Chat Completions `stream` and `model` fields to
+the Gemini request body. Streaming remains selected by `:streamGenerateContent?alt=sse`, and the model remains in the
+URL. Routed coverage now asserts the complete streaming request body, not only its converted `contents`. Array-form
+system/developer text now reaches `systemInstruction` through the shared Completions content reader instead of being
+silently discarded.
+
 ### refact(interactions): direct Interactions ↔ Claude Messages conversion
 
 `/v1/interactions` with `anthropic-messages` no longer bridges through Chat Completions. Direct request conversion

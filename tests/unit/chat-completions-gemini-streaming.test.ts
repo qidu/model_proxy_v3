@@ -183,8 +183,10 @@ describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode
 
   it('streaming: emits OpenAI chat.completion.chunk SSE with [DONE] terminator', async () => {
     let capturedUrl = '';
-    globalThis.fetch = (async (url: any) => {
+    let capturedBody: any;
+    globalThis.fetch = (async (url: any, init: any) => {
       capturedUrl = String(url);
+      capturedBody = JSON.parse(init.body);
       return geminiStreamResponse(['hel', 'lo']);
     }) as typeof fetch;
 
@@ -198,6 +200,9 @@ describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode
 
     assert.match(capturedUrl, /:streamGenerateContent/);
     assert.match(capturedUrl, /alt=sse/);
+    assert.deepEqual(capturedBody, {
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
     assert.equal(res.headers.get('content-type'), 'text/event-stream');
 
     const text = await res.text();

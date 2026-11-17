@@ -519,12 +519,9 @@ export function completionsToResponsesBody(
 
   if (completions.temperature !== undefined) responsesBody.temperature = completions.temperature;
   if (completions.top_p !== undefined) responsesBody.top_p = completions.top_p;
-  // Legacy `max_tokens` wins when both names are present; `max_completion_tokens` is the
-  // newer OpenAI spelling and is the only one some clients send. Same precedence as
-  // `completionsToClaudeBody`. Carrying only the legacy name left a client that used the
-  // newer one with no output bound at all on a Responses upstream.
-  const maxOutputTokens = (completions.max_tokens as number | undefined)
-    ?? (completions.max_completion_tokens as number | undefined);
+  // OpenAI deprecates legacy `max_tokens` in favor of `max_completion_tokens`.
+  const maxOutputTokens = (completions.max_completion_tokens as number | undefined)
+    ?? (completions.max_tokens as number | undefined);
   if (maxOutputTokens !== undefined) responsesBody.max_output_tokens = maxOutputTokens;
   if (completions.prompt_cache_key !== undefined) responsesBody.prompt_cache_key = completions.prompt_cache_key;
   // Retention and reasoning: same field name on both sides for `store`; the

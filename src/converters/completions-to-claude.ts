@@ -186,10 +186,9 @@ export async function completionsToClaudeBody(
   const claudeBody: Record<string, unknown> = {
     model,
     messages: claudeMessages,
-    // Legacy `max_tokens` wins when both names are present; `max_completion_tokens`
-    // is the newer OpenAI spelling and is the only one some clients send.
-    max_tokens: (completions.max_tokens as number | undefined)
-      ?? (completions.max_completion_tokens as number | undefined)
+    // OpenAI deprecates legacy `max_tokens` in favor of `max_completion_tokens`.
+    max_tokens: (completions.max_completion_tokens as number | undefined)
+      ?? (completions.max_tokens as number | undefined)
       ?? 4096,
     stream: completions.stream === true,
   };

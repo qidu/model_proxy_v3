@@ -57,13 +57,13 @@ describe('completionsToClaudeBody', () => {
     assert.equal(body.max_tokens, 1234);
   });
 
-  it('prefers max_tokens over max_completion_tokens when both are present', async () => {
+  it('prefers max_completion_tokens over legacy max_tokens when both are present', async () => {
     const body = await completionsToClaudeBody({
       messages: [{ role: 'user', content: 'hi' }],
       max_tokens: 777,
       max_completion_tokens: 1234,
     } as any, 'm');
-    assert.equal(body.max_tokens, 777);
+    assert.equal(body.max_tokens, 1234);
   });
 
   it('extracts the system message into top-level system field', async () => {
@@ -621,7 +621,7 @@ describe('completionsToResponsesBody', () => {
     assert.deepEqual(input[3].content, [{ type: 'output_text', text: 'the answer' }]);
   });
 
-  it('maps max_completion_tokens to max_output_tokens, preferring legacy max_tokens', () => {
+  it('maps max_completion_tokens to max_output_tokens, preferring it over legacy max_tokens', () => {
     const newer = completionsToResponsesBody({
       messages: [{ role: 'user', content: 'x' }],
       max_completion_tokens: 700,
@@ -633,7 +633,7 @@ describe('completionsToResponsesBody', () => {
       max_tokens: 500,
       max_completion_tokens: 700,
     } as any, 'm');
-    assert.equal(both.max_output_tokens, 500);
+    assert.equal(both.max_output_tokens, 700);
   });
 
   it('maps tools array to responses-style function tools', () => {

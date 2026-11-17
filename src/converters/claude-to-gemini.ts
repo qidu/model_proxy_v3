@@ -4,9 +4,11 @@
  */
 
 import { ClaudeMessagesRequest, ClaudeTextBlock, ClaudeImageBlock, ClaudeDocumentBlock, ClaudeToolUseBlock, ClaudeToolResultBlock } from '../types/claude.js';
+import type { OpenAIContent } from '../types/openai.js';
 import { isBlobRef, rebindBlobRef, type BlobRef } from '../utils/blob-refs.js';
 import { fetchImageAsInlineData } from '../utils/image-fetch.js';
 import { recursivelyCleanSchema } from './claude-to-openai.js';
+import { openAIContentToText } from './completions-to-responses.js';
 import { stringify } from '../utils/stringify.js';
 import type { Logger } from '../utils/logger.js';
 
@@ -579,16 +581,15 @@ export async function convertCompletionsToGeminiGenerateContentBody(
     const geminiBody: Record<string, unknown> = { contents };
 
     if (systemMsg) {
-        const sysContent = typeof systemMsg.content === 'string'
-            ? systemMsg.content
-            : '';
+        const sysContent = openAIContentToText(systemMsg.content as OpenAIContent);
         if (sysContent !== '') {
             geminiBody.systemInstruction = { parts: [{ text: sysContent }] };
         }
     }
 
     const config: Record<string, unknown> = {};
-    if (completions.max_tokens !== undefined) config.max_output_tokens = completions.max_tokens;
+    const maxOutputTokens = completions.max_completion_tokens ?? completions.max_tokens;
+    if (maxOutputTokens !== undefined) config.max_output_tokens = maxOutputTokens;
     if (completions.temperature !== undefined) config.temperature = completions.temperature;
     if (completions.top_p !== undefined) config.top_p = completions.top_p;
     if (completions.stop !== undefined) {
@@ -661,12 +662,6 @@ export async function convertCompletionsToGeminiGenerateContentBody(
         }
         geminiBody.toolConfig = { functionCallingConfig };
     }
-
-    if (completions.stream === true) geminiBody.stream = true;
-
-    // Carrier for the requested model — Gemini generateContent URL embeds the
-    // model, but the body field is harmless and useful for diagnostics.
-    geminiBody.model = model;
 
     return geminiBody;
 }

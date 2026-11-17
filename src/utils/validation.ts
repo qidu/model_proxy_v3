@@ -506,6 +506,12 @@ export function validateOpenAICompletionsRequest(request: Record<string, unknown
     }
   }
 
+  if (request.max_completion_tokens !== undefined) {
+    if (typeof request.max_completion_tokens !== 'number' || request.max_completion_tokens < 1) {
+      throw new ValidationError('max_completion_tokens must be a positive number');
+    }
+  }
+
   if (request.temperature !== undefined) {
     if (typeof request.temperature !== 'number' || request.temperature < 0 || request.temperature > 2) {
       throw new ValidationError('temperature must be a number between 0 and 2');
