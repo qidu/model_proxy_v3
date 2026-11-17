@@ -5,6 +5,18 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### refact(interactions): direct Interactions ↔ Claude Messages conversion
+
+`/v1/interactions` with `anthropic-messages` no longer bridges through Chat Completions. Direct request conversion
+preserves function tools and `strict`, MCP connectors, Google Search, code execution, native tool history, documents,
+thinking, generation controls, and structured output. Claude JSON/SSE converts directly into Interactions native
+search/code/MCP steps, signed thoughts, function calls, cache-aware usage, and terminal states.
+
+MCP requests add the Claude client beta header. Function allow-lists remain response-side constraints where Claude
+cannot express the set. State, agent, background, audio/video, and other fields without a faithful Claude equivalent
+are reported rather than renamed. Routed coverage is in `tests/unit/interactions-claude-direct.test.ts`, alongside the
+existing Interactions/Claude stream tests and request-ref matrix.
+
 ### refact(gemini): direct generateContent ↔ Claude Messages conversion
 
 `:generateContent` with `anthropic-messages` no longer routes through Chat Completions. The direct request converter

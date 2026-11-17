@@ -6,7 +6,7 @@ import { createLogger, logPipelineStage, logPipelineHeaders } from '../utils/log
 import { isSdkUrl, handleSdkOpenAIRequest } from '../utils/sdk-handler.js';
 import type { Env, Logger } from '../types/shared.js';
 import { addForwardedHeaders } from '../utils/routing.js';
-import { resolveIncomingAuthorization, normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader } from '../utils/auth-headers.js';
+import { resolveIncomingAuthorization, normalizeOpenAIAuthHeaders, ensureStructuredOutputsBetaHeader, ensureMcpClientBetaHeader } from '../utils/auth-headers.js';
 import { runHook, applyAfterUpstream, type HookContext } from '../utils/request-transform.js';
 import type { ModelRouteConfig } from '../utils/config-loader.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
@@ -44,11 +44,16 @@ import {
   claudeToGeminiResponse,
   createClaudeGeminiStreamState,
 } from '../converters/claude-to-gemini-response.js';
+import { extractInteractionsAllowedTools, interactionsToClaudeBody } from '../converters/interactions-to-claude.js';
+import {
+  claudeEventToInteractionEvents,
+  claudeToInteraction,
+  createClaudeInteractionStreamState,
+} from '../converters/claude-to-interactions.js';
 
 /**
- * Remaining Interactions → Claude bridge. GenerateContent uses the direct R7
- * converter before this legacy dispatch. The response returns in the client's
- * Gemini dialect.
+ * Legacy fallback for a Gemini-shaped body that did not match either direct
+ * Interactions or generateContent dispatch. Supported requests use direct pairs.
  */
 async function forwardCompletionsAsAnthropicMessages(
   openaiRequest: Record<string, unknown>,
@@ -614,6 +619,133 @@ function handleResponsesStreamAsGemini(
   });
 }
 
+async function forwardInteractionsAsAnthropicMessages(
+  requestBody: Record<string, unknown>,
+  targetUrl: string,
+  authHeaders: Record<string, string>,
+  requestId: string,
+  model: string,
+  logger: Logger,
+  originalRequest: Request,
+  env?: Env,
+  route?: ModelRouteConfig,
+): Promise<Response> {
+  let claudeBody = interactionsToClaudeBody(requestBody, model, { logger, requestId });
+  const isStreaming = claudeBody.stream === true;
+  const allowedTools = extractInteractionsAllowedTools(requestBody);
+  ensureMcpClientBetaHeader(authHeaders, claudeBody);
+  ensureStructuredOutputsBetaHeader(authHeaders, claudeBody);
+  if (route) {
+    const hookCtx: HookContext = {
+      hook: 'before_upstream', route, upstreamMode: 'anthropic-messages',
+      clientModel: model, requestId, streaming: isStreaming, logger,
+    };
+    ({ body: claudeBody, headers: authHeaders } = runHook('before_upstream', { body: claudeBody, headers: authHeaders }, hookCtx));
+  }
+
+  const anthropicHeaders = { ...authHeaders };
+  if (anthropicHeaders['x-api-key']) delete anthropicHeaders.Authorization;
+  const headers = {
+    'Content-Type': 'application/json',
+    ...addForwardedHeaders(anthropicHeaders, originalRequest),
+  };
+  logPipelineStage(logger, requestId, 'upstream-request', targetUrl, claudeBody);
+  logPipelineHeaders(logger, requestId, 'upstream-request', targetUrl, headers);
+  let response = await postJsonWithSpool(targetUrl, claudeBody, {
+    headers,
+    signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
+  });
+  if (route) {
+    response = await applyAfterUpstream(response, {
+      hook: 'after_upstream', route, upstreamMode: 'anthropic-messages',
+      clientModel: model, requestId, streaming: isStreaming, logger, signal: originalRequest.signal,
+    });
+  }
+  logPipelineHeaders(logger, requestId, 'upstream-response', targetUrl, response.headers);
+  recordResponseStatusCodeFromUpstream(response.status);
+  recordUpstreamResponseToolCount('anthropic-messages', 0);
+  recordUpstreamRateLimit(model, name => response.headers.get(name), targetUrl);
+  if (!response.ok) {
+    const upstreamBody = await withResponseText(response, requestId, logger, targetUrl, text => text, originalRequest.signal);
+    handleTargetApiError(response, 'Interactions (direct anthropic-messages)', { url: targetUrl, upstreamBody });
+  }
+
+  if (isStreaming) return handleClaudeStreamAsInteractions(response, model, requestId, logger, allowedTools);
+  const claudeJson = await receiveJsonResponse<Record<string, unknown>>(
+    response, requestId, logger, targetUrl, originalRequest.signal,
+  );
+  const interaction = claudeToInteraction(claudeJson, model, requestId, { logger, requestId, allowedTools });
+  logPipelineStage(logger, requestId, 'outbound', '/v1/interactions', interaction);
+  return new Response(JSON.stringify(interaction), {
+    headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+  });
+}
+
+function handleClaudeStreamAsInteractions(
+  response: Response,
+  model: string,
+  requestId: string,
+  logger: Logger,
+  allowedTools: Set<string> | null,
+): Response {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    throw new Error(`Claude upstream answered a streaming request with '${contentType || '(no content-type)'}' instead of text/event-stream`);
+  }
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const state = createClaudeInteractionStreamState(model, requestId);
+
+  const processEvent = async (rawEvent: string): Promise<void> => {
+    if (state.interaction.finished) return;
+    const data = rawEvent.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n');
+    if (!data || data === '[DONE]') return;
+    const event = JSON.parse(data) as Record<string, unknown>;
+    if (event.type === 'error') throw new Error(`Claude stream failed: ${JSON.stringify(event.error ?? event)}`);
+    for (const output of claudeEventToInteractionEvents(state, event, { logger, requestId, allowedTools })) {
+      logPipelineStage(logger, requestId, 'outbound', 'stream', output);
+      await writer.write(encoder.encode(`event: ${output.event_type as string}\ndata: ${JSON.stringify(output)}\n\n`));
+    }
+  };
+
+  (async () => {
+    try {
+      if (!response.body) throw new Error('Claude upstream returned an empty stream');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const rawChunk = decoder.decode(value, { stream: true });
+        logPipelineStage(logger, requestId, 'upstream-response', response.url || '(upstream SSE)', rawChunk);
+        buffer += rawChunk;
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || '';
+        for (const event of events) await processEvent(event);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) await processEvent(buffer);
+      if (!state.interaction.finished) throw new Error(`Claude stream ended before a terminal stop_reason (request ${requestId})`);
+      await writer.close();
+    } catch (error) {
+      logger.error(requestId, `Interactions direct Claude streaming error: ${(error as Error).message}`);
+      await writer.abort();
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive', 'x-request-id': requestId,
+    },
+  });
+}
+
 async function forwardInteractionsAsOpenAIResponses(
   requestBody: Record<string, unknown>,
   targetUrl: string,
@@ -815,6 +947,12 @@ export async function handleOpenAIRequest(
       ({ body: requestBody } = runHook('before_conversion', { body: requestBody, headers: authHeaders }, hookCtxConv));
     }
 
+    if (isInteractionsRequest && upstreamMode === 'anthropic-messages' && requestBody.input !== undefined) {
+      return forwardInteractionsAsAnthropicMessages(
+        requestBody, targetUrl, authHeaders, requestId,
+        modelId || (requestBody.model as string) || 'unknown', activeLogger, request, env, route,
+      );
+    }
     if (isInteractionsRequest && upstreamMode === 'openai-responses' && requestBody.input !== undefined) {
       return forwardInteractionsAsOpenAIResponses(
         requestBody, targetUrl, authHeaders, requestId,

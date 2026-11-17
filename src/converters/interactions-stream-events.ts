@@ -4,9 +4,8 @@
  * `step.stop`, `interaction.completed` (the union also declares
  * `interaction.status_update` and `error`, which neither egress here emits).
  *
- * Both `/v1/interactions` streaming egresses write through this module — the
- * Gemini-upstream transformer (`gemini-streaming.ts`) and the cross-mode one
- * (`handlers/cross-mode-stream.ts`). They used to disagree: the Gemini path
+ * The `/v1/interactions` streaming egresses write through this module, including
+ * Gemini, Responses, Claude, and the legacy cross-mode transformer. They used to disagree: the Gemini path
  * followed `docs/api/interactions.md`, whose vocabulary the SDK no longer
  * declares (`interaction.start` / `content.start|delta|stop` /
  * `interaction.complete` against the SDK's `interaction.created` / `step.*` /
@@ -164,6 +163,12 @@ function closeStep(
     ...(usage ? { usage } : {}),
   });
   state.open = null;
+}
+
+export function interactionStreamCloseStep(state: InteractionStreamState): Array<Record<string, unknown>> {
+  const events = interactionStreamCreated(state);
+  closeStep(state, events);
+  return events;
 }
 
 /**

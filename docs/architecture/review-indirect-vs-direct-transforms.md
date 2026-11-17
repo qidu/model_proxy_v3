@@ -1,8 +1,8 @@
 # Review: indirect ("bridged") transforms vs direct transforms
 
-**Status: updated after the native-Interactions and direct-conversion changes.** F5 and R1 through R7 described in the
-original review are implemented. The current matrices use **Native passthrough**, **Direct**, and **Bridged via …**
-labels. Typecheck, build, and the full unit suite pass (3122/3122) after the R7 changes.
+**Status: updated after the native-Interactions and direct-conversion changes.** F5, R1 through R7, and the final
+Interactions → Claude cell are implemented. The current matrices use **Native passthrough**, **Direct**, and
+**Bridged via …** labels. Typecheck, build, and the full unit suite pass (3125/3125) after the final direct-route change.
 
 Scope: the cross-mode matrix in [`README.md` § Supported `upstream_mode`](../../README.md#supported-upstream_mode)
 (and its copy in [`docs/api/list_of_api_and_schema.md`](../api/list_of_api_and_schema.md) §2), audited against the
@@ -21,12 +21,13 @@ Companion notes:
 
 1. **"Indirect" remains two independent mechanisms**: a request/response body hub through Chat Completions and, on
    routes that still use it, a stream pivot through `chat.completion.chunk`. A refactor must say which it replaces.
-2. **The original native/direct routes are complete through R7.** R4/R6 connect Responses and generateContent directly;
-   R7 connects generateContent and Claude directly. These pairs carry native tools, rich tool/reasoning history,
-   media/documents, generation controls, structured output, usage, and terminal states without synthetic intermediates.
-3. **Do not infer another converter from hop count alone.** R3 remains the precedent: most of its apparent margin was
-   two-line hop fixes, and only MCP plus real `document`/reasoning losses justified the pair. The remaining
-   Interactions → Claude bridge still needs a named requirement and field-survival measurement.
+2. **All inference matrix cells are now native, direct, or documented generateContent compatibility routes.** R4/R6
+   connect Responses and generateContent directly; R7 connects generateContent and Claude; Interactions ↔ Claude is now
+   direct too. These pairs carry native tools, rich tool/reasoning history, media/documents, generation controls,
+   structured output, usage, and terminal states without synthetic intermediates.
+3. **Hop count remains insufficient justification by itself.** R3 remains the precedent: most of its apparent margin was
+   two-line hop fixes, and only MCP plus real `document`/reasoning losses justified the pair. The final Interactions →
+   Claude refactor was justified by MCP/native tool declarations and native server-tool response steps.
 4. **`gemini-interactions` means native Interactions.** It is wired natively for `/v1/interactions` and
    `/v1/chat/completions`. The `/v1/messages`, `/v1/responses`, and generateContent cells still have their documented
    generateContent behavior; they must not be described as native Interactions.
@@ -46,7 +47,7 @@ stream conversion must be checked separately; a one-hop request does not prove a
 | `/v1/responses` | 1 ✅ direct Claude | 1 ✅ | 0 ✅ | 1 ✅ direct generateContent | 1 ⚠️ generateContent |
 | `/v1/chat/completions` | 1 ✅ | 0 ✅ | 1 ✅ | 1 ✅ | 1 ✅ native Interactions |
 | `/v1beta/models/<model>:generateContent` | 1 ✅ direct Claude | 1 ✅ | 1 ✅ direct Responses | 0 ✅ | 0 ⚠️ forwards to generateContent |
-| `/v1/interactions` | 2 ✅ | 1 ✅ | 1 ✅ direct Responses | 1 ✅ | 0 ✅ native Interactions |
+| `/v1/interactions` | 1 ✅ direct Claude | 1 ✅ | 1 ✅ direct Responses | 1 ✅ | 0 ✅ native Interactions |
 
 ✅ the matrix matches the implemented route · ⚠️ the route is labelled accurately, but native Interactions is not wired
 for that cell. The original F1/F2/F4 label errors and F5 dispatch mismatch are fixed.
@@ -73,7 +74,7 @@ for that cell. The original F1/F2/F4 label errors and F5 dispatch mismatch are f
 | `:generateContent` | `openai-responses` | generateContent → Responses (`gemini-to-responses.ts`) |
 | `:generateContent` | `gemini-generatecontent` | Native generateContent passthrough |
 | `:generateContent` | `gemini-interactions` | Body forwarded unchanged to generateContent; native Interactions is not wired |
-| `/v1/interactions` | `anthropic-messages` | Interactions → Completions → Claude |
+| `/v1/interactions` | `anthropic-messages` | Interactions → Claude (`interactions-to-claude.ts`) |
 | `/v1/interactions` | `openai-completions` | Interactions → Completions |
 | `/v1/interactions` | `openai-responses` | Interactions → Responses (`interactions-to-responses.ts`) |
 | `/v1/interactions` | `gemini-generatecontent` | Interactions → generateContent (`interactions-to-gemini.ts`) |
@@ -111,6 +112,7 @@ Direct exceptions now include:
 Interactions ⇄ native Interactions             (native passthrough on /v1/interactions)
 Completions ⇄ native Interactions             (Chat Completions front door)
 Interactions ⇄ Responses
+Interactions ⇄ Claude
 Claude ⇄ Responses
 Responses ⇄ Claude
 generateContent ⇄ Responses                   (R4 and R6; JSON and SSE too)
@@ -141,7 +143,9 @@ Direct streamers now bypass it for:
 - Gemini generateContent upstream → Responses (`gemini-to-responses.ts`), with direct Responses item lifecycle events
   for reasoning, messages, and function calls;
 - Claude upstream → generateContent (`claude-to-gemini-response.ts`), with signed thought parts, complete function calls,
-  cache-aware usage, and terminal finish reasons.
+  cache-aware usage, and terminal finish reasons;
+- Claude upstream → Interactions (`claude-to-interactions.ts`), with SDK-native search/code/MCP steps, signed thoughts,
+  function calls, terminal usage, and failure events.
 
 These mappers consume source events directly. They do not create a `chat.completion.chunk`; this is the required
 pattern when a direct request converter is intended to improve response/stream fidelity as well.
@@ -297,6 +301,17 @@ Claude `tool_choice` cannot express the set. Thought signatures preserve the old
 this is not a claim that signatures are valid across providers. Audio/video and fields with no Claude equivalent are
 reported and omitted.
 
+### `/v1/interactions` → `anthropic-messages`: implemented
+
+`interactions-to-claude.ts` replaces the final Completions request bridge. It maps function tools and `strict`, MCP
+connectors, Google Search, code execution, native tool history, documents, generation controls, thinking, and structured
+output. MCP requests add the Claude client beta header. Function allow-lists remain response-side constraints where
+Claude cannot express the set.
+
+`claude-to-interactions.ts` converts Claude JSON/SSE directly into SDK-native Interactions steps, including search/code/
+MCP calls and results, signed thoughts, function calls, cache-aware usage, and terminal failures. State IDs, agent/
+background/store settings, audio/video, and other fields without a faithful Claude equivalent are reported and omitted.
+
 ### Cases where direct conversion cannot invent a receptor
 
 - Responses targets still have no top-level `seed`, `stop`, or modalities field.
@@ -308,8 +323,8 @@ reported and omitted.
 
 ## 5. Cost model
 
-The current off-diagonal inventory is eighteen 1-hop cells, one 2-hop cell, no 3-hop cells, and one 0-hop
-Gemini-family cell that does not wire native Interactions. This is not an argument to make every cell direct.
+The current off-diagonal inventory is nineteen 1-hop cells, no multi-hop cells, and one 0-hop Gemini-family cell that
+does not wire native Interactions. This is not an argument to make every future cell direct.
 
 A direct pair must account for more than request field mapping:
 
@@ -331,8 +346,8 @@ state, and ref-matrix assertions for newly carried audio/document payloads.
 
 1. **Keep the corrected labels and routed regression coverage.** Do not reintroduce "Native" for a generateContent
    target or "Direct" for a route that still has a hidden Completions hop.
-2. **Measure a named user need before another pair.** All original R1–R7 candidates are implemented. The remaining
-   Interactions → Claude bridge needs its own requirement; hop count alone is not a justification.
+2. **No inference bridge remains.** All original R1–R7 candidates and the final Interactions → Claude cell are direct.
+   Future native-Interactions coverage is a separate compatibility decision, not a hidden Completions bridge.
 3. **Prefer a hop fix when the intermediate preserves the semantics.** Do not build a direct pair for a field that only
    one existing mapper drops accidentally.
 4. **Validate semantic mappings against real upstreams.** Provider resource IDs, encrypted reasoning, and built-in tools
@@ -374,8 +389,8 @@ Still worth separate cleanup:
    the direct branch precedes the legacy Gemini → Completions conversion in `src/handlers/openai.ts`.
 2. Inspect the direct pairs directly: `completions-to-interactions.ts`, `interactions-to-completions.ts`,
    `interactions-to-responses.ts`, `responses-to-interactions.ts`, `gemini-to-responses.ts`,
-   `responses-to-gemini.ts`, `responses-to-gemini-request.ts`, `gemini-to-claude-request.ts`, and
-   `claude-to-gemini-response.ts`.
+   `responses-to-gemini.ts`, `responses-to-gemini-request.ts`, `gemini-to-claude-request.ts`,
+   `claude-to-gemini-response.ts`, `interactions-to-claude.ts`, and `claude-to-interactions.ts`.
 3. Use the companion review's maximal-body method for field presence, then validate semantic equivalence with routed
    mocks and, where necessary, real upstream calls.
 4. Relevant routed coverage:
@@ -389,5 +404,7 @@ Still worth separate cleanup:
    - `tests/unit/gemini-responses-cross-mode-stream.test.ts`
    - `tests/unit/gemini-claude-direct.test.ts`
    - `tests/unit/anthropic-to-gemini-stream-parts.test.ts`
+   - `tests/unit/interactions-claude-direct.test.ts`
+   - `tests/unit/interactions-over-anthropic-stream.test.ts`
    - `tests/unit/request-ref-matrix.test.ts`
 5. Standard verification: `npm run typecheck`, `npm run build`, and `npm run test:unit`.

@@ -1,7 +1,6 @@
 /**
- * `/v1/interactions` served by an `anthropic-messages` upstream — the streaming
- * seam (`handleOpenAIRequest` → `forwardCompletionsAsAnthropicMessages` →
- * `handleCrossModeStreamingResponse`, source `anthropic-messages`).
+ * `/v1/interactions` served by an `anthropic-messages` upstream. The route now uses
+ * `forwardInteractionsAsAnthropicMessages` and direct Claude → Interactions SSE.
  *
  * This route had **no** streaming test at all: `gemini-responses-cross-mode-stream`
  * drives the `openai-responses` source only, and `interactions-stream-events`
