@@ -79,23 +79,12 @@ async function forwardCompletionsAsAnthropicMessages(
       'labels not carried to the anthropic-messages upstream: Claude metadata accepts only user_id; dropped');
   }
 
-  // DeepSeek's anthropic-compatible endpoint REQUIRES a `content[].thinking`
-  // block on any assistant turn that carried tool_use in thinking mode — a turn
-  // with only tool_use blocks is rejected with "content[].thinking ... must be
-  // passed back". Gemini clients often omit thoughtSignature; DeepSeek accepts
-  // an unsigned (even empty) thinking block. Ensure a leading thinking block on
-  // every assistant tool_use turn that lacks one.
-  // Verified against the live upstream (2026-08-02).
-  for (const m of (claudeBody.messages as Array<Record<string, unknown>>)) {
-    if (m.role === 'assistant' && Array.isArray(m.content)) {
-      const blocks = m.content as Array<Record<string, unknown>>;
-      const hasToolUse = blocks.some(b => b.type === 'tool_use');
-      const hasThinking = blocks.some(b => b.type === 'thinking');
-      if (hasToolUse && !hasThinking) {
-        blocks.unshift({ type: 'thinking', thinking: '' });
-      }
-    }
-  }
+  // The DeepSeek workaround that used to live here — an unsigned empty
+  // `content[].thinking` block prepended to every assistant tool_use turn — is
+  // now the `inject_missing_thinking_block` builtin, attached per target. It is
+  // only tolerable on an upstream that accepts an unsigned block; a
+  // spec-compliant Messages upstream requires `signature` on `ThinkingBlockParam`
+  // and rejected the fabricated one.
   // Paired with the body *before* the transforms run, not after. `filter_anthropic_beta`
   // is what makes the configured `anthropic_beta_map` authoritative, so a header added
   // afterwards bypasses it: a gateway configured to drop this legacy flag still received
@@ -108,8 +97,7 @@ async function forwardCompletionsAsAnthropicMessages(
   // repo runs it — including this function's sibling
   // `forwardCompletionsAsOpenAIResponses` — but this one did not, so an
   // anthropic-messages route reached from /v1/interactions or :generateContent
-  // silently ignored both. Placed after the thinking-block fixup above so a
-  // transform sees the body as it will actually be sent.
+  // silently ignored both.
   if (route) {
     const hookCtx: HookContext = {
       hook: 'before_upstream', route,

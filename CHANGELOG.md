@@ -5,6 +5,36 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converters): stop fabricating an unsigned thinking block on Claude tool histories
+
+`/v1/interactions` and `:generateContent` routed to an `anthropic-messages` target prepended
+`{"type":"thinking","thinking":""}` to every assistant turn that carried a `tool_use` block and no
+`thinking` block. The block has no `signature`, which the Messages API marks required on
+`ThinkingBlockParam`, so a spec-compliant upstream rejected the whole request before calling the
+model — reported against a Claude target as a client request that could never succeed, and
+reproducible from the converter alone. The injection was written for DeepSeek's Anthropic-compatible
+endpoint, which does accept an unsigned block (verified live 2026-08-02); commit `0b91415` copied it
+from `src/handlers/openai.ts` into `gemini-to-claude-request.ts` and `9c38d0d` into
+`interactions-to-claude.ts`, dropping the two qualifiers that made it safe there — *that* upstream,
+and thinking mode. It had since run for every `anthropic-messages` target reached from a
+Gemini-shaped or Interactions front door, where — unlike `claude.ts`'s native door, which sets
+`thinking: {"type":"disabled"}` when the client omits it — nothing suppresses thinking, so the
+fabricated block rode along on requests that had never enabled thinking at all.
+
+The shim is now the `inject_missing_thinking_block` builtin: opt-in per target, schema-gated to
+`anthropic-messages`, and listed in the `deepseek_v4_anthropic_compat` example beside
+`inject_missing_tool_results` and `strip_fresh_thinking`, which is where this repository already put
+the same DeepSeek quirk when it moved out of `src/handlers/claude.ts`. It reports each injection on
+the trace log rather than applying it silently, and it fills a turn only when the client's own
+history has no `thinking` block to use — a signed block the converter did carry is never replaced.
+
+A DeepSeek-compatible target reached from these front doors needs the builtin added to its transform
+set to keep the shim; the documented `deepseek_v4_anthropic_compat` set now includes it. Coverage:
+a row in `tests/unit/transform-ref-matrix.test.ts` (the builtin's effect on a ref-bearing body,
+through the real handler), its unit block in `request-transform.test.ts`, the reported request's
+exact converted body in `interactions-claude-direct.test.ts`, the opt-in route path in the same
+file, and the inverted pin in `gemini-claude-direct.test.ts`.
+
 ### fix(responses): carry top_k to the Claude and Completions upstreams
 
 A `/v1/responses` request's `top_p` already reached every upstream mode, but `top_k` reached only the two verbatim

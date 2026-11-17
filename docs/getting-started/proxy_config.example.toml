@@ -454,9 +454,12 @@ base_url = "https://openrouter.ai/api"
 #   - strip thinking-enabled when the conversation has no prior assistant
 #     thinking blocks (DeepSeek rejects it on fresh conversations with
 #     400 "The content[].thinking in the thinking mode must be passed back to the API")
+#   - prepend an unsigned empty thinking block to assistant tool_use turns
+#     (the same 400, for a turn that carried tool_use with no thinking block;
+#     DeepSeek accepts the unsigned block, a spec-compliant upstream does not)
 # [transforms.deepseek_v4_anthropic_compat]
 # schema = "anthropic-messages"
-# before_upstream.builtins = ["inject_missing_tool_results", "strip_fresh_thinking"]
+# before_upstream.builtins = ["inject_missing_tool_results", "strip_fresh_thinking", "inject_missing_thinking_block"]
 
 # MiniMax openai-completions compat:
 #   - rewrite assistant content "" → null when tool_calls present

@@ -1888,6 +1888,91 @@ describe('Tier-2 builtin: strip_fresh_thinking', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tier-2 builtin: inject_missing_thinking_block
+// ---------------------------------------------------------------------------
+
+describe('Tier-2 builtin: inject_missing_thinking_block', () => {
+  const set: TransformSet = {
+    name: 'inject_missing_thinking',
+    schema: 'anthropic-messages',
+    before_upstream: { builtins: ['inject_missing_thinking_block'] },
+  };
+
+  function ctx(traceLog?: string[]): HookContext {
+    return {
+      hook: 'before_upstream',
+      route: makeRoute([set]),
+      upstreamMode: 'anthropic-messages',
+      clientModel: 'test-model',
+      requestId: 'req-1',
+      streaming: false,
+      logger: {
+        debug: () => {}, info: () => {}, warn: () => {}, error: () => {},
+        trace: (_requestId: string, message: string) => { traceLog?.push(message); },
+      } as any,
+    };
+  }
+
+  it('prepends an unsigned empty block to the assistant turn that carried tool_use', () => {
+    const body = {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'lookup', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'x' }] },
+      ],
+    };
+    const traceLog: string[] = [];
+    const result = runHook('before_upstream', payload(body), ctx(traceLog));
+    const messages = result.body.messages as Array<Record<string, unknown>>;
+    assert.deepEqual(messages[1].content, [
+      { type: 'thinking', thinking: '' },
+      { type: 'tool_use', id: 'toolu_1', name: 'lookup', input: {} },
+    ]);
+    assert.equal(JSON.stringify(messages[0]), JSON.stringify(body.messages[0]), 'the user turn must not move');
+    assert.equal(JSON.stringify(messages[2]), JSON.stringify(body.messages[2]), 'nor the tool_result turn');
+    assert.equal(traceLog.length, 1, 'the shim must be reported, not applied silently');
+    assert.match(traceLog[0], /\[inject_missing_thinking_block\] prepended an unsigned empty thinking block to 1 /);
+  });
+
+  it('leaves a tool_use turn that already carries thinking alone', () => {
+    const signed = [
+      { type: 'thinking', thinking: 'reasoning', signature: 'sig-1' },
+      { type: 'tool_use', id: 'toolu_1', name: 'lookup', input: {} },
+    ];
+    const body = { messages: [{ role: 'assistant', content: signed }] };
+    const result = runHook('before_upstream', payload(body), ctx());
+    assert.deepEqual((result.body.messages as any[])[0].content, signed, 'no second block, and no signature invented');
+  });
+
+  it('touches only assistant turns that carry tool_use', () => {
+    const body = {
+      messages: [
+        { role: 'assistant', content: [{ type: 'text', text: 'no tool here' }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'x' }] },
+        { role: 'assistant', content: 'plain string content' },
+      ],
+    };
+    const result = runHook('before_upstream', payload(body), ctx());
+    assert.deepEqual(result.body.messages, body.messages);
+  });
+
+  it('fills every assistant tool_use turn, not only the last', () => {
+    const turn = (id: string) => ({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'lookup', input: {} }] });
+    const body = { messages: [turn('toolu_1'), turn('toolu_2')] };
+    const result = runHook('before_upstream', payload(body), ctx());
+    for (const message of result.body.messages as Array<Record<string, unknown>>) {
+      assert.equal((message.content as unknown[])[0] && (message.content as any[])[0].type, 'thinking');
+    }
+  });
+
+  it('leaves a body with no messages untouched', () => {
+    const body = { model: 'claude-test' };
+    const result = runHook('before_upstream', payload(body), ctx());
+    assert.deepEqual(result.body, body);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tier-2 builtin: ensure_trailing_user_message
 // ---------------------------------------------------------------------------
 

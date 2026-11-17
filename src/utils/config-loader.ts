@@ -260,7 +260,7 @@ export type TransformOp =
   | { op: 'remove';    path: string }
   | { op: 'map_value'; path: string; from: unknown; to: unknown; when_sibling?: string };
 
-export type BuiltinName = 'lowercase_tool_schema_types' | 'recover_tool_message_name' | 'inject_missing_tool_results' | 'strip_fresh_thinking' | 'filter_anthropic_beta' | 'ensure_tool_config_cache_ttl' | 'ensure_trailing_user_message' | 'assemble_sse_chunks' | 'restore_client_model_alias' | 'project_program_to_node_tool';
+export type BuiltinName = 'lowercase_tool_schema_types' | 'recover_tool_message_name' | 'inject_missing_tool_results' | 'strip_fresh_thinking' | 'inject_missing_thinking_block' | 'filter_anthropic_beta' | 'ensure_tool_config_cache_ttl' | 'ensure_trailing_user_message' | 'assemble_sse_chunks' | 'restore_client_model_alias' | 'project_program_to_node_tool';
 
 /** A named transform set declared under [transforms.<name>] */
 export interface TransformSet {
@@ -321,7 +321,7 @@ const SCHEMA_PATHS: Record<TransformSchema, Set<string>> = {
   ]),
 };
 
-const BUILTIN_NAMES: Set<BuiltinName> = new Set(['lowercase_tool_schema_types', 'recover_tool_message_name', 'inject_missing_tool_results', 'strip_fresh_thinking', 'filter_anthropic_beta', 'ensure_tool_config_cache_ttl', 'ensure_trailing_user_message', 'assemble_sse_chunks', 'restore_client_model_alias', 'project_program_to_node_tool']);
+const BUILTIN_NAMES: Set<BuiltinName> = new Set(['lowercase_tool_schema_types', 'recover_tool_message_name', 'inject_missing_tool_results', 'strip_fresh_thinking', 'inject_missing_thinking_block', 'filter_anthropic_beta', 'ensure_tool_config_cache_ttl', 'ensure_trailing_user_message', 'assemble_sse_chunks', 'restore_client_model_alias', 'project_program_to_node_tool']);
 
 /**
  * Backward-compatible hook name aliases.
@@ -428,6 +428,7 @@ export function validateTransformSet(name: string, set: TransformSet): Transform
       const BUILTIN_SCHEMA: Partial<Record<BuiltinName, TransformSchema[]>> = {
         'assemble_sse_chunks': ['openai-completions'],
         'strip_fresh_thinking': ['anthropic-messages'],
+        'inject_missing_thinking_block': ['anthropic-messages'],
         'ensure_trailing_user_message': ['anthropic-messages'],
       };
       const allowed = BUILTIN_SCHEMA[b];

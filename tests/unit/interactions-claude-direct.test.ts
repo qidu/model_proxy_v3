@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { interactionsToClaudeBody } from '../../src/converters/interactions-to-claude.js';
 import { handleOpenAIRequest } from '../../src/handlers/openai.js';
+import type { ModelRouteConfig } from '../../src/utils/config-loader.js';
 import { createLogger } from '../../src/utils/logger.js';
 
 const ENV = { LOG_LEVEL: 'error' } as any;
@@ -28,16 +29,27 @@ function parseSse(raw: string): Array<Record<string, any>> {
   });
 }
 
-async function send(body: Record<string, unknown>, stream = false): Promise<Response> {
+async function send(body: Record<string, unknown>, stream = false, route?: ModelRouteConfig): Promise<Response> {
   return handleOpenAIRequest(
     new Request('http://proxy/v1/interactions', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, ...(stream ? { stream: true } : {}) }),
     }),
     TARGET, { 'x-api-key': 'upstream-key' }, stream ? 'int-claude-stream' : 'int-claude-json',
-    'resolved-model', ENV, LOGGER, undefined, undefined, 'anthropic-messages',
+    'resolved-model', ENV, LOGGER, undefined, undefined, 'anthropic-messages', route,
   );
 }
+
+/** The DeepSeek anthropic-compat set: this builtin is its only consumer here. */
+const SHIM_ROUTE: ModelRouteConfig = {
+  targetUrl: TARGET,
+  upstreamMode: 'anthropic-messages',
+  transforms: [{
+    name: 'deepseek_v4_anthropic_compat',
+    schema: 'anthropic-messages',
+    before_upstream: { builtins: ['inject_missing_thinking_block'] },
+  }],
+};
 
 describe('Interactions → Claude direct request conversion', () => {
   it('carries MCP/native tools, strict functions, generation settings, and native history', () => {
@@ -109,6 +121,31 @@ describe('Interactions → Claude direct request conversion', () => {
     ]);
     assert.equal(JSON.stringify(body).includes('tool_calls'), false);
   });
+
+  it('does not fabricate a thinking block for a tool history that carries no thought', () => {
+    // Reported failure: an Interactions client that replayed a function_call it
+    // never accompanied with a `thought` step had `{type:'thinking', thinking:''}`
+    // prepended to its assistant turn. The block has no `signature`, which
+    // `ThinkingBlockParam` requires (docs/api/claude_api_docs/messages-create.md),
+    // so a spec-compliant upstream rejected the request before calling the model.
+    // Unsupported yes — but it was the converter that sent it: the client's own
+    // steps appear here exactly as given, with nothing added.
+    const body = interactionsToClaudeBody({
+      model: 'claude-sonnet-4-6',
+      input: [
+        { type: 'user_input', content: [{ type: 'text', text: 'What is the weather in Paris? Use the tool.' }] },
+        { type: 'function_call', id: 'call_weather_1', name: 'get_weather', arguments: { city: 'Paris' } },
+        { type: 'function_result', call_id: 'call_weather_1', name: 'get_weather', result: { temperature_c: 18 } },
+      ],
+    }, 'claude-sonnet-4-6');
+
+    assert.deepEqual(body.messages, [
+      { role: 'user', content: 'What is the weather in Paris? Use the tool.' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_weather_1', name: 'get_weather', input: { city: 'Paris' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_weather_1', content: '{"temperature_c":18}' }] },
+    ]);
+    assert.equal(JSON.stringify(body).includes('"thinking"'), false);
+  });
 });
 
 describe('/v1/interactions ↔ anthropic-messages direct route', () => {
@@ -158,6 +195,31 @@ describe('/v1/interactions ↔ anthropic-messages direct route', () => {
     assert.deepEqual(answer.usage, {
       total_input_tokens: 11, total_output_tokens: 5, total_cached_tokens: 2, total_tokens: 16,
     });
+  });
+
+  it('prepends the shim only when the target opts in via inject_missing_thinking_block', async () => {
+    // The other half of the contract: a DeepSeek round-trip still needs the
+    // unsigned block, and gets it from the transform set rather than from the
+    // converter. Same client steps as the regression above, opposite upstream body.
+    let upstreamBody: Record<string, unknown>;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(await new Response(init?.body as BodyInit).text());
+      return json({ id: 'msg_1', model: 'deepseek-v4', stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] });
+    }) as typeof fetch;
+
+    await send({
+      model: 'client',
+      input: [
+        { type: 'user_input', content: [{ type: 'text', text: 'What is the weather in Paris?' }] },
+        { type: 'function_call', id: 'call_weather_1', name: 'get_weather', arguments: { city: 'Paris' } },
+        { type: 'function_result', call_id: 'call_weather_1', name: 'get_weather', result: { temperature_c: 18 } },
+      ],
+    }, false, SHIM_ROUTE);
+
+    assert.deepEqual((upstreamBody!.messages as any[])[1].content, [
+      { type: 'thinking', thinking: '' },
+      { type: 'tool_use', id: 'call_weather_1', name: 'get_weather', input: { city: 'Paris' } },
+    ]);
   });
 
   it('streams native MCP calls and signed thoughts directly with terminal usage', async () => {

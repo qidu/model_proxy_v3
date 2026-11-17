@@ -180,13 +180,13 @@ async function contentsToClaude(
     else if (responseIndex > 0) lastCalls = [];
   }
 
-  for (const message of messages) {
-    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
-    const blocks = message.content as Array<Record<string, unknown>>;
-    if (blocks.some(block => block.type === 'tool_use') && !blocks.some(block => block.type === 'thinking')) {
-      blocks.unshift({ type: 'thinking', thinking: '' });
-    }
-  }
+  // No placeholder thinking block is fabricated here. DeepSeek's
+  // Anthropic-compatible endpoint requires a `content[].thinking` block on an
+  // assistant turn that carried tool_use, but it is the only upstream that
+  // tolerates the unsigned block that would satisfy it — `ThinkingBlockParam`
+  // requires `signature` (see the `thoughtSignature` handling above, which never
+  // invents one). A target that needs the shim opts in via the
+  // `inject_missing_thinking_block` builtin.
   if (messages.length === 0) throw new ValidationError('generateContent request produced no Claude messages');
   return { messages, system };
 }

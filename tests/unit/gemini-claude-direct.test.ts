@@ -106,11 +106,16 @@ describe('generateContent → Claude direct request conversion', () => {
     assert.equal(JSON.stringify(body).includes('tool_calls'), false);
   });
 
-  it('adds the existing DeepSeek thinking compatibility block to unsigned tool history', async () => {
+  it('leaves an unsigned tool history unsigned — the DeepSeek shim is opt-in', async () => {
+    // This converter used to prepend `{type:'thinking', thinking:''}` here. That
+    // block carries no `signature`, which `ThinkingBlockParam` requires, so only an
+    // upstream that ignores the field tolerates it (DeepSeek's anthropic-compatible
+    // endpoint). A target that needs it attaches the `inject_missing_thinking_block`
+    // builtin; the converter must not decide that for every upstream.
     const body = await geminiToClaudeBody({
       contents: [{ role: 'model', parts: [{ functionCall: { id: 'call_1', name: 'lookup', args: {} } }] }],
     }, 'resolved-model');
-    assert.deepEqual(body.messages[0].content[0], { type: 'thinking', thinking: '' });
+    assert.deepEqual(body.messages[0].content, [{ type: 'tool_use', id: 'call_1', name: 'lookup', input: {} }]);
   });
 });
 

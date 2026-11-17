@@ -89,7 +89,7 @@
  * (`chat-completions.ts:254`/`:335`, `responses.ts:951`) share the same
  * `postJsonWithSpool` re-detection the measured two exercise.
  *
- * Coverage: all ten `BUILTIN_NAMES` and all five op kinds, across the three
+ * Coverage: all eleven `BUILTIN_NAMES` and all five op kinds, across the three
  * hooks that can run on a ref-bearing body (`before_upstream` on the Anthropic,
  * Chat and already-OpenAI Messages rungs, `before_conversion` on the converted
  * Messages and Responses rungs).
@@ -124,6 +124,7 @@ const P = (seed: string) => Buffer.alloc(48, seed.charCodeAt(0)).toString('base6
 const LC_IMAGE = P('1');
 const TOOLRES_IMAGE = P('2');
 const THINK_IMAGE = P('3');
+const INJECTTHINK_IMAGE = P('L');
 const TRAIL_IMAGE = P('4');
 const SYSTEM_IMAGE = P('5');
 const BETA_IMAGE = P('6');
@@ -145,7 +146,7 @@ const ALL_PAYLOADS = [
   LC_IMAGE, TOOLRES_IMAGE, THINK_IMAGE, TRAIL_IMAGE, SYSTEM_IMAGE, BETA_IMAGE, ALIAS_IMAGE,
   RENAME_IMAGE, SET_IMAGE, REMOVE_IMAGE, DEFAULT_IMAGE, MAPVAL_IMAGE, CHAT_TOOL_IMAGE,
   SSE_IMAGE, CHAT_RENAME_IMAGE, MAXTOK_IMAGE, SETCONTENT_IMAGE, RESP_PROGRAM_IMAGE,
-  OPENAI_URL_IMAGE, CHAT_SET_IMAGE,
+  OPENAI_URL_IMAGE, CHAT_SET_IMAGE, INJECTTHINK_IMAGE,
 ];
 assert.equal(
   new Set(ALL_PAYLOADS).size,
@@ -274,6 +275,22 @@ const THINK_BODY = () => ({
       { type: 'text', text: 'describe' },
     ],
   }],
+});
+
+const INJECTTHINK_BODY = () => ({
+  model: 'claude-test',
+  max_tokens: 16,
+  messages: [
+    {
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: INJECTTHINK_IMAGE } },
+        { type: 'text', text: 'describe' },
+      ],
+    },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '18C' }] },
+  ],
 });
 
 const TRAIL_BODY = () => ({
@@ -496,6 +513,27 @@ const ROWS: Row[] = [
       assert.ok(!('thinking' in json(call)), 'a thinking-enabled request with no prior thinking block must lose the flag');
     },
     call: (r, route) => handleClaudeRequest(r, TARGET, AUTH, 't3', 'claude-test', ENV, LOGGER, route),
+  },
+  {
+    name: 'before_upstream: inject_missing_thinking_block',
+    clientPath: '/v1/messages', upstreamMode: 'anthropic-messages',
+    body: INJECTTHINK_BODY, refs: 1, carried: [INJECTTHINK_IMAGE], dropped: [],
+    streamedAfterTransform: true, acts: true,
+    set: setOf('injectthink', 'anthropic-messages', 'before_upstream', { builtins: ['inject_missing_thinking_block'] }),
+    effect: (call) => {
+      const msgs = json(call).messages;
+      assert.deepEqual(
+        msgs[1].content[0], { type: 'thinking', thinking: '' },
+        'the DeepSeek shim must be prepended by the transform, since the converter no longer writes it',
+      );
+      assert.equal(msgs[1].content[1].type, 'tool_use', 'ahead of the tool_use it exists to accompany');
+      assert.equal(msgs[1].content.length, 2, 'and without disturbing the rest of the turn');
+      assert.deepEqual(
+        msgs[2].content[0], { type: 'tool_result', tool_use_id: 'toolu_1', content: '18C' },
+        'the tool_result turn must be left where it was',
+      );
+    },
+    call: (r, route) => handleClaudeRequest(r, TARGET, AUTH, 't3b', 'claude-test', ENV, LOGGER, route),
   },
   {
     name: 'before_upstream: ensure_trailing_user_message',
@@ -947,7 +985,7 @@ describe('§5.4 transform contracts against ref-bearing bodies', () => {
     // for a name that was added to both places but never exercised here).
     const declared = [
       'lowercase_tool_schema_types', 'recover_tool_message_name', 'inject_missing_tool_results',
-      'strip_fresh_thinking', 'filter_anthropic_beta', 'ensure_tool_config_cache_ttl',
+      'strip_fresh_thinking', 'inject_missing_thinking_block', 'filter_anthropic_beta', 'ensure_tool_config_cache_ttl',
       'ensure_trailing_user_message', 'assemble_sse_chunks', 'restore_client_model_alias',
       'project_program_to_node_tool',
     ];

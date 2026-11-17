@@ -141,7 +141,11 @@ Key ideas:
 > **rejects a client-sent `{"type": "enabled"}` on a fresh conversation** (no prior assistant
 > turns containing thinking blocks) — attach the `strip_fresh_thinking` builtin (part of the
 > `deepseek_v4_anthropic_compat` set) to such targets to drop the flag in that case, or use
-> `"adaptive"` client-side, which the model handles autonomously.
+> `"adaptive"` client-side, which the model handles autonomously. The same endpoint rejects an
+> assistant turn that carried `tool_use` **with no `thinking` block**, which it will accept
+> unsigned and empty: attach `inject_missing_thinking_block` (also in that set) for that case.
+> The proxy no longer writes such a block on its own, because `signature` is required on
+> `ThinkingBlockParam` and a spec-compliant upstream rejects the unsigned form.
 
 > **Note — synthetic thinking-block signatures (Claude→OpenAI→Claude only):**
 > Anthropic's spec marks `signature` as REQUIRED on thinking content blocks, and clients such

@@ -357,6 +357,33 @@ function applyBuiltin(
     return;
   }
 
+  if (name === 'inject_missing_thinking_block') {
+    // DeepSeek's Anthropic-compatible endpoint REQUIRES a `content[].thinking`
+    // block on an assistant turn that carried tool_use in thinking mode — a turn
+    // with only tool_use blocks is rejected with "The content[].thinking in the
+    // thinking mode must be passed back to the API". DeepSeek accepts an
+    // unsigned (even empty) block; the spec-compliant Messages API does not
+    // (`ThinkingBlockParam.signature` is required), so fabricating one is a
+    // per-target decision, never a converter default. Verified against the live
+    // DeepSeek upstream (2026-08-02).
+    if (!Array.isArray(body.messages)) return;
+    let injected = 0;
+    for (const msg of body.messages as Record<string, unknown>[]) {
+      if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+      const blocks = msg.content as Array<Record<string, unknown>>;
+      if (!blocks.some(b => b.type === 'tool_use') || blocks.some(b => b.type === 'thinking')) continue;
+      blocks.unshift({ type: 'thinking', thinking: '' });
+      injected++;
+    }
+    if (injected > 0 && trace) {
+      trace.logger.trace(
+        trace.requestId,
+        `[inject_missing_thinking_block] prepended an unsigned empty thinking block to ${injected} assistant tool_use turn(s)`,
+      );
+    }
+    return;
+  }
+
   if (name === 'ensure_tool_config_cache_ttl') {
     // Translate the Anthropic-native system-block cache_control into the
     // litellm/Bedrock-bridge convention cache_control_injection_points.
