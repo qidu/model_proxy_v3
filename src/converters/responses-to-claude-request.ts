@@ -327,6 +327,7 @@ export function responsesToClaudeBody(
   if (toolChoice) body.tool_choice = toolChoice;
   if (typeof request.temperature === 'number') body.temperature = request.temperature;
   if (typeof request.top_p === 'number') body.top_p = request.top_p;
+  if (typeof request.top_k === 'number') body.top_k = request.top_k;
 
   const metadata = asRecord(request.metadata);
   const userId = metadata?.user_id ?? request.user ?? request.safety_identifier;

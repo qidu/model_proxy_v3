@@ -250,15 +250,16 @@ describe('convertResponsesToChatCompletions', () => {
     assert.equal(out.messages[1].role, 'user');
   });
 
-  it('copies optional parameters (temperature, max_output_tokens, top_p, stop)', () => {
+  it('copies optional parameters (temperature, max_output_tokens, top_p, top_k, stop)', () => {
     const out = convertResponsesToChatCompletions(
-      { input: 'hi', temperature: 0.5, max_output_tokens: 100, top_p: 0.9, stop: ['END'] },
+      { input: 'hi', temperature: 0.5, max_output_tokens: 100, top_p: 0.9, top_k: 40, stop: ['END'] },
       'model',
     );
 
     assert.equal(out.temperature, 0.5);
     assert.equal(out.max_tokens, 100);
     assert.equal(out.top_p, 0.9);
+    assert.equal(out.top_k, 40);
     assert.deepEqual(out.stop, ['END']);
   });
 

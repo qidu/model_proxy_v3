@@ -5,6 +5,24 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): carry top_k to the Claude and Completions upstreams
+
+A `/v1/responses` request's `top_p` already reached every upstream mode, but `top_k` reached only the two verbatim
+passthroughs (`openai-responses`, `open-responses`) and the Gemini modes. The direct Claude and Chat Completions
+conversions dropped it with no warning, so a client that set it silently got the upstream's own default instead. Both
+converters now carry it — `responses-to-claude-request.ts` onto Claude's `top_k`, `responses-to-completions.ts` onto the
+Completions body's — matching `responses-to-gemini-request.ts`, which has always read it on this front door.
+
+`top_k` is not in OpenAI's Responses schema, and `claude-to-responses.ts` / `gemini-to-responses.ts` still report it as
+having no faithful Responses equivalent when *emitting* a Responses body; that is the upstream wire, a separate question
+from what this front door accepts. `OpenAIRequest` now declares `top_k` beside the type's other non-OpenAI extensions
+(`thinking`, `reasoning_effort`), because this proxy's Completions targets are OpenAI-compatible providers that accept it.
+
+Coverage: `tests/unit/responses-sampling-knobs.test.ts` drives `/v1/responses` through all six accepted upstream modes
+and asserts `temperature` / `top_p` / `top_k` land in each target's own spelling (it fails on exactly the two rows this
+fix changes when the fix is reverted), plus a guard that a newly added mode cannot arrive without a declared knob
+placement, alongside the extended optional-parameter case in `responses-completions-roundtrip.test.ts`.
+
 ### fix(completions): prefer max_completion_tokens over legacy max_tokens
 
 Chat Completions conversion to Claude Messages, OpenAI Responses, and Gemini generateContent now gives

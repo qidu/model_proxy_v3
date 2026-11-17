@@ -63,6 +63,10 @@ export interface OpenAIRequest {
     max_completion_tokens?: number;
     temperature?: number;
     top_p?: number;
+    // Not in OpenAI's own schema; carried for OpenAI-compatible providers that
+    // declare it (the Gemini/Claude targets on this proxy do, so a client's
+    // `top_k` has somewhere to go on every upstream mode).
+    top_k?: number;
     stop?: string | string[];
     stream?: boolean;
     stream_options?: { include_usage?: boolean };

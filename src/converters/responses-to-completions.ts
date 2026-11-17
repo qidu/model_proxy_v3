@@ -193,6 +193,12 @@ export function convertResponsesToChatCompletions(
   if (responsesRequest.top_p !== undefined) {
     completionsRequest.top_p = responsesRequest.top_p as number;
   }
+  // OpenAI's own Chat Completions does not declare `top_k`, but OpenAI-compatible
+  // providers accept it and the client asked for it by name — the same treatment
+  // `responses-to-gemini-request.ts` gives it on this front door.
+  if (responsesRequest.top_k !== undefined) {
+    completionsRequest.top_k = responsesRequest.top_k as number;
+  }
   if (responsesRequest.stop !== undefined) {
     completionsRequest.stop = responsesRequest.stop as string | string[];
   }
