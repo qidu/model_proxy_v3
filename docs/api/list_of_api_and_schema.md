@@ -249,8 +249,8 @@ is selected by the route's `defaultMode` / model config.
 |---|---|
 | `GeminiUsage` | `{promptTokenCount, candidatesTokenCount?, totalTokenCount, cachedContentTokenCount?, thoughtsTokenCount?, toolUsePromptTokenCount?}` |
 | `GeminiInteractionRequest` | `{input, model, systemInstruction?, tools?, toolConfig?, generationConfig?, cachedContent?, agent?, previousInteractionId?, conversationId?, responseModalities?, safetySettings?, stream?}` |
-| `GeminiInteractionStatus` | `"in_progress"\|"requires_action"\|"completed"\|"failed"\|"cancelled"` |
-| `GeminiInteractionResponse` | `{id, object: "interaction", status, model, outputs: GeminiContent[], usage, created, updated, previousInteractionId?, conversationId?, error?}` |
+| `GeminiInteractionStatus` | `"in_progress"\|"requires_action"\|"completed"\|"failed"\|"cancelled"\|"incomplete"` |
+| `GeminiInteractionResponse` | `{id, object: "interaction", status, model, outputs: GeminiContent[], usage, created, updated, previousInteractionId?, conversationId?, errors?: Error[]}` |
 | `GeminiSSEEvent` | union of `interaction.created`, `interaction.completed`, `interaction.status_update`, `step.start`, `step.delta`, `step.stop`, `error` |
 
 ### 5.4 Model & agent option enums

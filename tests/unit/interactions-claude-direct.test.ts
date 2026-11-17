@@ -252,4 +252,41 @@ describe('/v1/interactions ↔ anthropic-messages direct route', () => {
     });
     assert.equal(events.some(event => event.object === 'chat.completion.chunk'), false);
   });
+
+  it('maps max_tokens to incomplete with errors[] and keeps partial JSON output', async () => {
+    globalThis.fetch = (async () => json({
+      id: 'msg_cut', model: 'claude-upstream', stop_reason: 'max_tokens',
+      content: [{ type: 'text', text: 'partial' }],
+    })) as typeof fetch;
+    const response = await send({ model: 'client', input: 'hi' });
+    const interaction = await response.json() as any;
+
+    assert.equal(interaction.status, 'incomplete');
+    assert.equal(interaction.outputs[0].text, 'partial');
+    assert.equal('error' in interaction, false);
+    assert.match(interaction.errors[0].message, /max_tokens/);
+  });
+
+  it('maps streamed max_tokens to incomplete with a diagnostic and closing errors[]', async () => {
+    globalThis.fetch = (async () => claudeSse([
+      { type: 'message_start', message: { id: 'msg_cut', content: [], usage: { input_tokens: 7, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 4 } },
+      { type: 'message_stop' },
+    ])) as typeof fetch;
+    const response = await send({ model: 'client', input: 'hi' }, true);
+    const events = parseSse(await response.text());
+    const error = events.find(event => event.event_type === 'error') as any;
+    const terminal = events.at(-1) as any;
+
+    assert.match(error.error.message, /max_tokens/);
+    assert.equal(terminal.event_type, 'interaction.completed');
+    assert.equal(terminal.interaction.status, 'incomplete');
+    assert.deepEqual(terminal.interaction.errors, [error.error]);
+    assert.deepEqual(terminal.interaction.steps, [
+      { type: 'model_output', content: [{ type: 'text', text: 'partial' }] },
+    ]);
+  });
 });

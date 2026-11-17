@@ -7,9 +7,10 @@
  *
  * 1. `finishReason` reached nothing. `status` was the literal `'completed'`, so a
  *    `MAX_TOKENS` answer claimed to be complete and a `SAFETY` block with no
- *    content claimed to be a completed answer with an empty `outputs`. Blocked
- *    and truncated answers are now `failed` with the upstream's reason, while a
- *    cleanly stopped function call is `requires_action`.
+ *    content claimed to be a completed answer with an empty `outputs`. A
+ *    `MAX_TOKENS` answer is now `incomplete`; blocked and otherwise truncated
+ *    answers are `failed` with the upstream's reason, while a cleanly stopped
+ *    function call is `requires_action`.
  * 2. Parts were relayed in the upstream's dialect. A generateContent
  *    `{inlineData}`/`{functionCall}` has no `type` (required by the Interactions
  *    `Content`), and a `{thought:true, text}` part became `{type:'text'}` — the
@@ -61,16 +62,16 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
     const out = interaction(upstream([{ text: 'hi' }], 'STOP'));
 
     assert.equal(out.status, 'completed');
-    assert.equal('error' in out, false);
+    assert.equal('errors' in out, false);
   });
 
-  it('reports truncation as failed with the reason stated, keeping the partial answer', () => {
+  it('reports token-limit truncation as incomplete with the reason stated, keeping the partial answer', () => {
     const out = interaction(upstream([{ text: 'truncated…' }], 'MAX_TOKENS'));
 
-    assert.equal(out.status, 'failed');
+    assert.equal(out.status, 'incomplete');
     assert.equal(out.outputs[0].text, 'truncated…');
-    assert.match(out.error.code, /#FinishReason\.MAX_TOKENS$/);
-    assert.match(out.error.message, /stopped the answer early/);
+    assert.match(out.errors[0].code, /#FinishReason\.MAX_TOKENS$/);
+    assert.match(out.errors[0].message, /stopped the answer early/);
   });
 
   it('requires action for a function call that stopped cleanly', () => {
@@ -78,7 +79,7 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
 
     assert.equal(out.status, 'requires_action');
     assert.equal(out.outputs[0].type, 'function_call');
-    assert.equal('error' in out, false);
+    assert.equal('errors' in out, false);
   });
 
   it('reports a withheld answer as failed, and does not call it an empty success', () => {
@@ -86,8 +87,8 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
 
     assert.equal(out.status, 'failed');
     assert.deepEqual(out.outputs, []);
-    assert.match(out.error.code, /#FinishReason\.SAFETY$/);
-    assert.match(out.error.message, /withheld the answer/);
+    assert.match(out.errors[0].code, /#FinishReason\.SAFETY$/);
+    assert.match(out.errors[0].message, /withheld the answer/);
   });
 
   it('reports a blocked prompt as failed, naming the block reason', () => {
@@ -98,21 +99,21 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
     });
 
     assert.equal(out.status, 'failed');
-    assert.match(out.error.code, /#BlockReason\.PROHIBITED_CONTENT$/);
+    assert.match(out.errors[0].code, /#BlockReason\.PROHIBITED_CONTENT$/);
   });
 
   it('treats an unspecified reason as a clean stop', () => {
     const out = interaction(upstream([{ text: 'hi' }], 'FINISH_REASON_UNSPECIFIED'));
 
     assert.equal(out.status, 'completed');
-    assert.equal('error' in out, false);
+    assert.equal('errors' in out, false);
   });
 
   it('never reports a completed interaction that also carries an error', () => {
     // review_fixes.md #11: `status` was derived from two hand-maintained sets while
-    // `error` was derived from "outside the clean values", so every reason in neither
+    // `errors` was derived from "outside the clean values", so every reason in neither
     // set (`NO_IMAGE`, `IMAGE_OTHER`, …) produced `status: "completed"` *and* an
-    // `error` — a contradiction a client cannot act on. Pinned as an invariant over
+    // error — a contradiction a client cannot act on. Pinned as an invariant over
     // the whole enum, plus a value the SDK does not declare yet, so a reason added
     // later cannot regress the same way.
     const reasons = [
@@ -125,7 +126,7 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
 
     for (const reason of reasons) {
       const out = interaction(upstream([{ text: 'hi' }], reason));
-      if (out.error) {
+      if (out.errors?.length > 0) {
         assert.notEqual(out.status, 'completed', `${reason} carried an error, so it cannot be a clean answer`);
       }
     }
@@ -138,7 +139,7 @@ describe('convertGenerateContentToInteraction — finishReason', () => {
       const out = interaction(upstream([{ text: 'hi' }], reason));
 
       assert.equal(out.status, 'failed', `${reason} is not a completed answer`);
-      assert.match(out.error.code, new RegExp(`#FinishReason\\.${reason}$`));
+      assert.match(out.errors[0].code, new RegExp(`#FinishReason\\.${reason}$`));
     }
   });
 });

@@ -22,6 +22,7 @@ import assert from 'node:assert/strict';
 
 import { handleGeminiRequest, handleGeminiRequestForMessages } from '../../src/handlers/gemini.js';
 import { createInteractionsStreamTransformer } from '../../src/converters/gemini-streaming.js';
+import { clearGeminiSSEState, processSSEBuffer } from '../../src/handlers/cross-mode-stream.js';
 
 const ENV = { LOG_LEVEL: 'error' } as any;
 const STREAM_URL = 'https://upstream.example/v1beta/models/gemini-test:streamGenerateContent?alt=sse';
@@ -125,15 +126,15 @@ describe('/v1/interactions streaming → Interactions events', () => {
       { type: 'model_output', content: [{ type: 'text', text: 'Hi there' }] },
       { type: 'function_call', name: 'f', arguments: { a: 1 }, id: 'c1' },
     ]);
-    assert.equal(complete.interaction.status, 'failed');
+    assert.equal(complete.interaction.status, 'incomplete');
     assert.deepEqual(complete.interaction.usage, {
       total_input_tokens: 3, total_output_tokens: 4, total_tokens: 7,
     });
 
-    // The failure the closing interaction used to carry: `InteractionSseEventInteraction`
-    // declares no `error` field, so it is the union's `error` event now.
+    // The event carries one diagnostic as `error`; the closing resource carries `errors[]`.
     const error = events.find(e => e.event_type === 'error');
     assert.match(error.error.code, /#FinishReason\.MAX_TOKENS$/);
+    assert.deepEqual(complete.interaction.errors, [error.error]);
     assert.ok(
       events.indexOf(error) < events.length - 1,
       'the reason precedes the closing frame',
@@ -229,5 +230,35 @@ describe('createInteractionsStreamTransformer — a truncated upstream stream', 
       () => new Response(source.pipeThrough(createInteractionsStreamTransformer('m', 'req-eof'))).text(),
       /ended before a finishReason/,
     );
+  });
+});
+
+describe('/v1/interactions streaming ← openai-completions', () => {
+  it('maps finish_reason length to incomplete with error and closing errors[] diagnostics', () => {
+    const requestId = 'req-openai-length';
+    const upstream = [
+      'data: {"id":"chatcmpl-cut","choices":[{"index":0,"delta":{"content":"partial"}}]}',
+      'data: {"id":"chatcmpl-cut","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}',
+      'data: [DONE]',
+      '',
+      '',
+    ].join('\n');
+
+    try {
+      const { processed } = processSSEBuffer(upstream, 'm', requestId, true, false);
+      const events = eventsOf(processed);
+      const error = events.find(event => event.event_type === 'error');
+      const completed = events.at(-1);
+
+      assert.match(error.error.code, /#FinishReason\.MAX_TOKENS$/);
+      assert.equal(completed.event_type, 'interaction.completed');
+      assert.equal(completed.interaction.status, 'incomplete');
+      assert.deepEqual(completed.interaction.errors, [error.error]);
+      assert.deepEqual(completed.interaction.steps, [
+        { type: 'model_output', content: [{ type: 'text', text: 'partial' }] },
+      ]);
+    } finally {
+      clearGeminiSSEState(requestId);
+    }
   });
 });

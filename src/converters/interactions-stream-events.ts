@@ -2,7 +2,7 @@
  * The `/v1/interactions` streaming dialect — the `InteractionSSEEvent` union of
  * `@google/genai`: `interaction.created`, `step.start`, `step.delta`,
  * `step.stop`, `interaction.completed` (the union also declares
- * `interaction.status_update` and `error`, which neither egress here emits).
+ * `interaction.status_update`, which these egresses do not use, and `error` for diagnostics).
  *
  * The `/v1/interactions` streaming egresses write through this module, including
  * Gemini, Responses, Claude, and the legacy cross-mode transformer. They used to disagree: the Gemini path
@@ -71,8 +71,12 @@ export interface InteractionStreamState {
    * the end here and emits the terminal frames once the stream is drained.
    */
   ended: boolean;
-  /** The upstream ended the answer early; this takes precedence over requires_action. */
+  /** The upstream failed the answer; this takes precedence over incomplete and requires_action. */
   failed: boolean;
+  /** The upstream stopped at a token limit; this takes precedence over requires_action. */
+  incomplete: boolean;
+  /** Diagnostics published on error events and the closing Interaction resource. */
+  errors: Array<Record<string, unknown>>;
   /** The answer's token usage, as the terminal frames report it. */
   usage?: Record<string, unknown>;
 }
@@ -90,6 +94,8 @@ export function createInteractionStreamState(model: string, requestId: string): 
     finished: false,
     ended: false,
     failed: false,
+    incomplete: false,
+    errors: [],
   };
 }
 
@@ -121,6 +127,7 @@ function lifecycleInteraction(
     updated: new Date().toISOString(),
     steps: state.steps,
     ...(usage ? { usage } : {}),
+    ...(state.errors.length > 0 ? { errors: state.errors } : {}),
   };
 }
 
@@ -322,23 +329,26 @@ export function completionsUsageToInteractionUsage(usage: unknown): Record<strin
 }
 
 /**
- * The `status` a finished answer's interaction carries: an incomplete answer is
- * failed even when it emitted a call; otherwise a turn that asked for a tool is
- * waiting on it, and anything else is done.
+ * The `status` a finished answer's interaction carries: failure and token-limit
+ * truncation both take precedence over a call; otherwise a turn that asked for a
+ * tool is waiting on it, and anything else is done.
  */
 export function interactionStreamStatus(state: InteractionStreamState): string {
   if (state.failed) return 'failed';
+  if (state.incomplete) return 'incomplete';
   return state.steps.some(step => step.type === 'function_call') ? 'requires_action' : 'completed';
 }
 
 /**
- * An `error` event, for an answer the upstream refused or cut short. The SDK's
- * `InteractionSseEventInteraction` declares no `error` field, so this is the only
- * frame a failure reason can reach the client on — the shape is the SDK's
- * `ErrorT` (`{code, message}`), which is what the non-streaming egress already
- * builds for the same failure.
+ * An `error` event, for an answer the upstream refused or cut short. The event
+ * carries one diagnostic as `error`; the closing Interaction repeats all such
+ * diagnostics in the resource's `errors` array.
  */
-export function interactionStreamError(error: Record<string, unknown>): Array<Record<string, unknown>> {
+export function interactionStreamError(
+  state: InteractionStreamState,
+  error: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  state.errors.push(error);
   return [{ event_type: 'error', error }];
 }
 

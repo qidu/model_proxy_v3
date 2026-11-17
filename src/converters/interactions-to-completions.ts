@@ -55,6 +55,7 @@ function finishReasonForStatus(
 ): string {
   if (status === 'requires_action' || (status === 'completed' && sawToolCall)) return 'tool_calls';
   if (status === 'completed') return 'stop';
+  if (status === 'incomplete') return 'length';
   if (status === 'failed') return 'content_filter';
   options?.logger?.warn(
     options.requestId ?? '',
@@ -151,6 +152,7 @@ export interface InteractionChatStreamState {
   toolCallCount: number;
   usage?: Record<string, unknown>;
   warned: Set<string>;
+  streamError?: unknown;
 }
 
 export function createInteractionChatStreamState(model: string, requestId: string): InteractionChatStreamState {
@@ -274,6 +276,9 @@ export function interactionEventToChatChunks(
 
   if (event.event_type === 'interaction.completed') {
     const interaction = asRecord(event.interaction);
+    if (state.streamError !== undefined && interaction?.status !== 'incomplete') {
+      throw new Error(`Interactions stream failed: ${stringify(state.streamError)}`);
+    }
     state.usage = interactionUsageToCompletionUsage(interaction?.usage) ?? state.usage;
     state.finished = true;
     ensureRole(state, chunks);
@@ -285,7 +290,8 @@ export function interactionEventToChatChunks(
   }
 
   if (event.event_type === 'error') {
-    throw new Error(`Interactions stream failed: ${stringify(event.error ?? event)}`);
+    state.streamError = event.error ?? event;
+    return chunks;
   }
 
   if (event.event_type !== 'interaction.status_update') warnStreamType(state, event.event_type, options);

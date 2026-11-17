@@ -294,6 +294,20 @@ export function convertOpenAIToGeminiInteractions(
             });
         }
 
+        const finishReason = choice.finish_reason;
+        interactionResponse.status = finishReason === 'length' ? 'incomplete'
+            : finishReason === 'content_filter' ? 'failed'
+                : toolCalls.length > 0 ? 'requires_action' : 'completed';
+        if (finishReason === 'length' || finishReason === 'content_filter') {
+            const geminiReason = finishReason === 'length' ? 'MAX_TOKENS' : 'SAFETY';
+            interactionResponse.errors = [{
+                code: `https://ai.google.dev/api/generate-content#FinishReason.${geminiReason}`,
+                message: finishReason === 'length'
+                    ? 'The upstream stopped the answer early (finish_reason length).'
+                    : 'The upstream withheld the answer (content_filter).',
+            }];
+        }
+
         // Skip empty content chunks in streaming
         if (outputs.length === 0) {
             // Return minimal response without outputs

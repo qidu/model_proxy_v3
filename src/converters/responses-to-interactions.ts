@@ -111,8 +111,9 @@ export function responsesToInteraction(
     }
   }
 
-  const failed = response.status === 'failed' || response.status === 'incomplete' || refusal !== '';
-  const status = failed ? 'failed' : outputs.some(output => output.type === 'function_call') ? 'requires_action' : 'completed';
+  const incomplete = response.status === 'incomplete';
+  const failed = response.status === 'failed' || refusal !== '';
+  const status = incomplete ? 'incomplete' : failed ? 'failed' : outputs.some(output => output.type === 'function_call') ? 'requires_action' : 'completed';
   const usage = responsesUsage(response.usage);
   return {
     id: `v1_${Date.now()}_${requestId}`,
@@ -124,7 +125,7 @@ export function responsesToInteraction(
     role: 'model',
     outputs,
     ...(usage ? { usage } : {}),
-    ...(failed ? { error: responseError(response, refusal || 'Responses request failed') } : {}),
+    ...(incomplete || failed ? { errors: [responseError(response, refusal || 'Responses request failed')] } : {}),
   };
 }
 
@@ -191,7 +192,7 @@ function flushFunctionCall(
 function terminalEvents(
   state: ResponsesInteractionStreamState,
   response: Record<string, unknown>,
-  failed: boolean,
+  outcome: 'completed' | 'incomplete' | 'failed',
   options?: ConversionOptions,
 ): Array<Record<string, unknown>> {
   const events: Array<Record<string, unknown>> = [];
@@ -199,8 +200,12 @@ function terminalEvents(
     events.push(...flushFunctionCall(state, index, undefined, options));
   }
   interactionStreamEnded(state.interaction, responsesUsage(response.usage));
-  if (failed) events.push(...interactionStreamError(responseError(response, state.refusal || 'Responses stream failed')));
-  events.push(...interactionStreamFinish(state.interaction, failed ? 'failed' : interactionStreamStatus(state.interaction)));
+  state.interaction.incomplete = outcome === 'incomplete';
+  state.interaction.failed = outcome === 'failed' || (outcome !== 'incomplete' && state.refusal !== '');
+  if (state.interaction.incomplete || state.interaction.failed) {
+    events.push(...interactionStreamError(state.interaction, responseError(response, state.refusal || 'Responses stream failed')));
+  }
+  events.push(...interactionStreamFinish(state.interaction, interactionStreamStatus(state.interaction)));
   return events;
 }
 
@@ -265,7 +270,8 @@ export function responsesEventToInteractionEvents(
   }
   if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.failed') {
     const response = asRecord(event.response) ?? {};
-    return terminalEvents(state, response, type !== 'response.completed' || state.refusal !== '', options);
+    const outcome = type === 'response.incomplete' ? 'incomplete' : type === 'response.failed' ? 'failed' : 'completed';
+    return terminalEvents(state, response, outcome, options);
   }
   return [];
 }

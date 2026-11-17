@@ -5,6 +5,18 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(interactions): preserve incomplete outcomes and errors[] diagnostics
+
+`/v1/interactions` now maps token-limit truncation to `status: "incomplete"` across generateContent
+(`finishReason: "MAX_TOKENS"`), Claude Messages (`stop_reason: "max_tokens"`), Responses (`status: "incomplete"`),
+and Chat Completions (`finish_reason: "length"`) upstreams, in both JSON and streaming responses. Partial content and
+usage are preserved; safety blocks and other failures remain `"failed"`. Native Interactions upstream answers routed
+to `/v1/chat/completions` now map `status: "incomplete"` to `finish_reason: "length"`.
+
+Interaction resources follow the newer schema's `errors: [...]` diagnostic field instead of singular `error`. SSE
+error events retain their schema's singular `error`, and the closing Interaction repeats those diagnostics in
+`errors`. Native Interactions JSON/SSE passthrough is unchanged.
+
 ### fix(converters): stop fabricating an unsigned thinking block on Claude tool histories
 
 `/v1/interactions` and `:generateContent` routed to an `anthropic-messages` target prepended

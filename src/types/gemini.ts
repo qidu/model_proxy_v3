@@ -232,7 +232,7 @@ export interface GeminiInteractionRequest {
 
 // --- Response Types ---
 
-export type GeminiInteractionStatus = 'in_progress' | 'requires_action' | 'completed' | 'failed' | 'cancelled';
+export type GeminiInteractionStatus = 'in_progress' | 'requires_action' | 'completed' | 'failed' | 'cancelled' | 'incomplete';
 
 export interface GeminiInteractionResponse {
     id: string;
@@ -244,6 +244,7 @@ export interface GeminiInteractionResponse {
     updated: string;
     role: 'model';
     outputs?: GeminiContent[];
+    errors?: Array<{ code?: string; message?: string }>;
     system_instruction?: string;
     tools?: GeminiTool[];
     usage?: GeminiUsage;

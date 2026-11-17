@@ -20,12 +20,11 @@
  * minted (`v1_<timestamp>_<requestId>`) even then, which is the identifier a
  * client would send back as `previous_interaction_id`.
  *
- * The interactions `status` enum has no "truncated" member
- * (`types/gemini.ts:235`), and the resource does declare an `error`
- * (`docs/api/list_of_api_and_schema.md:245`). A blocked or truncated answer is
- * therefore `failed` and carries the upstream's reason in `error`. A cleanly
- * stopped function call is `requires_action`, as the Interactions contract
- * declares; any other clean stop is `completed`.
+ * The interactions `status` enum has no "truncated" member. A `MAX_TOKENS`
+ * answer is `incomplete`; a blocked or otherwise truncated answer is `failed`.
+ * Non-clean outcomes carry the upstream's reason in `errors`. A cleanly stopped
+ * function call is `requires_action`, as the Interactions contract declares;
+ * any other clean stop is `completed`.
  */
 
 import { ProcessingError } from '../utils/errors.js';
@@ -83,10 +82,12 @@ export function convertGenerateContentToInteraction(
     const finishReason = typeof candidate?.finishReason === 'string' ? candidate.finishReason : '';
     const blockReason = blockedPromptReason(response.promptFeedback);
 
-    const error = interactionError(finishOutcome(finishReason, blockReason), finishReason, blockReason);
-    const failed = error !== undefined;
+    const outcome = finishOutcome(finishReason, blockReason);
+    const error = interactionError(outcome, finishReason, blockReason);
     const requiresAction = outputs.some(output => output.type === 'function_call');
-    const status = failed ? 'failed' : requiresAction ? 'requires_action' : 'completed';
+    const status = outcome === 'incomplete'
+        ? 'incomplete'
+        : error !== undefined ? 'failed' : requiresAction ? 'requires_action' : 'completed';
 
     const now = new Date().toISOString();
     const usage = convertUsage(asRecord(response.usageMetadata));
@@ -106,7 +107,7 @@ export function convertGenerateContentToInteraction(
         // Omitted when the upstream reported no count at all: `Usage` is optional on
         // the Interactions type, so an empty object is a claim where there is none.
         ...(Object.keys(usage).length > 0 ? { usage } : {}),
-        ...(error ? { error } : {}),
+        ...(error ? { errors: [error] } : {}),
     };
 
     return { interaction, dropped };
@@ -130,8 +131,8 @@ export function blockedPromptReason(promptFeedback: unknown): string | undefined
 /**
  * How the upstream ended the turn, classified once.
  *
- * `status` and `error` are both derived from this, so they cannot disagree — which
- * is what they did while `status` asked two hand-maintained sets and `error` asked
+ * `status` and `errors` are both derived from this, so they cannot disagree — which
+ * is what they did while `status` asked two hand-maintained sets and `errors` asked
  * "is this outside the clean values": a reason in neither set (`NO_IMAGE`,
  * `IMAGE_OTHER`, or a reason a later SDK adds) was reported as `status:
  * "completed"` *and* an `error` at once. Anything that is neither clean nor a
@@ -139,13 +140,14 @@ export function blockedPromptReason(promptFeedback: unknown): string | undefined
  * "truncated" says — the conservative reading, and the one that cannot silently
  * turn a failure into a finished answer.
  */
-type FinishOutcome = 'clean' | 'blocked' | 'truncated';
+type FinishOutcome = 'clean' | 'blocked' | 'incomplete' | 'truncated';
 
 function finishOutcome(finishReason: string, blockReason?: string): FinishOutcome {
     if (blockReason) return 'blocked';
     if (finishReason === '' || finishReason === 'STOP' || finishReason === 'FINISH_REASON_UNSPECIFIED') {
         return 'clean';
     }
+    if (finishReason === 'MAX_TOKENS') return 'incomplete';
     return BLOCKING_FINISH_REASONS.has(finishReason) ? 'blocked' : 'truncated';
 }
 

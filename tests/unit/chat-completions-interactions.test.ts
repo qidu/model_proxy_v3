@@ -166,6 +166,32 @@ api_key = "upstream-key"
     assert.deepEqual(chunks.at(-1)?.usage, { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 });
   });
 
+  it('maps an incomplete native JSON interaction to finish_reason length', async () => {
+    upstreamResponse = () => interactionResponse([{ type: 'text', text: 'partial' }], 'incomplete');
+    const response = await sendChat({});
+    const completion = await response.json() as any;
+
+    assert.equal(completion.choices[0].finish_reason, 'length');
+    assert.equal(completion.choices[0].message.content, 'partial');
+  });
+
+  it('maps an incomplete native stream and its diagnostic to finish_reason length', async () => {
+    upstreamResponse = () => interactionStream([
+      { event_type: 'interaction.created', interaction: { id: 'int_cut' } },
+      { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'partial' } },
+      { event_type: 'error', error: { code: '#FinishReason.MAX_TOKENS', message: 'output cap reached' } },
+      {
+        event_type: 'interaction.completed',
+        interaction: { id: 'int_cut', status: 'incomplete', errors: [{ code: '#FinishReason.MAX_TOKENS', message: 'output cap reached' }] },
+      },
+    ]);
+    const response = await sendChat({ stream: true });
+    const chunks = parseChatSse(await response.text()) as any[];
+
+    assert.equal(chunks.find(chunk => chunk.choices[0]?.delta?.content)?.choices[0].delta.content, 'partial');
+    assert.equal(chunks.find(chunk => chunk.choices[0]?.finish_reason)?.choices[0].finish_reason, 'length');
+  });
+
   it('aborts a truncated native stream instead of emitting a clean finish', async () => {
     upstreamResponse = () => interactionStream([
       { event_type: 'interaction.created', interaction: { id: 'int_truncated' } },

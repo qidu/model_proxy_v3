@@ -342,7 +342,20 @@ async function forwardCompletionsAsOpenAIResponses(
   if (isInteractionsRequest) {
     const interactionResponse = convertOpenAIToGeminiInteractions(syntheticCompletions, model, requestId);
     if (responsesJson.status === 'incomplete' || responsesJson.status === 'failed') {
-      interactionResponse.status = 'failed';
+      const incomplete = responsesJson.status === 'incomplete';
+      interactionResponse.status = incomplete ? 'incomplete' : 'failed';
+      if (!interactionResponse.errors) {
+        const upstreamError = responsesJson.error as Record<string, unknown> | undefined;
+        const incompleteReason = (responsesJson.incomplete_details as Record<string, unknown> | undefined)?.reason;
+        interactionResponse.errors = [{
+          code: typeof upstreamError?.code === 'string' ? upstreamError.code
+            : incompleteReason === 'max_output_tokens'
+              ? 'https://ai.google.dev/api/generate-content#FinishReason.MAX_TOKENS'
+              : incomplete ? String(incompleteReason ?? 'incomplete') : 'upstream_error',
+          message: typeof upstreamError?.message === 'string' ? upstreamError.message
+            : incomplete ? `Response incomplete: ${String(incompleteReason ?? 'unknown')}` : 'Responses request failed',
+        }];
+      }
     }
     logPipelineStage(logger, requestId, 'outbound', '/v1/interactions', interactionResponse);
     const outHeaders = { 'Content-Type': 'application/json', 'x-request-id': requestId };

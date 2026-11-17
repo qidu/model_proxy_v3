@@ -199,6 +199,44 @@ describe('native and direct Responses Interactions routes', () => {
     assert.deepEqual(completed?.interaction.usage, { total_input_tokens: 8, total_output_tokens: 3, total_tokens: 11 });
   });
 
+  it('keeps a Responses incomplete JSON answer incomplete with errors[] and partial output', async () => {
+    upstreamResponse = () => jsonResponse({
+      id: 'resp_cut', model: 'gpt-test', status: 'incomplete', created_at: 1767225600,
+      incomplete_details: { reason: 'max_output_tokens' },
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'partial' }] }],
+    });
+    const response = await send('openai-responses', { model: 'gpt-test', input: 'hi' });
+    const interaction = await response.json() as any;
+
+    assert.equal(interaction.status, 'incomplete');
+    assert.equal(interaction.outputs[0].text, 'partial');
+    assert.equal('error' in interaction, false);
+    assert.match(interaction.errors[0].message, /max_output_tokens/);
+  });
+
+  it('keeps a Responses incomplete stream incomplete and publishes its diagnostic', async () => {
+    upstreamResponse = () => responsesSse([
+      { type: 'response.created', response: { id: 'resp_cut' } },
+      { type: 'response.output_text.delta', delta: 'partial' },
+      {
+        type: 'response.incomplete',
+        response: { id: 'resp_cut', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } },
+      },
+    ]);
+    const response = await send('openai-responses', { model: 'gpt-test', input: 'hi', stream: true });
+    const events = parseInteractionSse(await response.text());
+    const error = events.find(event => event.event_type === 'error') as any;
+    const completed = events.at(-1) as any;
+
+    assert.match(error.error.message, /max_output_tokens/);
+    assert.equal(completed.event_type, 'interaction.completed');
+    assert.equal(completed.interaction.status, 'incomplete');
+    assert.deepEqual(completed.interaction.errors, [error.error]);
+    assert.deepEqual(completed.interaction.steps, [
+      { type: 'model_output', content: [{ type: 'text', text: 'partial' }] },
+    ]);
+  });
+
   it('aborts a direct stream when Responses ends without a terminal event', async () => {
     upstreamResponse = () => responsesSse([
       { type: 'response.created', response: { id: 'resp_truncated' } },

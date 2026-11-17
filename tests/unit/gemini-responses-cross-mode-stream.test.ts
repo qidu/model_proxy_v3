@@ -352,7 +352,7 @@ describe('Gemini front door → openai-responses: the SSE egress', () => {
     assert.equal(frames[3].interaction.status, 'requires_action');
   });
 
-  it('reports response.incomplete as failed even after a tool call', async () => {
+  it('reports response.incomplete as incomplete even after a tool call', async () => {
     const { frames } = await run([
       { type: 'response.created', response: { id: 'resp_cut' } },
       { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '' } },
@@ -365,7 +365,8 @@ describe('Gemini front door → openai-responses: the SSE egress', () => {
 
     const terminal = frames.at(-1);
     assert.equal(terminal.event_type, 'interaction.completed');
-    assert.equal(terminal.interaction.status, 'failed');
+    assert.equal(terminal.interaction.status, 'incomplete');
+    assert.match(terminal.interaction.errors[0].message, /max_output_tokens/);
   });
 
   it('reports upstream reasoning as a thought step, not as answer text', async () => {
@@ -446,7 +447,7 @@ describe('Gemini front door → openai-responses: the non-streaming egress', () 
     assert.deepEqual(out.usageMetadata, { promptTokenCount: 5, candidatesTokenCount: 3, totalTokenCount: 8 });
   });
 
-  it('reports an incomplete Responses answer as a failed Interaction even after a tool call', async () => {
+  it('reports an incomplete Responses answer as an incomplete Interaction even after a tool call', async () => {
     const out = await runJson({
       id: 'resp_cut', object: 'response', status: 'incomplete', model: 'gpt-upstream',
       incomplete_details: { reason: 'max_output_tokens' },
@@ -456,7 +457,9 @@ describe('Gemini front door → openai-responses: the non-streaming egress', () 
       ],
     }, { path: '/v1/interactions' });
 
-    assert.equal(out.status, 'failed');
+    assert.equal(out.status, 'incomplete');
+    assert.equal('error' in out, false);
+    assert.match(out.errors[0].code, /#FinishReason\.MAX_TOKENS$/);
   });
 
   it('reports a content-filtered answer as SAFETY', async () => {

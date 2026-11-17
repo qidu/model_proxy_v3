@@ -710,7 +710,7 @@ export function createInteractionsStreamTransformer(
 
         // The same conversion the non-streaming egress runs, over the parts this
         // stream accumulated: one place decides what a finish reason means — the
-        // interaction's `status`, its `usage`, and any `error`.
+        // interaction's `status`, its `usage`, and any `errors`.
         const { interaction } = convertGenerateContentToInteraction(
             {
                 ...(responseId ? { responseId } : {}),
@@ -724,11 +724,11 @@ export function createInteractionsStreamTransformer(
             model,
             requestId
         );
-        // `InteractionSseEventInteraction` declares no `error` field, so a refusal
-        // the conversion reports reaches the client on the union's `error` event —
-        // it would otherwise vanish with the frame that used to carry it.
-        if (interaction.error) {
-            writeAll(controller, interactionStreamError(interaction.error as Record<string, unknown>));
+        // Error events use the union's singular `error`; the closing Interaction
+        // carries the same diagnostics in its `errors` array.
+        const errors = Array.isArray(interaction.errors) ? interaction.errors : [];
+        for (const error of errors) {
+            writeAll(controller, interactionStreamError(streamState, error as Record<string, unknown>));
         }
         interactionStreamEnded(streamState, interaction.usage as Record<string, unknown> | undefined);
         writeAll(controller, interactionStreamFinish(streamState, interaction.status as string));

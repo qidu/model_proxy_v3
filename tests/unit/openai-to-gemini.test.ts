@@ -357,6 +357,24 @@ describe('convertOpenAIToGeminiInteractions', () => {
     assert.deepEqual(out.outputs[1], { type: 'text', text: 'final' });
   });
 
+  it('maps length to incomplete and content_filter to failed with errors[] diagnostics', () => {
+    for (const [finishReason, status, geminiReason] of [
+      ['length', 'incomplete', 'MAX_TOKENS'],
+      ['content_filter', 'failed', 'SAFETY'],
+    ]) {
+      const out = convertOpenAIToGeminiInteractions(
+        { choices: [{ message: { content: 'partial' }, finish_reason: finishReason, index: 0 }] },
+        'm',
+        'r',
+      ) as any;
+
+      assert.equal(out.status, status);
+      assert.equal(out.outputs[0].text, 'partial');
+      assert.equal('error' in out, false);
+      assert.match(out.errors[0].code, new RegExp(`#FinishReason\\.${geminiReason}$`));
+    }
+  });
+
   it('strips outputs key for empty content chunks', () => {
     const out = convertOpenAIToGeminiInteractions(
       { choices: [{ delta: { content: '' }, index: 0 }] },

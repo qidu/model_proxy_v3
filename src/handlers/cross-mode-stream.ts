@@ -608,9 +608,15 @@ function interactionsFramesForChunk(
     }
     toolCallBuffer?.clear();
     geminiToolCallBuffers.delete(requestId);
-    if (choice.finish_reason === 'content_filter') {
+    if (choice.finish_reason === 'length') {
+      state.incomplete = true;
+      events = [...events, ...interactionStreamError(state, {
+        code: 'https://ai.google.dev/api/generate-content#FinishReason.MAX_TOKENS',
+        message: 'The upstream stopped the answer early (finish_reason length).',
+      })];
+    } else if (choice.finish_reason === 'content_filter') {
       state.failed = true;
-      events = [...events, ...interactionStreamError({
+      events = [...events, ...interactionStreamError(state, {
         code: 'https://ai.google.dev/api/generate-content#FinishReason.SAFETY',
         message: 'The upstream withheld the answer (content_filter).',
       })];

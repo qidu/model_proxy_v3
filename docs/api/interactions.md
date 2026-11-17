@@ -1,3 +1,5 @@
+NOTICE: THIS DOC ID DEPRECATED.
+
 # Gemini API
 
 > **Superseded historical snapshot.** This document predates the current

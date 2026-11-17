@@ -168,16 +168,17 @@ export function claudeToInteraction(
   }
   if (suppressed > 0) warn(options, `suppressed ${suppressed} function call(s) outside allowed_tools`);
 
-  const failed = response.stop_reason === 'max_tokens' || response.stop_reason === 'refusal' || response.stop_reason === 'timeout';
+  const incomplete = response.stop_reason === 'max_tokens';
+  const failed = response.stop_reason === 'refusal' || response.stop_reason === 'timeout';
   const requiresAction = outputs.some(output => output.type === 'function_call');
   return {
     id: `v1_${Date.now()}_${requestId}`,
     model,
-    status: failed ? 'failed' : requiresAction ? 'requires_action' : 'completed',
+    status: incomplete ? 'incomplete' : failed ? 'failed' : requiresAction ? 'requires_action' : 'completed',
     object: 'interaction', created: new Date().toISOString(), updated: new Date().toISOString(), role: 'model',
     outputs,
     ...(claudeUsage(response.usage) ? { usage: claudeUsage(response.usage) } : {}),
-    ...(failed ? { error: interactionError(response.stop_reason) } : {}),
+    ...(incomplete || failed ? { errors: [interactionError(response.stop_reason)] } : {}),
   };
 }
 
@@ -351,9 +352,12 @@ export function claudeEventToInteractionEvents(
     if (state.suppressed > 0) warn(options, `suppressed ${state.suppressed} streamed function call(s) outside allowed_tools`);
     state.usage = { ...state.usage, ...asRecord(event.usage) };
     interactionStreamEnded(state.interaction, claudeUsage(state.usage));
-    const failed = ['max_tokens', 'refusal', 'timeout'].includes(delta.stop_reason);
-    if (failed) events.push(...interactionStreamError(interactionError(delta.stop_reason)));
-    events.push(...interactionStreamFinish(state.interaction, failed ? 'failed' : interactionStreamStatus(state.interaction)));
+    const incomplete = delta.stop_reason === 'max_tokens';
+    const failed = ['refusal', 'timeout'].includes(delta.stop_reason);
+    state.interaction.incomplete = incomplete;
+    state.interaction.failed = failed;
+    if (incomplete || failed) events.push(...interactionStreamError(state.interaction, interactionError(delta.stop_reason)));
+    events.push(...interactionStreamFinish(state.interaction, interactionStreamStatus(state.interaction)));
     return events;
   }
   return [];
