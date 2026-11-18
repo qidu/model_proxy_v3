@@ -168,6 +168,20 @@ describe('/v1/interactions → openai-responses: request fields reach the upstre
     assert.equal(upstream.temperature, 0.3);
   });
 
+  it('carries nested allowed_tools auto choice to an openai-completions upstream', async () => {
+    const upstream = await send({
+      model: 'gemini-test',
+      input: 'weather in Beijing?',
+      tools: [{
+        type: 'function', name: 'get_weather', description: 'Get the current weather for a city',
+        parameters: { type: 'object', properties: { city: { type: 'string' } } },
+      }],
+      generation_config: { tool_choice: { allowed_tools: { mode: 'auto', tools: ['get_weather'] } } },
+    }, 'openai-completions');
+
+    assert.equal(upstream.tool_choice, 'auto');
+  });
+
   it('carries generateContent generation config directly but not an undeclared store field', async () => {
     const upstream = await send(
       {

@@ -5,6 +5,19 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(interactions): send valid thinking configuration to Claude
+
+`/v1/interactions` requests with `thinking_summaries: "auto"` now use adaptive thinking for Claude Opus/Sonnet 4.6,
+preserving `thinking_level` through `output_config.effort` without inventing a token budget. Older Claude models receive
+manual thinking with a `budget_tokens` value capped below `max_tokens`; configurations too small for the required
+1,024-token budget are rejected before the upstream call.
+
+### fix(interactions): carry nested allowed_tools to Completions
+
+`/v1/interactions` requests routed to `openai-completions` now read the documented nested
+`generation_config.tool_choice.allowed_tools` shape. An `auto` allow-list produces `tool_choice: "auto"` instead of
+dropping the field; `any` / `validated` retain the existing forced-function or `required` mappings.
+
 ### fix(chat-completions): preserve Anthropic cache usage details
 
 `/v1/chat/completions` responses routed through `anthropic-messages` now map `cache_read_input_tokens` and

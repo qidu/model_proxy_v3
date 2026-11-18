@@ -225,6 +225,14 @@ describe('convertGeminiInteractionsToOpenAI — generation_config.tool_choice', 
     });
   });
 
+  it('maps the nested allowed_tools spelling without forcing an auto choice', () => {
+    assert.equal(withChoice({ allowed_tools: { mode: 'auto', tools: ['get_weather'] } }).tool_choice, 'auto');
+    assert.deepEqual(withChoice({ allowed_tools: { mode: 'validated', tools: ['get_weather'] } }).tool_choice, {
+      type: 'function',
+      function: { name: 'get_weather' },
+    });
+  });
+
   // Pinned, not fixed: Completions cannot express "one of these two, and no
   // other tool", so an allow-list of 2+ collapses to the looser 'required'.
   it("collapses a multi-name allow-list to 'required' (looser)", () => {

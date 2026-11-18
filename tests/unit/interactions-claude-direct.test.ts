@@ -29,14 +29,16 @@ function parseSse(raw: string): Array<Record<string, any>> {
   });
 }
 
-async function send(body: Record<string, unknown>, stream = false, route?: ModelRouteConfig): Promise<Response> {
+async function send(
+  body: Record<string, unknown>, stream = false, route?: ModelRouteConfig, upstreamModel = 'resolved-model',
+): Promise<Response> {
   return handleOpenAIRequest(
     new Request('http://proxy/v1/interactions', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, ...(stream ? { stream: true } : {}) }),
     }),
     TARGET, { 'x-api-key': 'upstream-key' }, stream ? 'int-claude-stream' : 'int-claude-json',
-    'resolved-model', ENV, LOGGER, undefined, undefined, 'anthropic-messages', route,
+    upstreamModel, ENV, LOGGER, undefined, undefined, 'anthropic-messages', route,
   );
 }
 
@@ -82,15 +84,15 @@ describe('Interactions → Claude direct request conversion', () => {
       },
       response_format: [{ type: 'object', properties: { answer: { type: 'string' } } }],
       labels: { user_id: 'user-1' },
-    }, 'resolved-model');
+    }, 'claude-sonnet-4-6');
 
-    assert.equal(body.model, 'resolved-model');
+    assert.equal(body.model, 'claude-sonnet-4-6');
     assert.equal(body.system, 'be precise');
     assert.equal(body.max_tokens, 256);
     assert.equal(body.temperature, 0.2);
     assert.equal(body.top_p, 0.9);
     assert.deepEqual(body.stop_sequences, ['STOP']);
-    assert.deepEqual(body.thinking, { type: 'enabled' });
+    assert.deepEqual(body.thinking, { type: 'adaptive' });
     assert.deepEqual(body.output_config, {
       effort: 'high',
       format: { type: 'json_schema', schema: { type: 'object', properties: { answer: { type: 'string' } } } },
@@ -122,6 +124,18 @@ describe('Interactions → Claude direct request conversion', () => {
     assert.equal(JSON.stringify(body).includes('tool_calls'), false);
   });
 
+  it('keeps manual thinking valid for models without adaptive support', () => {
+    const body = interactionsToClaudeBody({
+      model: 'client-model', input: 'hi', generation_config: { thinking_summaries: 'auto' },
+    }, 'claude-sonnet-4-5');
+
+    assert.deepEqual(body.thinking, { type: 'enabled', budget_tokens: 4095 });
+    assert.throws(() => interactionsToClaudeBody({
+      model: 'client-model', input: 'hi',
+      generation_config: { max_output_tokens: 1024, thinking_summaries: 'auto' },
+    }, 'claude-sonnet-4-5'), /budget_tokens.*max_tokens/);
+  });
+
   it('does not fabricate a thinking block for a tool history that carries no thought', () => {
     // Reported failure: an Interactions client that replayed a function_call it
     // never accompanied with a `thought` step had `{type:'thinking', thinking:''}`
@@ -150,6 +164,22 @@ describe('Interactions → Claude direct request conversion', () => {
 
 describe('/v1/interactions ↔ anthropic-messages direct route', () => {
   afterEach(() => { globalThis.fetch = realFetch; });
+
+  it('uses adaptive thinking for the reported Sonnet 4.6 request', async () => {
+    let upstreamBody: Record<string, unknown>;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(await new Response(init?.body as BodyInit).text());
+      return json({ id: 'msg_1', model: 'claude-sonnet-4-6', stop_reason: 'end_turn', content: [{ type: 'text', text: 'OK' }] });
+    }) as typeof fetch;
+
+    await send({
+      model: 'claude-model', input: 'Say OK',
+      generation_config: { thinking_level: 'high', thinking_summaries: 'auto' },
+    }, false, undefined, 'claude-sonnet-4-6');
+
+    assert.deepEqual(upstreamBody!.thinking, { type: 'adaptive' });
+    assert.deepEqual(upstreamBody!.output_config, { effort: 'high' });
+  });
 
   it('adds the MCP beta header and returns native tool/thought steps with filtered functions', async () => {
     let upstreamBody: Record<string, unknown>;

@@ -208,7 +208,8 @@ function geminiToolChoiceMode(value: unknown): 'auto' | 'none' | 'required' | un
  * Map a Gemini tool-choice value onto the Completions `tool_choice` vocabulary.
  *
  * Three spellings reach this: the Interactions `generation_config.tool_choice`
- * (bare enum, `{type, function}`, or `{mode, tools}`), generateContent's
+ * (bare enum, `{type, function}`, `{mode, tools}`, or nested
+ * `{allowed_tools: {mode, tools}}`), generateContent's
  * `toolConfig.functionCallingConfig` (`{mode: 'AUTO'|'ANY'|'NONE',
  * allowedFunctionNames}`), and generateContent's own `tool_choice`. Completions
  * only has `'auto'`, `'none'`, `'required'` and a forced single function:
@@ -216,8 +217,9 @@ function geminiToolChoiceMode(value: unknown): 'auto' | 'none' | 'required' | un
  *   'auto' | 'dynamic' (undocumented)       → 'auto'
  *   'any' | 'validated'                     → 'required'
  *   'none'                                  → 'none'
- *   {function:{name}} / one-name allow-list → {type:'function', function:{name}}
- *   allow-list of 2+ names                  → 'required'  (looser: the model may
+ *   {function:{name}} / one-name any/validated allow-list
+ *                                           → {type:'function', function:{name}}
+ *   any/validated allow-list of 2+ names    → 'required'  (looser: the model may
  *                                             call any declared tool, not only
  *                                             one of the listed ones)
  *   absent / unrecognized                   → undefined   (key omitted)
@@ -241,14 +243,19 @@ function geminiToolChoiceToOpenAI(toolChoice: unknown): unknown {
     return { type: 'function', function: { name: fnName } };
   }
 
-  // `allowedFunctionNames` is the generateContent spelling, `tools` the
-  // Interactions one. An empty or absent list constrains nothing.
-  const rawNames = Array.isArray(cfg.allowedFunctionNames) ? cfg.allowedFunctionNames : cfg.tools;
+  // `allowedFunctionNames` is the generateContent spelling; Interactions accepts
+  // both flat `tools` and the nested `allowed_tools.tools` form.
+  const allowed = asRecord(cfg.allowed_tools);
+  const rawNames = Array.isArray(cfg.allowedFunctionNames)
+    ? cfg.allowedFunctionNames
+    : allowed?.tools ?? cfg.tools;
   const names = Array.isArray(rawNames) ? rawNames.filter(n => typeof n === 'string' && n !== '') : [];
+  const mode = geminiToolChoiceMode(allowed?.mode ?? cfg.type ?? cfg.mode);
+  if (mode === 'auto' || mode === 'none') return mode;
   if (names.length === 1) return { type: 'function', function: { name: names[0] } };
   if (names.length > 1) return 'required';
 
-  return geminiToolChoiceMode(cfg.type ?? cfg.mode);
+  return mode;
 }
 
 /** A plain JSON object, or undefined for anything else (arrays included). */

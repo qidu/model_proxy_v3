@@ -397,8 +397,17 @@ export function interactionsToClaudeBody(
     outputConfig.format = { type: 'json_schema', schema: { type: 'object' } };
   }
   if (Object.keys(outputConfig).length > 0) body.output_config = outputConfig;
-  if (config.thinking_summaries === 'auto') body.thinking = { type: 'enabled' };
-  else if (config.thinking_summaries === 'none') body.thinking = { type: 'disabled' };
+  if (config.thinking_summaries === 'auto') {
+    if (/claude-(?:opus|sonnet)-4-6(?:$|-)/.test(model)) {
+      body.thinking = { type: 'adaptive' };
+    } else {
+      const maxTokens = body.max_tokens as number;
+      if (maxTokens <= 1024) {
+        throw new ValidationError('generation_config.max_output_tokens must exceed 1024: Claude thinking budget_tokens must be at least 1024 and less than max_tokens');
+      }
+      body.thinking = { type: 'enabled', budget_tokens: Math.min(10000, maxTokens - 1) };
+    }
+  } else if (config.thinking_summaries === 'none') body.thinking = { type: 'disabled' };
 
   const labels = asRecord(request.labels);
   if (typeof labels?.user_id === 'string' && labels.user_id !== '') body.metadata = { user_id: labels.user_id };
