@@ -13,7 +13,7 @@ import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.j
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { validateOpenAICompletionsRequest } from '../utils/validation.js';
 import { ValidationError } from '../utils/errors.js';
-import { claudeJsonToSyntheticCompletions } from './openai.js';
+import { claudeJsonToSyntheticCompletions, claudeUsageToCompletions } from './openai.js';
 import { warnDroppedOutputItems } from './cross-mode-stream.js';
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
 import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
@@ -214,6 +214,8 @@ export async function handleChatCompletionsPassthrough(
       let nextToolIndex = 0;
       let usagePromptTokens: number | undefined;
       let usageCompletionTokens: number | undefined;
+      let usageCachedTokens: number | undefined;
+      let usageCacheWriteTokens: number | undefined;
       (async () => {
         try {
           const reader = upstreamResponse.body!.getReader();
@@ -274,6 +276,8 @@ export async function handleChatCompletionsPassthrough(
                 } else if (parsed.type === 'message_start') {
                   const usage = (parsed.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined;
                   if (typeof usage?.input_tokens === 'number') usagePromptTokens = usage.input_tokens;
+                  if (typeof usage?.cache_read_input_tokens === 'number') usageCachedTokens = usage.cache_read_input_tokens;
+                  if (typeof usage?.cache_creation_input_tokens === 'number') usageCacheWriteTokens = usage.cache_creation_input_tokens;
                 } else if (parsed.type === 'message_delta') {
                   const delta = parsed.delta as Record<string, unknown> | undefined;
                   const usage = parsed.usage as Record<string, unknown> | undefined;
@@ -281,6 +285,8 @@ export async function handleChatCompletionsPassthrough(
                   // in message_start and the real cumulative counts only in message_delta.
                   if (typeof usage?.input_tokens === 'number' && usage.input_tokens > 0) usagePromptTokens = usage.input_tokens;
                   if (typeof usage?.output_tokens === 'number') usageCompletionTokens = usage.output_tokens;
+                  if (typeof usage?.cache_read_input_tokens === 'number') usageCachedTokens = usage.cache_read_input_tokens;
+                  if (typeof usage?.cache_creation_input_tokens === 'number') usageCacheWriteTokens = usage.cache_creation_input_tokens;
                   // `refusal` is the Anthropic dialect's member for a withheld answer
                   // and `content_filter` the Completions one, so the block survives to
                   // the client — as it does on this route's non-streaming shape, which
@@ -294,7 +300,13 @@ export async function handleChatCompletionsPassthrough(
                   await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 } else if (parsed.type === 'message_stop') {
                   if (includeUsage && usagePromptTokens !== undefined && usageCompletionTokens !== undefined) {
-                    const usageChunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [], usage: { prompt_tokens: usagePromptTokens, completion_tokens: usageCompletionTokens, total_tokens: usagePromptTokens + usageCompletionTokens } };
+                    const usage = claudeUsageToCompletions({
+                      input_tokens: usagePromptTokens,
+                      output_tokens: usageCompletionTokens,
+                      ...(usageCachedTokens !== undefined ? { cache_read_input_tokens: usageCachedTokens } : {}),
+                      ...(usageCacheWriteTokens !== undefined ? { cache_creation_input_tokens: usageCacheWriteTokens } : {}),
+                    });
+                    const usageChunk = { id: `chatcmpl_${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [], usage };
                     logPipelineStage(logger, requestId, 'outbound', path, usageChunk);
                     await writer.write(encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`));
                   }

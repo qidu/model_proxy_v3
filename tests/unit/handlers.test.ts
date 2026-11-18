@@ -757,6 +757,44 @@ describe('claudeJsonToSyntheticCompletions', () => {
     assert.deepEqual(out.usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
   });
 
+  it('maps Claude cache usage to OpenAI prompt token details', () => {
+    const out = claudeJsonToSyntheticCompletions({
+      content: [{ type: 'text', text: 'hello' }],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 4,
+        cache_creation_input_tokens: 2,
+      },
+    }, 'm');
+
+    assert.deepEqual(out.usage, {
+      prompt_tokens: 16,
+      completion_tokens: 5,
+      total_tokens: 21,
+      prompt_tokens_details: { cached_tokens: 4, cache_write_tokens: 2 },
+    });
+  });
+
+  it('preserves explicit zero cache usage', () => {
+    const out = claudeJsonToSyntheticCompletions({
+      content: [{ type: 'text', text: 'hello' }],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    }, 'm');
+
+    assert.deepEqual(out.usage, {
+      prompt_tokens: 10,
+      completion_tokens: 5,
+      total_tokens: 15,
+      prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+    });
+  });
+
   it('converts tool_use blocks to tool_calls and sets finish_reason=tool_calls', () => {
     const out = claudeJsonToSyntheticCompletions({
       content: [

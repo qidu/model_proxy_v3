@@ -5,6 +5,13 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(chat-completions): preserve Anthropic cache usage details
+
+`/v1/chat/completions` responses routed through `anthropic-messages` now map `cache_read_input_tokens` and
+`cache_creation_input_tokens` to `usage.prompt_tokens_details.cached_tokens` and `cache_write_tokens`. Non-streaming
+JSON and opt-in streaming usage chunks both include cached and written tokens in `prompt_tokens` and `total_tokens`,
+and retain explicit zero cache counts.
+
 ### fix(messages): emit nullable stop_sequence for Gemini responses
 
 `/v1/messages` responses converted from Gemini now include `stop_sequence: null` when no matched sequence is known,

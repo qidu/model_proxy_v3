@@ -23,11 +23,28 @@ function makeRequest(body: Record<string, unknown>, stream = false): Request {
   });
 }
 
-function anthropicStreamResponse(inputTokens: number, outputTokens: number, text = 'hi'): Response {
+function anthropicStreamResponse(
+  inputTokens: number,
+  outputTokens: number,
+  text = 'hi',
+  cache?: { read: number; written: number },
+): Response {
   const encoder = new TextEncoder();
   // GLM-style: message_start reports input_tokens: 0; real counts arrive in message_delta.
   const events = [
-    { type: 'message_start', message: { usage: { input_tokens: 0, output_tokens: 0 } } },
+    {
+      type: 'message_start',
+      message: {
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          ...(cache ? {
+            cache_read_input_tokens: cache.read,
+            cache_creation_input_tokens: cache.written,
+          } : {}),
+        },
+      },
+    },
     { type: 'content_block_delta', delta: { type: 'text_delta', text } },
     { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } },
     { type: 'message_stop' },
@@ -133,6 +150,20 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
     assert.deepEqual(last.usage, { prompt_tokens: 19, completion_tokens: 7, total_tokens: 26 });
     // The finish_reason chunk comes right before the usage chunk.
     assert.equal(parsed[parsed.length - 2].choices[0].finish_reason, 'stop');
+  });
+
+  it('maps Claude cache usage in the final usage chunk', async () => {
+    const parsed = await runStream(
+      { stream_options: { include_usage: true } },
+      () => anthropicStreamResponse(19, 7, 'hi', { read: 4, written: 2 }),
+    );
+
+    assert.deepEqual(parsed[parsed.length - 1].usage, {
+      prompt_tokens: 25,
+      completion_tokens: 7,
+      total_tokens: 32,
+      prompt_tokens_details: { cached_tokens: 4, cache_write_tokens: 2 },
+    });
   });
 
   it('opens with one role chunk and never repeats it', async () => {

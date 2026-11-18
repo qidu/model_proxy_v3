@@ -177,6 +177,26 @@ async function forwardCompletionsAsAnthropicMessages(
   return new Response(JSON.stringify(claudeJson), { headers: fallbackHeaders });
 }
 
+export function claudeUsageToCompletions(usage: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!usage) return undefined;
+  const input = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+  const output = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+  const cached = typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : undefined;
+  const written = typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : undefined;
+  const prompt = input + (cached ?? 0) + (written ?? 0);
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: output,
+    total_tokens: prompt + output,
+    ...(cached !== undefined || written !== undefined ? {
+      prompt_tokens_details: {
+        ...(cached !== undefined ? { cached_tokens: cached } : {}),
+        ...(written !== undefined ? { cache_write_tokens: written } : {}),
+      },
+    } : {}),
+  };
+}
+
 /**
  * Convert a Claude Messages JSON response to an OpenAI Chat Completions response shape.
  */
@@ -224,15 +244,7 @@ export function claudeJsonToSyntheticCompletions(claudeJson: Record<string, unkn
         : toolUseBlocks.length > 0 ? 'tool_calls'
         : 'stop',
     }],
-    usage: (() => {
-      const u = claudeJson.usage as Record<string, unknown> | undefined;
-      if (!u) return undefined;
-      return {
-        prompt_tokens: u.input_tokens ?? 0,
-        completion_tokens: u.output_tokens ?? 0,
-        total_tokens: ((u.input_tokens as number) ?? 0) + ((u.output_tokens as number) ?? 0),
-      };
-    })(),
+    usage: claudeUsageToCompletions(claudeJson.usage as Record<string, unknown> | undefined),
   };
 }
 
