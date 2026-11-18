@@ -547,10 +547,10 @@ describe('convertGeminiGenerateContentToClaude', () => {
     );
 
     assert.equal(resp.stop_reason, 'end_turn');
-    assert.equal('stop_sequence' in resp, false);
+    assert.equal(resp.stop_sequence, null);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /Gemini STOP is ambiguous for a request with stop_sequences/);
-    assert.match(warnings[0], /returning stop_reason "end_turn" without stop_sequence/);
+    assert.match(warnings[0], /returning stop_reason "end_turn" with stop_sequence null/);
 
     convertGeminiGenerateContentToClaude(
       { candidates: [{ content: { parts: [{ text: 'truncated' }] }, finishReason: 'MAX_TOKENS' }] },
@@ -571,6 +571,7 @@ describe('convertGeminiGenerateContentToClaude', () => {
     );
 
     assert.deepEqual(resp.content, [{ type: 'text', text: 'ok' }]);
+    assert.equal(resp.stop_sequence, null);
     assert.deepEqual(warnings, []);
   });
 });

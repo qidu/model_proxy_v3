@@ -279,6 +279,7 @@ describe('gemini.ts /v1/messages via :generateContent, converted non-SSE respons
       model: 'gemini-test',
       content: [{ type: 'text', text: '日本語 — ✓ ok' }],
       stop_reason: 'end_turn',
+      stop_sequence: null,
       usage: { input_tokens: 4, output_tokens: 259 },
     });
     // The image the upstream generated never reaches the client: the converter

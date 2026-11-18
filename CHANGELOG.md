@@ -5,6 +5,13 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(messages): emit nullable stop_sequence for Gemini responses
+
+`/v1/messages` responses converted from Gemini now include `stop_sequence: null` when no matched sequence is known,
+instead of omitting the field. Non-streaming JSON responses and streaming `message_start` / `message_delta` events use
+the same Anthropic-compatible shape. Gemini's ambiguous `STOP` reason still maps to `end_turn` and retains its warning;
+the proxy does not invent a matched sequence.
+
 ### feat(interactions): adopt the new Step schema and native upstream conversions
 
 Interaction resources now follow `docs/api/interactions_new.md`: non-streaming answers use `steps` instead of legacy

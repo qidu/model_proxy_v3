@@ -212,6 +212,7 @@ function ensureMessageStarted(
             model,
             content: [] as any[],
             stop_reason: null,
+            stop_sequence: null,
             usage: { input_tokens: 0, output_tokens: 0 },
         },
     };
@@ -365,12 +366,12 @@ function handleNativeGeminiChunk(
                 requestId,
                 `[gemini->claude] Gemini STOP is ambiguous for a request with stop_sequences: ` +
                 `a stop-sequence match cannot be distinguished from natural completion; ` +
-                `returning stop_reason "end_turn" without stop_sequence`
+                `returning stop_reason "end_turn" with stop_sequence null`
             );
         }
         sendClaudeEvent(controller, 'message_delta', {
             type: 'message_delta',
-            delta: { stop_reason: nativeStopReason(candidate?.finishReason, state, blocked) },
+            delta: { stop_reason: nativeStopReason(candidate?.finishReason, state, blocked), stop_sequence: null },
             ...(usage ? { usage } : {}),
         });
         sendClaudeEvent(controller, 'message_stop', { type: 'message_stop' });
@@ -430,6 +431,7 @@ function handleGeminiEvent(
                         model: model,
                         content: [] as any[],
                         stop_reason: null,
+                        stop_sequence: null,
                         usage: { input_tokens: 0, output_tokens: 0 },
                     },
                 };
@@ -515,7 +517,7 @@ function handleGeminiEvent(
             );
             const messageDelta = {
                 type: 'message_delta',
-                delta: { stop_reason: 'end_turn' },
+                delta: { stop_reason: 'end_turn', stop_sequence: null },
                 ...(usage ? { usage } : {}),
             };
             controller.enqueue(`event: message_delta\ndata: ${stringify(messageDelta)}\n\n`);
@@ -528,7 +530,7 @@ function handleGeminiEvent(
             if (event.status === 'failed') {
                 const errorDelta = {
                     type: 'message_delta',
-                    delta: { stop_reason: 'max_tokens' },
+                    delta: { stop_reason: 'max_tokens', stop_sequence: null },
                 };
                 controller.enqueue(`event: message_delta\ndata: ${stringify(errorDelta)}\n\n`);
             }

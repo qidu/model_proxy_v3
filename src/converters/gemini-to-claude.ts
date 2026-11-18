@@ -297,7 +297,7 @@ export function convertGeminiGenerateContentToClaude(
                         requestId,
                         `[gemini->claude] Gemini STOP is ambiguous for a request with stop_sequences: ` +
                         `a stop-sequence match cannot be distinguished from natural completion; ` +
-                        `returning stop_reason "end_turn" without stop_sequence`
+                        `returning stop_reason "end_turn" with stop_sequence null`
                     );
                 }
                 stopReason = 'end_turn';
@@ -366,6 +366,7 @@ export function convertGeminiGenerateContentToClaude(
         model: model,
         content: content,
         stop_reason: stopReason,
+        stop_sequence: null,
         usage: {
             input_tokens: usageMetadata?.promptTokenCount || 0,
             // The model's thoughts are output, and Anthropic has no field of its own

@@ -66,6 +66,8 @@ describe('createGeminiStreamTransformer — thought parts', () => {
     ]);
 
     const delta = events.find(e => e.event === 'message_delta')!;
+    assert.equal(events.find(e => e.event === 'message_start')!.data.message.stop_sequence, null);
+    assert.equal(delta.data.delta.stop_sequence, null);
     assert.deepEqual(delta.data.usage, { input_tokens: 7, output_tokens: 44 });
   });
 
@@ -80,6 +82,7 @@ describe('createGeminiStreamTransformer — thought parts', () => {
     ]);
 
     const delta = events.find(e => e.event === 'message_delta')!;
+    assert.equal(delta.data.delta.stop_sequence, null);
     assert.deepEqual(delta.data.usage, { input_tokens: 11, output_tokens: 54 });
   });
 
@@ -188,8 +191,9 @@ describe('createGeminiStreamTransformer — thought parts', () => {
     ));
 
     assert.equal(events.find(e => e.event === 'message_delta')!.data.delta.stop_reason, 'end_turn');
+    assert.equal(events.find(e => e.event === 'message_delta')!.data.delta.stop_sequence, null);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /Gemini STOP is ambiguous for a request with stop_sequences/);
-    assert.match(warnings[0], /returning stop_reason "end_turn" without stop_sequence/);
+    assert.match(warnings[0], /returning stop_reason "end_turn" with stop_sequence null/);
   });
 });
