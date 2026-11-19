@@ -250,6 +250,24 @@ function restoreResponseToolName(
 }
 
 /**
+ * The Responses `incomplete_details.reason` for a Claude `stop_reason`, or
+ * `undefined` when the stop reason is a clean end of turn. Two stop reasons end
+ * a turn short of finished:
+ *   - `max_tokens` — the model exhausted its token budget;
+ *   - `pause_turn` — the model paused a long-running turn, and the client
+ *     continues it by resending the response as-is (`messages-create.md:4520`).
+ * The spec's enum (`openai-response-final.md:119`) has no member for a pause,
+ * and a pause is not a budget exhaustion, so it must not report one: `steered`
+ * is its member for a turn that stopped at a safe, continuable boundary, which
+ * is what a pause is.
+ */
+function claudeIncompleteReason(stopReason: unknown): 'max_output_tokens' | 'steered' | undefined {
+  if (stopReason === 'max_tokens') return 'max_output_tokens';
+  if (stopReason === 'pause_turn') return 'steered';
+  return undefined;
+}
+
+/**
  * Convert a Claude Messages JSON response to Responses API format.
  */
 function claudeResponseToResponses(
@@ -264,9 +282,14 @@ function claudeResponseToResponses(
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, '')}`;
   const created_at = Math.floor(Date.now() / 1000);
   const msgId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
-  // stop_reason "max_tokens" means the model exhausted its token budget — the
-  // response is terminal-incomplete, not completed.
-  const isIncomplete = claudeJson.stop_reason === 'max_tokens';
+  // A stop reason that leaves the response short of a clean end of turn —
+  // `max_tokens` (budget exhausted) or `pause_turn` (a long-running turn the
+  // model paused) — makes it terminal-incomplete, not completed.
+  const incompleteReason = claudeIncompleteReason(claudeJson.stop_reason);
+  const isIncomplete = incompleteReason !== undefined;
+  if (claudeJson.stop_reason === 'pause_turn') {
+    logger?.warn(requestId ?? '', '[responses] Claude stop_reason "pause_turn" projected as status "incomplete" (incomplete_details.reason "steered")');
+  }
 
   const outputItems: unknown[] = [];
 
@@ -314,7 +337,7 @@ function claudeResponseToResponses(
     object: 'response',
     created_at,
     status: isIncomplete ? 'incomplete' : 'completed',
-    ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+    ...(isIncomplete ? { incomplete_details: { reason: incompleteReason } } : {}),
     model: (claudeJson.model as string) ?? model,
     output: outputItems.length > 0 ? outputItems : [{
       id: msgId,
@@ -522,9 +545,14 @@ function streamClaudeAsResponses(
         }
       }
 
-      // stop_reason "max_tokens" means the model exhausted its token budget —
-      // the open item and the response end terminal-incomplete, not completed.
-      const isIncomplete = stopReason === 'max_tokens';
+      // A stop reason that leaves the turn short of a clean end of turn —
+      // `max_tokens` or `pause_turn` — ends the open item and the response
+      // terminal-incomplete, not completed.
+      const incompleteReason = claudeIncompleteReason(stopReason);
+      const isIncomplete = incompleteReason !== undefined;
+      if (stopReason === 'pause_turn') {
+        activeLogger.warn(requestId, '[responses] Claude stop_reason "pause_turn" projected as status "incomplete" (incomplete_details.reason "steered")');
+      }
 
       if (textPartOpened) {
         await writer.write(encoder.encode(sseEvent('response.output_text.done', {
@@ -615,7 +643,7 @@ function streamClaudeAsResponses(
           model,
           output: outputItems,
           usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens, input_tokens_details: { cached_tokens: cachedTokens } },
-          ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+          ...(isIncomplete ? { incomplete_details: { reason: incompleteReason } } : {}),
         },
       })));
 

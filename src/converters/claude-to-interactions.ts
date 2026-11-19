@@ -175,8 +175,14 @@ export function claudeToInteraction(
   }
   if (suppressed > 0) warn(options, `suppressed ${suppressed} function call(s) outside allowed_tools`);
 
-  const incomplete = response.stop_reason === 'max_tokens';
+  // `pause_turn` — a long-running turn the model paused, which the client
+  // continues by resending the response as-is (`messages-create.md:4520`) — is
+  // incomplete, not a clean end of turn.
+  const incomplete = response.stop_reason === 'max_tokens' || response.stop_reason === 'pause_turn';
   const failed = response.stop_reason === 'refusal' || response.stop_reason === 'timeout';
+  if (response.stop_reason === 'pause_turn') {
+    warn(options, 'Claude stop_reason "pause_turn" projected as Interaction status "incomplete"');
+  }
   const requiresAction = outputs.some(output => output.type === 'function_call');
   return {
     id: `v1_${Date.now()}_${requestId}`,
@@ -363,8 +369,13 @@ export function claudeEventToInteractionEvents(
     if (state.suppressed > 0) warn(options, `suppressed ${state.suppressed} streamed function call(s) outside allowed_tools`);
     state.usage = { ...state.usage, ...asRecord(event.usage) };
     interactionStreamEnded(state.interaction, claudeUsage(state.usage));
-    const incomplete = delta.stop_reason === 'max_tokens';
+    // `pause_turn`: see `claudeToInteraction` — a paused long-running turn is
+    // incomplete, and the client continues it by resending the response as-is.
+    const incomplete = delta.stop_reason === 'max_tokens' || delta.stop_reason === 'pause_turn';
     const failed = ['refusal', 'timeout'].includes(delta.stop_reason);
+    if (delta.stop_reason === 'pause_turn') {
+      warn(options, 'Claude stop_reason "pause_turn" projected as Interaction status "incomplete"');
+    }
     state.interaction.incomplete = incomplete;
     state.interaction.failed = failed;
     if (incomplete || failed) events.push(...interactionStreamError(state.interaction, interactionError(delta.stop_reason)));

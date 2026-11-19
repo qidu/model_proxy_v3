@@ -197,6 +197,28 @@ describe('/v1/interactions → openai-responses: request fields reach the upstre
     assert.equal('store' in upstream, false);
     assert.equal(upstream.temperature, 0.3);
   });
+  it('carries generateContent responseJsonSchema to a Completions upstream', async () => {
+    const schema = {
+      type: 'object',
+      properties: { name: { type: 'string' }, price: { type: 'number' } },
+      required: ['name', 'price'],
+    };
+    const upstream = await send(
+      {
+        contents: [{ role: 'user', parts: [{ text: 'Return a product object' }] }],
+        generationConfig: { responseJsonSchema: schema },
+      },
+      'openai-completions',
+      '/v1beta/models/openai-model:generateContent',
+    );
+
+    assert.deepEqual(upstream.response_format, {
+      type: 'json_schema',
+      json_schema: { name: 'response', schema },
+    });
+    assert.deepEqual(upstream.messages, [{ role: 'user', content: 'Return a product object' }]);
+    assert.equal(upstream.stream, false);
+  });
 });
 
 /**

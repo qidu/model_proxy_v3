@@ -5,6 +5,31 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): project a paused Claude turn as incomplete
+
+`/v1/responses` responses routed through `anthropic-messages` now report `stop_reason: "pause_turn"` as
+`status: "incomplete"` with `incomplete_details: { reason: "steered" }` — in the JSON body and in the SSE terminal
+event (`response.incomplete`) — instead of `completed`. `max_tokens` keeps `reason: "max_output_tokens"`. The spec's
+enum has no member for a pause, and `steered` (its member for a turn that stopped at a safe, continuable boundary) is
+the closest honest match; the token-cap reason would blame a budget the model never hit. Each projection logs a
+warning.
+
+### fix(interactions): project a paused Claude turn as incomplete
+
+`/v1/interactions` responses routed through `anthropic-messages` now report `stop_reason: "pause_turn"` as
+`status: "incomplete"`, with a `pause_turn` diagnostic in `errors[]` as `max_tokens` already does — in the JSON body
+and in the closing streamed Interaction — instead of `completed`. A paused long-running turn is continued by resending
+the response as-is, so `completed` told the client the work was finished. Each projection logs a warning. The
+Claude→Completions and Claude→Gemini egresses still report a paused turn as a clean end of turn; that projection loss
+is untouched.
+
+### fix(generateContent): carry structured output to Completions upstreams
+
+`:generateContent` requests routed to `openai-completions` now translate `generationConfig.responseJsonSchema` (and its
+supported aliases) into the named OpenAI `response_format.json_schema`, normalizing Gemini schema type names.
+`responseMimeType: "application/json"` without a schema maps to `json_object` mode. The same constraints continue through
+the existing Completions-to-Responses conversion instead of being omitted from the upstream request.
+
 ### fix(routing): use endpoint-specific envelopes for malformed JSON
 
 Malformed request bodies rejected during model routing now return HTTP 400 with the client endpoint's error format:

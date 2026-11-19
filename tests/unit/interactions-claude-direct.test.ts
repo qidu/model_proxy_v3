@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { interactionsToClaudeBody } from '../../src/converters/interactions-to-claude.js';
 import { handleOpenAIRequest } from '../../src/handlers/openai.js';
 import type { ModelRouteConfig } from '../../src/utils/config-loader.js';
-import { createLogger } from '../../src/utils/logger.js';
+import { createLogger, type Logger } from '../../src/utils/logger.js';
 
 const ENV = { LOG_LEVEL: 'error' } as any;
 const LOGGER = createLogger({});
@@ -31,6 +31,7 @@ function parseSse(raw: string): Array<Record<string, any>> {
 
 async function send(
   body: Record<string, unknown>, stream = false, route?: ModelRouteConfig, upstreamModel = 'resolved-model',
+  logger: Logger = LOGGER,
 ): Promise<Response> {
   return handleOpenAIRequest(
     new Request('http://proxy/v1/interactions', {
@@ -38,8 +39,22 @@ async function send(
       body: JSON.stringify({ ...body, ...(stream ? { stream: true } : {}) }),
     }),
     TARGET, { 'x-api-key': 'upstream-key' }, stream ? 'int-claude-stream' : 'int-claude-json',
-    upstreamModel, ENV, LOGGER, undefined, undefined, 'anthropic-messages', route,
+    upstreamModel, ENV, logger, undefined, undefined, 'anthropic-messages', route,
   );
+}
+
+/** Logger that records the exact message handed to `warn`. */
+function recordingLogger(): { logger: Logger; warnings: string[] } {
+  const warnings: string[] = [];
+  const logger: Logger = {
+    traceEnabled: false,
+    trace() {},
+    debug() {},
+    info() {},
+    warn(_requestId, message) { warnings.push(message); },
+    error() {},
+  };
+  return { logger, warnings };
 }
 
 /** The DeepSeek anthropic-compat set: this builtin is its only consumer here. */
@@ -329,5 +344,44 @@ describe('/v1/interactions ↔ anthropic-messages direct route', () => {
     assert.deepEqual(terminal.interaction.steps, [
       { type: 'model_output', content: [{ type: 'text', text: 'partial' }] },
     ]);
+  });
+
+  it('maps pause_turn to incomplete and keeps the paused answer', async () => {
+    const { logger, warnings } = recordingLogger();
+    globalThis.fetch = (async () => json({
+      id: 'msg_pause', model: 'claude-upstream', stop_reason: 'pause_turn',
+      content: [{ type: 'text', text: 'partial' }],
+    })) as typeof fetch;
+    const interaction = await (await send({ model: 'client', input: 'hi' }, false, undefined, 'resolved-model', logger)).json() as any;
+
+    // A paused long-running turn is continued by resending the response as-is
+    // (`messages-create.md:4520`), so `completed` claimed the turn was over.
+    assert.equal(interaction.status, 'incomplete');
+    assert.equal(interaction.steps[0].content[0].text, 'partial');
+    assert.equal(interaction.errors[0].code, 'pause_turn');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /"pause_turn".*"incomplete"/);
+  });
+
+  it('maps streamed pause_turn to incomplete with a diagnostic', async () => {
+    const { logger, warnings } = recordingLogger();
+    globalThis.fetch = (async () => claudeSse([
+      { type: 'message_start', message: { id: 'msg_pause', content: [], usage: { input_tokens: 7, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'pause_turn' }, usage: { output_tokens: 4 } },
+      { type: 'message_stop' },
+    ])) as typeof fetch;
+    const events = parseSse(await (await send({ model: 'client', input: 'hi' }, true, undefined, 'resolved-model', logger)).text());
+    const error = events.find(event => event.event_type === 'error') as any;
+    const terminal = events.at(-1) as any;
+
+    assert.equal(error.error.code, 'pause_turn');
+    assert.deepEqual(terminal.interaction.errors, [error.error]);
+    assert.equal(terminal.interaction.status, 'incomplete');
+    assert.equal(terminal.interaction.steps[0].content[0].text, 'partial');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /"pause_turn".*"incomplete"/);
   });
 });

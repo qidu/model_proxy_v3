@@ -1029,7 +1029,7 @@ export function convertGeminiGenerateContentToOpenAI(
     }
 
     // Check for stream parameter in both top-level and generationConfig
-    const config = geminiRequest.generationConfig as Record<string, unknown> | undefined;
+    const config = (geminiRequest.generationConfig ?? geminiRequest.generation_config) as Record<string, unknown> | undefined;
     const stream = geminiRequest.stream === true || config?.stream === true;
 
     const result: Record<string, unknown> = { model, messages, stream };
@@ -1053,6 +1053,18 @@ export function convertGeminiGenerateContentToOpenAI(
         ?? config?.tool_choice,
     );
     if (tools.length > 0 && toolChoice !== undefined) result.tool_choice = toolChoice;
+
+    const schema = config?.responseJsonSchema ?? config?.response_json_schema ?? config?.responseSchema ?? config?.response_schema ?? geminiRequest.response_format;
+    const mime = config?.responseMimeType ?? config?.response_mime_type ?? geminiRequest.response_mime_type;
+    if (schema !== undefined) {
+      if (!asRecord(schema)) throw new ValidationError('generateContent response schema must be an object');
+      result.response_format = {
+        type: 'json_schema',
+        json_schema: { name: 'response', schema: normalizeGeminiSchema(schema) },
+      };
+    } else if (mime === 'application/json') {
+      result.response_format = { type: 'json_object' };
+    }
     return result;
   }
 

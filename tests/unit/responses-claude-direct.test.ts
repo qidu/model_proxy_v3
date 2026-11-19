@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { responsesToClaudeBody } from '../../src/converters/responses-to-claude-request.js';
 import { handleResponsesRequest } from '../../src/handlers/responses.js';
-import { createLogger } from '../../src/utils/logger.js';
+import { createLogger, type Logger } from '../../src/utils/logger.js';
 
 const TARGET = 'https://upstream.example/v1/messages';
 const ENV = { LOG_LEVEL: 'error' } as any;
@@ -19,17 +19,31 @@ function request(body: Record<string, unknown>): Request {
   });
 }
 
-async function send(body: Record<string, unknown>): Promise<Response> {
+async function send(body: Record<string, unknown>, logger: Logger = LOGGER): Promise<Response> {
   return handleResponsesRequest(
     request(body), TARGET, { Authorization: 'Bearer upstream-key' }, 'req-r5', 'resolved-model', ENV,
-    LOGGER, 'anthropic-messages',
+    logger, 'anthropic-messages',
   );
 }
 
-function claudeJson(content: Array<Record<string, unknown>>): Response {
+/** Logger that records the exact message handed to `warn`. */
+function recordingLogger(): { logger: Logger; warnings: string[] } {
+  const warnings: string[] = [];
+  const logger: Logger = {
+    traceEnabled: false,
+    trace() {},
+    debug() {},
+    info() {},
+    warn(_requestId, message) { warnings.push(message); },
+    error() {},
+  };
+  return { logger, warnings };
+}
+
+function claudeJson(content: Array<Record<string, unknown>>, stopReason?: string): Response {
   return new Response(JSON.stringify({
     id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-upstream', content,
-    stop_reason: content.some(block => block.type === 'tool_use') ? 'tool_use' : 'end_turn',
+    stop_reason: stopReason ?? (content.some(block => block.type === 'tool_use') ? 'tool_use' : 'end_turn'),
     usage: { input_tokens: 9, output_tokens: 3, cache_read_input_tokens: 2 },
   }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
@@ -168,5 +182,55 @@ describe('/v1/responses → anthropic-messages direct route', () => {
     assert.deepEqual(completed?.response.usage, {
       input_tokens: 4, output_tokens: 2, total_tokens: 6, input_tokens_details: { cached_tokens: 0 },
     });
+  });
+
+  it('projects a paused turn as incomplete/steered, and still reports max_tokens as max_output_tokens', async () => {
+    const { logger, warnings } = recordingLogger();
+    // `pause_turn` is a long-running turn the model paused; the client continues it
+    // by resending this response as-is (`messages-create.md:4520`). Reporting
+    // `completed` told the client the work was finished, and the spec's
+    // `max_output_tokens` would have blamed a budget the model never hit.
+    upstreamResponse = () => claudeJson([{ type: 'text', text: 'partial' }], 'pause_turn');
+    const paused = await (await send({ model: 'client-model', input: 'go' }, logger)).json() as any;
+
+    assert.equal(paused.status, 'incomplete');
+    assert.deepEqual(paused.incomplete_details, { reason: 'steered' });
+    assert.equal(paused.output[0].status, 'incomplete');
+    assert.equal(paused.output[0].content[0].text, 'partial');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /"pause_turn".*"incomplete"/);
+    assert.match(warnings[0], /"steered"/);
+
+    // The token cap keeps its own reason: the two causes share a status, not a cause.
+    upstreamResponse = () => claudeJson([{ type: 'text', text: 'cut' }], 'max_tokens');
+    const capped = await (await send({ model: 'client-model', input: 'go' }, logger)).json() as any;
+
+    assert.equal(capped.status, 'incomplete');
+    assert.deepEqual(capped.incomplete_details, { reason: 'max_output_tokens' });
+    assert.equal(warnings.length, 1);
+  });
+
+  it('ends a paused stream with response.incomplete and reason steered', async () => {
+    const { logger, warnings } = recordingLogger();
+    upstreamResponse = () => claudeSse([
+      { type: 'message_start', message: { usage: { input_tokens: 4, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'pause_turn' }, usage: { output_tokens: 2 } },
+      { type: 'message_stop' },
+    ]);
+    const events = parseSse(await (await send({ model: 'client-model', input: 'go', stream: true }, logger)).text());
+
+    const terminal = events.at(-1) as any;
+    assert.equal(terminal.type, 'response.incomplete');
+    assert.equal(terminal.response.status, 'incomplete');
+    assert.deepEqual(terminal.response.incomplete_details, { reason: 'steered' });
+    assert.equal(terminal.response.output[0].status, 'incomplete');
+    assert.equal(terminal.response.output[0].content[0].text, 'partial');
+    // A paused turn must not also announce a clean completion.
+    assert.equal(events.some(event => event.type === 'response.completed'), false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /"pause_turn".*"incomplete"/);
   });
 });

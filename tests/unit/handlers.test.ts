@@ -1396,6 +1396,62 @@ describe('convertGeminiGenerateContentToOpenAI — stopSequences', () => {
   });
 });
 
+describe('convertGeminiGenerateContentToOpenAI — structured output', () => {
+  function geminiRequest(generationConfig: Record<string, unknown>): Record<string, unknown> {
+    return {
+      model: 'gpt-target',
+      contents: [{ role: 'user', parts: [{ text: 'Return a product object' }] }],
+      generationConfig,
+    };
+  }
+
+  it('maps responseJsonSchema to the named Completions json_schema', () => {
+    const schema = {
+      type: 'object',
+      properties: { name: { type: 'string' }, price: { type: 'number' } },
+      required: ['name', 'price'],
+    };
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ responseJsonSchema: schema }));
+
+    assert.deepEqual(out.response_format, {
+      type: 'json_schema',
+      json_schema: { name: 'response', schema },
+    });
+  });
+
+  it('normalizes Gemini schema type names and prefers the schema over JSON mime mode', () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({
+      responseMimeType: 'application/json',
+      responseSchema: { type: 'OBJECT', properties: { name: { type: 'STRING' } } },
+    }));
+
+    assert.deepEqual(out.response_format, {
+      type: 'json_schema',
+      json_schema: {
+        name: 'response',
+        schema: { type: 'object', properties: { name: { type: 'string' } } },
+      },
+    });
+  });
+
+  it('maps responseMimeType application/json without a schema to JSON object mode', () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ responseMimeType: 'application/json' }));
+    assert.deepEqual(out.response_format, { type: 'json_object' });
+  });
+
+  it('rejects a non-object response schema instead of dropping it', () => {
+    assert.throws(
+      () => convertGeminiGenerateContentToOpenAI(geminiRequest({ responseJsonSchema: 'not-a-schema' })),
+      (error: any) => error.name === 'ValidationError' && error.status === 400,
+    );
+  });
+
+  it('invents no response_format when neither field is present', () => {
+    const out = convertGeminiGenerateContentToOpenAI(geminiRequest({ temperature: 0.3 }));
+    assert.equal('response_format' in out, false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // isGeminiRequest
 // ---------------------------------------------------------------------------
