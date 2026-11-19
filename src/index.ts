@@ -10,7 +10,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
 import { extractRawCredential } from './utils/auth-headers.js';
-import { createErrorResponse, createResponsesErrorResponse, OverLimitError, ClaudeProxyError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
+import { createErrorResponse, createResponsesErrorResponse, OverLimitError, ClaudeProxyError, ResponsesApiError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { wrapSseStreamWithKeepAlive } from './utils/sse-keepalive.js';
 import { createLogger, type Logger } from './utils/logger.js';
 import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled, isAnthropicModelId, toAnthropicModel } from './handlers/models.js';
@@ -1998,7 +1998,39 @@ export default {
             return createErrorResponse(error, requestId);
           }
           logger.error(requestId, `Failed to parse request body for model routing ${path}: ${(error as Error).message}`);
-          return createErrorResponse(new Error('Invalid request body'), requestId, 400);
+          const invalidBodyError = new ClaudeProxyError('Invalid request body', 400, 'invalid_request_error');
+          if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?')) {
+            return new Response(JSON.stringify({
+              error: { message: invalidBodyError.message, type: invalidBodyError.type, code: null },
+            }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+            });
+          }
+          if (path === '/v1/responses' || path.startsWith('/v1/responses/') || path.startsWith('/v1/responses?')) {
+            return createResponsesErrorResponse(
+              new ResponsesApiError(invalidBodyError.message, 400, 'invalid_request_error'),
+              requestId,
+            );
+          }
+          if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
+            return new Response(JSON.stringify({
+              error: { message: invalidBodyError.message, code: 'invalid_request' },
+            }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+            });
+          }
+          if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) &&
+              (path.includes(':generateContent') || path.includes(':streamGenerateContent') || path.includes(':countTokens'))) {
+            return new Response(JSON.stringify({
+              error: { code: 400, message: invalidBodyError.message, status: 'INVALID_ARGUMENT' },
+            }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+            });
+          }
+          return createErrorResponse(invalidBodyError, requestId);
         }
       } else if (isDynamicRoute(path)) {
         // Dynamic routing: /http/host/... or /https/host/...

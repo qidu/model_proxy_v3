@@ -5,6 +5,14 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(routing): use endpoint-specific envelopes for malformed JSON
+
+Malformed request bodies rejected during model routing now return HTTP 400 with the client endpoint's error format:
+OpenAI Chat Completions, Responses, Gemini Generate Content and Interactions, and Anthropic Messages each retain their
+own envelope instead of all receiving the Anthropic shape. Chat Completions includes a nullable `code` field, Responses
+uses `invalid_request_error`, and Interactions uses its string-coded error object. Rejected bodies are not
+forwarded upstream.
+
 ### fix(interactions): send valid thinking configuration to Claude
 
 `/v1/interactions` requests with `thinking_summaries: "auto"` now use adaptive thinking for Claude Opus/Sonnet 4.6,

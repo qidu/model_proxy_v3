@@ -102,6 +102,24 @@ curl https://api.openai.com/v1/chat/completions \
 }
 ```
 
+## Error Response (Chat Completions)
+
+HTTP errors return a structured `error` object. For example, malformed JSON returns HTTP 400:
+
+```json
+{
+  "error": {
+    "message": "Invalid request body",
+    "type": "invalid_request_error",
+    "code": null
+  }
+}
+```
+
+- `message`: Human-readable explanation of the error.
+- `type`: Error category, such as `invalid_request_error`.
+- `code`: A machine-readable error code, or `null` when no more specific code is available.
+
 ## Responses API (New)
 
 ```bash

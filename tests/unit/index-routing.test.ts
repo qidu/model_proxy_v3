@@ -697,14 +697,44 @@ claude = { base = "https://passthrough.example", mode = "anthropic-messages", ke
     assert.equal((await call('/dashboard/api/schedule/alias/route_schedule', 'DELETE')).status, 200);
   });
 
-  it('rejects malformed model JSON without forwarding upstream', async () => {
-    const response = await handler.fetch(new Request('http://proxy/v1/messages', {
-      method: 'POST',
-      headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
-      body: '{not-json',
-    }), env());
-    assert.equal(response.status, 400);
-    assert.match(JSON.stringify(await response.json()), /Invalid request body/);
+  it('rejects malformed model JSON with the endpoint-specific error envelope', async () => {
+    const cases = [
+      {
+        path: '/v1/messages',
+        expected: { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid request body' } },
+      },
+      {
+        path: '/v1/chat/completions',
+        expected: { error: { message: 'Invalid request body', type: 'invalid_request_error', code: null } },
+      },
+      {
+        path: '/v1/responses',
+        expected: { error: { message: 'Invalid request body', type: 'invalid_request_error', param: null, code: null } },
+      },
+      {
+        path: '/v1beta/models/gemini-test:generateContent',
+        expected: { error: { code: 400, message: 'Invalid request body', status: 'INVALID_ARGUMENT' } },
+      },
+      {
+        path: '/v1/models/gemini-test:generateContent',
+        expected: { error: { code: 400, message: 'Invalid request body', status: 'INVALID_ARGUMENT' } },
+      },
+      {
+        path: '/v1/interactions',
+        expected: { error: { message: 'Invalid request body', code: 'invalid_request' } },
+      },
+    ];
+
+    for (const { path, expected } of cases) {
+      const response = await handler.fetch(new Request(`http://proxy${path}`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer client-key', 'Content-Type': 'application/json' },
+        body: '{"model":"claude-model","messages":[{"role":"user","content":"你好"}],"max_tokens":}',
+      }), env());
+      assert.equal(response.status, 400, path);
+      assert.match(response.headers.get('content-type') || '', /application\/json/, path);
+      assert.deepEqual(await response.json(), expected, path);
+    }
     assert.deepEqual(upstreamUrls, []);
   });
 

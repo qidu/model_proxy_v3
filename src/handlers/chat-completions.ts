@@ -67,13 +67,13 @@ export async function handleChatCompletionsPassthrough(
   } catch (err) {
     if (err instanceof ValidationError) {
       logger.warn(requestId, `${path} validation failed: ${err.message}`);
-      return new Response(JSON.stringify({ error: { message: err.message, type: 'invalid_request_error' } }), {
+      return new Response(JSON.stringify({ error: { message: err.message, type: 'invalid_request_error', code: null } }), {
         status: 400,
         headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
       });
     }
     logger.warn(requestId, `${path} invalid JSON body: ${(err as Error).message}`);
-    return new Response(JSON.stringify({ error: { message: 'Invalid JSON body', type: 'invalid_request_error' } }), {
+    return new Response(JSON.stringify({ error: { message: 'Invalid JSON body', type: 'invalid_request_error', code: null } }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
     });
