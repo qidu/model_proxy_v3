@@ -1,0 +1,33 @@
+{
+  "base_url": "http://127.0.0.1:7777",
+  "decision_alias": "bench-decision",
+  "random_alias": "bench-random",
+  "repeats": 5,
+  "max_tokens": 512,
+  "temperature": 0,
+  "request_timeout_ms": 120000,
+  "judge": {
+    "model": "qn-ds-v41",
+    "timeout_ms": 120000
+  },
+  "prompts": [
+    {
+      "id": "code-1",
+      "category": "code",
+      "prompt": "Write a Python function that finds the first duplicate in a list, with tests.",
+      "rubric": "Correct algorithm, clear edge-case handling, and meaningful tests."
+    },
+    {
+      "id": "analysis-1",
+      "category": "analysis",
+      "prompt": "Explain the tradeoffs between optimistic and pessimistic locking for a small inventory service.",
+      "rubric": "Technically correct comparison that reaches a practical recommendation."
+    },
+    {
+      "id": "chat-1",
+      "category": "chat",
+      "prompt": "Rewrite this in one friendly sentence: Your request has been received and will be processed shortly.",
+      "rubric": "One friendly sentence that preserves the original meaning."
+    }
+  ]
+}

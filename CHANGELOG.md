@@ -5,6 +5,24 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(routing): accept native Clef criteria for composite decisions
+
+Composite target selection now preserves Clef's label-to-description `criteria`
+object when calling `/decision`. The shared adapter previously accepted only the
+legacy sidecar's array form, causing composite decisions to fail before the HTTP
+request and silently use fallback ordering. A successful resolver test now
+verifies the outgoing native criteria and selected-target ordering.
+
+### feat(benchmark): compare decision and weighted-random routing online
+
+Added `npm run benchmark:routing`, a live paired A/B runner for the existing
+composite `decision` and weighted `share` alias modes. The runner interleaves
+both aliases over the same prompts and records selected models, success rates,
+end-to-end latency, token usage, optional token prices, and optional
+independent-model quality scores in JSONL. Failures remain visible in the raw
+results and summary. See `docs/guides/semantic-routing-ab-benchmark.md` for the
+matching two-alias configuration, experiment setup, and interpretation limits.
+
 ### fix(responses): project a paused Claude turn as incomplete
 
 `/v1/responses` responses routed through `anthropic-messages` now report `stop_reason: "pause_turn"` as

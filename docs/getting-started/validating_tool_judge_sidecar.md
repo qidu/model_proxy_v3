@@ -112,6 +112,12 @@ threshold = 0.5
 mode = "choice"
 max_batch_tools = 50
 
+#judge_url = "http://127.0.0.1:8765"
+#timeout_ms = 10000
+#mode = "choice"
+#use_decision_api = false
+#model = "laya"
+
 [models.echo]
 upstream_mode = "anthropic-messages"
 base_url = "http://127.0.0.1:8890"

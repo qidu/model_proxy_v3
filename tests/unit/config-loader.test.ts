@@ -3054,6 +3054,52 @@ describe('resolveCompositeWithDecision', () => {
     // Should fail-open and return original candidates
     assert.deepEqual(result, candidates);
   });
+
+  it('sends native Clef criteria and puts the selected target first', async () => {
+    const { resolveCompositeWithDecision } = await import('../../src/utils/config-loader.js');
+    const proxyConfig: ProxyConfig = {
+      models: {
+        claude: {
+          base_url: 'https://x',
+          'model-a': ['model-a', '', ''],
+          'model-b': ['model-b', '', ''],
+        } as any,
+      },
+      composite: {
+        'test-alias': {
+          'model-a': { ability: 'coding' },
+          'model-b': { ability: 'reasoning' },
+          decision: { model: 'laya', url: 'http://localhost:8765/decision', threshold: 0.5 },
+        },
+      },
+    };
+    const originalFetch = globalThis.fetch;
+    let sentBody: any;
+    globalThis.fetch = async (_input, init) => {
+      sentBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        model: 'laya',
+        answers: {
+          target_selection: {
+            type: 'choice',
+            choice: 'model-b',
+            confidence: 0.9,
+            probabilities: { 'model-a': 0.1, 'model-b': 0.9 },
+          },
+        },
+      }), { status: 200 });
+    };
+    try {
+      const result = await resolveCompositeWithDecision('test-alias', proxyConfig, { prompt: 'Explain this proof' });
+      assert.equal(result[0]?.modelName, 'model-b');
+      assert.deepEqual(sentBody.questions.target_selection.criteria, {
+        'model-a': 'Abilities: coding',
+        'model-b': 'Abilities: reasoning',
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

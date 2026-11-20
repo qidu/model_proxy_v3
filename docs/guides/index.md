@@ -39,6 +39,7 @@ Practical guides for integrating Model Proxy v3 with various clients and using s
 
 ### Monitoring & Debugging
 - [Live Stats](./live-stats.md) — TUI/web dashboard, JSONL usage-dump format, startup stats restoration
+- [Decision vs Weighted-Random Benchmark](./semantic-routing-ab-benchmark.md) — Live paired A/B comparison of existing composite routing modes
 - [SSE Streaming Review](./sse_streaming_review.md)
 - [StreamGenerateContent Analysis](./streamgeneratecontent_analysis.md)
 - [StreamGenerateContent Implementation Summary](./streamgeneratecontent_implementation_summary.md)

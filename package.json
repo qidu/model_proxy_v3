@@ -18,6 +18,7 @@
     "start": "node dist/server.js",
     "server": "tsx src/server.ts",
     "test:unit": "node --experimental-global-webcrypto --import tsx --import ./tests/setup/silent-logs.ts --test tests/unit/**/*.test.ts",
+    "benchmark:routing": "tsx tests/perf/semantic-routing-ab.ts",
     "prepublishOnly": "npm run build && npm run test:unit"
   },
   "dependencies": {

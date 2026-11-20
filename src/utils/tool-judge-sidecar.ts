@@ -59,7 +59,7 @@ export interface JudgeRequest {
 export interface JudgeChoiceQuestion {
   type: 'choice';
   instructions: string;
-  criteria: string[];
+  criteria: string[] | Record<string, string>;
 }
 
 export interface JudgeNoulQuestion {
@@ -148,7 +148,8 @@ export interface ClefResponse {
 /**
  * Adapt a sidecar JudgeRequest to a Clef request.
  * Maps sidecar question types to Clef question types.
- * Converts choice criteria from array (sidecar) to object (Clef).
+ * Converts legacy choice criteria from an array to an object; Clef's native
+ * label-to-description object is preserved.
  */
 export function adaptToClefRequest(
   request: JudgeRequest,
@@ -157,10 +158,13 @@ export function adaptToClefRequest(
   const clefQuestions: Record<string, ClefQuestion> = {};
   for (const [qid, question] of Object.entries(request.questions)) {
     if (question.type === 'choice') {
-      // Convert criteria from array ["keep", "discard"] to object {"keep": "Keep the tool", "discard": "Discard the tool"}
       const criteria: Record<string, string> = {};
-      for (const criterion of question.criteria) {
-        criteria[criterion] = criterion === 'keep' ? 'Keep the tool' : 'Discard the tool';
+      if (Array.isArray(question.criteria)) {
+        for (const criterion of question.criteria) {
+          criteria[criterion] = criterion === 'keep' ? 'Keep the tool' : 'Discard the tool';
+        }
+      } else {
+        Object.assign(criteria, question.criteria);
       }
       clefQuestions[qid] = {
         type: 'choice',
