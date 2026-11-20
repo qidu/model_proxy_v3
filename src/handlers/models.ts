@@ -8,7 +8,7 @@ import { Logger } from '../utils/logger.js';
 import type { OpenAIModelsResponse } from '../types/openai.js';
 import { mergeOpenAIModelsResponse } from '../converters/openai-to-claude.js';
 import { validateModelsRequestParams } from '../utils/validation.js';
-import { createErrorResponse, handleTargetApiError } from '../utils/errors.js';
+import { createErrorResponse, createOpenAIErrorResponse, handleTargetApiError } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
@@ -230,7 +230,7 @@ export async function handleModelsRequest(
           request.signal,
         );
       } catch (error) {
-        return createErrorResponse(error as Error, requestId);
+        return createOpenAIErrorResponse(error as Error, requestId);
       }
       handleTargetApiError(response, 'Models API', { url: targetApiUrl.toString(), upstreamBody: upstreamErrorBody });
     }
@@ -254,7 +254,7 @@ export async function handleModelsRequest(
         request.signal,
       );
     } catch (error) {
-      if (!(error instanceof SyntaxError)) return createErrorResponse(error as Error, requestId);
+      if (!(error instanceof SyntaxError)) return createOpenAIErrorResponse(error as Error, requestId);
       throw error;
     }
     upstreamModels = mergeOpenAIModelsResponse(openaiResponse, []);

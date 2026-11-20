@@ -1280,7 +1280,7 @@ ${args.extra ?? ''}
 
     const REMOTE = `\n[remote]\nrecord_server = ${JSON.stringify(RECORD_URL)}\n`;
 
-    it('spills the error body past threshold_bytes, never clones it, and streams the same bytes to the client', async () => {
+    it('spills the error body past threshold_bytes and normalizes it for the client without cloning', async () => {
       const message = `upstream exploded: ${'e'.repeat(6000)}`;
       const upstreamBody = JSON.stringify({ error: { message, type: 'server_error' } });
       assert.ok(Buffer.byteLength(upstreamBody, 'utf8') > 4096, 'the fixture has to cross the threshold');
@@ -1295,11 +1295,13 @@ ${args.extra ?? ''}
       const clientText = await response.text();
       await settleRecord();
 
-      assert.equal(clientText, upstreamBody, 'the client receives the upstream error byte for byte, out of the spool');
+      assert.equal(clientText, JSON.stringify({
+        error: { message, type: 'server_error', param: null, code: null },
+      }), 'the client receives the upstream message in an OpenAI envelope');
       assert.equal(records.length, 1, 'the failure is still recorded to the collector');
       assert.equal(records[0].response_status, 500);
-      assert.deepEqual(records[0].response_body, { error: { message, type: 'server_error' } },
-        'the collector gets the upstream error body, not a truncation of it');
+      assert.deepEqual(records[0].response_body, { error: { message, type: 'server_error', param: null, code: null } },
+        'the collector gets the complete normalized error body');
       assert.deepEqual(responseSpills(), [], 'the spill is released once the client has drained it');
       assert.equal(getLiveSpillBytes(), 0);
     });
@@ -1315,16 +1317,17 @@ ${args.extra ?? ''}
       await settleRecord();
 
       assert.equal(response.status, 500, 'the cap breach is a spool failure, not the upstream 502');
-      const payload = await response.json() as { type: string; error: { type: string; message: string } };
-      assert.equal(payload.error.type, 'processing_error');
+      const payload = await response.json() as { error: { type: string; message: string } };
+      assert.equal(payload.error.type, 'server_error');
       assert.match(payload.error.message, /Response body too large/);
       assert.deepEqual(records, [], 'no record is posted for a body the proxy refused to read');
       assert.deepEqual(responseSpills(), [], 'the refused body leaves no spill behind');
       assert.equal(getLiveSpillBytes(), 0);
     });
 
-    it('leaves the error path byte-identical when the spool is off, and still records the parsed body', async () => {
-      const upstreamBody = JSON.stringify({ error: { message: `legacy ${'l'.repeat(6000)}`, type: 'server_error' } });
+    it('normalizes the error when the spool is off and records the complete normalized body', async () => {
+      const message = `legacy ${'l'.repeat(6000)}`;
+      const upstreamBody = JSON.stringify({ error: { message, type: 'server_error' } });
       const { records } = upstreamError(upstreamBody, 500);
       writeConfig({ enabled: false, extra: `threshold_bytes = 1024\n${REMOTE}record_response_body = true\n` });
 
@@ -1336,23 +1339,30 @@ ${args.extra ?? ''}
       // path does, which is why the spool turns it into a bounded receive.
       assert.equal(clones, 1, 'with the spool off the error body is still read through a clone');
       assert.equal(records.length, 1);
-      assert.deepEqual(records[0].response_body, JSON.parse(upstreamBody));
-      assert.equal(clientText, upstreamBody, 'the clone leaves the client copy untouched');
+      assert.deepEqual(records[0].response_body, {
+        error: { message, type: 'server_error', param: null, code: null },
+      });
+      assert.equal(clientText, JSON.stringify({
+        error: { message, type: 'server_error', param: null, code: null },
+      }));
       assert.equal(responseSpills().length, 0, 'nothing is spilled when the spool is off');
     });
 
-    it('does not read the error body at all when record_response_body is off', async () => {
-      const upstreamBody = JSON.stringify({ error: { message: `unread ${'u'.repeat(6000)}`, type: 'server_error' } });
+    it('normalizes the error body without recording it when record_response_body is off', async () => {
+      const message = `unread ${'u'.repeat(6000)}`;
+      const upstreamBody = JSON.stringify({ error: { message, type: 'server_error' } });
       const { records } = upstreamError(upstreamBody, 500);
       writeConfig({ enabled: true, extra: `threshold_bytes = 1024\n${REMOTE}record_response_body = false\n` });
 
       const { value: response, clones } = await countingClones(() => handler.fetch(completionsRequest(), env()));
-      assert.equal(clones, 0, 'no body read, so nothing to clone');
+      assert.equal(clones, 0, 'the bounded normalization read does not clone');
       assert.deepEqual(responseSpills(), [], 'and nothing brought to disk on the way');
       const clientText = await response.text();
       await settleRecord();
 
-      assert.equal(clientText, upstreamBody);
+      assert.equal(clientText, JSON.stringify({
+        error: { message, type: 'server_error', param: null, code: null },
+      }));
       assert.equal(records.length, 1, 'the failure is still recorded, just without a body');
       assert.equal(records[0].response_status, 500);
       assert.equal('response_body' in records[0], false, 'the record carries no body');

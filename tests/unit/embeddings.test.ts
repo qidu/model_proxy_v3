@@ -57,8 +57,7 @@ describe('handleEmbeddingsRequest', () => {
 
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
-      type: 'error',
-      error: { type: 'error', message: 'Invalid JSON body' },
+      error: { message: 'Invalid JSON body', type: 'invalid_request_error', param: null, code: null },
     });
     assert.equal(calls(), 0);
   });
@@ -70,8 +69,7 @@ describe('handleEmbeddingsRequest', () => {
       const response = await handle(JSON.stringify({ model, input: 'text' }));
       assert.equal(response.status, 400);
       assert.deepEqual(await response.json(), {
-        type: 'error',
-        error: { type: 'error', message: 'Missing required field: model' },
+        error: { message: 'Missing required field: model', type: 'invalid_request_error', param: null, code: null },
       });
     }
     assert.equal(calls(), 0);
@@ -84,8 +82,7 @@ describe('handleEmbeddingsRequest', () => {
       const response = await handle(JSON.stringify(body));
       assert.equal(response.status, 400);
       assert.deepEqual(await response.json(), {
-        type: 'error',
-        error: { type: 'error', message: 'Missing required field: input' },
+        error: { message: 'Missing required field: input', type: 'invalid_request_error', param: null, code: null },
       });
     }
     assert.equal(calls(), 0);
@@ -168,7 +165,7 @@ describe('handleEmbeddingsRequest', () => {
     });
   });
 
-  it('forwards a non-OK upstream status and body unchanged', async () => {
+  it('normalizes a non-OK upstream body under the upstream status', async () => {
     const upstreamBody = JSON.stringify({ error: { message: 'quota exceeded' } });
     stubFetch(new Response(upstreamBody, { status: 429 }));
 
@@ -177,7 +174,9 @@ describe('handleEmbeddingsRequest', () => {
     assert.equal(response.status, 429);
     assert.equal(response.headers.get('content-type'), 'application/json');
     assert.equal(response.headers.get('x-request-id'), requestId);
-    assert.equal(await response.text(), upstreamBody);
+    assert.deepEqual(await response.json(), {
+      error: { message: 'quota exceeded', type: 'rate_limit_error', param: null, code: null },
+    });
   });
 
   it('returns 502 for malformed successful upstream JSON', async () => {
@@ -187,8 +186,7 @@ describe('handleEmbeddingsRequest', () => {
 
     assert.equal(response.status, 502);
     assert.deepEqual(await response.json(), {
-      type: 'error',
-      error: { type: 'error', message: 'Invalid upstream response' },
+      error: { message: 'Invalid upstream response', type: 'server_error', param: null, code: null },
     });
   });
 
@@ -334,10 +332,9 @@ describe('handleEmbeddingsRequest with upstream_mode "ollama-embed"', () => {
 
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
-      type: 'error',
       error: {
-        type: 'error',
         message: 'encoding_format "base64" is not supported by the "ollama-embed" upstream: Ollama\'s POST /api/embed returns float arrays only',
+        type: 'invalid_request_error', param: null, code: null,
       },
     });
     assert.equal(calls(), 0);
@@ -351,10 +348,9 @@ describe('handleEmbeddingsRequest with upstream_mode "ollama-embed"', () => {
 
       assert.equal(response.status, 502, `expected 502 for ${JSON.stringify(upstreamBody)}`);
       assert.deepEqual(await response.json(), {
-        type: 'error',
         error: {
-          type: 'error',
           message: 'Invalid upstream response: POST /api/embed returned no usable "embeddings" array',
+          type: 'server_error', param: null, code: null,
         },
       });
     }
@@ -374,7 +370,7 @@ describe('handleEmbeddingsRequest with upstream_mode "ollama-embed"', () => {
     });
   });
 
-  it('forwards a non-OK upstream status and body unchanged', async () => {
+  it('normalizes an Ollama error into the OpenAI client envelope', async () => {
     const upstreamBody = JSON.stringify({ error: 'model "nomic-embed-text" not found' });
     stubFetch(new Response(upstreamBody, { status: 404 }));
 
@@ -382,7 +378,9 @@ describe('handleEmbeddingsRequest with upstream_mode "ollama-embed"', () => {
 
     assert.equal(response.status, 404);
     assert.equal(response.headers.get('x-request-id'), requestId);
-    assert.equal(await response.text(), upstreamBody);
+    assert.deepEqual(await response.json(), {
+      error: { message: 'model "nomic-embed-text" not found', type: 'not_found_error', param: null, code: null },
+    });
   });
 
   it('leaves the body byte-identical when upstream_mode is absent or "openai-completions"', async () => {

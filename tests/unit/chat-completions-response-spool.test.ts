@@ -570,16 +570,14 @@ describe('chat-completions.ts openai-responses conversion, admission (§5.9)', (
 // ---------------------------------------------------------------------------
 
 /**
- * The two converted branches' `!response.ok` reads (`:128` for an
- * `anthropic-messages` upstream, `:368` for `gemini-generatecontent`) called
- * `response.text()` and *returned* the text to the client, so an error answer was
+ * The converted branches' `!response.ok` reads previously called
+ * `response.text()` and returned the text to the client, so an error answer was
  * the one body on this egress that no `max_response_bytes`, no spill and no §5.9
- * charge applied to. Both now go through `withResponseText` on the identity
- * consumer: the relayed bytes are unchanged, while a cap breach, a spill failure
- * or a §5.9 refusal propagates out of the handler instead of being handed to the
- * client as the upstream's own error. The handler has no enclosing try/catch, so
- * that propagation leaves it unmodified — the same path every other error on this
- * egress takes.
+ * charge applied to. They now go through `withResponseText` on the identity
+ * consumer and normalize the envelope for the OpenAI client while preserving the
+ * upstream status and message. A cap breach, a spill failure or a §5.9 refusal
+ * propagates out of the handler instead of being handed to the client as the
+ * upstream's own error.
  */
 
 const ERROR_SITES = [
@@ -609,17 +607,18 @@ async function thrownBy(run: () => Promise<unknown>): Promise<Error> {
 
 for (const site of ERROR_SITES) {
   describe(`chat-completions.ts ${site.name} upstream error body (§5.7)`, () => {
-    it('relays the error body through the spill, byte for byte', async () => {
+    it('normalizes the error body consistently through the spill', async () => {
       const payload = errorPayload('x'.repeat(400));
+      const expected = JSON.stringify({
+        error: { message: `upstream said ${'x'.repeat(400)}`, type: 'rate_limit_error', param: null, code: null },
+      });
 
-      // Baseline: spooling off, which is the `response.text()` behaviour this
-      // replaces — the same request must still answer the same way.
       setSpoolConfig(SPOOL_DEFAULTS);
       stubUpstream(() => errorResponse(payload));
       const baseline = await post(site.mode);
       const baselineText = await baseline.text();
       assert.equal(baseline.status, 429);
-      assert.equal(baselineText, payload);
+      assert.equal(baselineText, expected);
 
       const chunks = twoChunks(payload);
 
@@ -643,7 +642,7 @@ for (const site of ERROR_SITES) {
       assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the received prefix must be on disk, charged');
       assert.equal(response.status, baseline.status, 'the upstream status is still the client’s');
       assert.equal(response.headers.get('x-request-id'), 'req-chat-response');
-      assert.equal(text, baselineText, 'the relayed error body must be byte-identical');
+      assert.equal(text, baselineText, 'spooling must not change the normalized error body');
       assert.equal(calls(), 1);
       assert.deepEqual(spillFiles(config), [], 'the spill must be released before the response is returned');
       assert.equal(getLiveSpillBytes(), 0);

@@ -77,13 +77,11 @@ export class OverLimitError extends ClaudeProxyError {
  * Error thrown when an upstream API returned a 4xx/5xx with a response body.
  *
  * Claude Code matches upstream error wording for capability-rejection
- * recovery, so the client must receive the upstream body unmodified rather
- * than a proxy-synthesized envelope. This class carries that raw body (plus a
- * small bag of upstream headers worth preserving) through the throw/catch
- * path to createErrorResponse / createResponsesErrorResponse, which render it
- * verbatim. The synthesized `message` is still used for server-side logs and
- * failover classification (status / instanceof ClaudeProxyError semantics are
- * unchanged).
+ * recovery, so endpoint renderers preserve the upstream message while
+ * normalizing the envelope. This class carries that raw body (plus a small bag
+ * of upstream headers worth preserving) through the throw/catch path. The
+ * synthesized `message` is still used for server-side logs and failover
+ * classification (status / instanceof ClaudeProxyError semantics are unchanged).
  */
 export class UpstreamApiError extends ClaudeProxyError {
   constructor(
@@ -147,6 +145,37 @@ function isJsonBody(text: string): boolean {
   } catch {
     return false;
   }
+}
+
+function upstreamErrorField(error: UpstreamApiError, field: 'param' | 'code'): string | null {
+  try {
+    const parsed = JSON.parse(error.upstreamBody);
+    const value = parsed?.error?.[field];
+    return typeof value === 'string' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function errorResponseHeaders(error: Error, requestId: string | undefined, status: number): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const upstreamHeaders = error instanceof UpstreamApiError ? error.upstreamHeaders : undefined;
+  if (upstreamHeaders) {
+    for (const [key, value] of Object.entries(upstreamHeaders)) {
+      if (key !== 'content-type' && key !== 'retry-after') headers[key] = value;
+    }
+  }
+  if (requestId) headers['x-request-id'] = requestId;
+  applyRetryHeaders(headers, status, upstreamHeaders);
+  return headers;
+}
+
+function createRawUpstreamErrorResponse(error: Error, requestId?: string): Response | null {
+  if (!(error instanceof UpstreamApiError) || !error.upstreamBody || !isJsonBody(error.upstreamBody)) return null;
+  const headers = errorResponseHeaders(error, requestId, error.status);
+  const upstreamContentType = error.upstreamHeaders['content-type'];
+  if (upstreamContentType) headers['Content-Type'] = upstreamContentType;
+  return new Response(error.upstreamBody, { status: error.status, headers });
 }
 
 /**
@@ -235,28 +264,6 @@ export function createErrorResponse(
   requestId?: string,
   customStatus?: number
 ): Response {
-  // Upstream error with a captured body: forward the upstream body unmodified
-  // (Claude Code matches upstream error wording for capability-rejection
-  // recovery). Only JSON bodies are forwarded verbatim; a non-JSON or missing
-  // body falls through to the synthesized envelope below.
-  if (error instanceof UpstreamApiError && error.upstreamBody && isJsonBody(error.upstreamBody)) {
-    const passthroughHeaders: Record<string, string> = {};
-    for (const [k, v] of Object.entries(error.upstreamHeaders)) {
-      passthroughHeaders[k] = k === 'retry-after' ? (normalizeRetryAfterSeconds(v) ?? v) : v;
-    }
-    if (!passthroughHeaders['content-type']) {
-      passthroughHeaders['content-type'] = 'application/json';
-    }
-    if (requestId) {
-      passthroughHeaders['x-request-id'] = requestId;
-    }
-    applyRetryHeaders(passthroughHeaders, error.status, error.upstreamHeaders);
-    return new Response(error.upstreamBody, {
-      status: error.status,
-      headers: passthroughHeaders,
-    });
-  }
-
   let responseStatus = customStatus ?? 500;
   let errorType = 'error';
   let message = error.message;
@@ -264,6 +271,9 @@ export function createErrorResponse(
   if (error instanceof ClaudeProxyError) {
     responseStatus = error.status;
     errorType = error.type;
+    if (error instanceof UpstreamApiError) {
+      message = extractUpstreamMessage(error.upstreamBody) ?? error.message;
+    }
   } else if (customStatus === undefined) {
     // No explicit status and not a ClaudeProxyError — this is the outer-catch
     // path where transport errors (DNS / refused / TLS / abort) surface as
@@ -289,15 +299,7 @@ export function createErrorResponse(
     },
   };
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-
-  if (requestId) {
-    headers['x-request-id'] = requestId;
-  }
-
-  applyRetryHeaders(headers, responseStatus);
+  const headers = errorResponseHeaders(error, requestId, responseStatus);
 
   return new Response(JSON.stringify(errorResponse), {
     status: responseStatus,
@@ -307,8 +309,8 @@ export function createErrorResponse(
 
 /**
  * Extract the user-facing message from an upstream error response body.
- * Checks `error.message` (Anthropic/OpenAI format) then top-level `message`.
- * Returns undefined if no parseable message is found.
+ * Checks `error.message` (Anthropic/OpenAI/Gemini), a string `error` (Ollama),
+ * then top-level `message`. Returns undefined if no parseable message is found.
  */
 export function extractUpstreamMessage(rawBody: string | undefined): string | undefined {
   if (!rawBody) return undefined;
@@ -317,6 +319,9 @@ export function extractUpstreamMessage(rawBody: string | undefined): string | un
     if (parsed && typeof parsed === 'object') {
       if (parsed.error && typeof parsed.error === 'object' && typeof parsed.error.message === 'string' && parsed.error.message.trim()) {
         return parsed.error.message;
+      }
+      if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        return parsed.error;
       }
       if (typeof parsed.message === 'string' && parsed.message.trim()) {
         return parsed.message;
@@ -398,9 +403,8 @@ export function handleTargetApiError(
   }
 
   if (requestInfo?.upstreamBody) {
-    // Carry the raw upstream body to the client (see UpstreamApiError). The
-    // synthesized errorMessage above is kept for logs and failover
-    // classification only.
+    // Keep the source body so the endpoint renderer can preserve its message and
+    // fields without leaking the upstream protocol's envelope.
     throw new UpstreamApiError(errorMessage, status, errorType, requestInfo.upstreamBody, captureUpstreamErrorHeaders(response));
   }
   throw new ClaudeProxyError(errorMessage, status, errorType);
@@ -460,19 +464,12 @@ export function createResponsesErrorResponse(
     type = error.type;
     param = error.param;
     code = error.code;
-  } else if (error instanceof UpstreamApiError && error.upstreamBody && isJsonBody(error.upstreamBody)) {
-    // Forward the upstream error body unmodified (same rationale as
-    // createErrorResponse) with the upstream status.
-    const passthroughHeaders: Record<string, string> = {};
-    for (const [k, v] of Object.entries(error.upstreamHeaders)) {
-      passthroughHeaders[k] = k === 'retry-after' ? (normalizeRetryAfterSeconds(v) ?? v) : v;
-    }
-    if (!passthroughHeaders['content-type']) {
-      passthroughHeaders['content-type'] = 'application/json';
-    }
-    if (requestId) passthroughHeaders['x-request-id'] = requestId;
-    applyRetryHeaders(passthroughHeaders, error.status, error.upstreamHeaders);
-    return new Response(error.upstreamBody, { status: error.status, headers: passthroughHeaders });
+  } else if (error instanceof UpstreamApiError) {
+    status = error.status;
+    type = responsesErrorTypeForStatus(status);
+    message = extractUpstreamMessage(error.upstreamBody) ?? error.message;
+    param = upstreamErrorField(error, 'param');
+    code = upstreamErrorField(error, 'code');
   } else if (error instanceof ClaudeProxyError) {
     status = error.status;
     type = responsesErrorTypeForStatus(status);
@@ -487,14 +484,156 @@ export function createResponsesErrorResponse(
     type = responsesErrorTypeForStatus(status);
   }
 
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (requestId) headers['x-request-id'] = requestId;
-  applyRetryHeaders(headers, status);
+  const headers = errorResponseHeaders(error, requestId, status);
 
   return new Response(JSON.stringify({ error: { message, type, param, code } }), {
     status,
     headers,
   });
+}
+
+function openAIErrorTypeForStatus(status: number): string {
+  if (status === 400) return 'invalid_request_error';
+  if (status === 401) return 'authentication_error';
+  if (status === 403) return 'permission_error';
+  if (status === 404) return 'not_found_error';
+  if (status === 429) return 'rate_limit_error';
+  return status >= 500 ? 'server_error' : 'invalid_request_error';
+}
+
+/** Create an OpenAI-style error for Completions, Embeddings, and Models clients. */
+export function createOpenAIErrorResponse(
+  error: Error,
+  requestId?: string,
+  customStatus?: number,
+): Response {
+  let status = customStatus ?? 500;
+  let message = error.message;
+  let param: string | null = null;
+  let code: string | null = null;
+
+  if (error instanceof ClaudeProxyError) {
+    status = error.status;
+    if (error instanceof UpstreamApiError) {
+      message = extractUpstreamMessage(error.upstreamBody) ?? error.message;
+      param = upstreamErrorField(error, 'param');
+      code = upstreamErrorField(error, 'code');
+    }
+  } else if (customStatus === undefined) {
+    const classified = classifyTransportError(error);
+    if (classified) {
+      status = classified.status;
+      message = classified.message;
+    }
+  }
+
+  return new Response(JSON.stringify({
+    error: { message, type: openAIErrorTypeForStatus(status), param, code },
+  }), {
+    status,
+    headers: errorResponseHeaders(error, requestId, status),
+  });
+}
+
+/** Normalize an upstream error without changing the chat handler's return-based control flow. */
+export function createOpenAIUpstreamErrorResponse(
+  response: Response,
+  upstreamBody: string,
+  requestId?: string,
+): Response {
+  const message = extractUpstreamMessage(upstreamBody) ?? `Target API returned error: ${response.status}`;
+  const error = new UpstreamApiError(
+    message,
+    response.status,
+    openAIErrorTypeForStatus(response.status),
+    upstreamBody,
+    captureUpstreamErrorHeaders(response),
+  );
+  return createOpenAIErrorResponse(error, requestId);
+}
+
+function interactionsErrorCodeForStatus(status: number): string {
+  if (status === 404) return 'not_found';
+  if (status === 429) return 'rate_limit_exceeded';
+  return status >= 500 ? 'server_error' : 'invalid_request';
+}
+
+export function createInteractionsErrorResponse(error: Error, requestId?: string): Response {
+  let status = 500;
+  let message = error.message;
+  if (error instanceof ClaudeProxyError) {
+    status = error.status;
+    if (error instanceof UpstreamApiError) message = extractUpstreamMessage(error.upstreamBody) ?? error.message;
+  } else {
+    const classified = classifyTransportError(error);
+    if (classified) {
+      status = classified.status;
+      message = classified.message;
+    }
+  }
+  return new Response(JSON.stringify({
+    error: { message, code: interactionsErrorCodeForStatus(status) },
+  }), {
+    status,
+    headers: errorResponseHeaders(error, requestId, status),
+  });
+}
+
+function geminiErrorStatusForHttp(status: number): string {
+  if (status === 400) return 'INVALID_ARGUMENT';
+  if (status === 401) return 'UNAUTHENTICATED';
+  if (status === 403) return 'PERMISSION_DENIED';
+  if (status === 404) return 'NOT_FOUND';
+  if (status === 429) return 'RESOURCE_EXHAUSTED';
+  if (status === 502 || status === 503 || status === 504) return 'UNAVAILABLE';
+  return status >= 500 ? 'INTERNAL' : 'FAILED_PRECONDITION';
+}
+
+export function createGeminiErrorResponse(error: Error, requestId?: string): Response {
+  let status = 500;
+  let message = error.message;
+  if (error instanceof ClaudeProxyError) {
+    status = error.status;
+    if (error instanceof UpstreamApiError) message = extractUpstreamMessage(error.upstreamBody) ?? error.message;
+  } else {
+    const classified = classifyTransportError(error);
+    if (classified) {
+      status = classified.status;
+      message = classified.message;
+    }
+  }
+  return new Response(JSON.stringify({
+    error: { code: status, message, status: geminiErrorStatusForHttp(status) },
+  }), {
+    status,
+    headers: errorResponseHeaders(error, requestId, status),
+  });
+}
+
+/** Select the error envelope from the client-facing route, never the upstream mode. */
+export function createEndpointErrorResponse(error: Error, path: string, requestId?: string, customStatus?: number): Response {
+  const effectiveError = customStatus !== undefined && !(error instanceof ClaudeProxyError)
+    ? new ClaudeProxyError(error.message, customStatus)
+    : error;
+  if (path.startsWith('/passthrough/')) {
+    return createRawUpstreamErrorResponse(effectiveError, requestId) ?? createErrorResponse(effectiveError, requestId, customStatus);
+  }
+  if (path === '/v1/responses' || path.startsWith('/v1/responses/') || path.startsWith('/v1/responses?')) {
+    return createResponsesErrorResponse(effectiveError, requestId);
+  }
+  if (path === '/v1/chat/completions' || path.startsWith('/v1/chat/completions?') ||
+      path === '/v1/embeddings' || path.startsWith('/v1/embeddings?') ||
+      path === '/v1/models' || path.startsWith('/v1/models?')) {
+    return createOpenAIErrorResponse(effectiveError, requestId, customStatus);
+  }
+  if (path === '/v1/interactions' || path.startsWith('/v1/interactions?')) {
+    return createInteractionsErrorResponse(effectiveError, requestId);
+  }
+  if ((path.startsWith('/v1beta/models/') || path.startsWith('/v1/models/')) &&
+      (path.includes(':generateContent') || path.includes(':streamGenerateContent') || path.includes(':countTokens'))) {
+    return createGeminiErrorResponse(effectiveError, requestId);
+  }
+  return createErrorResponse(effectiveError, requestId, customStatus);
 }
 
 /**
@@ -536,9 +675,8 @@ export function handleResponsesApiError(
   }
 
   if (requestInfo?.upstreamBody) {
-    // Carry the raw upstream body to the client (see UpstreamApiError). The
-    // Responses-spec envelope below would discard the upstream wording Claude
-    // Code matches on for capability-rejection recovery.
+    // The Responses renderer keeps the upstream wording and any param/code
+    // fields while replacing the source protocol's envelope.
     throw new UpstreamApiError(errorMessage, status, responsesErrorTypeForStatus(status), requestInfo.upstreamBody, captureUpstreamErrorHeaders(response));
   }
   throw new ResponsesApiError(errorMessage, status, responsesErrorTypeForStatus(status));

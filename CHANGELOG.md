@@ -5,6 +5,18 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(errors): normalize upstream envelopes for each client API
+
+Upstream non-2xx responses and proxy-generated failures now use the client-facing
+endpoint's error schema instead of leaking the upstream protocol's envelope or
+falling back to Anthropic for every route. This covers OpenAI Chat Completions,
+Embeddings, and Models, Anthropic Messages, Responses, Interactions, and Gemini
+Generate Content/Count Tokens. The upstream HTTP status and extracted message are
+preserved, including invalid provider fields such as `"type": "<nil>"` being
+replaced with a status-appropriate client error type; OpenAI `param`/`code` and
+retry/rate-limit headers survive when available. Explicit `/passthrough/...`
+routes retain byte-for-byte JSON upstream error forwarding.
+
 ### fix(routing): accept native Clef criteria for composite decisions
 
 Composite target selection now preserves Clef's label-to-description `criteria`

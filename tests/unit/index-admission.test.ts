@@ -454,9 +454,8 @@ describe('§5.9 byte admission in the request path', () => {
 
     assert.equal(admittedAtSend, nominal(bytes, 2), 'a non-ref body holds its charge across the send');
     assert.equal(response.status, 503);
-    const payload = await response.json() as { type: string; error: { type: string; message: string } };
-    assert.equal(payload.type, 'error');
-    assert.equal(payload.error.type, 'over_limit_error');
+    const payload = await response.json() as { error: { code: string; message: string } };
+    assert.equal(payload.error.code, 'server_error');
     assert.match(payload.error.message, /admission timed out after 60 ms/);
     assert.equal(upstreamCalls, 1, 'the request itself was admitted — the refusal is the response admission');
     assert.equal(getAdmittedBytes(), 0);

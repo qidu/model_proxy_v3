@@ -12,7 +12,7 @@ import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fe
 import { recordResponseStatusCodeFromUpstream } from '../utils/dashboard-stats.js';
 import { recordUpstreamRateLimit } from '../utils/provider-quota.js';
 import { validateOpenAICompletionsRequest } from '../utils/validation.js';
-import { ValidationError } from '../utils/errors.js';
+import { ValidationError, createOpenAIUpstreamErrorResponse } from '../utils/errors.js';
 import { claudeJsonToSyntheticCompletions, claudeUsageToCompletions } from './openai.js';
 import { warnDroppedOutputItems } from './cross-mode-stream.js';
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
@@ -38,8 +38,7 @@ import { collectBlobRefs } from '../utils/blob-refs.js';
 import { createRefAwareJsonBody } from '../utils/ref-serializer.js';
 import { postJsonWithSpool } from '../utils/spool-json.js';
 import { getSpoolConfig } from '../utils/spool.js';
-import { receiveJsonResponse, receiveResponseBody, withResponseText } from '../utils/spool-response.js';
-import { admitResponseMaterialization, type AdmissionLease } from '../utils/spool-admission.js';
+import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 
 
 export async function handleChatCompletionsPassthrough(
@@ -167,16 +166,10 @@ export async function handleChatCompletionsPassthrough(
     logger.debug(requestId, `${path} resp: status=${upstreamResponse.status} stream=${isStreaming}`);
 
     if (!upstreamResponse.ok) {
-      // §5.7: the error body goes through the same bounded receive as a success
-      // body, on the identity consumer — this branch relays the upstream's own
-      // error bytes, it never converts them. A cap breach, a spill write failure
-      // or a §5.9 refusal therefore propagates as itself instead of being served
-      // to the client as the upstream's answer (rule #8).
+      // §5.7: bound the error body like a success body, then normalize only its
+      // envelope; the upstream status and message reach the OpenAI client intact.
       const errText = await withResponseText(upstreamResponse, requestId, logger, targetUrl, (text) => text, request.signal);
-      return new Response(errText, {
-        status: upstreamResponse.status,
-        headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
-      });
+      return createOpenAIUpstreamErrorResponse(upstreamResponse, errText, requestId);
     }
 
     if (isStreaming) {
@@ -382,39 +375,9 @@ export async function handleChatCompletionsPassthrough(
     recordUpstreamRateLimit(model, (name) => responsesUpstreamResponse.headers.get(name), targetUrl);
     logger.debug(requestId, `${path} resp: status=${responsesUpstreamResponse.status} stream=${isStreaming}`);
 
-    const responseHeaders = new Headers(responsesUpstreamResponse.headers);
-    responseHeaders.set('x-request-id', requestId);
-
-    // An error answer is not a Responses object to convert — it is relayed as
-    // bytes under the upstream's own status. §5.7: the body is received with
-    // bounded memory — `max_response_bytes` enforced, the upstream cancelled on
-    // breach — and forwarded from that spool unparsed. Identity forwarding never
-    // parses: the trace line reads the same spool rather than teeing a second
-    // reader that would pull the body through beside the client's.
     if (!responsesUpstreamResponse.ok) {
-      const received = await receiveResponseBody(responsesUpstreamResponse.body);
-      if (logger.traceEnabled) {
-        // §5.9: the trace line is this shape's only materialization, so it is
-        // the only thing charged, and the lease is given back as soon as it is read.
-        let lease: AdmissionLease;
-        try {
-          lease = await admitResponseMaterialization(received.size, request.signal);
-        } catch (error) {
-          await received.release();
-          throw error;
-        }
-        try {
-          logPipelineStage(logger, requestId, 'upstream-response', responsesUpstreamResponse.url || targetUrl, await received.readText());
-        } finally {
-          lease.release();
-        }
-      }
-      logPipelineHeaders(logger, requestId, 'outbound', path, responseHeaders);
-      return new Response(received.readStream(), {
-        status: responsesUpstreamResponse.status,
-        statusText: responsesUpstreamResponse.statusText,
-        headers: responseHeaders,
-      });
+      const errText = await withResponseText(responsesUpstreamResponse, requestId, logger, targetUrl, (text) => text, request.signal);
+      return createOpenAIUpstreamErrorResponse(responsesUpstreamResponse, errText, requestId);
     }
 
     if (isStreaming) {
@@ -573,12 +536,8 @@ export async function handleChatCompletionsPassthrough(
     logger.debug(requestId, `${path} resp: status=${geminiUpstreamResponse.status} stream=${isStreaming}`);
 
     if (!geminiUpstreamResponse.ok) {
-      // §5.7: bounded on the same identity consumer as the anthropic branch above.
       const errText = await withResponseText(geminiUpstreamResponse, requestId, logger, geminiTargetUrl, (text) => text, request.signal);
-      return new Response(errText, {
-        status: geminiUpstreamResponse.status,
-        headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
-      });
+      return createOpenAIUpstreamErrorResponse(geminiUpstreamResponse, errText, requestId);
     }
 
     if (isStreaming) {
@@ -807,9 +766,13 @@ export async function handleChatCompletionsPassthrough(
   recordUpstreamRateLimit((parsedBody.model as string) || modelId, (name) => upstreamResponse.headers.get(name), targetUrl);
   logger.debug(requestId, `${path} resp: status=${upstreamResponse.status} stream=${isStreaming}`);
 
-  // Forward the response body as-is. Pure passthrough: outbound body to the
-  // client equals the raw upstream-response body. §5.7: log the upstream bytes
-  // by observing the client's own path, not by teeing a second reader.
+  if (!upstreamResponse.ok) {
+    const errText = await withResponseText(upstreamResponse, requestId, logger, targetUrl, (text) => text, request.signal);
+    return createOpenAIUpstreamErrorResponse(upstreamResponse, errText, requestId);
+  }
+
+  // Forward successful response bodies as-is. §5.7: log the upstream bytes by
+  // observing the client's own path, not by teeing a second reader.
   const responseHeaders = new Headers(upstreamResponse.headers);
   responseHeaders.set('x-request-id', requestId);
 
@@ -901,10 +864,7 @@ async function handleAsGeminiInteractions(
   recordUpstreamRateLimit(model, name => upstreamResponse.headers.get(name), targetUrl);
   if (!upstreamResponse.ok) {
     const errText = await withResponseText(upstreamResponse, requestId, logger, targetUrl, text => text, request.signal);
-    return new Response(errText, {
-      status: upstreamResponse.status,
-      headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
-    });
+    return createOpenAIUpstreamErrorResponse(upstreamResponse, errText, requestId);
   }
 
   if (isStreaming) {

@@ -298,7 +298,7 @@ const SITES: Site[] = [
       assert.ok(body.includes(marker), 'the large model id must survive the bounded read');
       assert.equal((JSON.parse(body).data as unknown[]).length, 2);
     },
-    failure: { status: 500, type: 'processing_error' },
+    failure: { status: 500, type: 'server_error' },
   },
   {
     name: 'handleAnthropicModelsDiscovery',
@@ -401,8 +401,8 @@ for (const site of SITES) {
         const response = answer as Response;
         assert.equal(response.status, site.failure.status, 'the cap is a proxy limit, and the client is told so');
         assert.equal(response.headers.get('x-request-id'), REQUEST_ID);
-        const body = await response.json() as { type: string; error: { type: string; message: string } };
-        assert.equal(body.type, 'error');
+        const body = await response.json() as { type?: string; error: { type: string; message: string } };
+        if (site.name === 'handleAnthropicModelsDiscovery') assert.equal(body.type, 'error');
         assert.equal(body.error.type, site.failure.type);
         assert.match(body.error.message, /too large/);
       }
@@ -440,13 +440,11 @@ describe('handleModelsRequest degradation split (§5.7)', () => {
 
     const response = await handleModelsRequest(modelsRequest(), MODELS_TARGET, AUTH, REQUEST_ID, LOGGER, ENV);
 
-    // 503 over_limit_error, never the 200 config-only list: the body may be
-    // perfectly good JSON, so degrading here would hide a proxy limit behind a
-    // smaller answer (rule #8).
+    // The 503 must never become a 200 config-only list: the body may be perfectly
+    // good JSON, so degrading would hide a proxy limit behind a smaller answer.
     assert.equal(response.status, 503);
-    const body = await response.json() as { type: string; error: { type: string; message: string } };
-    assert.equal(body.type, 'error');
-    assert.equal(body.error.type, 'over_limit_error');
+    const body = await response.json() as { error: { type: string; message: string } };
+    assert.equal(body.error.type, 'server_error');
     assert.match(body.error.message, /exceed max_materialized_body_bytes/);
     assert.deepEqual(spillFiles(config), [], 'a refused body must not leave its bytes on disk');
     assert.equal(getLiveSpillBytes(), 0);
@@ -573,9 +571,8 @@ describe('upstream error bodies (§5.7)', () => {
     // list — a smaller success standing in for a proxy limit (rule #8).
     assert.equal(response.status, 500);
     assert.equal(response.headers.get('x-request-id'), REQUEST_ID);
-    const payload = await response.json() as { type: string; error: { type: string; message: string } };
-    assert.equal(payload.type, 'error');
-    assert.equal(payload.error.type, 'processing_error');
+    const payload = await response.json() as { error: { type: string; message: string } };
+    assert.equal(payload.error.type, 'server_error');
     assert.match(payload.error.message, /too large/);
     assert.equal(src.cancelled, true, 'the upstream body must be cancelled, not left flowing');
     assert.deepEqual(spillFiles(config), [], 'a rejected error body removes its partial spill');

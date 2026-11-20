@@ -106,6 +106,25 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
     return chunks.filter(s => s !== '[DONE]').map(s => JSON.parse(s));
   }
 
+  it('normalizes an Anthropic upstream error into the OpenAI client envelope', async () => {
+    const message = 'InvokeModel: ValidationException: max_tokens: 99999999 > 128000';
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      type: 'error',
+      error: { type: '<nil>', message },
+    }), { status: 400, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+
+    const response = await handleChatCompletionsPassthrough(
+      makeRequest({ model: 'a', messages: [{ role: 'user', content: 'Hello' }], max_tokens: 99999999 }),
+      'https://upstream/v1/messages',
+      { Authorization: 'Bearer k' }, 'rid', testLogger, env, 'a', 'anthropic-messages',
+    );
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: { message, type: 'invalid_request_error', param: null, code: null },
+    });
+  });
+
   it('reports an upstream refusal as content_filter, not as a clean stop', async () => {
     // The Anthropic dialect's member for a withheld answer is `refusal`
     // (`messages-create.md:4521`); the Completions member for the same fact is

@@ -470,10 +470,16 @@ for (const site of SITES) {
       if (site.malformedIs502) {
         const response = await site.invoke();
         assert.equal(response.status, 502, 'a body that is not JSON is still "Invalid upstream response"');
-        assert.deepEqual(await response.json(), {
-          type: 'error',
-          error: { type: 'error', message: 'Invalid upstream response' },
-        });
+        if (site.name === 'embeddings') {
+          assert.deepEqual(await response.json(), {
+            error: { message: 'Invalid upstream response', type: 'server_error', param: null, code: null },
+          });
+        } else {
+          assert.deepEqual(await response.json(), {
+            type: 'error',
+            error: { type: 'error', message: 'Invalid upstream response' },
+          });
+        }
       } else {
         const caught = await caughtFrom(() => site.invoke());
         assert.ok(caught instanceof SyntaxError, `expected SyntaxError, got ${String(caught)}`);
@@ -523,15 +529,16 @@ for (const site of SITES) {
 // ---------------------------------------------------------------------------
 
 /**
- * The two handlers whose `!response.ok` branch reads a body at all. Both forward
- * the upstream error body verbatim, so one table covers them; token counting
- * reads nothing on that branch (it warns and falls back to the character count).
+ * The two handlers whose `!response.ok` branch reads a body at all. Embeddings
+ * normalizes the upstream error into OpenAI's envelope; decision forwards it
+ * verbatim. Token counting reads nothing on that branch (it warns and falls back
+ * to the character count).
  */
 const ERROR_SITES = SITES.filter((site) => site.name !== 'token-counting');
 
 for (const site of ERROR_SITES) {
   describe(`${site.name} upstream error body (§5.7)`, () => {
-    it('forwards an upstream error body verbatim, having spilled it on the way', async () => {
+    it('preserves an upstream error through the spill and the handler output contract', async () => {
       const config = configureSpool();
       const status = 429;
       const errorBody = JSON.stringify({
@@ -553,7 +560,13 @@ for (const site of ERROR_SITES) {
       assert.deepEqual(seen[1], { files: 1, bytes: chunks[0].byteLength }, 'the error body must have been on disk mid-receive');
       assert.equal(response.status, status, 'the upstream status must reach the client unedited');
       assert.equal(response.headers.get('x-request-id'), REQUEST_ID);
-      assert.equal(await response.text(), errorBody, 'the error body must be forwarded byte for byte');
+      if (site.name === 'embeddings') {
+        assert.deepEqual(await response.json(), {
+          error: { message: `upstream says ${'x'.repeat(300)}`, type: 'rate_limit_error', param: null, code: null },
+        });
+      } else {
+        assert.equal(await response.text(), errorBody, 'the decision error body must be forwarded byte for byte');
+      }
       assert.deepEqual(spillFiles(config), [], 'the spill must be released before the response is returned');
       assert.equal(clones, 0, 'the proxy must not hold a second copy of the body');
     });

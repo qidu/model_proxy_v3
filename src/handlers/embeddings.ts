@@ -10,7 +10,7 @@
  */
 
 import type { Env, Logger } from '../types/shared.js';
-import { createErrorResponse } from '../utils/errors.js';
+import { createOpenAIErrorResponse, createOpenAIUpstreamErrorResponse } from '../utils/errors.js';
 import { addForwardedHeaders } from '../utils/routing.js';
 import { createUpstreamAbortSignal, getUpstreamBodyTimeoutMs } from '../utils/fetch-timeout.js';
 import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
@@ -82,15 +82,15 @@ export async function handleEmbeddingsRequest(
   try {
     body = JSON.parse(bodyText);
   } catch {
-    return createErrorResponse(new Error('Invalid JSON body'), requestId, 400);
+    return createOpenAIErrorResponse(new Error('Invalid JSON body'), requestId, 400);
   }
 
   // Validate required fields
   if (!body.model || typeof body.model !== 'string') {
-    return createErrorResponse(new Error('Missing required field: model'), requestId, 400);
+    return createOpenAIErrorResponse(new Error('Missing required field: model'), requestId, 400);
   }
   if (body.input === undefined || body.input === null) {
-    return createErrorResponse(new Error('Missing required field: input'), requestId, 400);
+    return createOpenAIErrorResponse(new Error('Missing required field: input'), requestId, 400);
   }
 
   const isOllamaEmbed = upstreamMode === 'ollama-embed';
@@ -99,7 +99,7 @@ export async function handleEmbeddingsRequest(
   // honoured. Handing back floats to a caller that asked for base64 would be a
   // silent correctness bug, so reject it explicitly.
   if (isOllamaEmbed && body.encoding_format === 'base64') {
-    return createErrorResponse(
+    return createOpenAIErrorResponse(
       new Error('encoding_format "base64" is not supported by the "ollama-embed" upstream: Ollama\'s POST /api/embed returns float arrays only'),
       requestId,
       400,
@@ -121,10 +121,6 @@ export async function handleEmbeddingsRequest(
 
   if (!upstreamResponse.ok) {
     logger.error(requestId, `Upstream embedding error: ${upstreamResponse.status}`);
-    // Forward upstream error as-is. §5.7: one bounded receive, as on the success
-    // path below — `max_response_bytes` bounds an error body too, and a cap
-    // breach, a spill write failure or a §5.9 refusal propagates as itself rather
-    // than being forwarded as though it came from the upstream (rule #8).
     const errorText = await withResponseText(
       upstreamResponse,
       requestId,
@@ -133,13 +129,7 @@ export async function handleEmbeddingsRequest(
       (text) => text,
       request.signal,
     );
-    return new Response(errorText, {
-      status: upstreamResponse.status,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-request-id': requestId,
-      },
-    });
+    return createOpenAIUpstreamErrorResponse(upstreamResponse, errorText, requestId);
   }
 
   // §5.7: one bounded receive — above `threshold_bytes` the body lives on this
@@ -158,13 +148,13 @@ export async function handleEmbeddingsRequest(
     // breach, a write failure or a §5.9 refusal is one of the proxy's own limits
     // and must surface as itself, not as a claim about the upstream (rule #8).
     if (!(error instanceof SyntaxError)) throw error;
-    return createErrorResponse(new Error('Invalid upstream response'), requestId, 502);
+    return createOpenAIErrorResponse(new Error('Invalid upstream response'), requestId, 502);
   }
 
   if (isOllamaEmbed) {
     const converted = fromOllamaEmbedResponse(responseData, body.model);
     if (!converted) {
-      return createErrorResponse(
+      return createOpenAIErrorResponse(
         new Error('Invalid upstream response: POST /api/embed returned no usable "embeddings" array'),
         requestId,
         502,

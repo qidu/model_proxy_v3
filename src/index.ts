@@ -10,7 +10,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { extractAuthHeaders, transformAuthHeadersForUpstream, formatApiKeyForUpstream, parseDynamicRoute, isHostAllowed, getHandlerType, buildTargetUrl, buildUpstreamUrl, sanitizeUpstreamResponseHeaders, getSidecarForwardedHeaders } from './utils/routing.js';
 import { extractRawCredential } from './utils/auth-headers.js';
-import { createErrorResponse, createResponsesErrorResponse, OverLimitError, ClaudeProxyError, ResponsesApiError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
+import { createErrorResponse, createEndpointErrorResponse, createResponsesErrorResponse, OverLimitError, ClaudeProxyError, ResponsesApiError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { wrapSseStreamWithKeepAlive } from './utils/sse-keepalive.js';
 import { createLogger, type Logger } from './utils/logger.js';
 import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled, isAnthropicModelId, toAnthropicModel } from './handlers/models.js';
@@ -1051,8 +1051,9 @@ export default {
       const devNoKey = env.DEV_NO_KEY === 'true' || env.DEV_NO_KEY === '1';
       if (!hasAuth && !devNoKey && !isModelsListPath) {
         logger.warn(requestId, `Missing auth headers (need Authorization, x-api-key, or x-goog-api-key) for ${path}`);
-        return createErrorResponse(
+        return createEndpointErrorResponse(
           new Error('Missing authentication: provide Authorization, x-api-key, or x-goog-api-key header.'),
+          path,
           requestId,
           401
         );
@@ -1113,8 +1114,9 @@ export default {
           // applies with `[spool] enabled = false` too — that switch decides
           // whether disk is used, not whether the body is bounded.
           logger.warn(requestId, `Auth server (${authUrl}) unreachable: ${(err as Error).message}`);
-          return createErrorResponse(
+          return createEndpointErrorResponse(
             new Error(`Authentication service unavailable: could not reach remote auth server (${authUrl}). ${(err as Error).message}`),
+            path,
             requestId,
             503,
           );
@@ -1152,7 +1154,7 @@ export default {
           const detail = authServiceMessage
             ? `Remote auth server rejected the request (HTTP ${authStatus}): ${authServiceMessage}`
             : `Remote auth server rejected the request (HTTP ${authStatus}). This is a failure from the configured remote auth_server.`;
-          return createErrorResponse(new Error(detail), requestId, 401);
+          return createEndpointErrorResponse(new Error(detail), path, requestId, 401);
         }
 
         // Contract gate: a 200 response MUST advertise the wire-contract
@@ -1161,8 +1163,9 @@ export default {
         // reject (401) before parsing any `targets[]` (never silently fall back).
         if (!hasRequiredProtocolVersion(authRespBodyText)) {
           logger.warn(requestId, `Remote auth server (${authUrl}) returned 200 without a valid "version" field for ${path}; rejecting.`);
-          return createErrorResponse(
+          return createEndpointErrorResponse(
             new Error('Remote auth server response is missing the required "version" field. This is a failure from the configured remote auth_server.'),
+            path,
             requestId,
             401,
           );
@@ -1272,7 +1275,7 @@ export default {
           } else {
             logger.warn(requestId, `Request body rejected: ${(error as Error).message}`);
           }
-          return createErrorResponse(error as Error, requestId);
+          return createEndpointErrorResponse(error as Error, path, requestId);
         }
       }
 
@@ -1995,7 +1998,7 @@ export default {
           // error type. Only swallow generic errors as a 400 body-parse failure.
           if (error instanceof ClaudeProxyError) {
             logger.error(requestId, `Proxy error during model routing ${path}: ${error.message}`);
-            return createErrorResponse(error, requestId);
+            return createEndpointErrorResponse(error, path, requestId);
           }
           logger.error(requestId, `Failed to parse request body for model routing ${path}: ${(error as Error).message}`);
           const invalidBodyError = new ClaudeProxyError('Invalid request body', 400, 'invalid_request_error');
@@ -2612,7 +2615,7 @@ export default {
             // be forwarded: the refusal is the client's answer, not a footnote
             // in the dump (rule #8).
             logger.warn(requestId, `Request body not available for the debug log: ${(error as Error).message}`);
-            return createErrorResponse(error as Error, requestId);
+            return createEndpointErrorResponse(error as Error, path, requestId);
           }
           try {
             const { writeFileSync } = await import('fs');
@@ -3240,9 +3243,8 @@ export default {
       return applyCorsHeaders(await restorePrivacyResponse(response, piiMapping, requestId, logger, request.signal), request, env);
 
     } catch (error) {
-      // Handle errors without exposing sensitive info. The envelope shape
-      // follows the endpoint family: Responses-spec for /v1/responses routes,
-      // Anthropic for everything else.
+      // Handle errors without exposing sensitive info. The envelope follows the
+      // client-facing endpoint family, independently of the upstream wire mode.
       if (!modelFailureRecorded && failedModelId) {
         recordModelFailedRequest(failedModelId);
       }
@@ -3250,10 +3252,7 @@ export default {
       logger.error(requestId, `Catch Error [model=${failedModelId ?? '-'} status=${err.status ?? '-'} type=${err.type ?? '-'}: ${err.message}`);
       recordRequestTiming(path, Date.now() - requestStartTime);
       recordModelTiming(failedModelId, Date.now() - requestStartTime);
-      if (path === '/v1/responses' || path.startsWith('/v1/responses/') || path.startsWith('/v1/responses?')) {
-        return createResponsesErrorResponse(error as Error, requestId);
-      }
-      return createErrorResponse(error as Error, requestId);
+      return createEndpointErrorResponse(error as Error, path, requestId);
     }
     })();
     } finally {

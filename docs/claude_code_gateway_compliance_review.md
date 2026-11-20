@@ -33,7 +33,7 @@ Consequences:
 
 Per the scope rule, the *header*-preservation half of this fix applies to `anthropic-messages` only; the *body*-forwarding half applies to every path, since error wording is payload, not an Anthropic header.
 
-**Status**: ✅ **FIXED** — `handleTargetApiError`/`handleResponsesApiError` now throw `UpstreamApiError` (a `ClaudeProxyError` subclass carrying the raw upstream body + preserved headers); `createErrorResponse`/`createResponsesErrorResponse` render that body verbatim with the upstream status. Non-JSON/missing bodies still fall back to the synthesized envelope. The synthesized message is retained for logs and failover classification (status/`instanceof` semantics unchanged).
+**Status**: ✅ **FIXED** — `handleTargetApiError`/`handleResponsesApiError` throw `UpstreamApiError` (a `ClaudeProxyError` subclass carrying the raw upstream body + preserved headers). Endpoint renderers preserve the upstream message, status, and retry headers while normalizing the envelope for the client-facing API, so cross-protocol routes do not leak upstream schemas. Explicit `/passthrough/...` routes still render JSON upstream bodies verbatim. The synthesized message is retained for logs and failover classification (status/`instanceof` semantics unchanged).
 
 ---
 
@@ -305,7 +305,7 @@ Net after scoping: **10 FIXED/COMPLIANT, 1 PARTIAL-and-mostly-done, 2 PENDING.**
 
 All items below are scoped to `anthropic-messages` unless noted.
 
-1. ~~**Item 1**~~ — DONE. Error body forwarding via `UpstreamApiError` + verbatim rendering in `createErrorResponse`/`createResponsesErrorResponse`.
+1. ~~**Item 1**~~ — DONE. Error wording and headers are carried by `UpstreamApiError`; endpoint renderers normalize envelopes, with verbatim rendering reserved for explicit `/passthrough/...` routes.
 2. ~~**Item 2**~~ — DONE. `retry-after` + `x-should-retry` emitted on all proxy-generated 429/503.
 3. ~~**Item 3**~~ — DONE. Ping synthesis via `wrapSseStreamWithKeepAlive`, applied centrally in runAttempt and in the passthrough handler.
 4. **Item 4** — DONE for shape/filter/gate/UA (`claude-cli` + `claude-code`). **Item 13 remains**: the 3 s cap / redirect-failure / fail-loud behavior exists only in the gated `handleAnthropicModelsDiscovery`; `handleModelsRequest` still uses the generic upstream timeout and swallows upstream failures into a config-only list.

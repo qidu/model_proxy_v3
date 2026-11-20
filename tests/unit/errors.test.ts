@@ -12,6 +12,7 @@ import {
   UpstreamApiError,
   classifyTransportError,
   createErrorResponse,
+  createEndpointErrorResponse,
   handleTargetApiError,
   validateRequired,
   validateString,
@@ -145,15 +146,18 @@ describe('createErrorResponse', () => {
     assert.equal(resp.status, 503);
   });
 
-  it('forwards an upstream error body unmodified with status and headers', async () => {
-    const upstreamBody = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'model does not support tools' } });
+  it('normalizes an upstream error body while preserving its message, status, and headers', async () => {
+    const upstreamBody = JSON.stringify({ error: { message: 'model does not support tools', type: '<nil>' } });
     const err = new UpstreamApiError('synthesized log message', 400, 'invalid_request_error', upstreamBody, {
       'content-type': 'application/json',
       'anthropic-ratelimit-unified-status': 'rejected',
     });
     const resp = createErrorResponse(err, 'req-upstream');
     assert.equal(resp.status, 400);
-    assert.equal(await resp.text(), upstreamBody);
+    assert.deepEqual(await resp.json(), {
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'model does not support tools' },
+    });
     assert.equal(resp.headers.get('x-request-id'), 'req-upstream');
     assert.equal(resp.headers.get('anthropic-ratelimit-unified-status'), 'rejected');
   });
@@ -189,6 +193,70 @@ describe('createErrorResponse', () => {
     const resp = createErrorResponse(err);
     assert.equal(resp.headers.get('retry-after'), '18');
     assert.equal(resp.headers.get('x-should-retry'), 'false');
+  });
+});
+
+describe('createEndpointErrorResponse', () => {
+  const upstreamBody = JSON.stringify({
+    type: 'error',
+    error: { type: '<nil>', message: 'max_tokens exceeds the model limit', param: 'max_tokens', code: 'too_many' },
+  });
+  const upstreamError = () => new UpstreamApiError(
+    'log-only message', 400, 'invalid_request_error', upstreamBody, { 'retry-after': '7' },
+  );
+
+  const cases = [
+    {
+      path: '/v1/chat/completions',
+      expected: { error: { message: 'max_tokens exceeds the model limit', type: 'invalid_request_error', param: 'max_tokens', code: 'too_many' } },
+    },
+    {
+      path: '/v1/embeddings',
+      expected: { error: { message: 'max_tokens exceeds the model limit', type: 'invalid_request_error', param: 'max_tokens', code: 'too_many' } },
+    },
+    {
+      path: '/v1/models',
+      expected: { error: { message: 'max_tokens exceeds the model limit', type: 'invalid_request_error', param: 'max_tokens', code: 'too_many' } },
+    },
+    {
+      path: '/v1/messages',
+      expected: { type: 'error', error: { type: 'invalid_request_error', message: 'max_tokens exceeds the model limit' } },
+    },
+    {
+      path: '/v1/responses',
+      expected: { error: { message: 'max_tokens exceeds the model limit', type: 'invalid_request', param: 'max_tokens', code: 'too_many' } },
+    },
+    {
+      path: '/v1/interactions',
+      expected: { error: { message: 'max_tokens exceeds the model limit', code: 'invalid_request' } },
+    },
+    {
+      path: '/v1beta/models/claude-test:generateContent',
+      expected: { error: { code: 400, message: 'max_tokens exceeds the model limit', status: 'INVALID_ARGUMENT' } },
+    },
+  ];
+
+  for (const { path, expected } of cases) {
+    it(`uses the ${path} client envelope for an Anthropic upstream error`, async () => {
+      const response = createEndpointErrorResponse(upstreamError(), path, 'req-endpoint');
+      assert.equal(response.status, 400);
+      assert.equal(response.headers.get('x-request-id'), 'req-endpoint');
+      assert.deepEqual(await response.json(), expected);
+    });
+  }
+
+  it('keeps explicit passthrough upstream bodies byte-for-byte', async () => {
+    const response = createEndpointErrorResponse(upstreamError(), '/passthrough/v1/chat/completions', 'req-passthrough');
+    assert.equal(response.status, 400);
+    assert.equal(await response.text(), upstreamBody);
+  });
+
+  it('uses endpoint envelopes for local errors with an explicit status', async () => {
+    const response = createEndpointErrorResponse(new Error('missing credentials'), '/v1/chat/completions', 'req-auth', 401);
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), {
+      error: { message: 'missing credentials', type: 'authentication_error', param: null, code: null },
+    });
   });
 });
 

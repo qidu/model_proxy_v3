@@ -250,7 +250,7 @@ describe('handleChatCompletionsPassthrough — openai-responses streaming conver
     assertNoTerminalFrame(partial);
   });
 
-  it('relays an upstream error body unchanged, under the upstream status', async () => {
+  it('normalizes an upstream error under the upstream status', async () => {
     globalThis.fetch = (async () => new Response(JSON.stringify({ error: { message: 'bad key' } }), {
       status: 401,
       headers: { 'content-type': 'application/json' },
@@ -261,6 +261,8 @@ describe('handleChatCompletionsPassthrough — openai-responses streaming conver
 
     assert.equal(response.status, 401);
     assert.equal(response.headers.get('x-request-id'), 'rid');
-    assert.deepEqual(await response.json(), { error: { message: 'bad key' } });
+    assert.deepEqual(await response.json(), {
+      error: { message: 'bad key', type: 'authentication_error', param: null, code: null },
+    });
   });
 });
