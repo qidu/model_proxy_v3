@@ -302,18 +302,32 @@ export async function convertClaudeToGeminiRequest(
     // upstream answered with its own defaults.
     const thinking = claudeRequest.thinking;
     const stopSequences = Array.isArray(claudeRequest.stop_sequences) ? claudeRequest.stop_sequences : [];
+    const responseFormat = claudeRequest.output_config?.format;
+    const effort = claudeRequest.output_config?.effort ?? claudeRequest.reasoning_effort;
     // A disabled config is not a knob — it asks for the upstream's default — so it
     // must not create a generation_config on its own.
     const thinkingOn = thinking !== undefined && thinking.type !== 'disabled' && thinking.type !== false;
     if (
         claudeRequest.temperature !== undefined ||
+        claudeRequest.top_p !== undefined ||
         claudeRequest.max_tokens !== undefined ||
         thinkingOn ||
-        stopSequences.length > 0
+        effort !== undefined ||
+        stopSequences.length > 0 ||
+        responseFormat !== undefined
     ) {
         const config: Record<string, unknown> = {};
         if (claudeRequest.temperature !== undefined) config.temperature = claudeRequest.temperature;
+        if (claudeRequest.top_p !== undefined) config.top_p = claudeRequest.top_p;
         if (claudeRequest.max_tokens !== undefined) config.max_output_tokens = claudeRequest.max_tokens;
+        if (responseFormat !== undefined) {
+            const schema = responseFormat.schema as unknown;
+            if (responseFormat.type !== 'json_schema' || !schema || typeof schema !== 'object' || Array.isArray(schema)) {
+                throw new Error('Cannot convert Claude output_config.format to Gemini: json_schema requires a schema object');
+            }
+            config.response_mime_type = 'application/json';
+            config.response_schema = recursivelyCleanSchema(schema);
+        }
         // Claude `stop_sequences` -> generationConfig.stopSequences (snake_case is
         // this block's spelling, as `max_output_tokens` above; Google's JSON
         // parser accepts the proto field name).
@@ -324,12 +338,15 @@ export async function convertClaudeToGeminiRequest(
         // reasoning withheld, so the client could never see it. `type: 'enabled'`
         // with no budget means "dynamic" upstream: the budget field is omitted
         // rather than guessed.
-        if (thinkingOn && thinking) {
-            const budget = 'budget_tokens' in thinking ? thinking.budget_tokens : undefined;
-            config.thinking_config = {
-                include_thoughts: true,
-                ...(typeof budget === 'number' && budget > 0 ? { thinking_budget: budget } : {}),
-            };
+        if (thinkingOn || effort) {
+            const thinkingConfig: Record<string, unknown> = {};
+            if (effort) thinkingConfig.thinking_level = effort === 'max' ? 'HIGH' : effort.toUpperCase();
+            if (thinkingOn && thinking) {
+                const budget = 'budget_tokens' in thinking ? thinking.budget_tokens : undefined;
+                thinkingConfig.include_thoughts = true;
+                if (typeof budget === 'number' && budget > 0) thinkingConfig.thinking_budget = budget;
+            }
+            config.thinking_config = thinkingConfig;
         }
         request.generation_config = config;
     }

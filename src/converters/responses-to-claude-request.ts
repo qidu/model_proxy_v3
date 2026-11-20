@@ -338,6 +338,7 @@ export function responsesToClaudeBody(
   if (typeof reasoning?.effort === 'string') {
     outputConfig.effort = reasoning.effort === 'minimal' ? 'low' : reasoning.effort === 'xhigh' ? 'max' : reasoning.effort;
   }
+  if (reasoning?.summary === 'auto') body.thinking = { type: 'enabled' };
   const text = asRecord(request.text);
   const format = asRecord(text?.format);
   if (format?.type === 'json_schema') {

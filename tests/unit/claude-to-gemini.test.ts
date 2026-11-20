@@ -196,6 +196,45 @@ describe('convertClaudeToGeminiRequest', async () => {
     });
   });
 
+  it('maps top_p into generation_config when it is the only generation knob', async () => {
+    const req = {
+      model: 'gemini',
+      top_p: 0.5,
+      messages: [{ role: 'user', content: 'hi' }],
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.generation_config, { top_p: 0.5 });
+  });
+
+  it('maps structured output into generation_config when it is the only generation knob', async () => {
+    const req = {
+      model: 'gemini',
+      output_config: {
+        format: {
+          type: 'json_schema',
+          schema: {
+            type: 'object',
+            properties: { answer: { type: 'string' } },
+            required: ['answer'],
+            additionalProperties: false,
+          },
+        },
+      },
+      messages: [{ role: 'user', content: 'Return a JSON object' }],
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.generation_config, {
+      response_mime_type: 'application/json',
+      response_schema: {
+        type: 'object',
+        properties: { answer: { type: 'string' } },
+        required: ['answer'],
+      },
+    });
+  });
+
   it('omits generation_config when neither temperature nor max_tokens is set', async () => {
     const req = {
       model: 'gemini',
@@ -218,6 +257,20 @@ describe('convertClaudeToGeminiRequest', async () => {
     assert.deepEqual(out.generation_config, {
       max_output_tokens: 16384,
       thinking_config: { include_thoughts: true, thinking_budget: 8192 },
+    });
+  });
+
+  it('combines output effort and enabled thinking in thinking_config', async () => {
+    const req = {
+      model: 'gemini',
+      output_config: { effort: 'high' },
+      thinking: { type: 'enabled' },
+      messages: [{ role: 'user', content: 'hi' }],
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = await convertClaudeToGeminiRequest(req) as any;
+    assert.deepEqual(out.generation_config, {
+      thinking_config: { thinking_level: 'HIGH', include_thoughts: true },
     });
   });
 

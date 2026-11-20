@@ -66,7 +66,7 @@ describe('Responses → Claude direct request conversion', () => {
   it('maps native tools, reasoning, structured output, and parallel-tool policy directly', () => {
     const body = responsesToClaudeBody({
       model: 'client-model', input: 'search and run', max_output_tokens: 128,
-      reasoning: { effort: 'high' }, parallel_tool_calls: false,
+      reasoning: { effort: 'high', summary: 'auto' }, parallel_tool_calls: false,
       text: { format: { type: 'json_schema', name: 'answer', schema: { type: 'object' } } },
       tools: [
         { type: 'function', name: 'lookup', parameters: { type: 'object' }, strict: true },
@@ -92,6 +92,7 @@ describe('Responses → Claude direct request conversion', () => {
     assert.deepEqual(body.output_config, {
       effort: 'high', format: { type: 'json_schema', schema: { type: 'object' } },
     });
+    assert.deepEqual(body.thinking, { type: 'enabled' });
   });
 
   it('keeps reasoning, function calls, results, and text in input order without a Completions hub', () => {

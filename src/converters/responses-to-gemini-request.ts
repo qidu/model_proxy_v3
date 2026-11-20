@@ -278,7 +278,6 @@ export async function responsesToGeminiBody(
   const body: Record<string, unknown> = {
     model,
     contents,
-    stream: request.stream === true,
     ...(instructions.length > 0 ? { systemInstruction: { parts: [{ text: instructions.join('\n') }] } } : {}),
     ...(declarations.length > 0 || nativeTools.length > 0
       ? { tools: [...(declarations.length > 0 ? [{ functionDeclarations: declarations }] : []), ...nativeTools] }
@@ -303,7 +302,11 @@ export async function responsesToGeminiBody(
   if (request.stop !== undefined) generation.stopSequences = Array.isArray(request.stop) ? request.stop : [request.stop];
   const reasoning = asRecord(request.reasoning);
   const thinking: Record<string, unknown> = {};
-  if (typeof reasoning?.effort === 'string') thinking.thinkingLevel = reasoning.effort;
+  if (typeof reasoning?.effort === 'string') {
+    thinking.thinkingLevel = reasoning.effort === 'max' || reasoning.effort === 'xhigh'
+      ? 'HIGH'
+      : reasoning.effort.toUpperCase();
+  }
   if (reasoning?.summary === 'auto') thinking.includeThoughts = true;
   if (Object.keys(thinking).length > 0) generation.thinkingConfig = thinking;
   const format = asRecord(asRecord(request.text)?.format);

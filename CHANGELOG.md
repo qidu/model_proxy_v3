@@ -5,6 +5,42 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(gemini): emit valid uppercase thinking levels
+
+Generate Content requests now use the SDK-declared uppercase `ThinkingLevel`
+values (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`). Both direct Responses→Gemini and
+Claude→Gemini conversion apply the casing, and Responses `max` / `xhigh` efforts
+fold to the highest Gemini level, `HIGH`.
+
+### fix(gemini): preserve Responses reasoning through Claude
+
+Responses `reasoning.summary: "auto"` now enables Claude thinking without
+inventing a token budget. Claude `output_config.effort` / `reasoning_effort` and
+thinking settings combine into Gemini `generation_config.thinking_config`, so the
+legacy Responses→Claude→Gemini chain retains both the requested level and thought
+summaries.
+
+### fix(gemini): preserve Claude structured output schemas
+
+Claude Messages `output_config.format` now converts to Gemini
+`generation_config.response_mime_type: "application/json"` and a cleaned
+`response_schema`, including when structured output is the only generation knob.
+This preserves Responses `text.format` on routes that bridge through Claude.
+
+### fix(gemini): preserve Claude top_p sampling
+
+Claude Messages requests converted to Gemini Generate Content now retain `top_p`
+as `generation_config.top_p`, including when it is the only generation knob. This
+also preserves `top_p` on routes that bridge Responses through Claude instead of
+using the direct Responses→Gemini converter.
+
+### fix(responses): omit the unsupported Gemini stream body field
+
+`/v1/responses` requests routed to `gemini-generatecontent` no longer include
+`stream` in the upstream JSON body. Streaming remains selected exclusively by the
+`:streamGenerateContent?alt=sse` URL, preventing Gemini from rejecting both streaming
+and non-streaming requests with `Unknown name "stream"`.
+
 ### fix(chat-completions): preserve Responses reasoning token usage
 
 Completions responses routed through `openai-responses` now map upstream

@@ -165,11 +165,18 @@ describe('Responses → generateContent direct request conversion', () => {
     });
     assert.deepEqual(body.generationConfig, {
       maxOutputTokens: 128,
-      thinkingConfig: { thinkingLevel: 'high', includeThoughts: true },
+      thinkingConfig: { thinkingLevel: 'HIGH', includeThoughts: true },
       responseMimeType: 'application/json', responseJsonSchema: { type: 'object' },
     });
     assert.equal(JSON.stringify(body).includes('__namespaceMap'), false);
     assert.equal(JSON.stringify(body).includes('"messages"'), false);
+  });
+
+  it('folds max and xhigh reasoning efforts to Gemini HIGH', async () => {
+    for (const effort of ['max', 'xhigh']) {
+      const body = await responsesToGeminiBody({ input: 'hi', reasoning: { effort } }, 'resolved-model');
+      assert.deepEqual(body.generationConfig, { thinkingConfig: { thinkingLevel: 'HIGH' } });
+    }
   });
 });
 
@@ -244,6 +251,7 @@ describe('R4/R6 routed direct conversion', () => {
     );
 
     assert.equal(upstreamUrl, 'https://upstream.test/v1beta/models/gemini-resolved:generateContent');
+    assert.equal('stream' in upstreamBody!, false);
     assert.equal(upstreamBody!.messages, undefined);
     assert.deepEqual(upstreamBody!.toolConfig, { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['crm_Z_lookup'] } });
     const answer = await response.json() as any;
@@ -260,8 +268,10 @@ describe('R4/R6 routed direct conversion', () => {
 
   it('streams Gemini chunks directly as Responses reasoning, text, calls, and terminal usage', async () => {
     let upstreamUrl = '';
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    let upstreamBody: Record<string, unknown>;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       upstreamUrl = String(input);
+      upstreamBody = JSON.parse(await new Response(init?.body as BodyInit).text());
       return geminiSse([
         { candidates: [{ content: { role: 'model', parts: [{ thought: true, text: 'thinking' }] } }] },
         { candidates: [{ content: { role: 'model', parts: [{ text: 'answer' }] } }] },
@@ -282,6 +292,7 @@ describe('R4/R6 routed direct conversion', () => {
     );
 
     assert.equal(upstreamUrl, 'https://upstream.test/v1beta/models/gemini-resolved:streamGenerateContent?alt=sse');
+    assert.equal('stream' in upstreamBody!, false);
     const events = parseSse(await response.text());
     assert.equal(events[0].type, 'response.created');
     assert.ok(events.some(event => event.type === 'response.reasoning_summary_text.delta' && event.delta === 'thinking'));
