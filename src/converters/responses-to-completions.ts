@@ -747,13 +747,15 @@ function convertResponsesContentToCompletions(content: unknown): OpenAIContent {
  * `prompt_tokens_details.cached_tokens`, the field this repository's downstream
  * converters read back (`convertOpenAIToClaudeResponse`, the streaming
  * converter). Dropping it here would make a cached prompt look uncached on the
- * next front door.
+ * next front door. Likewise, `output_tokens_details.reasoning_tokens` maps to
+ * `completion_tokens_details.reasoning_tokens`.
  */
 export interface ChatCompletionsUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
   prompt_tokens_details?: { cached_tokens: number };
+  completion_tokens_details?: { reasoning_tokens: number };
 }
 
 /** Map a Responses `usage` object onto Chat Completions usage. */
@@ -767,10 +769,15 @@ export function responsesUsageToChatCompletions(usage: unknown): ChatCompletions
     completion_tokens: output,
     total_tokens: typeof u.total_tokens === 'number' ? u.total_tokens : input + output,
   };
-  const details = u.input_tokens_details;
-  if (details && typeof details === 'object') {
-    const cached = (details as Record<string, unknown>).cached_tokens;
+  const inputDetails = u.input_tokens_details;
+  if (inputDetails && typeof inputDetails === 'object') {
+    const cached = (inputDetails as Record<string, unknown>).cached_tokens;
     if (typeof cached === 'number') mapped.prompt_tokens_details = { cached_tokens: cached };
+  }
+  const outputDetails = u.output_tokens_details;
+  if (outputDetails && typeof outputDetails === 'object') {
+    const reasoning = (outputDetails as Record<string, unknown>).reasoning_tokens;
+    if (typeof reasoning === 'number') mapped.completion_tokens_details = { reasoning_tokens: reasoning };
   }
   return mapped;
 }

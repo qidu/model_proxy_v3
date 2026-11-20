@@ -74,7 +74,17 @@ function textAnswer(text: string): Array<Record<string, unknown>> {
     { type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: 'msg_1' } },
     {
       type: 'response.completed',
-      response: { id: 'resp_stream', created_at: 1700000123, model: 'gpt-upstream', usage: { input_tokens: 19, output_tokens: 7, total_tokens: 26 } },
+      response: {
+        id: 'resp_stream',
+        created_at: 1700000123,
+        model: 'gpt-upstream',
+        usage: {
+          input_tokens: 19,
+          output_tokens: 7,
+          total_tokens: 26,
+          output_tokens_details: { reasoning_tokens: 5 },
+        },
+      },
     },
   ];
 }
@@ -169,7 +179,12 @@ describe('handleChatCompletionsPassthrough — openai-responses streaming conver
 
     const last = chunks[chunks.length - 1];
     assert.deepEqual(last.choices, []);
-    assert.deepEqual(last.usage, { prompt_tokens: 19, completion_tokens: 7, total_tokens: 26 });
+    assert.deepEqual(last.usage, {
+      prompt_tokens: 19,
+      completion_tokens: 7,
+      total_tokens: 26,
+      completion_tokens_details: { reasoning_tokens: 5 },
+    });
     assert.equal(chunks[chunks.length - 2].choices[0].finish_reason, 'stop', 'usage follows the finish_reason frame');
   });
 

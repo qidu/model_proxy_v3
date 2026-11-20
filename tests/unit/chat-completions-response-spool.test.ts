@@ -150,7 +150,12 @@ function responsesBody(filler = 'ok'): Record<string, unknown> {
       role: 'assistant',
       content: [{ type: 'output_text', text: filler, annotations: [] }],
     }],
-    usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+    usage: {
+      input_tokens: 3,
+      output_tokens: 1,
+      total_tokens: 4,
+      output_tokens_details: { reasoning_tokens: 1 },
+    },
   };
 }
 
@@ -491,7 +496,12 @@ describe('chat-completions.ts non-SSE response (§5.7)', () => {
     assert.equal(answer.object, 'chat.completion');
     assert.equal(answer.choices[0].message.content, 'q'.repeat(400));
     assert.equal(answer.choices[0].finish_reason, 'stop');
-    assert.deepEqual(answer.usage, { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 });
+    assert.deepEqual(answer.usage, {
+      prompt_tokens: 3,
+      completion_tokens: 1,
+      total_tokens: 4,
+      completion_tokens_details: { reasoning_tokens: 1 },
+    });
     // The converted read releases the spill itself, before the answer is serialized.
     assert.deepEqual(spillFiles(config), [], 'the spill must be released once the body has been read');
     assert.equal(getLiveSpillBytes(), 0);

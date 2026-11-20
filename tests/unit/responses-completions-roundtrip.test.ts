@@ -1102,6 +1102,24 @@ describe('convertResponsesToChatCompletionsAnswer', () => {
     assert.deepEqual(dropped, {});
   });
 
+  it('carries reasoning token usage into completion_tokens_details', () => {
+    const { completions } = convertResponsesToChatCompletionsAnswer(responsesAnswer([], {
+      usage: {
+        input_tokens: 11,
+        output_tokens: 20,
+        total_tokens: 31,
+        output_tokens_details: { reasoning_tokens: 15 },
+      },
+    }), 'client-model');
+
+    assert.deepEqual(completions.usage, {
+      prompt_tokens: 11,
+      completion_tokens: 20,
+      total_tokens: 31,
+      completion_tokens_details: { reasoning_tokens: 15 },
+    });
+  });
+
   it('keeps a refusal out of content and reasoning in reasoning_content', () => {
     const { completions } = convertResponsesToChatCompletionsAnswer(responsesAnswer([
       { type: 'reasoning', summary: [{ type: 'summary_text', text: 'thought ' }], content: [{ type: 'reasoning_text', text: 'hard' }] },
@@ -1283,7 +1301,14 @@ describe('responsesStreamEventToChatChunks', () => {
       { type: 'response.output_text.delta', delta: 'ok' },
       {
         type: 'response.completed',
-        response: { usage: { input_tokens: 7, output_tokens: 2, input_tokens_details: { cached_tokens: 3 } } },
+        response: {
+          usage: {
+            input_tokens: 7,
+            output_tokens: 2,
+            input_tokens_details: { cached_tokens: 3 },
+            output_tokens_details: { reasoning_tokens: 1 },
+          },
+        },
       },
     ]);
 
@@ -1291,7 +1316,11 @@ describe('responsesStreamEventToChatChunks', () => {
     assert.deepEqual(chunks[2].choices[0], { index: 0, delta: {}, finish_reason: 'stop' });
     assert.equal(state.finished, true);
     assert.deepEqual(state.usage, {
-      prompt_tokens: 7, completion_tokens: 2, total_tokens: 9, prompt_tokens_details: { cached_tokens: 3 },
+      prompt_tokens: 7,
+      completion_tokens: 2,
+      total_tokens: 9,
+      prompt_tokens_details: { cached_tokens: 3 },
+      completion_tokens_details: { reasoning_tokens: 1 },
     });
     assert.deepEqual(state.dropped, { image_generation_call: 1 });
   });

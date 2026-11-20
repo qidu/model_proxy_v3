@@ -5,6 +5,13 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(chat-completions): preserve Responses reasoning token usage
+
+Completions responses routed through `openai-responses` now map upstream
+`usage.output_tokens_details.reasoning_tokens` to
+`usage.completion_tokens_details.reasoning_tokens`. Both non-streaming JSON responses and
+opt-in streaming usage chunks retain the count instead of dropping it during protocol conversion.
+
 ### fix(errors): normalize upstream envelopes for each client API
 
 Upstream non-2xx responses and proxy-generated failures now use the client-facing
