@@ -27,9 +27,9 @@ export interface OpenAIResponsesResponse {
   object: 'response';
   created_at: number;
   status: 'completed' | 'in_progress' | 'failed' | 'incomplete';
-  incomplete_details?: { reason: string };
+  error: { code: string; message: string } | null;
+  incomplete_details: { reason: string } | null;
   model: string;
-  output_text?: string;
   output: Array<{
     id: string;
     type: 'message' | 'function_call' | 'function_call_output' | 'web_search_call' | 'code_interpreter_call' | 'computer_call' | 'computer_call_output' | 'file_search_call' | 'reasoning' | 'refusal';
@@ -94,6 +94,8 @@ export function convertCompletionsToResponses(
       object: 'response',
       created_at,
       status: 'completed',
+      error: null,
+      incomplete_details: null,
       model: completionsResponse.model || model,
       output: [{
         id: `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
@@ -254,27 +256,14 @@ export function convertCompletionsToResponses(
     },
   } : undefined;
 
-  // Collect all output_text content across message output items for the convenience field
-  const outputTextParts: string[] = [];
-  for (const item of outputItems) {
-    if (item.type === 'message' && item.content) {
-      for (const part of item.content) {
-        if (part.type === 'output_text' && part.text) {
-          outputTextParts.push(part.text);
-        }
-      }
-    }
-  }
-  const output_text = outputTextParts.length > 0 ? outputTextParts.join('') : undefined;
-
   return {
     id: responseId,
     object: 'response',
     created_at,
     status: isIncomplete ? 'incomplete' : 'completed',
-    ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+    error: null,
+    incomplete_details: isIncomplete ? { reason: 'max_output_tokens' } : null,
     model: completionsResponse.model || model,
-    output_text,
     output: outputItems,
     usage,
   };

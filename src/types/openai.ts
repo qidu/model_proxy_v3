@@ -74,6 +74,7 @@ export interface OpenAIRequest {
         | { type: "text" | "json_object" }
         | { type: "json_schema"; json_schema: { name: string; schema: unknown; strict?: boolean } };
     service_tier?: string;
+    user?: string;
     metadata?: Record<string, string>;
     parallel_tool_calls?: boolean;
     tools?: Array<{

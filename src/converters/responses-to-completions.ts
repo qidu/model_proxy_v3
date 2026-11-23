@@ -228,6 +228,9 @@ export function convertResponsesToChatCompletions(
   if (responsesRequest.service_tier !== undefined) {
     completionsRequest.service_tier = responsesRequest.service_tier as string;
   }
+  if (responsesRequest.user !== undefined) {
+    completionsRequest.user = responsesRequest.user as string;
+  }
   if (responsesRequest.metadata !== undefined) {
     completionsRequest.metadata = responsesRequest.metadata as Record<string, string>;
   }

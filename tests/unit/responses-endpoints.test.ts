@@ -374,6 +374,8 @@ describe('Responses endpoint handlers', () => {
       object: 'response',
       created_at: body.created_at,
       status: 'completed',
+      error: null,
+      incomplete_details: null,
       model: 'claude-upstream',
       output: [
         {

@@ -337,7 +337,8 @@ function claudeResponseToResponses(
     object: 'response',
     created_at,
     status: isIncomplete ? 'incomplete' : 'completed',
-    ...(isIncomplete ? { incomplete_details: { reason: incompleteReason } } : {}),
+    error: null,
+    incomplete_details: isIncomplete ? { reason: incompleteReason } : null,
     model: (claudeJson.model as string) ?? model,
     output: outputItems.length > 0 ? outputItems : [{
       id: msgId,
@@ -397,7 +398,7 @@ function streamClaudeAsResponses(
       await writer.write(encoder.encode(sseEvent('response.created', {
         type: 'response.created',
         sequence_number: nextSeq(),
-        response: { id: responseId, object: 'response', created_at, status: 'in_progress', model, output: [] },
+        response: { id: responseId, object: 'response', created_at, status: 'in_progress', error: null, incomplete_details: null, model, output: [] },
       })));
       streamStarted = true;
 
@@ -640,10 +641,11 @@ function streamClaudeAsResponses(
           object: 'response',
           created_at,
           status: isIncomplete ? 'incomplete' : 'completed',
+          error: null,
+          incomplete_details: isIncomplete ? { reason: incompleteReason } : null,
           model,
           output: outputItems,
           usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens, input_tokens_details: { cached_tokens: cachedTokens } },
-          ...(isIncomplete ? { incomplete_details: { reason: incompleteReason } } : {}),
         },
       })));
 
@@ -665,6 +667,7 @@ function streamClaudeAsResponses(
               status: 'failed',
               model,
               output: [],
+              incomplete_details: null,
               error: { code: 'server_error', message: err instanceof Error ? err.message : String(err) },
             },
           })));
@@ -1316,7 +1319,7 @@ function streamCompletionsAsResponses(
       await writer.write(encoder.encode(sseEvent('response.created', {
         type: 'response.created',
         sequence_number: nextSeq(),
-        response: { id: responseId, object: 'response', created_at, status: 'in_progress', model, output: [] },
+        response: { id: responseId, object: 'response', created_at, status: 'in_progress', error: null, incomplete_details: null, model, output: [] },
       })));
       streamStarted = true;
 
@@ -1783,10 +1786,11 @@ function streamCompletionsAsResponses(
         object: 'response',
         created_at,
         status: isIncomplete ? 'incomplete' : 'completed',
+        error: null,
+        incomplete_details: isIncomplete ? { reason: 'max_output_tokens' } : null,
         model: upstreamModel,
         output: outputItems,
         usage,
-        ...(isIncomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
         ...(conversationId ? { conversation: conversationId } : {}),
       };
 
@@ -1821,6 +1825,7 @@ function streamCompletionsAsResponses(
               status: 'failed',
               model,
               output: [],
+              incomplete_details: null,
               error: { code: 'server_error', message: err instanceof Error ? err.message : String(err) },
             },
           })));

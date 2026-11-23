@@ -42,8 +42,10 @@ describe('convertCompletionsToResponses', () => {
     assert.ok(out.id.startsWith('resp_'), 'id must have resp_ prefix');
     assert.equal(out.object, 'response');
     assert.equal(out.status, 'completed');
+    assert.equal(out.error, null);
+    assert.equal(out.incomplete_details, null);
     assert.equal(out.model, 'gpt-4o');
-    assert.equal(out.output_text, 'hello world');
+    assert.equal(Object.hasOwn(out, 'output_text'), false, 'raw Responses JSON omits the SDK-only convenience property');
 
     const msgItem = out.output.find(o => o.type === 'message');
     assert.ok(msgItem, 'must have a message output item');
@@ -86,7 +88,6 @@ describe('convertCompletionsToResponses', () => {
 
     const msgItem = out.output.find(o => o.type === 'message')!;
     assert.deepEqual(msgItem.content, [{ type: 'output_text', text: 'look at this', annotations: [] }]);
-    assert.equal(out.output_text, 'look at this', 'the text beside it must survive');
     assert.equal(warnings.filter(w => /image/i.test(w)).length, 1, 'the drop must be reported');
 
     // An answer that carried *only* an image loses its message item, so the
@@ -189,7 +190,8 @@ describe('convertCompletionsToResponses', () => {
       'model',
     );
 
-    assert.equal(out.output_text, 'final');
+    const messageItem = out.output.find(o => o.type === 'message');
+    assert.equal(messageItem?.content?.[0].text, 'final');
     const reasoningItem = out.output.find(o => o.type === 'reasoning') as any;
     assert.ok(reasoningItem);
     assert.equal(reasoningItem.content[0].text, 'hmm');
@@ -204,6 +206,9 @@ describe('convertCompletionsToResponses', () => {
     assert.equal(out.output.length, 1);
     assert.equal(out.output[0].type, 'message');
     assert.equal(out.output[0].content![0].text, '');
+    assert.equal(out.error, null);
+    assert.equal(out.incomplete_details, null);
+    assert.equal(Object.hasOwn(out, 'output_text'), false);
   });
 });
 
@@ -871,16 +876,18 @@ describe('convertInputItemsToMessages', () => {
 });
 
 describe('request parameter forwarding (spec item 10)', () => {
-  it('forwards service_tier, metadata, and parallel_tool_calls', () => {
+  it('forwards service_tier, user, metadata, and parallel_tool_calls', () => {
     const out = convertResponsesToChatCompletions({
       model: 'm',
       input: 'hi',
       service_tier: 'priority',
+      user: 'end-user-123',
       metadata: { tenant: 't1' },
       parallel_tool_calls: false,
     }, 'm');
 
     assert.equal(out.service_tier, 'priority');
+    assert.equal(out.user, 'end-user-123');
     assert.deepEqual(out.metadata, { tenant: 't1' });
     assert.equal(out.parallel_tool_calls, false);
   });

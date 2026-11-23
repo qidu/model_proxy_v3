@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): preserve nullable envelopes and upstream user identifiers
+
+`/v1/responses` routes through `anthropic-messages` and `openai-completions` now explicitly return `error: null` and `incomplete_details: null` when those fields have no value, across JSON responses and created, terminal, and failed SSE events. Responses routed to Chat Completions also forward the request's `user` identifier upstream and omit the redundant SDK-only top-level `output_text` convenience property while retaining text in `output[].content`.
+
 ### fix(chat-completions): close structured-output schemas for Messages
 
 `/v1/chat/completions` requests routed to `anthropic-messages` now recursively set `additionalProperties: false` on object schemas in `response_format.json_schema`, including nested properties, array items, definitions, and combinators. The `json_object` mapping includes the same required member. This prevents Messages upstreams from rejecting `output_config.format.schema` with `ValidationException: ... 'additionalProperties' must be explicitly set to false`.

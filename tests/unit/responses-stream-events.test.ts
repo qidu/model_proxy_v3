@@ -176,9 +176,15 @@ describe('Responses SSE event shape — completions upstream', () => {
     const partDone = events.find((e) => e.event === 'response.content_part.done');
     assert.deepEqual(partDone?.data?.part, { type: 'output_text', text: 'Hello', annotations: [] });
 
+    const created = events.find((e) => e.event === 'response.created')?.data?.response as Record<string, unknown>;
+    assert.equal(created.error, null);
+    assert.equal(created.incomplete_details, null);
+
     const completed = events.find((e) => e.event === 'response.completed');
     const responseObj = completed?.data?.response as Record<string, unknown>;
     assert.equal(responseObj.status, 'completed');
+    assert.equal(responseObj.error, null);
+    assert.equal(responseObj.incomplete_details, null);
   });
 
   it('emits response.failed when the upstream stream errors mid-flight', async () => {
@@ -197,6 +203,7 @@ describe('Responses SSE event shape — completions upstream', () => {
     const failed = events.find((e) => e.event === 'response.failed');
     const responseObj = failed?.data?.response as Record<string, unknown>;
     assert.equal(responseObj.status, 'failed');
+    assert.equal(responseObj.incomplete_details, null);
     assert.deepEqual(
       { code: (responseObj.error as Record<string, unknown>).code, message: (responseObj.error as Record<string, unknown>).message },
       { code: 'server_error', message: 'upstream boom' },
@@ -220,6 +227,7 @@ describe('Responses SSE event shape — completions upstream', () => {
     const terminal = events.find((e) => e.event === 'response.incomplete');
     const responseObj = terminal?.data?.response as Record<string, unknown>;
     assert.equal(responseObj.status, 'incomplete');
+    assert.equal(responseObj.error, null);
     assert.deepEqual(responseObj.incomplete_details, { reason: 'max_output_tokens' });
     const output = responseObj.output as Array<Record<string, unknown>>;
     assert.equal(output[0].status, 'incomplete');
@@ -255,6 +263,13 @@ describe('Responses SSE event shape — anthropic upstream', () => {
 
     const partDone = events.find((e) => e.event === 'response.content_part.done');
     assert.deepEqual(partDone?.data?.part, { type: 'output_text', text: 'Hi', annotations: [] });
+
+    const created = events.find((e) => e.event === 'response.created')?.data?.response as Record<string, unknown>;
+    assert.equal(created.error, null);
+    assert.equal(created.incomplete_details, null);
+    const completed = events.find((e) => e.event === 'response.completed')?.data?.response as Record<string, unknown>;
+    assert.equal(completed.error, null);
+    assert.equal(completed.incomplete_details, null);
   });
 
   it('ends with response.incomplete when stop_reason is max_tokens', async () => {
@@ -269,6 +284,7 @@ describe('Responses SSE event shape — anthropic upstream', () => {
     const terminal = events.find((e) => e.event === 'response.incomplete');
     const responseObj = terminal?.data?.response as Record<string, unknown>;
     assert.equal(responseObj.status, 'incomplete');
+    assert.equal(responseObj.error, null);
     assert.deepEqual(responseObj.incomplete_details, { reason: 'max_output_tokens' });
   });
 
@@ -283,6 +299,9 @@ describe('Responses SSE event shape — anthropic upstream', () => {
     const names = events.map((e) => e.event);
     assert.equal(names[names.length - 2], 'response.failed');
     assert.equal(names[names.length - 1], '[DONE]');
+    const failed = events.find((e) => e.event === 'response.failed')?.data?.response as Record<string, unknown>;
+    assert.equal(failed.incomplete_details, null);
+    assert.deepEqual(failed.error, { code: 'server_error', message: 'upstream boom' });
   });
 });
 
@@ -347,6 +366,7 @@ describe('Responses non-streaming conversion', () => {
 
     const response = convertCompletionsToResponses(completions, 'm');
     assert.equal(response.status, 'incomplete');
+    assert.equal(response.error, null);
     assert.deepEqual(response.incomplete_details, { reason: 'max_output_tokens' });
     assert.equal(response.output[0].status, 'incomplete');
     const content = response.output[0].content as Array<Record<string, unknown>>;
@@ -364,7 +384,8 @@ describe('Responses non-streaming conversion', () => {
 
     const response = convertCompletionsToResponses(completions, 'm');
     assert.equal(response.status, 'completed');
-    assert.equal(response.incomplete_details, undefined);
+    assert.equal(response.error, null);
+    assert.equal(response.incomplete_details, null);
   });
 });
 
