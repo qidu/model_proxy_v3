@@ -54,7 +54,7 @@ export async function handleChatCompletionsPassthrough(
 ): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
-  logger.info(requestId, `${path} passthrough → ${targetUrl} model=${modelId || 'unknown'} upstream=${upstreamMode || 'openai-completions'}`);
+  logger.info(requestId, `${path} routing to → ${targetUrl} model=${modelId || 'unknown'} upstream=${upstreamMode || 'openai-completions'}`);
 
   const bodyText = await request.text();
 
@@ -582,7 +582,7 @@ export async function handleChatCompletionsPassthrough(
             const rawChunk = decoder.decode(value, { stream: true });
             logPipelineStage(logger, requestId, 'upstream-response', geminiUpstreamResponse.url || geminiTargetUrl, rawChunk);
             buffer += rawChunk;
-            const events = buffer.split('\n\n');
+            const events = buffer.split(/\r?\n\r?\n/);
             buffer = events.pop() || '';
             for (const event of events) {
               if (!event.trim()) continue;

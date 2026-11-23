@@ -114,6 +114,43 @@ describe('convertCompletionsToGeminiGenerateContentBody', () => {
     }]);
   });
 
+  it('resolves an omitted tool-result name from the matching assistant tool call', async () => {
+    const out = await convertCompletionsToGeminiGenerateContentBody(
+      {
+        model: 'g',
+        messages: [
+          { role: 'user', content: 'What is the weather?' },
+          {
+            role: 'assistant', content: '',
+            tool_calls: [{
+              id: 'call_1', type: 'function',
+              function: { name: 'get_weather', arguments: '{"city":"sf"}' },
+            }],
+          },
+          { role: 'tool', tool_call_id: 'call_1', content: 'sunny' },
+        ],
+      },
+      'g',
+    );
+
+    assert.deepEqual(out.contents[2].parts, [{
+      functionResponse: { id: 'call_1', name: 'get_weather', response: { content: 'sunny' } },
+    }]);
+  });
+
+  it('rejects an unnamed tool result with no matching assistant tool call', async () => {
+    await assert.rejects(
+      () => convertCompletionsToGeminiGenerateContentBody(
+        {
+          model: 'g',
+          messages: [{ role: 'tool', tool_call_id: 'call_missing', content: 'sunny' }],
+        },
+        'g',
+      ),
+      (err: Error) => /call_missing/.test(err.message) && /no matching preceding assistant tool_call/.test(err.message),
+    );
+  });
+
   it('omits ids when tool calls and results carry none or an empty id', async () => {
     const out = await convertCompletionsToGeminiGenerateContentBody(
       {

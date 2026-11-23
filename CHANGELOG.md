@@ -5,6 +5,18 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(chat-completions): accept CRLF-framed Gemini SSE events
+
+`/v1/chat/completions` responses routed through `gemini-generatecontent` now accept both LF and CRLF event boundaries. Google streams using `\r\n\r\n` previously produced only `[DONE]`, dropping function calls and finish chunks. A function call followed by a separate empty-text `STOP` event now emits `delta.tool_calls` and `finish_reason: "tool_calls"` before `[DONE]`.
+
+### fix(chat-completions): resolve Gemini tool-result names
+
+OpenAI tool messages routed to `gemini-generatecontent` no longer need an explicit `name`. The converter resolves an omitted name from the preceding assistant `tool_calls` entry matching `tool_call_id`; an explicit name still takes precedence. Unmatched unnamed tool results now fail locally with a descriptive error instead of sending Gemini an empty `functionResponse.name` and receiving `REQUIRED_FIELD_MISSING`.
+
+### refactor(logging): clarify Chat Completions routing messages
+
+The `/v1/chat/completions` upstream forwarding log now says `routing to` instead of `passthrough`, avoiding confusion with the separate verbatim `/passthrough/...` routes.
+
 ### fix(gemini): emit valid uppercase thinking levels
 
 Generate Content requests now use the SDK-declared uppercase `ThinkingLevel`

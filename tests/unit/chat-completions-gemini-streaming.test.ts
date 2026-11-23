@@ -287,6 +287,50 @@ describe('handleChatCompletionsPassthrough — gemini-generatecontent cross-mode
     assert.equal(raw[raw.length - 1], '[DONE]');
   });
 
+  it('streaming: parses CRLF events when functionCall and STOP arrive separately', async () => {
+    const events = [
+      {
+        candidates: [{
+          content: {
+            role: 'model',
+            parts: [{ functionCall: { name: 'get_weather', args: { city: 'Paris' } } }],
+          },
+        }],
+      },
+      {
+        candidates: [{
+          content: { role: 'model', parts: [{ text: '' }] },
+          finishReason: 'STOP',
+        }],
+        usageMetadata: { promptTokenCount: 19, candidatesTokenCount: 14, totalTokenCount: 92 },
+      },
+    ];
+    const payload = events.map(event => `data: ${JSON.stringify(event)}`).join('\r\n\r\n') + '\r\n\r\n';
+    globalThis.fetch = (async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } })) as typeof fetch;
+
+    const res = await handleChatCompletionsPassthrough(
+      makeRequest({ model: 'g', messages: [{ role: 'user', content: 'weather in Paris?' }] }, true),
+      'https://upstream/v1beta/models/g:generateContent',
+      { Authorization: 'Bearer k' }, 'rid-crlf-tool', testLogger, env, 'g', 'gemini-generatecontent',
+    );
+
+    const { chunks, raw } = parseSSE(await res.text());
+    const toolChunk = chunks.find(c => c.choices[0]?.delta?.tool_calls);
+    assert.ok(toolChunk, 'expected the CRLF-framed functionCall to produce delta.tool_calls');
+    const call = toolChunk.choices[0].delta.tool_calls[0];
+    assert.match(call.id, /^tool_\d+_0$/);
+    assert.equal(call.function.name, 'get_weather');
+    assert.deepEqual(JSON.parse(call.function.arguments), { city: 'Paris' });
+    assert.equal(chunks.filter(c => c.choices[0]?.delta?.content).length, 0);
+    assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, 'tool_calls');
+    assert.equal(raw[raw.length - 1], '[DONE]');
+  });
+
   it("streaming: carries the upstream functionCall.id instead of minting one", async () => {
     globalThis.fetch = (async () => geminiToolCallStreamResponse('gemini-call-7')) as typeof fetch;
 

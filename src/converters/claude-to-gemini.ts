@@ -528,6 +528,7 @@ export async function convertCompletionsToGeminiGenerateContentBody(
     const otherMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
     const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [];
+    const toolNamesById = new Map<string, string>();
 
     for (const m of otherMessages) {
         const role = m.role === 'assistant' ? 'model' : (m.role as string);
@@ -540,6 +541,9 @@ export async function convertCompletionsToGeminiGenerateContentBody(
         if (toolCalls && toolCalls.length > 0) {
             for (const tc of toolCalls) {
                 const fn = tc.function as Record<string, unknown> | undefined;
+                if (typeof tc.id === 'string' && tc.id !== '' && typeof fn?.name === 'string' && fn.name !== '') {
+                    toolNamesById.set(tc.id, fn.name);
+                }
                 let args: unknown = (fn?.arguments as string) ?? {};
                 if (typeof args === 'string' && args !== '') {
                     try { args = JSON.parse(args); } catch { /* keep string */ }
@@ -559,10 +563,20 @@ export async function convertCompletionsToGeminiGenerateContentBody(
         if (m.role === 'tool') {
             // Tool result — emit as functionResponse on a user turn.
             parts.length = 0;
+            const toolCallId = typeof m.tool_call_id === 'string' ? m.tool_call_id : '';
+            const name = typeof m.name === 'string' && m.name !== ''
+                ? m.name
+                : toolNamesById.get(toolCallId);
+            if (!name) {
+                throw new Error(
+                    `Cannot convert tool result "${toolCallId || '<missing tool_call_id>'}" to a Gemini functionResponse: ` +
+                    `no matching preceding assistant tool_call carries a function name`
+                );
+            }
             parts.push({
                 functionResponse: {
-                    ...(typeof m.tool_call_id === 'string' && m.tool_call_id !== '' ? { id: m.tool_call_id } : {}),
-                    name: (m.name as string) || '',
+                    ...(toolCallId !== '' ? { id: toolCallId } : {}),
+                    name,
                     response: { content: m.content ?? '' },
                 },
             });
