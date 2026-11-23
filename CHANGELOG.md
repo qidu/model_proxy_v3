@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(chat-completions): close structured-output schemas for Messages
+
+`/v1/chat/completions` requests routed to `anthropic-messages` now recursively set `additionalProperties: false` on object schemas in `response_format.json_schema`, including nested properties, array items, definitions, and combinators. The `json_object` mapping includes the same required member. This prevents Messages upstreams from rejecting `output_config.format.schema` with `ValidationException: ... 'additionalProperties' must be explicitly set to false`.
+
 ### fix(chat-completions): accept CRLF-framed Gemini SSE events
 
 `/v1/chat/completions` responses routed through `gemini-generatecontent` now accept both LF and CRLF event boundaries. Google streams using `\r\n\r\n` previously produced only `[DONE]`, dropping function calls and finish chunks. A function call followed by a separate empty-text `STOP` event now emits `delta.tool_calls` and `finish_reason: "tool_calls"` before `[DONE]`.

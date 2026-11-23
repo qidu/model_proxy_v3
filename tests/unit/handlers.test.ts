@@ -254,26 +254,73 @@ describe('completionsToClaudeBody', () => {
     assert.deepEqual((body.messages as any[])[0].content[0].input, {});
   });
 
-  it('maps response_format json_object to the permissive output_config schema', async () => {
+  it('maps response_format json_object to the required closed output_config schema', async () => {
     const body = await completionsToClaudeBody({
       messages: [{ role: 'user', content: 'x' }],
       response_format: { type: 'json_object' },
     } as any, 'm');
     // Anthropic has no schema-less JSON mode: `format.type` is always
-    // `json_schema` and `format.schema` is required, so `json_object` becomes the
-    // permissive object schema rather than being dropped.
+    // `json_schema` and `format.schema` is required, so `json_object` becomes an
+    // object schema rather than being dropped. Messages requires every object
+    // schema to declare `additionalProperties: false` explicitly.
     assert.deepEqual(body.output_config, {
-      format: { type: 'json_schema', schema: { type: 'object' } },
+      format: { type: 'json_schema', schema: { type: 'object', additionalProperties: false } },
     });
   });
 
-  it('passes a response_format json_schema through verbatim', async () => {
-    const schema = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] };
+  it('closes every object in a response_format json_schema without mutating the input', async () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        a: { type: 'string' },
+        nested: { type: 'object', properties: { value: { type: 'string' } } },
+        list: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' } } } },
+        union: { anyOf: [{ type: 'object', properties: { x: { type: 'string' } } }, { type: 'null' }] },
+      },
+      required: ['a'],
+    };
+    const originalSchema = structuredClone(schema);
     const body = await completionsToClaudeBody({
       messages: [{ role: 'user', content: 'x' }],
       response_format: { type: 'json_schema', json_schema: { name: 'answer', schema } },
     } as any, 'm');
-    assert.deepEqual(body.output_config, { format: { type: 'json_schema', schema } });
+    assert.deepEqual(body.output_config, {
+      format: {
+        type: 'json_schema',
+        schema: {
+          type: 'object',
+          properties: {
+            a: { type: 'string' },
+            nested: {
+              type: 'object',
+              properties: { value: { type: 'string' } },
+              additionalProperties: false,
+            },
+            list: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: { id: { type: 'string' } },
+                additionalProperties: false,
+              },
+            },
+            union: {
+              anyOf: [
+                {
+                  type: 'object',
+                  properties: { x: { type: 'string' } },
+                  additionalProperties: false,
+                },
+                { type: 'null' },
+              ],
+            },
+          },
+          required: ['a'],
+          additionalProperties: false,
+        },
+      },
+    });
+    assert.deepEqual(schema, originalSchema);
     // The Completions-side `name` and `strict` have no Messages counterpart, and
     // `output_config` may carry `effort`/`task_budget` — neither must leak in.
     assert.deepEqual(Object.keys((body.output_config as any).format), ['type', 'schema']);
@@ -328,7 +375,7 @@ describe('completionsToClaudeBody', () => {
       reasoning_effort: 'high',
     } as any, 'm');
     assert.deepEqual(body.output_config, {
-      format: { type: 'json_schema', schema: { type: 'object' } },
+      format: { type: 'json_schema', schema: { type: 'object', additionalProperties: false } },
       effort: 'high',
     });
   });

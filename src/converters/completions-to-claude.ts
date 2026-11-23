@@ -31,6 +31,34 @@ function parseJsonObject(value: unknown): Record<string, unknown> {
   }
 }
 
+function normalizeClaudeOutputSchema(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(normalizeClaudeOutputSchema);
+
+  const schema = value as Record<string, unknown>;
+  const normalized: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(schema)) {
+    if (['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'].includes(key)
+      && entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      normalized[key] = Object.fromEntries(
+        Object.entries(entry).map(([name, child]) => [name, normalizeClaudeOutputSchema(child)]),
+      );
+    } else if (['items', 'contains', 'additionalProperties', 'unevaluatedProperties', 'propertyNames', 'if', 'then', 'else', 'not'].includes(key)) {
+      normalized[key] = normalizeClaudeOutputSchema(entry);
+    } else if (['allOf', 'anyOf', 'oneOf', 'prefixItems'].includes(key) && Array.isArray(entry)) {
+      normalized[key] = entry.map(normalizeClaudeOutputSchema);
+    } else {
+      normalized[key] = entry;
+    }
+  }
+
+  // Structured Outputs rejects object schemas unless this member is explicitly false.
+  if (normalized.type === 'object' || Array.isArray(normalized.type) && normalized.type.includes('object')) {
+    normalized.additionalProperties = false;
+  }
+  return normalized;
+}
+
 /**
  * Convert an OpenAI message `content` value into the Claude representation:
  *   - string content returns as a string (preserves the common simple case).
@@ -203,13 +231,14 @@ export async function completionsToClaudeBody(
   // Structured output: Completions spells it `response_format`, the Messages API
   // `output_config.format`. Anthropic has no schema-less JSON mode — the format's
   // `type` is always `json_schema` and its `schema` is required — so a Completions
-  // `json_object` (a valid JSON object, no declared shape) becomes the permissive
-  // object schema, the closest expressible equivalent. `text` asks for the default
-  // and an unmapped `type` stays unmapped, as in `completionsToResponsesBody`.
+  // `json_object` (a valid JSON object, no declared shape) becomes the minimal
+  // closed object schema accepted by Messages, the closest expressible equivalent.
+  // `text` asks for the default and an unmapped `type` stays unmapped, as in
+  // `completionsToResponsesBody`.
   const responseFormat = completions.response_format as Record<string, unknown> | undefined;
   if (responseFormat && typeof responseFormat === 'object') {
     if (responseFormat.type === 'json_object') {
-      claudeBody.output_config = { format: { type: 'json_schema', schema: { type: 'object' } } };
+      claudeBody.output_config = { format: { type: 'json_schema', schema: { type: 'object', additionalProperties: false } } };
     } else if (responseFormat.type === 'json_schema') {
       const jsonSchema = responseFormat.json_schema as Record<string, unknown> | undefined;
       const schema = jsonSchema?.schema;
@@ -219,7 +248,7 @@ export async function completionsToClaudeBody(
       if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
         throw new ValidationError("response_format json_schema requires a 'json_schema.schema' object");
       }
-      claudeBody.output_config = { format: { type: 'json_schema', schema } };
+      claudeBody.output_config = { format: { type: 'json_schema', schema: normalizeClaudeOutputSchema(schema) } };
     }
   }
 

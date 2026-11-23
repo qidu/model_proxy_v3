@@ -227,7 +227,7 @@ describe('handleChatCompletionsPassthrough — anthropic-messages cross-mode str
 
     assert.equal(upstreamHeaders?.get('anthropic-beta'), 'structured-outputs-2025-11-13');
     assert.deepEqual(upstreamBody?.output_config, {
-      format: { type: 'json_schema', schema: { type: 'object' } },
+      format: { type: 'json_schema', schema: { type: 'object', additionalProperties: false } },
     });
   });
 
