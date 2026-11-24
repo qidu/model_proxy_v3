@@ -13,6 +13,7 @@ import { extractRawCredential } from './utils/auth-headers.js';
 import { createErrorResponse, createEndpointErrorResponse, createResponsesErrorResponse, OverLimitError, ClaudeProxyError, ResponsesApiError, classifyTransportError, extractUpstreamMessage } from './utils/errors.js';
 import { wrapSseStreamWithKeepAlive } from './utils/sse-keepalive.js';
 import { createLogger, type Logger } from './utils/logger.js';
+import { createTrajectoryRequest, recordTrajectoryResponse, resolveTrajectorySessionId, type TrajectoryRequestContext } from './utils/trajectory.js';
 import { handleModelsRequest, getModelCount, handleAnthropicModelsDiscovery, isAnthropicModelDiscoveryEnabled, isAnthropicModelId, toAnthropicModel } from './handlers/models.js';
 import { handleTokenCountingRequest } from './handlers/token-counting.js';
 import { handleMessagesRequest } from './handlers/messages.js';
@@ -864,6 +865,7 @@ export default {
     }
 
     let finalResponse: Response;
+    let trajectoryRequest: TrajectoryRequestContext | undefined;
     try {
       finalResponse = await (async (): Promise<Response> => {
     try {
@@ -1434,6 +1436,14 @@ export default {
         try {
           let bodyText = await readIngressSpoolText(request);
           const body = JSON.parse(bodyText);
+          if (proxyConfig.general?.trajectory === true) {
+            trajectoryRequest = createTrajectoryRequest(
+              path,
+              requestId,
+              resolveTrajectorySessionId(request.headers),
+              body,
+            );
+          }
           // Keep the parsed body visible at dispatch (the ladder rebuilds a
           // fresh Request per rung from it). Same object reference — the
           // in-place privacy/kompress/erase mutations below stay reflected.
@@ -3278,6 +3288,9 @@ export default {
       await rawIngressSpool?.release();
     }
 
+    if (trajectoryRequest) {
+      finalResponse = recordTrajectoryResponse(finalResponse, trajectoryRequest, logger);
+    }
     // Defer the in-flight decrement until the response body has finished
     // streaming to the client. server.ts consumes this release when it's done
     // piping the body (or immediately for non-streaming/error responses). If the

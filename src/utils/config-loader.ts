@@ -31,6 +31,7 @@ export interface ProxyConfig {
     budget_to_effort_high?: number | string;
     global_token_limit?: string;
     week_start_day?: 'monday' | 'sunday';
+    trajectory?: boolean;
     /** Store config api_keys in the OS keychain (see src/utils/key-store.ts). */
     store_key_in_system?: boolean;
   };

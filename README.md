@@ -176,6 +176,8 @@ full wire-level contract.
 - **Usage accounting** — per-model token and request stats, plus per-tool and
   per-agent stats (request/response counts, payload size, block counts), viewable
   in a web dashboard or a live terminal UI.
+- **Agent trajectories** — optional structured JSONL records of client-boundary
+  messages, exposed reasoning, tool calls/results, assistant text, and usage.
 - **Token limits** — global and per-alias token caps over a configurable window (sliding `Nh`/`Nd` or calendar `1w`/`1m`). Returns HTTP 413 when exceeded.
 - **Sidecars** — optional privacy-filter (sidecar or local hash-only mode),
   compression, image-encode, and tool-judge sidecars: redact or shrink request
@@ -905,6 +907,42 @@ The [`docs/`](./docs/) folder has deep-dives on specific topics:
 - **Request/response transform hooks** — `docs/reference/transforms-reference.md` (current reference: hooks, Tier-1 ops, Tier-2 built-ins incl. `restore_client_model_alias`, `[transforms.*]` / `[transforms.default]` config) — plus `docs/architecture/design_request_transform_hooks.md` (original design) and `docs/contributing/implementation_of_request_transform_hooks.md` (implementation log)
 - **Agent harness integrations** — [`docs/guides/agents/`](./docs/guides/agents/) (per-agent guides; e.g. [using this proxy as an LLM provider for deepseek-harness](./docs/guides/agents/proxy-as-provider-for-deepseek-harness.md))
 
+## Agent trajectory logging
+
+Enable structured client-boundary trajectory records in `proxy_config.toml`:
+
+```toml
+[general]
+trajectory = true
+```
+
+The proxy appends one JSON object per model response to
+`./model_proxy_trajectory.jsonl` (created with mode `0600`). Agent clients should
+send a stable session header so requests receive increasing `sequence` values
+within that session. Recognized headers, in precedence order, are
+`x-agent-session-id`, `x-session-id`, `x-deepseek-harness-session-id`,
+`x-opencode-session`, `x-claude-code-session-id`, `x-cursor-session-id`,
+`x-hermes-session-id`, `session-id`, `session_id`, `thread-id`, and
+`conversation_id`. Header names are case-insensitive. Without a recognized
+header, `session_id` is the request ID and `sequence` is `1`.
+
+```json
+{"session_id":"agent-run-123","request_id":"req_...","sequence":4,"timestamp":"2026-01-01T00:00:00.000Z","type":"action","request_messages":[],"reasoning":[],"tool_calls":[],"tool_results":[],"assistant_text":"","usage":{},"status":"completed"}
+```
+
+`request_messages` and `tool_results` come from the inbound client request before
+proxy privacy, compression, or routing transforms. `reasoning`, `tool_calls`,
+`assistant_text`, and `usage` come from the already-converted client response;
+SSE streams are reassembled while their original bytes pass through unchanged.
+Messages, Chat Completions, Responses, Interactions, and Gemini Generate Content
+endpoints are supported. Status is the terminal response status where available,
+or `completed`, `failed`, or `cancelled`.
+
+The file contains full prompts, tool arguments/results, exposed reasoning, and
+responses. Protect it accordingly. This is the model-visible trajectory: hidden
+model reasoning and client-side state or tool execution that never returns to the
+proxy cannot be recorded.
+
 ## Interactive agent session (optional)
 
 Start an interactive [`pi-agent-core`](https://github.com/earendil-works/pi-agent-core)
@@ -930,7 +968,10 @@ replies → set a budget (tokens and/or turns, default 50,000,000 tokens / 100 t
 enter a free-text task. The agent runs with `read_file`/`write_file`/`bash` tools (plus
 `find_skill`/`add_skill` when the `skills` CLI is available, capped at 5 runtime
 installs/session) until the task completes or the budget is hit, then prompts for a
-follow-up task in the same conversation. Set `TRAJ=true` to also log the full session
+follow-up task in the same conversation. Each interactive run generates a UUID and
+passes it to the Pi SDK as `sessionId`; loopback requests also carry it as
+`x-agent-session-id`, so verification, follow-ups, and every selected endpoint
+schema share one proxy trajectory session. Set `TRAJ=true` to also log the full session
 transcript to a private (`0600`), per-session file under `os.tmpdir()`.
 
 **Logging:** proxy diagnostics (every `console` level, including WARN/ERROR) are shown on a

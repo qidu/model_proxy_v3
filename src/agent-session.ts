@@ -1459,8 +1459,16 @@ export function diffWorkDirSnapshots(before: Map<string, number>, after: Map<str
 // Provider wiring
 // ---------------------------------------------------------------------------
 
-function buildSelfModel(alias: string, port: number): Model<ProxyApiType> {
-  return buildProxyPiModel(alias, `http://127.0.0.1:${port}`);
+export function buildSelfModel(
+  alias: string,
+  port: number,
+  sessionId: string,
+  api: ProxyApiType = 'anthropic-messages',
+): Model<ProxyApiType> {
+  return {
+    ...buildProxyPiModel(alias, proxyBaseUrlForApi(port, api), api),
+    headers: { 'x-agent-session-id': sessionId },
+  };
 }
 
 /**
@@ -1556,6 +1564,7 @@ export async function startAgentSession(source: AgentSessionSource): Promise<voi
  *  at each return. */
 async function runAgentSession(source: AgentSessionSource): Promise<void> {
   const { env, loadConfig, port } = source;
+  const sessionId = randomUUID();
 
     // Label the terminal window with the agent's own identity so it's
   // distinguishable from the proxy's other TUI/TRAJ sessions running
@@ -1691,7 +1700,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
           }
         : { name: 'model_proxy_v3 (DEV_NO_KEY)', resolve: async () => ({ auth: {} }) },
     },
-    models: aliases.map((alias) => buildSelfModel(alias, port)),
+    models: aliases.map((alias) => buildSelfModel(alias, port, sessionId)),
     api: {
       'anthropic-messages': anthropicMessagesApi(),
       'openai-completions': openAICompletionsApi(),
@@ -1753,6 +1762,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
         }),
       },
       streamFn: models.streamSimple.bind(models),
+      sessionId,
     });
     candidateRef.current = candidate;
 
@@ -1835,12 +1845,8 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   }
   console.log(dim(`[proxy] using endpoint schema: ${selectedApi}`));
 
-  // Build model with selected API and create new agent for the session.
-  // The base URL is per-API: each SDK appends its own path and they disagree
-  // about where the version segment lives, so a bare origin made every api
-  // but anthropic-messages request an unversioned path the proxy rejects.
-  const baseUrl = proxyBaseUrlForApi(port, selectedApi);
-  const sessionModel = buildProxyPiModel(selectedAlias, baseUrl, selectedApi);
+  // Build the selected endpoint's model while retaining the same session ID.
+  const sessionModel = buildSelfModel(selectedAlias, port, sessionId, selectedApi);
   models.setProvider(provider); // ensure provider is still registered
   const sessionModels = createModels();
   sessionModels.setProvider(provider);
@@ -1863,6 +1869,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       }),
     },
     streamFn: sessionModels.streamSimple.bind(sessionModels),
+    sessionId,
   });
   candidateRef.current = agent;
 

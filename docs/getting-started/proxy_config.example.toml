@@ -48,6 +48,9 @@ budget_to_effort_high = 128000
 global_token_limit = "700M 1w"
 # Anchor day for the `1w` calendar window. Default is "monday".
 week_start_day = "monday"
+# Opt in to client-boundary agent trajectory records. Appends JSONL to
+# ./model_proxy_trajectory.jsonl (created with mode 0600). Off by default.
+# trajectory = true
 # Store config api_keys in the OS keychain (local/dev-host use only — not for
 # Docker or Cloudflare Workers). Applies only to configured api_keys of
 # [models.*] targets, [models.default].api_key, and [models.passthrough] keys

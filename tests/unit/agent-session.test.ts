@@ -15,6 +15,7 @@ import {
   DEFAULT_BUDGET,
   BUDGET_PROMPT_DEFAULT,
   buildModelPickerItems,
+  buildSelfModel,
   RuledInput,
   setProxyLogRow,
   captureConsoleOutput,
@@ -510,6 +511,25 @@ describe('formatUsage', () => {
 
   it('omits the token part when the budget has no token limit', () => {
     assert.equal(formatUsage(1276, 1, { turns: 20 }), 'usage: 1 / 20 turns');
+  });
+});
+
+describe('buildSelfModel', () => {
+  it('adds the trajectory session header and selects the API-specific base URL', () => {
+    const sessionId = '3d6f2c3e-51af-4b52-9e4d-caf8e052043e';
+    const cases = [
+      ['anthropic-messages', 'http://127.0.0.1:8788'],
+      ['openai-completions', 'http://127.0.0.1:8788/v1'],
+      ['openai-responses', 'http://127.0.0.1:8788/v1'],
+      ['open-responses', 'http://127.0.0.1:8788/v1'],
+      ['google-generative-ai', 'http://127.0.0.1:8788/v1beta'],
+    ] as const;
+    for (const [api, baseUrl] of cases) {
+      const model = buildSelfModel('test-alias', 8788, sessionId, api);
+      assert.equal(model.api, api);
+      assert.equal(model.baseUrl, baseUrl);
+      assert.deepEqual(model.headers, { 'x-agent-session-id': sessionId });
+    }
   });
 });
 

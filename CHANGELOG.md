@@ -5,6 +5,14 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(agent): propagate Pi SDK session IDs to trajectory records
+
+The built-in interactive Pi agent now generates one UUID per run and supplies it to both the verification and selected-endpoint `Agent` instances through `AgentOptions.sessionId`. Its loopback models also send `x-agent-session-id`, ensuring Anthropic, OpenAI Completions/Responses, Open Responses, and Gemini requests all share the same trajectory session across follow-up tasks while allowing SDK-aware providers to use the ID for caching.
+
+### feat(trajectory): record structured client-boundary agent trajectories
+
+`[general] trajectory = true` now appends one structured JSON object per model response to `./model_proxy_trajectory.jsonl`. The recorder snapshots inbound client messages before proxy transforms and observes the already-converted client response, reassembling streamed text, exposed reasoning, tool calls, and usage. Records include tool results from the inbound history, response status, timestamps, request IDs, and per-session sequence numbers. Session detection accepts the generic `x-agent-session-id`, plugin headers `x-session-id`/`x-opencode-session`, DeepSeek Harness' `x-deepseek-harness-session-id`, Claude Code's `x-claude-code-session-id`, Cursor's `x-cursor-session-id`, Codex's `session-id`/`session_id`/`thread-id`/`conversation_id`, and Hermes' `X-Hermes-Session-Id`; requests without one use their request ID as a single-request session. The opt-in file is created with mode `0600` and recording failures are reported without changing the model response.
+
 ### fix(anthropic-beta): parse the wire format and forward headers verbatim
 
 `anthropic-beta` now parses as a comma-separated list for local feature detection, so `interleaved-thinking-2025-05-14` correctly enables the thinking-budget exception in Messages and token-counting requests. Routing forwards the original header unchanged, including unknown values, without JSON serialization or allowlisting. The explicitly configured `filter_anthropic_beta` transform remains the only filtering and renaming path.
