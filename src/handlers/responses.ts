@@ -260,8 +260,8 @@ function restoreResponseToolName(
  *     continues it by resending the response as-is (`messages-create.md:4520`).
  * The spec's enum (`openai-response-final.md:119`) has no member for a pause,
  * and a pause is not a budget exhaustion, so it must not report one: `steered`
- * is its member for a turn that stopped at a safe, continuable boundary, which
- * is what a pause is.
+ * is its member for a turn that stopped at a safe, continuable boundary, making
+ * it the closest continuable-boundary approximation.
  */
 function claudeIncompleteReason(stopReason: unknown): 'max_output_tokens' | 'steered' | undefined {
   if (stopReason === 'max_tokens') return 'max_output_tokens';
@@ -596,9 +596,10 @@ function streamClaudeAsResponses(
         activeLogger.warn(requestId, `[responses] suppressed ${suppressedToolCalls} tool call(s) outside allowed_tools`);
       }
       if (outputItems.length === 0) {
-        // output: [] is invalid per spec — synthesize an empty message item.
-        // It must get the full lifecycle events too: a client rebuilding state
-        // from SSE events must not first see this item in the terminal payload.
+        // Synthesize an empty message item as a direct-reply fallback when no output
+        // items remain (for example, after allowed_tools suppression). It must get
+        // the full lifecycle events too: a client rebuilding state from SSE events
+        // must not first see this item in the terminal payload.
         const fallbackIndex = nextOutputIndex++;
         const fallbackItem = { id: itemId, type: 'message', status: isIncomplete ? 'incomplete' : 'completed', role: 'assistant', content: [{ type: 'output_text', text: '', annotations: [] }] };
         await writer.write(encoder.encode(sseEvent('response.output_item.added', {
@@ -1728,10 +1729,10 @@ function streamCompletionsAsResponses(
         activeLogger.warn(requestId, `[responses] suppressed ${suppressedToolCalls.size} tool call(s) outside allowed_tools`);
       }
 
-      // output: [] is invalid per spec. If the stream had only thinking/reasoning content
-      // (no text, no tool calls), emit a fallback empty-text message item so the client
-      // receives a non-empty output array. It gets the full lifecycle events too — a
-      // client rebuilding state from SSE events must not first see it in the terminal payload.
+      // If the stream had only thinking/reasoning content (no text, no tool calls),
+      // emit a fallback empty-text message item as a direct reply. It gets the full
+      // lifecycle events too — a client rebuilding state from SSE events must not first
+      // see it in the terminal payload.
       if (outputItems.every((it: unknown) => (it as Record<string, unknown>).type === 'reasoning')) {
         const fallbackIndex = nextOutputIndex++;
         const fallbackItem = {

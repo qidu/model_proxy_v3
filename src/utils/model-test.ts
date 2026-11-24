@@ -19,9 +19,9 @@ function buildClaudeToolRequest(): Record<string, unknown> {
   };
 }
 
-// `max_tokens` is rejected by the OpenAI Responses API ("Unsupported parameter:
-// 'max_tokens' is not supported"), which expects `max_completion_tokens` instead.
-// Map the parameter name per upstream mode so the test request is accepted as-is.
+// These builders produce a Completions-shaped intermediate, not a native Responses request.
+// For Responses upstreams, `completionsToResponsesBody()` later maps
+// `max_completion_tokens` to the native Responses `max_output_tokens` field.
 export function maxTokensField(upstreamMode: string): string {
   return (upstreamMode === 'openai-responses' || upstreamMode === 'open-responses') ? 'max_completion_tokens' : 'max_tokens';
 }

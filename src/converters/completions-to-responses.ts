@@ -233,9 +233,9 @@ export function convertCompletionsToResponses(
     }
   }
 
-  // output: [] is invalid per spec. If every tool call was suppressed (or the
-  // message was otherwise empty) and only a reasoning item remains, emit a
-  // fallback empty-text message item — the spec's "direct reply" fallback.
+  // If every tool call was suppressed (or the message was otherwise empty) and only
+  // a reasoning item remains, emit a fallback empty-text message item — the spec's
+  // permitted "direct reply" fallback.
   if (outputItems.every(it => it.type === 'reasoning')) {
     outputItems.push({
       id: `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
