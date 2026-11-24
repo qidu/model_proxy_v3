@@ -48,7 +48,8 @@ export type OpenAIRole = "system" | "user" | "assistant" | "tool" | "developer";
 
 export interface OpenAIMessage {
     role: OpenAIRole;
-    content: OpenAIContent;
+    // null is valid per OpenAI spec for assistant messages carrying only tool_calls.
+    content: OpenAIContent | null;
     name?: string;
     tool_calls?: OpenAIToolCall[];
     tool_call_id?: string;

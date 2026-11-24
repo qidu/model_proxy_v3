@@ -520,18 +520,18 @@ async function testThinkingDisabledStripped() {
 /**
  * TC1717: Thinking Budget Clamp (unit test, no live proxy)
  * Covers the 4 branches of clampThinkingBudget introduced in commit 53632e7:
- *   (a) budget_tokens > max_tokens  → clamp down to max_tokens
- *   (b) budget_tokens <= max_tokens → return unchanged
+ *   (a) budget_tokens >= max_tokens → clamp down to max_tokens - 1
+ *   (b) budget_tokens < max_tokens  → return unchanged
  *   (c) interleaved-thinking beta   → skip clamp (budget may exceed max_tokens)
- *   (d) max_tokens < 1024 + clamp needed → throw (no valid clamp exists)
+ *   (d) max_tokens <= 1024 + clamp needed → throw (no valid clamp exists)
  */
 async function testClampThinkingBudget() {
   await loadValidationModule();
   const mk = (budget) => ({ type: 'enabled', budget_tokens: budget });
 
-  // (a) clamp when budget exceeds max_tokens
+  // (a) clamp when budget equals or exceeds max_tokens
   const a = clampThinkingBudget(mk(5000), 2000);
-  assert(a.budget_tokens === 2000, `should clamp to max_tokens, got ${a.budget_tokens}`);
+  assert(a.budget_tokens === 1999, `should clamp to max_tokens - 1, got ${a.budget_tokens}`);
 
   // (b) pass-through when budget is already within max_tokens
   const b = clampThinkingBudget(mk(2000), 8000);
@@ -541,10 +541,10 @@ async function testClampThinkingBudget() {
   const c = clampThinkingBudget(mk(5000), 2000, /*interleavedThinking*/ true);
   assert(c.budget_tokens === 5000, `should not clamp under interleaved-thinking, got ${c.budget_tokens}`);
 
-  // (d) max_tokens below the 1024 minimum → throws
+  // (d) max_tokens at or below 1024 cannot fit a valid clamped budget → throws
   let threw = false;
   try { clampThinkingBudget(mk(5000), 500); } catch { threw = true; }
-  assert(threw, 'should throw when max_tokens < 1024 and clamping is required');
+  assert(threw, 'should throw when max_tokens <= 1024 and clamping is required');
 }
 
 /**

@@ -342,10 +342,12 @@ export function convertClaudeTokenCountingToOpenAI(
                 });
             }
 
-            // OpenAI requires content to be non-null for assistant messages with tool calls
+            // For tool-call turns whose text blocks are empty or absent, emit null rather
+            // than "" for upstreams such as DeepSeek, which reject empty content beside tool_calls.
+            const text = textParts.join('\n');
             const assistantMessage: OpenAIMessage = {
                 role: 'assistant',
-                content: textParts.length > 0 ? textParts.join('\n') : ''
+                content: toolCalls.length > 0 && text === '' ? null : text
             };
 
             if (toolCalls.length > 0) {
@@ -462,10 +464,12 @@ export function convertClaudeToOpenAIRequest(
                 });
             }
 
-            // OpenAI requires content to be non-null for assistant messages with tool calls
+            // For tool-call turns whose text blocks are empty or absent, emit null rather
+            // than "" for upstreams such as DeepSeek, which reject empty content beside tool_calls.
+            const text = textParts.join('\n');
             const assistantMessage: OpenAIMessage = {
                 role: 'assistant',
-                content: textParts.length > 0 ? textParts.join('\n') : ''
+                content: toolCalls.length > 0 && text === '' ? null : text
             };
 
             if (toolCalls.length > 0) {

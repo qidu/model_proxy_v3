@@ -395,15 +395,21 @@ describe('clampThinkingBudget', () => {
     assert.equal(clampThinkingBudget(t, 100), t);
   });
 
-  it('returns input unchanged when budget <= maxTokens', () => {
+  it('returns input unchanged when budget < maxTokens', () => {
     const t = { type: 'enabled' as const, budget_tokens: 500 };
     assert.equal(clampThinkingBudget(t, 1000), t);
   });
 
-  it('clamps budget down to maxTokens when budget exceeds', () => {
+  it('clamps budget to maxTokens - 1 when budget exceeds (must be strictly less)', () => {
     const t = { type: 'enabled' as const, budget_tokens: 5000 };
     const clamped = clampThinkingBudget(t, 2000);
-    assert.equal(clamped.budget_tokens, 2000);
+    assert.equal(clamped.budget_tokens, 1999);
+  });
+
+  it('clamps when budget equals maxTokens', () => {
+    const t = { type: 'enabled' as const, budget_tokens: 2000 };
+    const clamped = clampThinkingBudget(t, 2000);
+    assert.equal(clamped.budget_tokens, 1999);
   });
 
   it('preserves budget when interleavedThinking is true even if budget exceeds maxTokens', () => {
@@ -420,6 +426,23 @@ describe('clampThinkingBudget', () => {
     );
   });
 
+  it('throws when maxTokens is 1024 and clamp is required', () => {
+    assert.throws(
+      () => clampThinkingBudget({ type: 'enabled', budget_tokens: 2000 }, 1024),
+      /cannot be clamped.*at least 1,024.*less than max_tokens/,
+    );
+    assert.throws(
+      () => clampThinkingBudget({ type: 'enabled', budget_tokens: 1024 }, 1024),
+      /cannot be clamped.*at least 1,024.*less than max_tokens/,
+    );
+  });
+
+  it('clamps to 1024 when maxTokens is 1025', () => {
+    const t = { type: 'enabled' as const, budget_tokens: 2000 };
+    const clamped = clampThinkingBudget(t, 1025);
+    assert.equal(clamped.budget_tokens, 1024);
+  });
+
   it('returns input unchanged when thinking is not an object', () => {
     assert.equal(clampThinkingBudget(null as any, 1000), null);
   });
@@ -432,7 +455,7 @@ describe('clampThinkingBudget', () => {
   it('clamps for boolean true thinking type', () => {
     const t = { type: true as const, budget_tokens: 5000 };
     const r = clampThinkingBudget(t, 2000);
-    assert.equal(r.budget_tokens, 2000);
+    assert.equal(r.budget_tokens, 1999);
   });
 });
 

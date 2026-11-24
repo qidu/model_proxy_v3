@@ -5,6 +5,12 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(converter): emit null content on tool-only assistant messages; enforce strict thinking budget
+
+`convertClaudeToOpenAIRequest` and `convertClaudeTokenCountingToOpenAI` now emit `content: null` (not `""`) for assistant messages that carry only tool calls and no text. `""` caused upstreams such as DeepSeek to reject the turn; `null` is what `openai.ts` already produced for the same case. `OpenAIMessage.content` is widened to `OpenAIContent | null` accordingly.
+
+`clampThinkingBudget` now enforces `budget_tokens < max_tokens` strictly: the pass-through guard uses `<` (was `<=`) and the clamp produces `maxTokens - 1` (was `maxTokens`). The Claude API spec requires the budget to be strictly less than `max_tokens`; equality was previously permitted.
+
 ### fix(responses): preserve nullable envelopes and upstream user identifiers
 
 `/v1/responses` routes through `anthropic-messages` and `openai-completions` now explicitly return `error: null` and `incomplete_details: null` when those fields have no value, across JSON responses and created, terminal, and failed SSE events. Responses routed to Chat Completions also forward the request's `user` identifier upstream and omit the redundant SDK-only top-level `output_text` convenience property while retaining text in `output[].content`.

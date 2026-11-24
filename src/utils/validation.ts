@@ -330,8 +330,8 @@ export function validateClaudeContentBlock(
  *   (anthropic-beta: interleaved-thinking-2025-05-14), budget_tokens may
  *   exceed max_tokens up to the full context window
  *
- * If max_tokens itself is below 1,024 and thinking is enabled with a budget,
- * no valid clamp exists — throws with a clear message.
+ * If max_tokens itself is at or below 1,024 and thinking is enabled with a
+ * budget, no valid clamp exists — throws with a clear message.
  */
 export function clampThinkingBudget(
   thinking: ThinkingConfigParam,
@@ -344,21 +344,22 @@ export function clampThinkingBudget(
   const isEnabled = thinking.type === 'enabled' || thinking.type === true;
   if (!isEnabled) return thinking;
   if (typeof thinking.budget_tokens !== 'number') return thinking;
-  if (thinking.budget_tokens <= maxTokens) return thinking;
+  if (thinking.budget_tokens < maxTokens) return thinking;
 
   // Interleaved-thinking exception: budget may exceed max_tokens
   // (per docs/claude-extended-thinking.md:323)
   if (interleavedThinking) return thinking;
 
-  // max_tokens < 1,024 cannot satisfy the thinking minimum budget.
-  // Clamping here would produce an invalid budget that fails downstream validation.
-  if (maxTokens < 1024) {
+  // max_tokens <= 1,024 cannot satisfy both the thinking minimum budget and
+  // the requirement that the budget be strictly less than max_tokens.
+  if (maxTokens <= 1024) {
     throw new ValidationError(
-      `thinking.budget_tokens cannot be clamped to max_tokens (${maxTokens}): max_tokens must be at least 1,024 when thinking is enabled`
+      `thinking.budget_tokens cannot be clamped: no value is both at least 1,024 and less than max_tokens (${maxTokens})`
     );
   }
 
-  return { ...thinking, budget_tokens: maxTokens };
+  // budget_tokens must be strictly less than max_tokens (Claude API spec).
+  return { ...thinking, budget_tokens: maxTokens - 1 };
 }
 
 /**

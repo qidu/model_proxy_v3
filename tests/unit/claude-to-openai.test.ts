@@ -205,7 +205,7 @@ describe('convertClaudeToOpenAIRequest — messages', () => {
     assert.match(out.messages[0].content as string, /"type":"text"/);
   });
 
-  it('maps assistant tool_use to tool_calls with stringified args and empty content', () => {
+  it('maps assistant tool_use to tool_calls with stringified args and null content', () => {
     const req = {
       model: 'm',
       max_tokens: 1,
@@ -218,12 +218,29 @@ describe('convertClaudeToOpenAIRequest — messages', () => {
     const out = convertClaudeToOpenAIRequest(req, 'gpt');
     const asst = out.messages[0] as any;
     assert.equal(asst.role, 'assistant');
-    assert.equal(asst.content, '');
+    assert.equal(asst.content, null);
     assert.deepEqual(asst.tool_calls, [{
       id: 'call_9',
       type: 'function',
       function: { name: 'search', arguments: '{"q":"cats"}' },
     }]);
+  });
+
+  it('uses null content when an empty text block accompanies tool_use', () => {
+    const req = {
+      model: 'm',
+      max_tokens: 1,
+      messages: [{
+        role: 'assistant',
+        content: [
+          { type: 'text', text: '' },
+          { type: 'tool_use', id: 'call_10', name: 'search', input: {} },
+        ],
+      }],
+    } as unknown as ClaudeMessagesRequest;
+
+    const out = convertClaudeToOpenAIRequest(req, 'gpt');
+    assert.equal(out.messages[0].content, null);
   });
 
   it('preserves assistant thinking as reasoning_content', () => {
@@ -382,7 +399,13 @@ describe('convertClaudeTokenCountingToOpenAI', () => {
       tools: [{ name: 't', description: '', input_schema: { type: 'object' } }],
       messages: [
         { role: 'user', content: 'hi' },
-        { role: 'assistant', content: [{ type: 'tool_use', id: 'c', name: 't', input: {} }] },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '' },
+            { type: 'tool_use', id: 'c', name: 't', input: {} },
+          ],
+        },
       ],
     } as unknown as ClaudeTokenCountingRequest;
 
@@ -392,6 +415,7 @@ describe('convertClaudeTokenCountingToOpenAI', () => {
     assert.equal(out.messages[0].content, 'sys');
     assert.equal(out.tools!.length, 1);
     const asst = out.messages[out.messages.length - 1] as any;
+    assert.equal(asst.content, null);
     assert.equal(asst.tool_calls[0].id, 'c');
   });
 });
