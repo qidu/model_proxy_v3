@@ -545,7 +545,7 @@ function resolveUpstreamTarget(input: ResolveUpstreamTargetInput): ResolvedUpstr
     if (isGemini) {
       return { kind: 'count-tokens', targetUrl: geminiModelUrl('countTokens'), handlerType: 'generateContent', upstreamMode };
     }
-    // countTokens has no OpenAI equivalent — proxy the request upstream as-is and return the raw JSON.
+    // Bridge non-Gemini routes through the Claude-style token-counting endpoint.
     // Dialect difference: a fixed route reports the handler as token-counting.
     return {
       kind: 'count-tokens',
@@ -761,11 +761,6 @@ export default {
     const logger = createLogger(env as Record<string, unknown>);
     const url = new URL(request.url);
     const path = url.pathname;
-
-    // Debug: log all request headers
-    // const headersObj: Record<string, string> = {};
-    // request.headers.forEach((value, key) => { headersObj[key] = value; });
-    // logger.debug(requestId, `Request headers: ${JSON.stringify(headersObj)}`);
 
     // Load proxy config on first request
     const configPath = env.PROXY_CONFIG_PATH;

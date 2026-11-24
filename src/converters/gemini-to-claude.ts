@@ -1,6 +1,6 @@
 /**
  * Gemini to Claude Response Converter
- * Converts Gemini Interactions API responses to Claude API format
+ * Converts Gemini Interactions and generateContent API responses to Claude API format
  */
 
 import { ClaudeMessagesResponse, ClaudeContentBlock, ClaudeTextBlock, ClaudeToolUseBlock, ClaudeToolResultBlock } from '../types/claude.js';

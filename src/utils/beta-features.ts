@@ -86,7 +86,7 @@ export function createBetaHeader(features: AnthropicBeta[]): string {
 }
 
 /**
- * Validate beta features for specific endpoints
+ * Endpoint hook retained for compatibility; currently performs no validation.
  */
 export function validateBetaFeaturesForEndpoint(
     betaFeatures: AnthropicBeta[] | null,
@@ -96,24 +96,18 @@ export function validateBetaFeaturesForEndpoint(
         return;
     }
 
-    // Endpoint-specific validations
     if (endpoint === 'v1/messages/count_tokens') {
         if (!hasBetaFeature(betaFeatures, 'token-counting-2024-11-01')) {
-            // Token counting API requires specific beta feature
         }
     }
 
-    // Files API validation (if implemented in future)
     if (endpoint.startsWith('v1/files')) {
         if (!hasBetaFeature(betaFeatures, 'files-api-2025-04-14')) {
-            // Files API requires specific beta feature
         }
     }
 
-    // Skills API validation (if implemented in future)
     if (endpoint.startsWith('v1/skills')) {
         if (!hasBetaFeature(betaFeatures, 'skills-2025-10-02')) {
-            // Skills API requires specific beta feature
         }
     }
 }

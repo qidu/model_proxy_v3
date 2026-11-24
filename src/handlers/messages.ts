@@ -80,20 +80,6 @@ function normalizeOpenAICompletionsBody(requestBody: Record<string, unknown>): R
 }
 
 /**
- * The `/v1/messages` → `openai-responses` hop used to carry private copies of the three
- * Completions→Responses request conversions. Those copies were folded into the shared
- * `completionsToResponsesBody` (`src/converters/completions-to-responses.ts`), and the hop
- * now builds its body with the direct `claudeToResponsesBody`
- * (`src/converters/claude-to-responses.ts`) instead — the Completions intermediate had no
- * field for `mcp_servers`, skipped `document` blocks, and dropped `tools[].strict`.
- * `completionsToResponsesBody` is still the converter for a client that sends an
- * already-OpenAI-shaped body to `/v1/messages` (the branch below), which is a different
- * input format and keeps the shared converter. See
- * `docs/api/review-interactions-to-openai-responses-hops.md` and
- * `docs/architecture/review-indirect-vs-direct-transforms.md`.
- */
-
-/**
  * Handle messages API request
  */
 export async function handleMessagesRequest(
@@ -148,9 +134,7 @@ export async function handleMessagesRequest(
       requestBody.thinking = normalized;
     }
   }
-  // const requestBody = await request.json() as Record<string, unknown>;
-  
-  // Detect Gemini CLI and force non-streaming to avoid JSON parsing issues
+  // Log the client user agent and streaming flag for request diagnostics
   const userAgent = request.headers.get('user-agent') || '';
   activeLogger.debug(requestId, `UA: ${userAgent}, stream = ${requestBody.stream}`);
   

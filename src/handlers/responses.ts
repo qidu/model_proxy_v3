@@ -1,8 +1,9 @@
 /**
  * Responses API handler for Claude Proxy v3
  *
- * Handles POST /responses endpoint (OpenAI Responses API format)
- * Supports both OpenAI Responses API pass-through and conversion to Chat Completions
+ * Handles POST /v1/responses (OpenAI Responses API format).
+ * Supports native pass-through and conversions to and from Chat Completions,
+ * Claude Messages, and Gemini Interactions / generateContent.
  */
 
 import { Env } from '../types/shared.js';
@@ -53,7 +54,8 @@ import { getSpoolConfig } from '../utils/spool.js';
  * the response, then look it up when those call_ids appear in a later request
  * and inject reasoning_content onto the assistant messages we create.
  *
- * Entries auto-expire after 10 minutes so the map stays bounded.
+ * Entries expire after 10 minutes, but expiration is lazy: an entry is removed
+ * only when its key is looked up.
  */
 const reasoningByCallId = new Map<string, { reasoning: string; expiry: number }>();
 const REASONING_TTL_MS = 10 * 60 * 1000; // 10 minutes

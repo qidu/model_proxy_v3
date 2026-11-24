@@ -426,8 +426,19 @@ The full conformance analysis lives in [the gap review](./docs/api/review-for-ga
 
 ### Code map: endpoints → handlers → converters
 
-**Handlers** (`src/handlers/`) own the HTTP pipeline for one route shape — URL building, auth headers, hooks, the upstream `fetch`, streaming mechanics, and observability.
-**Converters** (`src/converters/`) are pure schema translations between API dialects (request, response, and SSE event shapes) — no network, routing, or logging.
+**Handlers** (`src/handlers/`) orchestrate the HTTP pipeline for one route shape: reading and validating the request, applying auth headers and hooks, building the upstream URL, invoking converters, calling the upstream provider, and returning the JSON or streaming response. They also own transport errors and observability.
+
+**Converters** (`src/converters/`) translate between API dialects — Claude Messages, OpenAI Chat Completions / Responses, and Gemini GenerateContent / Interactions. They map request and response fields such as messages, content blocks, tools, reasoning, usage, and finish reasons, as well as streaming events. Converters do not choose routes or make upstream HTTP calls; some accept a logger or request context for conversion diagnostics.
+
+For example, when `/v1/messages` targets an OpenAI Chat Completions upstream, the handler coordinates this flow:
+
+```text
+Claude request → handler → request converter → OpenAI upstream
+                     ↑                              ↓
+Claude response ← response converter ← upstream response
+```
+
+In short, the **handler manages the request lifecycle**, while the **converter translates the data**.
 
 | Client endpoint | Handler | Cross-format converters used |
 |---|---|---|

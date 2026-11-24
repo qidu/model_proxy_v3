@@ -45,8 +45,6 @@ export async function handleClaudeRequest(
     // that ever does need the wire body must be handed one explicitly (a receive,
     // as the ingress does) rather than by teeing this one.
     const requestBody = await request.json() as Record<string, unknown>;
-    // Parse request body
-    //const requestBody = await request.json() as Record<string, unknown>;
     // §5.3 egress shape. Shape 2 (the default, and every other handler today):
     // the send boundary forwards refs, not payloads — put the inline payloads
     // back before anything reads this body. Shape 3 (this route's send, below):

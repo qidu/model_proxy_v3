@@ -1,7 +1,7 @@
 /**
- * Passthrough handler for /v1/chat/completions.
- * Forwards the request as-is to the upstream OpenAI-compatible endpoint.
- * No format conversion is performed.
+ * Handler for /v1/chat/completions.
+ * Supports native OpenAI-compatible passthrough and conversions to and from
+ * Claude Messages, OpenAI Responses, and Gemini API formats.
  */
 
 import type { Env, Logger } from '../types/shared.js';
@@ -703,11 +703,9 @@ export async function handleChatCompletionsPassthrough(
 
     // Native Gemini JSON -> Claude -> OpenAI completions JSON. Reuses the
     // existing chain also used by forwardCompletionsAsAnthropicMessages.
-    // Known limitation: convertGeminiGenerateContentToClaude only extracts
-    // text parts today; tool/thought response parts are dropped. Tracked
-    // as a follow-up. §5.7: bounded receive as above, and no payload extraction
-    // for the same reason the limitation gives — the converter drops
-    // `inline_data` parts before any converted value exists to extract from.
+    // §5.7: bounded receive as above. No payload extraction is needed for
+    // `inline_data` parts: they have no Claude Messages response projection and
+    // are dropped and reported by the converter.
     const geminiJson = await receiveJsonResponse<Record<string, unknown>>(
       geminiUpstreamResponse, requestId, logger, geminiUpstreamResponse.url || geminiTargetUrl, request.signal,
     );

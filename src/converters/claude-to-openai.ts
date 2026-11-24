@@ -277,7 +277,7 @@ export function convertClaudeTokenCountingToOpenAI(
 ): OpenAITokenCountingRequest {
     const openaiMessages: OpenAIMessage[] = [];
 
-    // Handle system message - must be first in OpenAI format
+    // Prepend the Claude system prompt as an OpenAI system message
     if (claudeRequest.system) {
         const systemContent = typeof claudeRequest.system === 'string'
             ? claudeRequest.system
@@ -397,7 +397,7 @@ export function convertClaudeToOpenAIRequest(
 ): OpenAIRequest {
     const openaiMessages: OpenAIMessage[] = [];
 
-    // Handle system message - must be first in OpenAI format
+    // Prepend the Claude system prompt as an OpenAI system message
     if (claudeRequest.system) {
         const systemContent = typeof claudeRequest.system === 'string' 
             ? claudeRequest.system 

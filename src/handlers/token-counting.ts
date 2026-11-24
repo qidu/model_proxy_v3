@@ -6,7 +6,7 @@
  * Features:
  * - Supports both API-based and local token counting
  * - Local counting is enabled via LOCAL_TIKTOKEN=true environment variable
- * - Falls back to byte-based counting for user text when API-based counting fails
+ * - Falls back to character-based counting for user text when API-based counting fails
  * - Uses tiktoken for accurate BPE token counting when LOCAL_TIKTOKEN=true
  */
 
@@ -233,7 +233,7 @@ async function handleApiBasedTokenCounting(
     signal: createUpstreamAbortSignal(route?.timeout ?? getUpstreamBodyTimeoutMs(env)),
   });
 
-  // Handle target API errors (fallback to byte-based estimate for user text)
+  // Handle target API errors (fallback to character-based estimate for user text)
   if (!response.ok) {
     const bodyPreview = JSON.stringify(openaiRequest).substring(0, 1000);
     logger.warn(requestId, `API-based token counting failed (${response.status}), falling back to character-based estimate`);

@@ -112,7 +112,6 @@ async function calculateLocalTokens(
             return 0;
         }
     }
-    // For output tokens, we can only estimate or use upstream value
     // Return 0 as fallback since we can't predict completion size
     return 0;
 }
@@ -207,7 +206,6 @@ export async function convertOpenAIToClaudeResponse(
                         thinkingSignature = thinkingPart.signature;
                     }
                 }
-                // Handle other part types as needed
             }
 
             textContent = textParts.join('');
