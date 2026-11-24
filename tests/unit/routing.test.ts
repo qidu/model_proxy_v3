@@ -7,7 +7,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTargetUrl, buildUpstreamUrl, getHandlerType, parseDynamicRoute, transformAuthHeadersForUpstream } from '../../src/utils/routing.js';
+import { buildTargetUrl, buildUpstreamUrl, extractAuthHeaders, getHandlerType, parseDynamicRoute, transformAuthHeadersForUpstream } from '../../src/utils/routing.js';
 import { decayEffectiveCompositeShare, getEffectiveCompositeShare, recoverEffectiveCompositeShare, resetEffectiveCompositeSharesForTest } from '../../src/index.js';
 
 describe('composite primary effective share decay', () => {
@@ -555,6 +555,35 @@ describe('buildTargetUrl', () => {
   });
 });
 
+
+describe('anthropic-beta forwarding', () => {
+  const betaValues = [
+    'future-oauth-capability, interleaved-thinking-2025-05-14,unknown-feature',
+    '["prompt-caching-2024-07-31","future-feature"]',
+  ];
+
+  it('extractAuthHeaders forwards every value unchanged', () => {
+    for (const value of betaValues) {
+      const headers = extractAuthHeaders(new Request('http://localhost/v1/messages', {
+        headers: { 'x-api-key': 'sk-test', 'anthropic-beta': value },
+      }));
+      assert.equal(headers['anthropic-beta'], value);
+    }
+  });
+
+  it('transformAuthHeadersForUpstream forwards every value unchanged', () => {
+    for (const value of betaValues) {
+      const headers = transformAuthHeadersForUpstream(
+        new Request('http://localhost/v1/messages', {
+          headers: { 'x-api-key': 'sk-test', 'anthropic-beta': value },
+        }),
+        'anthropic-messages',
+        '/v1/messages',
+      );
+      assert.equal(headers['anthropic-beta'], value);
+    }
+  });
+});
 
 describe('transformAuthHeadersForUpstream', () => {
   const makeRequest = (path: string, headers: Record<string, string>) =>

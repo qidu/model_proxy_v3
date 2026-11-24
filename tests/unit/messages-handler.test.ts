@@ -51,11 +51,12 @@ async function postMessages(
   body: Record<string, unknown>,
   upstreamMode = 'openai-completions',
   logger?: Logger,
+  authHeaders: Record<string, string> = { Authorization: 'Bearer upstream-key' },
 ): Promise<Response> {
   return handleMessagesRequest(
     messagesRequest(body),
     TARGET_URL,
-    { Authorization: 'Bearer upstream-key' },
+    authHeaders,
     'req-messages',
     'gpt-test',
     ENV,
@@ -604,6 +605,23 @@ describe('handleMessagesRequest', () => {
     assert.equal(response.status, 200);
     assert.equal(upstreamCalls[0].body.reasoning_effort, 'high');
     assert.equal('thinking' in upstreamCalls[0].body, false);
+  });
+
+  it('honors interleaved thinking from a comma-separated beta header without clamping', async () => {
+    const betaHeader = 'future-feature, interleaved-thinking-2025-05-14';
+    const response = await postMessages({
+      model: 'gpt-test',
+      max_tokens: 2048,
+      thinking: { type: 'enabled', budget_tokens: 4096 },
+      messages: [{ role: 'user', content: 'Think carefully' }],
+    }, 'openai-completions', undefined, {
+      Authorization: 'Bearer upstream-key',
+      'anthropic-beta': betaHeader,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamCalls[0].body.reasoning_effort, 'high');
+    assert.equal(upstreamCalls[0].headers['anthropic-beta'], betaHeader);
   });
 
   it('forwards Responses options and flattens tool schemas and forced choice', async () => {

@@ -8,7 +8,6 @@
  * - /https/api.qnaigc.com/openai/v1/models/deepseek-v3.1/v1/messages (Messages API)
  */
 
-import { validateBetaFeatures as validateBetaFeaturesUtil } from './beta-features.js';
 import { createLogger } from './logger.js';
 import { pickRawApiKey } from './auth-headers.js';
 
@@ -328,14 +327,7 @@ function extractAuthHeaders(request: Request): Record<string, string> {
   // Forward beta feature headers (verbatim, carries OAuth)
   const betaVersionHeader = request.headers.get('anthropic-beta');
   if (betaVersionHeader) {
-    // Validate beta features
-    const validatedFeatures = validateBetaFeaturesUtil(betaVersionHeader);
-    if (validatedFeatures) {
-      headers['anthropic-beta'] = JSON.stringify(validatedFeatures);
-    } else {
-      // Forward as-is if validation fails (should still work)
-      headers['anthropic-beta'] = betaVersionHeader.replace(/[\r\n\0]/g, '');
-    }
+    headers['anthropic-beta'] = betaVersionHeader;
   }
 
   // Forward anthropic-version header (required by Claude Code Gateway)
@@ -451,12 +443,7 @@ function transformAuthHeadersForUpstream(
   if (upstreamMode === 'anthropic-messages') {
     const betaVersionHeader = request.headers.get('anthropic-beta');
     if (betaVersionHeader) {
-      const validatedFeatures = validateBetaFeaturesUtil(betaVersionHeader);
-      if (validatedFeatures) {
-        headers['anthropic-beta'] = JSON.stringify(validatedFeatures);
-      } else {
-        headers['anthropic-beta'] = betaVersionHeader.replace(/[\r\n\0]/g, '');
-      }
+      headers['anthropic-beta'] = betaVersionHeader;
     }
   }
 

@@ -121,6 +121,27 @@ describe('handleTokenCountingRequest API counting', () => {
     assert.deepEqual(await response.json(), { type: 'token_count', input_tokens: 11 });
   });
 
+  it('honors interleaved thinking from a comma-separated beta header', async () => {
+    const betaHeader = 'future-feature, interleaved-thinking-2025-05-14';
+    let capturedHeaders: Headers | undefined;
+    globalThis.fetch = (async (_url, init) => {
+      capturedHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify({ usage: { prompt_tokens: 11 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const response = await handle({
+      ...validBody(),
+      max_tokens: 512,
+      thinking: { type: 'enabled', budget_tokens: 1024 },
+    }, {
+      authHeaders: { ...authHeaders, 'anthropic-beta': betaHeader },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { type: 'token_count', input_tokens: 11 });
+    assert.equal(capturedHeaders?.get('anthropic-beta'), betaHeader);
+  });
+
   it('returns zero when a successful upstream response has no usage', async () => {
     stubFetch(new Response(JSON.stringify({ choices: [] }), { status: 200 }));
 

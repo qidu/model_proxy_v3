@@ -785,12 +785,10 @@ describe('Tier-2 builtin: filter_anthropic_beta', () => {
     assert.equal(result.headers['anthropic-beta'], 'a,b,c');
   });
 
-  it('handles comma-separated input (real Claude Code format), not JSON', () => {
-    // The legacy beta-features.ts path treats the header as a JSON array and
-    // fails on comma-separated input. This builtin must NOT parse JSON.
+  it('does not interpret JSON-shaped input as comma-separated entries', () => {
     const headers = { 'anthropic-beta': '["computer-use-2025-01-24","advanced-tool-use-2025-11-20"]' };
     const result = runHook('before_upstream', payload({}, headers), makeCtx([set]));
-    // The literal JSON string is one comma-less "entry" not in the map → dropped.
+    // JSON punctuation prevents either comma-separated entry from matching the map.
     assert.equal('anthropic-beta' in result.headers, false);
   });
 

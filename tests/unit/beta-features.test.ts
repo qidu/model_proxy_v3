@@ -1,11 +1,6 @@
 /**
  * Unit tests for the anthropic-beta header helpers in src/utils/beta-features.ts.
  *
- * These pure parse/validate functions had no direct unit coverage. Key behaviors
- * under test: unknown features are silently dropped (not forwarded upstream),
- * invalid JSON / non-array input returns null (never throws), and header
- * round-tripping via createBetaHeader.
- *
  * Run with: npx tsx --test tests/unit/beta-features.test.ts
  */
 
@@ -20,70 +15,43 @@ import {
   validateBetaFeaturesForEndpoint,
 } from '../../src/utils/beta-features.js';
 
-// ---------------------------------------------------------------------------
-// validateBetaFeatures
-// ---------------------------------------------------------------------------
-
 describe('validateBetaFeatures', () => {
   it('returns null for null / empty header', () => {
     assert.equal(validateBetaFeatures(null), null);
     assert.equal(validateBetaFeatures(''), null);
   });
 
-  it('parses a JSON array of valid features', () => {
+  it('parses comma-separated features and trims whitespace', () => {
     assert.deepEqual(
-      validateBetaFeatures('["prompt-caching-2024-07-31","pdfs-2024-09-25"]'),
-      ['prompt-caching-2024-07-31', 'pdfs-2024-09-25'],
+      validateBetaFeatures('prompt-caching-2024-07-31, interleaved-thinking-2025-05-14,pdfs-2024-09-25'),
+      ['prompt-caching-2024-07-31', 'interleaved-thinking-2025-05-14', 'pdfs-2024-09-25'],
     );
   });
 
-  it('silently drops unknown features, keeping only valid ones', () => {
+  it('preserves unknown features instead of allowlisting values', () => {
     assert.deepEqual(
-      validateBetaFeatures('["prompt-caching-2024-07-31","made-up-feature-9999"]'),
-      ['prompt-caching-2024-07-31'],
+      validateBetaFeatures('future-oauth-capability,made-up-feature-9999'),
+      ['future-oauth-capability', 'made-up-feature-9999'],
     );
   });
 
-  it('returns an empty array when all features are unknown', () => {
-    assert.deepEqual(validateBetaFeatures('["nope-1","nope-2"]'), []);
-  });
-
-  it('returns an empty array for an empty JSON array', () => {
-    assert.deepEqual(validateBetaFeatures('[]'), []);
-  });
-
-  it('returns null on invalid JSON (never throws)', () => {
-    assert.equal(validateBetaFeatures('not-json'), null);
-    assert.equal(validateBetaFeatures('{'), null);
-  });
-
-  it('returns null when JSON is valid but not an array', () => {
-    assert.equal(validateBetaFeatures('"prompt-caching-2024-07-31"'), null);
-    assert.equal(validateBetaFeatures('{"a":1}'), null);
-    assert.equal(validateBetaFeatures('42'), null);
-  });
-
-  it('returns null when the array contains a non-string element', () => {
-    // A non-string element throws internally, which is caught -> null.
-    assert.equal(validateBetaFeatures('["prompt-caching-2024-07-31", 123]'), null);
+  it('skips empty entries', () => {
+    assert.deepEqual(validateBetaFeatures('prompt-caching-2024-07-31, ,pdfs-2024-09-25,'), [
+      'prompt-caching-2024-07-31',
+      'pdfs-2024-09-25',
+    ]);
+    assert.deepEqual(validateBetaFeatures(' , '), []);
   });
 
   it('accepts every feature in VALID_BETA_FEATURES', () => {
-    const header = JSON.stringify(VALID_BETA_FEATURES);
-    assert.deepEqual(validateBetaFeatures(header), [...VALID_BETA_FEATURES]);
+    assert.deepEqual(validateBetaFeatures(VALID_BETA_FEATURES.join(',')), [...VALID_BETA_FEATURES]);
   });
 });
 
-// ---------------------------------------------------------------------------
-// hasBetaFeature
-// ---------------------------------------------------------------------------
-
 describe('hasBetaFeature', () => {
-  it('true when the feature is present', () => {
-    assert.equal(
-      hasBetaFeature(['prompt-caching-2024-07-31', 'pdfs-2024-09-25'], 'pdfs-2024-09-25'),
-      true,
-    );
+  it('detects interleaved thinking in a normal comma-separated header', () => {
+    const features = validateBetaFeatures('future-feature,interleaved-thinking-2025-05-14');
+    assert.equal(hasBetaFeature(features, 'interleaved-thinking-2025-05-14'), true);
   });
 
   it('false when the feature is absent', () => {
@@ -99,36 +67,25 @@ describe('hasBetaFeature', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// createBetaHeader
-// ---------------------------------------------------------------------------
-
 describe('createBetaHeader', () => {
-  it('serializes features to a JSON array string', () => {
+  it('serializes features to a comma-separated string', () => {
     assert.equal(
       createBetaHeader(['prompt-caching-2024-07-31', 'pdfs-2024-09-25']),
-      '["prompt-caching-2024-07-31","pdfs-2024-09-25"]',
+      'prompt-caching-2024-07-31,pdfs-2024-09-25',
     );
   });
 
   it('round-trips through validateBetaFeatures', () => {
-    const features = ['token-counting-2024-11-01', 'files-api-2025-04-14'] as const;
-    const header = createBetaHeader([...features]);
-    assert.deepEqual(validateBetaFeatures(header), [...features]);
+    const features = ['token-counting-2024-11-01', 'files-api-2025-04-14'];
+    assert.deepEqual(validateBetaFeatures(createBetaHeader(features)), features);
   });
 
-  it('serializes an empty list to "[]"', () => {
-    assert.equal(createBetaHeader([]), '[]');
+  it('serializes an empty list to an empty string', () => {
+    assert.equal(createBetaHeader([]), '');
   });
 });
 
-// ---------------------------------------------------------------------------
-// validateBetaFeaturesForEndpoint
-// ---------------------------------------------------------------------------
-
 describe('validateBetaFeaturesForEndpoint', () => {
-  // Current implementation performs no throwing validation; it must never throw
-  // regardless of endpoint or feature presence. These tests pin that contract.
   it('does not throw for null features', () => {
     assert.doesNotThrow(() => validateBetaFeaturesForEndpoint(null, 'v1/messages/count_tokens'));
   });

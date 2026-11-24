@@ -29,48 +29,22 @@ export const VALID_BETA_FEATURES = [
 export type AnthropicBeta = typeof VALID_BETA_FEATURES[number];
 
 /**
- * Parse and validate anthropic-beta header
+ * Parse the comma-separated anthropic-beta header for local feature detection.
  */
-export function validateBetaFeatures(headerValue: string | null): AnthropicBeta[] | null {
+export function validateBetaFeatures(headerValue: string | null): string[] | null {
     if (!headerValue) {
         return null;
     }
 
-    try {
-        // Parse as JSON array
-        const features = JSON.parse(headerValue);
-
-        if (!Array.isArray(features)) {
-            throw new Error('anthropic-beta header must be a JSON array');
-        }
-
-        // Validate each feature
-        const validFeatures: AnthropicBeta[] = [];
-        for (const feature of features) {
-            if (typeof feature !== 'string') {
-                throw new Error(`Beta feature must be a string, got ${typeof feature}`);
-            }
-
-            if (VALID_BETA_FEATURES.includes(feature as any)) {
-                validFeatures.push(feature as AnthropicBeta);
-            } else {
-                // Drop unknown features — do NOT forward unrecognized beta values upstream.
-            }
-        }
-
-        return validFeatures;
-    } catch (error) {
-        // Return null to indicate parsing failed, but don't throw
-        return null;
-    }
+    return headerValue.split(',').map(feature => feature.trim()).filter(Boolean);
 }
 
 /**
  * Check if a specific beta feature is enabled
  */
 export function hasBetaFeature(
-    betaFeatures: AnthropicBeta[] | null,
-    feature: AnthropicBeta
+    betaFeatures: string[] | null,
+    feature: string
 ): boolean {
     if (!betaFeatures) {
         return false;
@@ -81,15 +55,15 @@ export function hasBetaFeature(
 /**
  * Create beta feature header value
  */
-export function createBetaHeader(features: AnthropicBeta[]): string {
-    return JSON.stringify(features);
+export function createBetaHeader(features: string[]): string {
+    return features.join(',');
 }
 
 /**
  * Endpoint hook retained for compatibility; currently performs no validation.
  */
 export function validateBetaFeaturesForEndpoint(
-    betaFeatures: AnthropicBeta[] | null,
+    betaFeatures: string[] | null,
     endpoint: string
 ): void {
     if (!betaFeatures) {

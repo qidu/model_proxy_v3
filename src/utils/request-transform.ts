@@ -481,8 +481,7 @@ function applyBuiltin(
     //   - entry not in map           → drop
     //   - map value is null / ""     → drop
     //   - map value is a non-empty   → emit the mapped name
-    // Input format is the real Claude Code comma-separated form
-    // (e.g. "a,b,c") — NOT the JSON array form beta-features.ts handles.
+    // Input format is the real Claude Code comma-separated form (e.g. "a,b,c").
     const raw = headers['anthropic-beta'];
     if (!raw) return;
     const map = set.anthropic_beta_map;
