@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(anthropic-beta): parse the wire format and forward headers verbatim
+
+`anthropic-beta` now parses as a comma-separated list for local feature detection, so `interleaved-thinking-2025-05-14` correctly enables the thinking-budget exception in Messages and token-counting requests. Routing forwards the original header unchanged, including unknown values, without JSON serialization or allowlisting. The explicitly configured `filter_anthropic_beta` transform remains the only filtering and renaming path.
+
 ### fix(converter): emit null content on tool-only assistant messages; enforce strict thinking budget
 
 `convertClaudeToOpenAIRequest` and `convertClaudeTokenCountingToOpenAI` now emit `content: null` (not `""`) for assistant messages that carry only tool calls and no text. `""` caused upstreams such as DeepSeek to reject the turn; `null` is what `openai.ts` already produced for the same case. `OpenAIMessage.content` is widened to `OpenAIContent | null` accordingly.
