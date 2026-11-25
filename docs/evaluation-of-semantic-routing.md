@@ -46,7 +46,7 @@ For the examples added to the draft:
 | Judge signal unresolved with `on_unknown = "no_match"` | Evaluation continues to lower-priority decisions |
 | Multiple decisions match | Verify tier, confidence comparability, priority, and name ordering |
 
-Also test projection boundaries (`0.40`, `0.75`), negative weights, and unresolved-term imputation counts.
+Also test score/cosine normalization, projection boundaries (`0.20`, `0.40`), negative weights, unresolved-term imputation counts, and that imputation can move the weighted sum in either direction.
 
 These tests detect **shadowed rules**: a high-priority decision that prevents lower-priority decisions from ever being used.
 

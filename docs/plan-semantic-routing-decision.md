@@ -706,27 +706,50 @@ stands: **a failed signal is never silently `False`.**
 ### 5.5 Projections
 
 ```toml
+# All term values are normalized to [0,1] before weighting (see the
+# normalization rule below), so with these weights the sum lies in
+# [-0.35, 0.75] and the bands are calibrated to that range.
 [routing.projections.effort]
 method = "weighted_sum"
 terms = [
-  { signal = "decision.difficulty",      weight = 0.30 },
+  { signal = "decision.difficulty",         weight = 0.30 },
   { signal = "decision.needs:deliberation", weight = 0.35 },
   { signal = "decision.needs:verification", weight = 0.10 },
-  { signal = "keyword.brief_request",    weight = -0.35 },
+  { signal = "keyword.brief_request",       weight = -0.35 },
 ]
 bands = [
-  { lt  = 0.40, emit = "effort_off"    },
-  { gte = 0.40, lt = 0.675, emit = "effort_medium" },
-  { gte = 0.675, lt = 1.15, emit = "effort_high"   },
-  { gte = 1.15, emit = "effort_max"    },
+  { lt  = 0.20, emit = "effort_off"    },
+  { gte = 0.20, lt = 0.40, emit = "effort_medium" },
+  { gte = 0.40, lt = 0.55, emit = "effort_high"   },
+  { gte = 0.55, emit = "effort_max"    },
 ]
 ```
 
+- **Term values and configured defaults are normalized to `[0,1]` before
+  weighting.** This is load-bearing: the weights are only comparable if the
+  quantities they scale share a range. A `score` answer is a *probability-weighted
+  level* that can land between levels (`clef-schema-output.json`), so a 5-level
+  rubric produces a raw value in `[0,4]`; divide it by `(levelCount − 1)`, where
+  `levelCount` is the length of the question's `criteria`, mapping
+  `[0, levels−1] → [0,1]`. A `noul` is already `[0,1]`; a `choice` match
+  contributes the option's probability `[0,1]`; `keyword`/`structure`/`context`
+  matches contribute `1.0`/`0.0`. An `embedding` score is a cosine similarity in
+  `[-1,1]`, so projections map it with `(score + 1) / 2` (clamped to `[0,1]` for
+  floating-point round-off). Without these conversions a single `score` term
+  silently dominates a sum its weight says should be one contributor among
+  several. Raw values still drive *decision* predicates (`difficulty gte 2` means
+  level 2) and embedding match thresholds; normalization applies only inside
+  projections.
 - A term whose signal is missing or unresolved contributes its **weighted
-  default** (configurable `default`, default `0`), and the projection records
-  how many terms were imputed. A projection is never `Unknown` — it is a
+  normalized default** (configurable `default`, default `0`), and the projection
+  records how many terms were imputed. A projection is never `Unknown` — it is a
   computation over values, and an imputed value is reported, not hidden
-  (rule 8).
+  (rule 8). **This is an asymmetry worth stating:** a signal referenced *directly*
+  by a decision honours `on_unknown` when it fails, but the same signal referenced
+  *through a projection* imputes its default and recomputes the band without taking
+  an unresolved path. A failed positive-weight `difficulty` drops the effort sum;
+  a failed negative-weight term can instead raise it, so imputation can move the
+  emitted band in either direction. §9's degradation story documents this.
 - `bands` are first-match-wins (`threshold_bands` semantics). A second method
   `multi_emit` (every matching band emits) is available for the "flag all
   applicable bands" case.
@@ -950,9 +973,9 @@ terms = [
   {signal = "keyword.brief_request", weight = -0.35, default = 0}
 ]
 bands = [
-  {lt = 0.40, emit = "effort_low"},
-  {gte = 0.40, lt = 0.75, emit = "effort_medium"},
-  {gte = 0.75, emit = "effort_high"}
+  {lt = 0.20, emit = "effort_low"},
+  {gte = 0.20, lt = 0.40, emit = "effort_medium"},
+  {gte = 0.40, emit = "effort_high"}
 ]
 
 [routing.decisions.high_effort_analysis]
@@ -1284,7 +1307,7 @@ monkey-patching `globalThis.fetch` and asserting the outgoing body.
 | signals | `tests/unit/signals.test.ts` | keyword modes; structural signals against fixture bodies; a `<background>`-style client-injected block does **not** create signals (reuse `stripClientInjectedContent`, rule 4) |
 | signals | same | a failing signal lands in `signalErrors` and is **unresolved**, never `false` |
 | clef body | same | the batched request carries exactly one question per needed signal, with stable ids, and is forwarded byte-for-byte through the existing endpoint |
-| projections | `tests/unit/semantic-projections.test.ts` | `weighted_sum` values; band boundaries are `[gte, lt)` with the first band matching; imputed terms are counted and reported; emitted names appear as `projection` signals of kind `none` |
+| projections | `tests/unit/semantic-projections.test.ts` | `score` and cosine normalization; exact `weighted_sum` values; band boundaries are `[gte, lt)` with the first band matching; imputed terms are counted and reported and can move the sum in either direction; emitted names appear as `projection` signals of kind `none` |
 | embedding | `tests/unit/embedding-signal.test.ts` | cosine math on fixtures; `mean`/`max`/`any` aggregation; negative-candidate margin; threshold boundary is inclusive; **dimension mismatch is an error, not a truncation** |
 | provider | same | prototype-embedding failure at startup is a loud error; a cold cache is correct; the cache key includes backend/model/dimension |
 | routing | `tests/unit/index-routing.test.ts` | decision changes `compositeAttempts[0]`; `route` rewrites `body.model`; `apply_to = "composite"` leaves direct model names untouched |
@@ -1379,17 +1402,18 @@ intended trigger for migrating a hot signal from A to B.
 | A ≪ B on fuzzy intent categories | the judge's semantic reading is worth its RTT; B stays a pre-filter |
 | nothing beats the cheap↔best line | the pool's price/quality spread is the problem, not the router |
 
-**Sequencing** (matches §15.3; amended 2026-11-10): these benchmarks are
-long-running online experiments, not development tests — they need the shipped
-router and live traffic (step 4's shadow validation, the 3× judge-drift runs,
-real-hardware judge latency per the honesty constraint below), so they follow
-building rather than gate it. **D vs. C** still costs zero new code
-(`resolveCompositeWithDecision` and `share` both exist) and still answers the
-most important question — whether judge-based selection beats random at all —
-but it runs once phases 0–2 ship, not before them. Add **A** once phase 0's
-evaluator exists, replayed offline against the same matrix. Build **B** only if
-A's *measured* overhead shows the per-request judge call dominating, or a
-taxonomy outgrows one `choice` question (§7.1).
+**Sequencing** (matches §15.3; amended 2026-11-10): the **D-vs-C regret replay
+is a pre-build gate**, not an online experiment. The capability matrix and both
+selectors need zero new proxy code, no shipped router, and no live traffic
+(`resolveCompositeWithDecision` and `share` both exist). Run **C 3×** and D with
+a fixed seed plus a seed distribution before recording the verdict, so the
+**C ≤ D → do not build the ladder** stop is not decided by one stochastic sample.
+The routing-overhead figure and the online work follow building: they need the
+shipped router, live traffic, and real-hardware judge latency per the honesty
+constraint below. Add **A** once phase 0's evaluator exists, replay it offline
+against the same matrix **3×**, and run step 4's shadow validation after phases
+0–2 ship. Build **B** only if A's *measured* overhead shows the per-request judge
+call dominating, or a taxonomy outgrows one `choice` question (§7.1).
 
 **Honesty constraint (§8.4).** Judge latency for the cost model must be
 measured on real hardware with the laya sidecar running — MLX is
@@ -1437,19 +1461,16 @@ parallel once phase 0's signal interface is frozen.
 
 ---
 
-## 15. Open decisions (owner's call)
+## 15. Decisions (owner's call)
 
-1. **Config shape — one `[routing]` block, or extend `[composite.*.decision]`?**
-   The plan recommends a top-level `[routing]` block because decisions must be
-   able to target direct model names, not only composite aliases, and because a
-   ladder wants a flat priority space. The cheaper alternative keeps decisions
-   alias-scoped: add `questions` and an embedding provider to the existing
-   composite `decision` block and stop there. That is a real option and it is
-   much smaller — it just cannot express "this request goes to a *different
-   model*, not a different target of the same alias".
-   Note this adds a **third routing dialect** alongside the existing fixed-route
-   and model-route paths. Per `AGENTS.md` rule 5 this is surfaced rather than
-   decided here.
+1. **Config shape — settled 2026-11-10: one top-level `[routing]` block.**
+   Decisions must be able to target direct model names, not only composite aliases,
+   and a ladder wants a flat priority space. The cheaper alias-scoped alternative —
+   adding `questions` and an embedding provider to the existing composite `decision`
+   block — cannot express "this request goes to a *different model*, not a different
+   target of the same alias". The additional routing dialect alongside fixed-route
+   and model-route paths is accepted. Routing-stage precedence and whether `route`
+   may name a composite alias remain open under D10 in the implementation TODO.
 
 2. **Embedding backend (§8.2).** Recommended: Ollama `/api/embed`, reusing the
    existing converters. Alternative: extend `submodules/laya-mlx` with

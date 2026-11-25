@@ -152,16 +152,29 @@ that config could never have loaded. Fixed 2026-11-08 to
 as a finding because it is the failure mode increment 3's validation exists to
 catch, and because it shows the plan's examples are not themselves under test.
 
-**A12. Measurement follows building — it is an online experiment, not a
-development test.** Plan §12.1's sequencing paragraph said "run D vs. C first",
-which read as a pre-build gate and put P8's title ("runs alongside P0–P5") at
-odds with increment 25's ("D vs C first"). Ruled 2026-11-10: these benchmarks
-are long-running experiments that need the shipped router and live traffic —
-§12.1 step 4's shadow validation, the 3× judge-drift runs, and real-hardware
-judge latency (§12.1's own honesty constraint already forbids stub-derived
-numbers) — so P8 starts once phases 0–2 ship and never gates them. The D/C arms
-cost zero new proxy code either way, which is what §12.1's "zero new code" was
-actually claiming. Plan §12.1's sequencing paragraph amended the same day.
+**A12. Measurement splits — the D-vs-C *regret* replay is a pre-build gate; the
+*overhead* figure and the online arms follow building.** Plan §12.1's sequencing
+paragraph said "run D vs. C first", which read as a pre-build gate. Ruled
+2026-11-10 that all of P8 followed the ship; **re-ruled 2026-11-10** after the
+owner's call, because that over-generalized. The split:
+
+- **Pre-build gate (runnable now, zero new proxy code).** The capability matrix
+  (one expensive run), arm C (`resolveCompositeWithDecision`, exists) and arm D
+  (`share`, exists), and the **regret-vs-oracle** number. This answers "does
+  ability-based judge selection beat weighted random at all" and "does it clear
+  the cheap↔best line" — and §12.1's results table already makes it a stop:
+  **C ≤ D → do not build the ladder.** None of this needs the shipped router or
+  live traffic, so it runs *before* phase 0's larger build. C runs **3×** and D
+  runs with a fixed seed plus a seed distribution as part of the gate; a
+  stochastic stop/proceed verdict must not rest on one sample.
+- **Follows building (online, after phases 0–2).** The routing-**overhead**
+  figure (needs live judge latency on real hardware — §12.1's honesty constraint
+  forbids stub-derived numbers), arm A and its 3× judge-drift runs (needs phase
+  0's evaluator), and §12.1 step 4's shadow validation.
+
+So P8 no longer starts wholesale after the ship: increment 25's regret replay is
+the gate, increment 26 (arm A) and the overhead/online work stay post-ship. Plan
+§12.1's sequencing paragraph amended the same day.
 
 ---
 
@@ -172,19 +185,42 @@ first." These are that set, plus the ones §A surfaced. Each is a config-visible
 architecture-visible choice, so it is the owner's (rule 5), and each blocks the
 increment named.
 
-- [ ] **D1 — one top-level `[routing]` block, or extend `[composite.*.decision]`?**
-  (plan §15.1) Blocks increments 1–3 and everything after.
-  Recommendation: `[routing]`, because decisions must target direct model names and a
-  ladder wants one flat priority space. The alias-scoped alternative is much smaller
-  and cannot express "this request goes to a different *model*".
-  Must be answered together with D2 — they are one decision.
+- [x] **D1 — one top-level `[routing]` block, or extend `[composite.*.decision]`? →
+  top-level `[routing]`.** (plan §15.1) Settled 2026-11-10 in favour of the plan's
+  recommendation: decisions must target direct model names and a ladder wants one flat
+  priority space, which the alias-scoped alternative cannot express. Unblocks
+  increments 1–2 and the config-shape work in increment 3; D10 still blocks `route`
+  alias validation there and precedence wiring in increment 14. Answered together with
+  D2 — they are one decision.
 
-- [ ] **D2 — accept a third routing dialect.** The repo already has fixed-route
-  (`parseFixedRoute`), model-route, and composite/alias resolution; `[routing]` is a
-  fourth resolution stage above all of them. Rule 5 says surface it, not decide it.
-  If accepted, the precedence has to be *stated and tested* — proposed:
-  auth ladder (`_coordCandidate` / `authTargets`) > coordinator > fusion > **routing
-  decisions** > `getCompositeAliasMode`'s existing chain. Blocks increment 12.
+- [x] **D2 — accept a third routing dialect. → accepted, with the precedence stated in
+  D10.** The repo already has fixed-route (`parseFixedRoute`), model-route, and
+  composite/alias resolution; `[routing]` is a fourth resolution stage above all of
+  them. Settled 2026-11-10: accepted. Acceptance carries the obligation that the
+  precedence be *stated and tested* — that obligation is now its own decision, D10,
+  because it is where the acceptance costs real wiring (increment 14's skip set). The
+  proposed order stands: auth ladder (`_coordCandidate` / `authTargets`) > coordinator
+  > fusion > **routing decisions** > `getCompositeAliasMode`'s existing chain.
+  Increment 12 may proceed under the accepted dialect; increment 14 still waits on
+  D10's precedence decision.
+
+- [ ] **D10 — routing stage precedence, and alias names in `route` outcomes.** (follows
+  from D1/D2) Blocks increment 3's `route` validation and increment 14's skip-when
+  logic. With the top-level `[routing]`
+  accepted, two wiring questions become visible:
+  - **Skip-when set for `apply_to = "all"`.** Increment 14 inserts routing after
+    `modelName` is read but must skip when auth ladder / coordinator / fusion already
+    own the request. That set is the precedence rule in code form. The D2 order
+    (auth > coord > fusion > routing > composite chain) means increment 14's
+    "unchanged with `[routing]` present" test is the **primary** deliverable — it pins
+    that skipping happens correctly — not the secondary one.
+  - **Can a `route` outcome name a composite alias?** If yes, it re-enters
+    `getCompositeAliasMode` and loops back into the chain the routing stage sits above.
+    If no, `route` must name a direct model and load validation rejects alias names.
+    Recommendation: reject alias names in `route` at load — keeps the new stage strictly
+    above the old chain (clean, and matches the D1 justification "target direct model
+    names"). Under that recommendation, a `candidates` outcome may list alias names and
+    only `route` is constrained.
 
 - [ ] **D3 — how `budget_ms` relates to `requestTimeoutMs()`** (§A5). Blocks
   increment 10. Proposed: `budget_ms` is the hard total for all judge traffic in one
@@ -303,6 +339,11 @@ config to read, and so a broken config fails at load instead of at request time.
     signal or projection name — signals are one flat namespace (§5.4), so a collision
     silently shadowed by insertion order is the same class of bug as a duplicate
     section.
+  - Settle D10 before implementing `route`-alias validation. Its recommendation is a
+    hard load error when `route` names a composite alias, keeping the routing stage
+    strictly above `getCompositeAliasMode`'s chain; if the owner instead allows alias
+    names, validation and resolution must implement and test that decision rather than
+    silently applying the recommendation.
   - **Runtime** allow-list for `[routing.embedding].backend` (§6's "known gap" bullet;
     the union type at `:210` is compile-time only and the plan asks that this class of
     silent misconfiguration not exist for the new feature).
@@ -312,7 +353,10 @@ config to read, and so a broken config fails at load instead of at request time.
   - **Done when:** `tests/unit/config-loader.test.ts` has a parse → serialize → parse
     round-trip that is byte-identical for §6.2 **and** §6.4, and one test per load
     error above asserting the error *path* (e.g. `routing.decisions.code.rules`), not
-    merely that validation failed.
+    merely that validation failed. Once D10 is settled, a `route` outcome naming a
+    composite alias also has a test for the chosen behavior — if rejected, the load
+    fails with the decision path named; if accepted, resolution through the alias is
+    asserted explicitly.
 
 ## P1 — Evaluator: pure, no I/O
 
@@ -464,14 +508,18 @@ never throws, never silently `False`.
     `compositeAttempts[0]`, `route` rewrites `body.model`, and
     `apply_to = "composite"` leaves a direct model name untouched.
 
-- [ ] **14. Hook `apply_to = "all"`.** *Plan §10 row 5; D2.*
+- [ ] **14. Hook `apply_to = "all"`.** *Plan §10 row 5; D2, D10.*
   - `src/index.ts`: after `modelName` is read (`:1600`) and after schedule resolution
     (`:1612`), before deferred auth (`:1632`) and before the auth-ladder branch
     (`:1638`) — so a routing decision's model name is what auth sees. Skipped when
     the auth ladder owns routing, and when coordinator/fusion already own the alias.
-  - **Done when:** a test proves the routed model reaches the upstream body for a
-    non-composite path, and a second test proves the auth ladder / coordinator /
-    fusion paths are unchanged with `[routing]` present.
+  - This skip set **is** the D2 precedence order in code form (auth > coordinator >
+    fusion > routing > composite chain), so getting it right is the point of the
+    increment, not a guard around it (D10).
+  - **Done when:** the **primary** test proves the auth ladder / coordinator / fusion
+    paths are byte-unchanged with `[routing]` present (the precedence pin, D10), and a
+    second test proves the routed model reaches the upstream body for a non-composite
+    path the skip set does not claim.
 
 - [ ] **15. The summary log line.** *Plan §9, §11.*
   - One line per routed request in the tool judge's style: strategy, resolved/total
@@ -494,15 +542,31 @@ never throws, never silently `False`.
 ## P4 — Projections (phase 1)
 
 - [ ] **17. `weighted_sum` + `threshold_bands`.** *Plan §5.5, §6.3, §12.*
-  - Terms over signal values with signed weights; a missing/unresolved term
-    contributes its configured `default` (default `0`) and is **counted** in the
-    report (rule 8). A projection is never `Unknown`.
+  - Normalize every term value and configured default to `[0,1]` before applying
+    signed weights: divide a `score` value by its question's `levelCount − 1`, and
+    map an embedding cosine score with `(score + 1) / 2`. Raw values still drive
+    decision predicates and embedding match thresholds.
+  - A missing/unresolved term contributes its configured normalized `default`
+    (default `0`) and is **counted** in the report (rule 8). A projection is never
+    `Unknown`.
+  - **Projection asymmetry (note for §9/docs increment 20):** signals referenced
+    directly honour `on_unknown`; signals referenced through a projection do not. An
+    unresolved `difficulty` signal imputes its default (0), so a decision keyed on
+    `projection.effort_high` can fail to match rather than taking an `on_unknown`
+    path. With a negative-weight term, imputing zero instead removes a negative
+    contribution and can move the result to a **higher** band. This is the
+    "unresolved masquerades as negative" failure mode (R1 item 2) re-entering
+    through the projection layer, which is explicitly exempt from K3 logic. The
+    degradation story must call out that imputation can move the band either way.
   - Bands are first-match-wins with `[gte, lt)` bounds; emitted names become signals of
     type `projection`, kind `none`, confidence 1.0 — referenceable by decisions,
     never ranked on.
-  - **Done when:** `tests/unit/semantic-projections.test.ts` pins exact sums, each
-    band boundary (`0.399…`, `0.40`, `0.749…`, `0.75`), the imputed-term count, and
-    that an emitted name lands in `signalValues`/matches as `projection.<name>`.
+  - **Done when:** `tests/unit/semantic-projections.test.ts` pins exact normalized
+    sums (including a five-level raw `score` of 2 becoming 0.5 and a cosine score of
+    −0.5 becoming 0.25), each §6.3 band boundary (`0.199…`, `0.20`, `0.399…`, `0.40`),
+    the imputed-term count, imputation movement in both directions with positive and
+    negative weights, and that an emitted name lands in `signalValues`/matches as
+    `projection.<name>`.
 
 - [ ] **18. `sigmoid_distance` calibration + `multi_emit`.** *Plan §5.5, §6.3.*
   - Small, and only worth building with a config that uses it — if none does, delete
@@ -531,7 +595,10 @@ never throws, never silently `False`.
 
 - [ ] **20. Docs.** *Plan §13, D8.*
   - `docs/reference/semantic-decision.md` (signals, decisions, projections, outcomes,
-    `on_unknown`, the degradation story, a worked ladder), index entries, the
+    `on_unknown`, the degradation story — including the projection asymmetry from
+    increment 17: a signal read through a projection uses its imputed default instead
+    of honouring `on_unknown`, which can move the emitted band either down or up — a
+    worked ladder), index entries, the
     `[routing]` block in `docs/reference/configuration-reference.md`,
     `docs/reference/routing-and-aliases.md` (where the layer sits in resolution
     order), a note in `docs/architecture/design_decision_composite_targeting.md` that
@@ -590,27 +657,35 @@ judge call is the bottleneck, or a taxonomy outgrows one `choice` question** (pl
     signal kind, and the README documents that MLX is Apple-Silicon-only so CI cannot
     run it — the honesty constraint is part of the deliverable, not a footnote.
 
-## P8 — Evidence and measurement (long-running online experiments; they follow
-phases 0–2 and never gate them — §A12)
+## P8 — Evidence and measurement (the D-vs-C regret replay gates the build; the
+overhead figure and arm A follow phases 0–2 — §A12)
 
-- [ ] **25. D vs C — zero new proxy code, and not a gate.** *Plan §12.1, sequencing
-    amended 2026-11-10 (§A12).*
+- [ ] **25. D vs C regret — zero new proxy code, and the pre-build gate.** *Plan §12.1,
+    sequencing re-amended 2026-11-10 (§A12).*
   - Extend `tests/perf/benchmark.ts` with the four-arm harness: a labeled prompt suite
     (~300–500), a fixed 3–5 model pool, and the capability matrix (every model × every
     prompt → `{score, tokens, latency, cost}`). Then replay the **existing** arms:
     `share`/weighted (D) and `[composite.*.decision]` (C). This answers "does judge
-    selection beat weighted random at all" from modes that already exist — but it is a
-    long-running online experiment over live traffic (the §12.1 shadow-validation
-    step), not a development test, so it runs after phases 0–2 ship and nothing in
-    P0–P5 waits on its verdict.
-  - **Done when:** the harness reports regret-vs-oracle per category, quality-per-dollar
-    against the cheap↔best line, and the routing-overhead share — and it states which
-    figures are stubbed. Judge latency must be measured on real hardware; a
-    stub-derived overhead number is worthless here (§12.1's honesty constraint).
+    selection beat weighted random at all" from modes that already exist, needs no new
+    proxy code and no shipped router, so it **runs before phase 0's larger build** — it
+    is the gate §12.1's results table already writes (**C ≤ D → do not build the
+    ladder**).
+  - Run C **3×** to expose judge drift and D with a fixed seed plus a seed distribution
+    before recording the verdict. These repetitions are part of the gate, not post-ship
+    work; only A's judge-drift runs wait for the evaluator.
+  - The routing-**overhead** figure is *not* part of this gate: it needs live judge
+    latency on real hardware and stays post-ship (§A12, §12.1 honesty constraint). The
+    gate is a quality verdict (regret), not a cost verdict.
+  - **Done when:** the harness reports regret-vs-oracle per category and
+    quality-per-dollar against the cheap↔best line across all three C runs and D's seed
+    distribution — and the verdict (proceed to phase 0, or stop) is recorded here.
+    Overhead/latency columns may be left as stubbed-and-labeled until the post-ship run
+    fills them.
 
 - [ ] **26. A against the same matrix, once the evaluator exists.** *Plan §12.1.*
-  - Replay is a lookup, not a re-run. Run judge arms 3× to expose drift; add the
-    labeled-ideal router as the ceiling any category policy can reach.
+  - Replay is a lookup, not a re-run. Run A 3× to expose drift (C's three runs are
+    already part of increment 25); add the labeled-ideal router as the ceiling any
+    category policy can reach.
   - **Done when:** §12.1's "reading the results" table is filled in with this repo's
     numbers, and the conclusion (build / don't build / hybrid) is written into the
     plan rather than left in a terminal.
