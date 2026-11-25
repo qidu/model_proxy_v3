@@ -736,7 +736,15 @@ PORT=8788 model-proxy-v3                # default port is 8788
 
 ```bash
 npm run build:native     # -> dist/model-proxy-v3-<host-triple>
+dist/model-proxy-v3-<host-triple> --version
+# model-proxy-v3@v2.8.6-8th-g529ff1a
 ```
+
+The version contains the nearest Git tag, the number of commits since that tag,
+and the commit ID. Both `npm run build` and `npm run build:native` embed it. The
+same `VERSION` value is used by the dashboard, TUI, RPC, startup log, and API
+responses. The `VERSION` environment variable overrides it at build time or
+runtime; commands that execute the TypeScript source directly default to `dev`.
 
 The output is named `<name>-<host target triple>` (e.g.
 `model-proxy-v3-x86_64-apple-darwin`), the same name the Tauri tray's

@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(build): embed Git version metadata in native binaries
+
+Node and native builds now support `--version` and report `model-proxy-v3@<tag>-<ordinal-commit-distance>-g<commit>` using metadata from `git describe --tags --long --always --dirty`. The regular build writes the version to `dist/version.js`; the native build embeds it with esbuild. The same build version flows through `env.VERSION` to the dashboard, TUI, RPC, startup log, and API responses. CI checkouts fetch full tag history, and every native binary is executed with `--version` to verify its embedded metadata. Docker builds use the `VERSION` build argument because their build context has no Git metadata.
+
 ### fix(responses): use developer input messages for GPT-6.2 and later
 
 `/v1/chat/completions`, `/v1/messages`, `/v1beta/models/<model>:generateContent`, and `/v1/interactions` requests routed to `openai-responses` now convert system/developer messages into leading Responses `input` items with `role: "developer"` for `gpt-6.2` and numerically later `gpt-*` models, including suffixed model IDs. Earlier GPT and non-GPT models retain the joined top-level `instructions` behavior. Note: Native Responses pass-through still forwards instructions unchanged.

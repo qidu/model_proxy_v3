@@ -25,6 +25,8 @@ COPY tsconfig.server.json ./
 COPY src/ ./src/
 COPY submodules/ ./submodules/
 
+# No .git directory is copied; use the image build argument instead.
+ARG VERSION=dev
 RUN npm run build
 
 # Drop devDependencies (wrangler, claude/codex/genai SDKs, etc.) now that the build is done
@@ -40,7 +42,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/submodules ./submodules
 COPY --from=builder /app/dist ./dist
 
-ARG VERSION
+ARG VERSION=dev
 ENV VERSION=$VERSION
 ENV LOCAL_TIKTOKEN=true
 ENV TIKTOKEN_MODEL="o200k_base"

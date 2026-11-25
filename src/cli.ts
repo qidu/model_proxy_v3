@@ -37,6 +37,7 @@ Commands:
   --export-openclaw-providers  Print a ~/.openclaw/openclaw.json models.providers entry for this proxy
   --export-dsh                 Print a deepseek-harness (dsh) llm-pi-ai provider config for this proxy
   --validate-config            Validate the config file and report errors/warnings
+  --version                    Show the build version
   --help, -h                   Show this help
 
 Modes:
@@ -89,6 +90,10 @@ export function runCli(argv: string[], env: Env): number | null {
 
   if (argv.includes('--help') || argv.includes('-h')) {
     process.stdout.write(USAGE);
+    return 0;
+  }
+  if (argv.includes('--version')) {
+    process.stdout.write(`model-proxy-v3@${env.VERSION || 'dev'}\n`);
     return 0;
   }
 

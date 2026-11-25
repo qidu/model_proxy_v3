@@ -5,8 +5,8 @@
  * Node's built-in SEA (Single Executable Application) support.
  *
  * This is an ADDITIONAL distribution channel, not a replacement for anything:
- *   - `npm run build`  -> tsc -p tsconfig.server.json -> dist/*.js + node_modules
- *                         (what the Dockerfile ships: `node dist/server.js`)
+ *   - `npm run build`  -> tsc -p tsconfig.server.json + dist/version.js
+ *                         -> dist/*.js + node_modules (what the Dockerfile ships)
  *   - `npm run build:native` (this script) -> dist/<name> single binary
  *
  * HOW SEA WORKS: SEA takes exactly ONE JavaScript file — it does not walk
@@ -71,6 +71,7 @@ import {
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { getBuildVersion } from './build-version.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -149,8 +150,8 @@ function outputName() {
  *
  * A literal double quote cannot be represented inside a double-quoted word in
  * a way that survives both cmd and the child's argv parsing, so rather than
- * emit something subtly wrong we fail loud. No word in this script contains
- * one.
+ * emit something subtly wrong we fail loud when a word that needs quoting
+ * contains one.
  */
 function quoteForCmd(word) {
   if (!/[ \t&|<>^()]/.test(word)) return word;
@@ -295,6 +296,8 @@ function main() {
   mkdirSync(DIST, { recursive: true });
 
   const bundlePath = path.join(BUILD, 'bundle.js');
+  const buildVersion = getBuildVersion(ROOT);
+  console.error(`[build-sea] build version: ${buildVersion}`);
 
   // --- 1. Bundle ---------------------------------------------------------
   //
@@ -337,6 +340,7 @@ function main() {
     '--format=cjs',
     '--loader:.json=json',
     '--define:import.meta.url=__SEA_IMPORT_META_URL__',
+    `--define:__BUILD_VERSION__=${JSON.stringify(buildVersion)}`,
     "--banner:js=const __SEA_IMPORT_META_URL__ = require('node:url').pathToFileURL(process.execPath).href;",
     ...EXTERNALS.map((m) => `--external:${m}`),
     `--outfile=${bundlePath}`,

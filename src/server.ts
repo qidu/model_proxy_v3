@@ -15,6 +15,7 @@ import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseH
 import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled, setTokenRetentionWindow, isEnvFlagEnabled } from './utils/dashboard-stats.js';
 import { consumeStreamFailureReporter } from './utils/stream-failure.js';
 import { runCli } from './cli.js';
+import { BUILD_VERSION } from './version.js';
 
 // Import the Workers fetch handler
 import handler from './index.js';
@@ -34,7 +35,7 @@ export function nodeResponseHeaders(response: Response): Record<string, string> 
 export function buildNodeEnv(source: NodeJS.ProcessEnv = process.env): NodeEnv {
   return {
     NODE_ENV: source.NODE_ENV || 'production',
-    VERSION: source.VERSION || 'dev',
+    VERSION: source.VERSION || BUILD_VERSION,
     ALLOWED_ORIGINS: source.ALLOWED_ORIGINS || '*',
     LOCAL_TIKTOKEN: source.LOCAL_TIKTOKEN || 'false',
     ALLOWED_HOSTS: source.ALLOWED_HOSTS || '127.0.0.1,localhost',

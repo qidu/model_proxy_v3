@@ -30,6 +30,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: false
+          # The regular build also embeds git describe output.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -94,6 +96,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: false
+          # git describe needs the nearest release tag and the commits since it.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -133,6 +137,18 @@ jobs:
           fi
           echo "path=$expected" >> "$GITHUB_OUTPUT"
           echo "$expected"
+
+      - name: Check binary version
+        shell: bash
+        run: |
+          version_output="$("${{ steps.binary.outputs.path }}" --version)"
+          echo "$version_output"
+          recent_tag="$(git describe --tags --abbrev=0)"
+          commit="$(git rev-parse --short HEAD)"
+          if [[ "$version_output" != *"$recent_tag"* || "$version_output" != *"$commit"* ]]; then
+            echo "::error::expected $recent_tag and $commit in: $version_output"
+            exit 1
+          fi
 
       - name: Upload the binary
         uses: actions/upload-artifact@v4

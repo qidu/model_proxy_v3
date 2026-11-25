@@ -123,7 +123,7 @@ describe('runCli argument handling', () => {
   it('--help exits 0 and documents every command', () => {
     const result = capture(['--help'], envFor(goodPath));
     assert.equal(result.code, 0);
-    for (const command of ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--validate-config', '--default-model']) {
+    for (const command of ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--validate-config', '--version', '--default-model']) {
       assert.ok(result.out.includes(command), `help must mention ${command}`);
     }
     assert.ok(result.out.includes('~/.pi/agent/models.json'), 'help must point --export-pi-models at the pi models file');
@@ -132,6 +132,16 @@ describe('runCli argument handling', () => {
       result.out.includes('~/.openclaw/openclaw.json'),
       'help must point --export-openclaw-providers at the OpenClaw config file',
     );
+  });
+
+  it('--version prints the shared VERSION without loading config', () => {
+    const result = capture(
+      ['--version'],
+      envFor(join(tempDir, 'missing.toml'), { VERSION: 'v2.8.6-8th-g529ff1a' }),
+    );
+    assert.equal(result.code, 0);
+    assert.equal(result.out, 'model-proxy-v3@v2.8.6-8th-g529ff1a\n');
+    assert.equal(result.err, '');
   });
 
   it('rejects an unknown argument with exit code 2', () => {
