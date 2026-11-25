@@ -39,6 +39,7 @@ import { budgetToReasoningEffort, type ThinkingConversionOptions } from './claud
 interface ConversionOptions {
   logger?: Logger;
   requestId?: string;
+  systemMessagesAsDeveloper?: boolean;
   /** Thinking-budget → reasoning-effort thresholds, as the config declares them. */
   conversion?: ThinkingConversionOptions;
 }
@@ -336,10 +337,13 @@ export function claudeToResponsesBody(
   if (input.length === 0) throw new ValidationError('Claude request produced no Responses input items');
 
   const instructions = systemToInstructions(request.system, options);
+  if (instructions !== undefined && options?.systemMessagesAsDeveloper) {
+    input.unshift({ type: 'message', role: 'developer', content: [{ type: 'input_text', text: instructions }] });
+  }
   const body: Record<string, unknown> = {
     model,
     input,
-    ...(instructions !== undefined ? { instructions } : {}),
+    ...(instructions !== undefined && !options?.systemMessagesAsDeveloper ? { instructions } : {}),
     ...(request.stream === true ? { stream: true } : {}),
   };
 

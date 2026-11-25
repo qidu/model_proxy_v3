@@ -7,6 +7,7 @@ import { classifyInteractionsInput, functionArgs, interactionResponseSchema, typ
 interface ConversionOptions {
   logger?: Logger;
   requestId?: string;
+  systemMessagesAsDeveloper?: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -176,11 +177,26 @@ function appendTurn(
 ): void {
   if (turn.role === 'system' || turn.role === 'developer') {
     const parts = contentParts(turn.content, 'user', `${where}.content`, options);
-    systemTexts.push(...parts.filter(part => part.type === 'input_text').map(part => part.text as string));
+    if (options?.systemMessagesAsDeveloper) {
+      input.push({ type: 'message', role: 'developer', content: parts });
+    } else {
+      systemTexts.push(...parts.filter(part => part.type === 'input_text').map(part => part.text as string));
+    }
     return;
   }
   const role = turn.role === 'model' || turn.role === 'assistant' ? 'assistant' : 'user';
   input.push({ type: 'message', role, content: contentParts(turn.content, role, `${where}.content`, options) });
+}
+
+function withLeadingDeveloperMessages(
+  input: Array<Record<string, unknown>>,
+  options?: ConversionOptions,
+): Array<Record<string, unknown>> {
+  if (!options?.systemMessagesAsDeveloper) return input;
+  return [
+    ...input.filter(item => item.type === 'message' && item.role === 'developer'),
+    ...input.filter(item => item.type !== 'message' || item.role !== 'developer'),
+  ];
 }
 
 function interactionInputToResponses(
@@ -200,7 +216,7 @@ function interactionInputToResponses(
       if (!turn) throw new ValidationError(`input.messages[${index}] must be an object`);
       appendTurn(input, systemTexts, turn, `input.messages[${index}]`, options);
     }
-    return input;
+    return withLeadingDeveloperMessages(input, options);
   }
   const entries: InteractionsInputEntry[] = classifyInteractionsInput(Array.isArray(value) ? value : [value], 'input');
   for (const entry of entries) {
@@ -213,7 +229,7 @@ function interactionInputToResponses(
     });
   }
   if (input.length === 0 && systemTexts.length === 0) throw new ValidationError('Interactions input produced no Responses items');
-  return input;
+  return withLeadingDeveloperMessages(input, options);
 }
 
 function responseTools(
@@ -310,10 +326,19 @@ export function interactionsToResponsesBody(
   const systemTexts: string[] = [];
   const input = interactionInputToResponses(request.input, systemTexts, options);
   const declaredSystem = request.system_instruction ?? request.systemInstruction;
-  if (typeof declaredSystem === 'string' && declaredSystem !== '') systemTexts.unshift(declaredSystem);
-  else if (declaredSystem !== undefined) {
+  if (typeof declaredSystem === 'string' && declaredSystem !== '') {
+    if (options?.systemMessagesAsDeveloper) {
+      input.unshift({ type: 'message', role: 'developer', content: [{ type: 'input_text', text: declaredSystem }] });
+    } else {
+      systemTexts.unshift(declaredSystem);
+    }
+  } else if (declaredSystem !== undefined) {
     const parts = contentParts(asRecord(declaredSystem)?.parts ?? declaredSystem, 'user', 'system_instruction', options);
-    systemTexts.unshift(...parts.filter(part => part.type === 'input_text').map(part => part.text as string));
+    if (options?.systemMessagesAsDeveloper) {
+      input.unshift({ type: 'message', role: 'developer', content: parts });
+    } else {
+      systemTexts.unshift(...parts.filter(part => part.type === 'input_text').map(part => part.text as string));
+    }
   }
 
   const body: Record<string, unknown> = {

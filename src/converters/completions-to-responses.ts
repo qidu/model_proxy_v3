@@ -397,6 +397,14 @@ function completionsToolChoiceToResponses(toolChoice: unknown): unknown {
   return name === undefined ? undefined : { type: 'function', name };
 }
 
+export function isGpt62OrLater(model: string): boolean {
+  const match = /^gpt-(\d+)(?:\.(\d+))?/i.exec(model);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2] ?? 0);
+  return major > 6 || (major === 6 && minor >= 2);
+}
+
 /**
  * Convert an OpenAI Chat Completions body to an OpenAI Responses body (`input`).
  * Used to route Gemini endpoints (interactions/generateContent) through an
@@ -405,15 +413,26 @@ function completionsToolChoiceToResponses(toolChoice: unknown): unknown {
 export function completionsToResponsesBody(
   completions: Record<string, unknown>,
   model: string,
-  options?: { logger?: Logger; requestId?: string },
+  options?: { logger?: Logger; requestId?: string; systemMessagesAsDeveloper?: boolean },
 ): Record<string, unknown> {
   const messages = (completions.messages as OpenAIMessage[]) || [];
   const input: unknown[] = [];
-  const instructions = messages
-    .filter(msg => msg.role === 'system' || msg.role === 'developer')
+  const systemMessages = messages.filter(msg => msg.role === 'system' || msg.role === 'developer');
+  const instructions = options?.systemMessagesAsDeveloper ? '' : systemMessages
     .map(msg => openAIContentToText(msg.content))
     .filter(text => text !== '')
     .join('\n');
+
+  if (options?.systemMessagesAsDeveloper) {
+    for (const msg of systemMessages) {
+      const contentParts = openAIContentToResponsesParts(msg.content, 'input_text');
+      input.push({
+        type: 'message',
+        role: 'developer',
+        content: contentParts.length > 0 ? contentParts : [{ type: 'input_text', text: '' }],
+      });
+    }
+  }
 
   for (const msg of messages) {
     if (msg.role === 'system' || msg.role === 'developer') {

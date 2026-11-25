@@ -94,14 +94,14 @@ describe('handleChatCompletionsPassthrough — openai-responses streaming conver
   after(() => { globalThis.fetch = realFetch; });
   afterEach(() => { globalThis.fetch = realFetch; });
 
-  async function run(events: Array<Record<string, unknown>>, body: Record<string, unknown> = {}, splitAt?: number): Promise<{ response: Response; chunks: any[] }> {
+  async function run(events: Array<Record<string, unknown>>, body: Record<string, unknown> = {}, splitAt?: number, model = 'gpt-test'): Promise<{ response: Response; chunks: any[] }> {
     upstreamBodies = [];
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       await recordUpstreamBody(init);
       return responsesStreamResponse(events, splitAt);
     }) as typeof fetch;
     const response = await handleChatCompletionsPassthrough(
-      makeRequest(body), RESPONSES_URL, { Authorization: 'Bearer k' }, 'rid', testLogger, env, 'gpt-test', 'openai-responses',
+      makeRequest({ ...body, model }), RESPONSES_URL, { Authorization: 'Bearer k' }, 'rid', testLogger, env, model, 'openai-responses',
     );
     return { response, chunks: await readChunks(response) };
   }
@@ -215,6 +215,59 @@ describe('handleChatCompletionsPassthrough — openai-responses streaming conver
     const sent = JSON.parse(upstreamBodies[0]);
     assert.deepEqual(sent.metadata, { team: 'qa' });
     assert.equal(sent.parallel_tool_calls, false);
+  });
+
+  it('extracts system and developer messages as developer input for gpt-6.2', async () => {
+    await run(textAnswer('ok'), {
+      messages: [
+        { role: 'system', content: 'rule one' },
+        { role: 'developer', content: 'rule two' },
+        { role: 'user', content: 'q' },
+      ],
+    }, undefined, 'gpt-6.2-mini');
+
+    const sent = JSON.parse(upstreamBodies[0]);
+    assert.equal(sent.instructions, undefined);
+    assert.deepEqual(sent.input, [
+      { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'rule one' }] },
+      { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'rule two' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'q' }] },
+    ]);
+  });
+
+  it('uses developer input for numerically later GPT versions', async () => {
+    for (const model of ['gpt-6.10', 'gpt-7', 'gpt-7o']) {
+      await run(textAnswer('ok'), {
+        messages: [
+          { role: 'system', content: 'rule' },
+          { role: 'user', content: 'q' },
+        ],
+      }, undefined, model);
+
+      const sent = JSON.parse(upstreamBodies[0]);
+      assert.equal(sent.model, model);
+      assert.equal(sent.instructions, undefined, model);
+      assert.equal(sent.input[0].role, 'developer', model);
+      assert.equal(sent.input[1].role, 'user', model);
+    }
+  });
+
+  it('keeps top-level instructions for earlier GPT and non-GPT models', async () => {
+    for (const model of ['gpt-6.1', 'gpt-5.4', 'claude-sonnet-5']) {
+      await run(textAnswer('ok'), {
+        messages: [
+          { role: 'system', content: 'rule one' },
+          { role: 'developer', content: 'rule two' },
+          { role: 'user', content: 'q' },
+        ],
+      }, undefined, model);
+
+      const sent = JSON.parse(upstreamBodies[0]);
+      assert.equal(sent.instructions, 'rule one\nrule two', model);
+      assert.deepEqual(sent.input, [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'q' }] },
+      ], model);
+    }
   });
 
   it('carries a refused answer to the client as delta.refusal, not as an empty answer', async () => {

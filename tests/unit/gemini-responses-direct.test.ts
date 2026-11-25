@@ -184,6 +184,40 @@ describe('R4/R6 routed direct conversion', () => {
   afterEach(() => { globalThis.fetch = realFetch; });
   after(() => { globalThis.fetch = realFetch; });
 
+  it('uses leading developer input messages for gpt-6.2 system content', async () => {
+    let upstreamBody: Record<string, unknown>;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(await new Response(init?.body as BodyInit).text());
+      return json({
+        id: 'resp_system', status: 'completed', model: 'gpt-6.2',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+        usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+      });
+    }) as typeof fetch;
+    const response = await handleOpenAIRequest(
+      new Request('http://proxy/v1beta/models/gpt-6.2:generateContent', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: 'declared rule' }] },
+          contents: [
+            { role: 'system', parts: [{ text: 'turn rule' }] },
+            { role: 'user', parts: [{ text: 'hello' }] },
+          ],
+        }),
+      }),
+      'https://upstream.test/v1/responses', { Authorization: 'Bearer key' }, 'r6-system', 'gpt-6.2',
+      ENV, LOGGER, false, undefined, 'openai-responses',
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamBody!.instructions, undefined);
+    assert.deepEqual(upstreamBody!.input, [
+      { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'declared rule' }] },
+      { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'turn rule' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+    ]);
+  });
+
   it('routes generateContent tools directly to Responses and returns direct Gemini JSON', async () => {
     let upstreamBody: Record<string, unknown>;
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {

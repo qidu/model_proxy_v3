@@ -79,6 +79,24 @@ const minimalBody = (extra: Record<string, unknown> = {}): Record<string, unknow
 });
 
 describe('/v1/interactions → openai-responses: request fields reach the upstream', () => {
+  it('uses leading developer input messages for gpt-6.2 system content', async () => {
+    const upstream = await send({
+      model: 'gpt-6.2',
+      system_instruction: 'declared rule',
+      input: { messages: [
+        { role: 'system', content: 'turn rule' },
+        { role: 'user', content: 'hello' },
+      ] },
+    }, 'openai-responses');
+
+    assert.equal(upstream.instructions, undefined);
+    assert.deepEqual(upstream.input, [
+      { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'declared rule' }] },
+      { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'turn rule' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+    ]);
+  });
+
   it('carries the sampling knobs as the Responses spellings', async () => {
     const upstream = await send(minimalBody({
       generation_config: { temperature: 0.3, top_p: 0.9, max_output_tokens: 1234, thinking_level: 'minimal' },

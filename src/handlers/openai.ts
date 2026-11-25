@@ -24,7 +24,7 @@ import {
   defaultMissingOpenAIMessageRoles,
 } from '../converters/gemini-to-openai.js';
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
-import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
+import { completionsToResponsesBody, isGpt62OrLater } from '../converters/completions-to-responses.js';
 import { convertResponsesToChatCompletionsAnswer } from '../converters/responses-to-completions.js';
 import { interactionsToResponsesBody } from '../converters/interactions-to-responses.js';
 import {
@@ -271,7 +271,9 @@ async function forwardCompletionsAsOpenAIResponses(
   isStreaming?: boolean,
   route?: ModelRouteConfig,
 ): Promise<Response> {
-  let responsesBody: Record<string, unknown> = completionsToResponsesBody(openaiRequest, model, { logger, requestId });
+  let responsesBody: Record<string, unknown> = completionsToResponsesBody(openaiRequest, model, {
+    logger, requestId, systemMessagesAsDeveloper: isGpt62OrLater(model),
+  });
 
   // No warning for the Interactions `labels` map here: it rides the intermediate as
   // `metadata`, which `completionsToResponsesBody` re-emits into a field the Responses
@@ -522,7 +524,9 @@ async function forwardGenerateContentAsOpenAIResponses(
   env?: Env,
   route?: ModelRouteConfig,
 ): Promise<Response> {
-  let responsesBody = geminiToResponsesBody(requestBody, model, { logger, requestId });
+  let responsesBody = geminiToResponsesBody(requestBody, model, {
+    logger, requestId, systemMessagesAsDeveloper: isGpt62OrLater(model),
+  });
   if (forceStreaming) responsesBody.stream = true;
   const isStreaming = responsesBody.stream === true;
   if (route) {
@@ -770,7 +774,9 @@ async function forwardInteractionsAsOpenAIResponses(
   env?: Env,
   route?: ModelRouteConfig,
 ): Promise<Response> {
-  let responsesBody = interactionsToResponsesBody(requestBody, model, { logger, requestId });
+  let responsesBody = interactionsToResponsesBody(requestBody, model, {
+    logger, requestId, systemMessagesAsDeveloper: isGpt62OrLater(model),
+  });
   if (route) {
     const hookCtx: HookContext = {
       hook: 'before_upstream', route, upstreamMode: 'openai-responses',

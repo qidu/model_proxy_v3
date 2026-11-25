@@ -37,7 +37,7 @@ import { getSpoolConfig } from '../utils/spool.js';
 import { receiveJsonResponse, withResponseText } from '../utils/spool-response.js';
 // The one Completions→Responses request converter, shared with the /v1/interactions and
 // /v1/chat/completions hops. No import cycle: openai.ts does not import this module.
-import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
+import { completionsToResponsesBody, isGpt62OrLater } from '../converters/completions-to-responses.js';
 
 /**
  * Get token counting configuration from environment
@@ -250,10 +250,11 @@ export async function handleMessagesRequest(
       // of what this branch built by hand: it also emits `instructions`, `store`,
       // `response_format`, `reasoning_effort`, `prompt_cache_key` and the assistant
       // reasoning items.
+      const responsesModel = (openaiRequestBody.model as string | undefined) ?? model;
       let responsesBody: Record<string, unknown> = completionsToResponsesBody(
         openaiRequestBody as unknown as Record<string, unknown>,
-        (openaiRequestBody.model as string | undefined) ?? model,
-        { logger: activeLogger, requestId },
+        responsesModel,
+        { logger: activeLogger, requestId, systemMessagesAsDeveloper: isGpt62OrLater(responsesModel) },
       );
       // Re-asserted rather than taken from the converter: `stream` here is the proxy's
       // own decision (`?alt=sse` and the streaming doorways can force it), not a field
@@ -540,7 +541,12 @@ export async function handleMessagesRequest(
     const responsesBody: Record<string, unknown> = claudeToResponsesBody(
       claudeRequest,
       targetModelId,
-      { logger: activeLogger, requestId, conversion: conversionOptions },
+      {
+        logger: activeLogger,
+        requestId,
+        systemMessagesAsDeveloper: isGpt62OrLater(targetModelId),
+        conversion: conversionOptions,
+      },
     );
     responsesBody.stream = isStreaming;
 

@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(responses): use developer input messages for GPT-6.2 and later
+
+`/v1/chat/completions`, `/v1/messages`, `/v1beta/models/<model>:generateContent`, and `/v1/interactions` requests routed to `openai-responses` now convert system/developer messages into leading Responses `input` items with `role: "developer"` for `gpt-6.2` and numerically later `gpt-*` models, including suffixed model IDs. Earlier GPT and non-GPT models retain the joined top-level `instructions` behavior. Note: Native Responses pass-through still forwards instructions unchanged.
+
 ### feat(agent): propagate Pi SDK session IDs to trajectory records
 
 The built-in interactive Pi agent now generates one UUID per run and supplies it to both the verification and selected-endpoint `Agent` instances through `AgentOptions.sessionId`. Its loopback models also send `x-agent-session-id`, ensuring Anthropic, OpenAI Completions/Responses, Open Responses, and Gemini requests all share the same trajectory session across follow-up tasks while allowing SDK-aware providers to use the ID for caching.

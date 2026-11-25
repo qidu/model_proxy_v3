@@ -16,7 +16,7 @@ import { ValidationError, createOpenAIUpstreamErrorResponse } from '../utils/err
 import { claudeJsonToSyntheticCompletions, claudeUsageToCompletions } from './openai.js';
 import { warnDroppedOutputItems } from './cross-mode-stream.js';
 import { completionsToClaudeBody } from '../converters/completions-to-claude.js';
-import { completionsToResponsesBody } from '../converters/completions-to-responses.js';
+import { completionsToResponsesBody, isGpt62OrLater } from '../converters/completions-to-responses.js';
 import {
   convertResponsesToChatCompletionsAnswer,
   createResponsesChatStreamState,
@@ -338,7 +338,9 @@ export async function handleChatCompletionsPassthrough(
   // When the upstream is openai-responses, convert the completions body to Responses API format
   if (upstreamMode === 'openai-responses') {
     const model = (modelId || parsedBody.model as string || 'unknown');
-    let responsesBody: Record<string, unknown> = completionsToResponsesBody(parsedBody, model, { logger, requestId });
+    let responsesBody: Record<string, unknown> = completionsToResponsesBody(parsedBody, model, {
+      logger, requestId, systemMessagesAsDeveloper: isGpt62OrLater(model),
+    });
     logger.debug(requestId, `${path} converted to openai-responses body`);
 
     // before_upstream on the converted responses body (handles max_tokens rename etc.)

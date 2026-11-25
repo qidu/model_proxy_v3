@@ -52,13 +52,14 @@ async function postMessages(
   upstreamMode = 'openai-completions',
   logger?: Logger,
   authHeaders: Record<string, string> = { Authorization: 'Bearer upstream-key' },
+  modelId = 'gpt-test',
 ): Promise<Response> {
   return handleMessagesRequest(
     messagesRequest(body),
     TARGET_URL,
     authHeaders,
     'req-messages',
-    'gpt-test',
+    modelId,
     ENV,
     logger,
     undefined,
@@ -167,6 +168,37 @@ describe('handleMessagesRequest', () => {
       stop_sequence: null,
       usage: { input_tokens: 3, output_tokens: 1 },
     });
+  });
+
+  it('uses a developer input message for system content with gpt-6.2 Responses upstreams', async () => {
+    upstreamBody = {
+      id: 'resp-system',
+      object: 'response',
+      created_at: 1700000001,
+      status: 'completed',
+      model: 'gpt-6.2-mini',
+      output: [{
+        id: 'msg-system', type: 'message', status: 'completed', role: 'assistant',
+        content: [{ type: 'output_text', text: 'ok' }],
+      }],
+      usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+    };
+
+    const response = await postMessages({
+      model: 'gpt-6.2-mini',
+      system: 'be precise',
+      messages: [{ role: 'user', content: 'hello' }],
+    }, 'openai-responses', undefined, undefined, 'gpt-6.2-mini');
+
+    assertUpstreamBody({
+      model: 'gpt-6.2-mini',
+      input: [
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'be precise' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+      ],
+      stream: false,
+    });
+    assert.equal(response.status, 200);
   });
 
   it('converts a non-streaming Responses text and function_call result to Claude', async () => {

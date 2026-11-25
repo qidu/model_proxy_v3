@@ -9,6 +9,7 @@ import type { NamespaceMap } from './responses-to-completions.js';
 interface ConversionOptions {
   logger?: Logger;
   requestId?: string;
+  systemMessagesAsDeveloper?: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -116,6 +117,7 @@ function contentsToResponses(
   if (!Array.isArray(contents)) throw new ValidationError('generateContent contents must be an array');
   const input: Array<Record<string, unknown>> = [];
   const instructions: string[] = [];
+  const developerMessages: Array<Record<string, unknown>> = [];
   let lastCalls: LastCall[] = [];
 
   for (const [contentIndex, value] of contents.entries()) {
@@ -125,7 +127,12 @@ function contentsToResponses(
     const parts = content.parts;
     if (!Array.isArray(parts)) throw new ValidationError(`contents[${contentIndex}].parts must be an array`);
     if (content.role === 'system' || content.role === 'developer') {
-      instructions.push(systemInstructionText({ parts }));
+      const text = systemInstructionText({ parts });
+      if (options?.systemMessagesAsDeveloper) {
+        developerMessages.push({ type: 'message', role: 'developer', content: [{ type: 'input_text', text }] });
+      } else {
+        instructions.push(text);
+      }
       continue;
     }
 
@@ -191,8 +198,8 @@ function contentsToResponses(
     else if (parts.some(part => asRecord(part)?.functionResponse || asRecord(part)?.function_response)) lastCalls = [];
   }
 
-  if (input.length === 0 && instructions.length === 0) throw new ValidationError('generateContent request produced no Responses input');
-  return { input, instructions };
+  if (input.length === 0 && instructions.length === 0 && developerMessages.length === 0) throw new ValidationError('generateContent request produced no Responses input');
+  return { input: [...developerMessages, ...input], instructions };
 }
 
 function responseTools(
@@ -273,7 +280,13 @@ export function geminiToResponsesBody(
   const { input, instructions } = contentsToResponses(request.contents, options);
   const declaredSystem = request.systemInstruction ?? request.system_instruction;
   const system = systemInstructionText(declaredSystem);
-  if (system !== '') instructions.unshift(system);
+  if (system !== '') {
+    if (options?.systemMessagesAsDeveloper) {
+      input.unshift({ type: 'message', role: 'developer', content: [{ type: 'input_text', text: system }] });
+    } else {
+      instructions.unshift(system);
+    }
+  }
 
   const config = asRecord(request.generationConfig ?? request.generation_config) ?? {};
   const body: Record<string, unknown> = {
