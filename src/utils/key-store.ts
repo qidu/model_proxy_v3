@@ -5,7 +5,8 @@
  * on config load, stored into the OS keychain (macOS Keychain / Windows
  * Credential Vault / Linux Secret Service via `@github/keytar`), and the
  * config file on disk is rewritten to the literal sentinel
- * `STORE_KEY_IN_SYSTEM`. On every later load, sentinel values are resolved
+ * `__STORE_KEY_IN_SYSTEM__` (the previous `STORE_KEY_IN_SYSTEM` spelling is
+ * accepted for compatibility). On every later load, sentinel values are resolved
  * back from the keychain into the in-memory config, so the synchronous
  * routing code keeps working with real keys.
  *
@@ -20,15 +21,13 @@
  * enabled but the keychain itself is unavailable, the error is fatal — no
  * silent fallback (it would affect every key).
  *
- * Exception — the win32 single-executable build: `@github/keytar` needs too
- * many dependencies on Windows (Visual Studio Build Tools with the C++ workload
- * + Python 3, via node-gyp) to be worth carrying into a self-contained
- * single-file distribution, so that build stores the keys in the executable's
- * own file body instead (body-key-store.ts, addressed by `process.execPath`).
- * That store is PLAINTEXT inside the exe — a deliberate portability-for-secrecy
- * trade, only used where an OS keychain is not practical. macOS and Linux keep
- * the OS keychain via `@github/keytar`; Docker, Cloudflare Workers and
- * macOS/Linux SEA binaries keep the fatal error above.
+ * Exception — the win32 single-executable build: its release ZIP includes a
+ * sibling `keytar.node`, loaded relative to `process.execPath`, so the normal
+ * backend is Windows Credential Vault. A standalone exe without that addon
+ * falls back to storing keys in its own file body (body-key-store.ts). That
+ * fallback is PLAINTEXT inside the exe and logs a warning when engaged. macOS
+ * and Linux keep the OS keychain via `@github/keytar`; Docker, Cloudflare
+ * Workers and macOS/Linux SEA binaries keep the fatal error above.
  *
  * An individual sentinel that has no matching keychain entry is NOT fatal:
  * that one slot is cleared to
@@ -44,12 +43,19 @@
  */
 
 import { copyFileSync, readFileSync, writeFileSync } from 'fs';
-import { tryBodyKeyStore } from './body-key-store.js';
+import { createRequire } from 'module';
+import { dirname, join } from 'path';
+import { isSea, tryBodyKeyStore } from './body-key-store.js';
 import type { ModelCategoryConfig, ProxyConfig } from './config-loader.js';
 
 export const KEY_STORE_SERVICE = 'model_proxy_v3';
 export const KEY_STORE_BUNDLE_ACCOUNT = '__api_keys_v1__';
-export const STORE_KEY_IN_SYSTEM = 'STORE_KEY_IN_SYSTEM';
+export const STORE_KEY_IN_SYSTEM = '__STORE_KEY_IN_SYSTEM__';
+export const STORE_KEY_IN_SYSTEM_ALIAS = 'STORE_KEY_IN_SYSTEM';
+
+export function isStoreKeyInSystem(value: unknown): boolean {
+  return value === STORE_KEY_IN_SYSTEM || value === STORE_KEY_IN_SYSTEM_ALIAS;
+}
 
 /** Minimal keytar surface used here (subset of @github/keytar's API). */
 export interface KeytarLike {
@@ -161,18 +167,24 @@ function collectKeySlots(config: ProxyConfig): KeySlot[] {
 }
 
 /**
- * Locations of every api_key slot currently holding the `STORE_KEY_IN_SYSTEM`
+ * Locations of every api_key slot currently holding a system-key-store
  * sentinel. Used by the loader to refuse Consul/Apollo configs carrying
  * sentinels (they cannot be resolved without the local file + keychain).
  */
 export function findSentinelApiKeys(config: ProxyConfig): string[] {
-  return collectKeySlots(config).filter((slot) => slot.get() === STORE_KEY_IN_SYSTEM).map((slot) => slot.location);
+  return collectKeySlots(config).filter((slot) => isStoreKeyInSystem(slot.get())).map((slot) => slot.location);
 }
 
 /** Module specifier kept non-literal on purpose: tsc must not require the
  *  keytar addon to be linked at build time (fresh checkouts / Docker don't
  *  build the submodule); absence is a runtime KeyStoreError instead. */
 const KEYTAR_MODULE = '@github/keytar';
+
+async function loadWindowsSeaKeytar(): Promise<KeytarLike | null> {
+  if (process.platform !== 'win32' || !(await isSea())) return null;
+  const requireFromExecutable = createRequire(process.execPath);
+  return requireFromExecutable(join(dirname(process.execPath), 'keytar.node')) as KeytarLike;
+}
 
 /** findCredentials (broad keychain enumeration, as opposed to the scoped
  *  getPassword lookup) has been observed to hang indefinitely rather than
@@ -195,17 +207,21 @@ export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: 
 async function loadKeytar(opts: { keytarImpl?: KeytarLike }): Promise<KeytarLike> {
   if (opts.keytarImpl) return opts.keytarImpl;
   try {
+    const windowsSeaKeytar = await loadWindowsSeaKeytar();
+    if (windowsSeaKeytar) return windowsSeaKeytar;
     const mod = await import(KEYTAR_MODULE);
     return ((mod as { default?: KeytarLike }).default ?? mod) as KeytarLike;
   } catch (err) {
-    // win32 SEA fallback: keytar needs too many dependencies on Windows (VS
-    // Build Tools + Python 3, via node-gyp), so the win32 single-executable
-    // build stores the keys in the executable's own file body instead (see
-    // body-key-store.ts). Null on every other platform, and on any binary that
-    // is not a real SEA whose execPath basename is not node/node.exe — so a
-    // plain Node install is never a target.
+    // A win32 SEA without its sibling keytar.node retains the standalone-exe
+    // fallback. Other platforms and plain Node installs keep the fatal error.
     const body = await tryBodyKeyStore();
-    if (body) return body;
+    if (body) {
+      console.warn(
+        `[key-store] Windows Credential Vault addon failed to load: ${(err as Error).message}; ` +
+          `falling back to PLAINTEXT key storage inside ${process.execPath}`,
+      );
+      return body;
+    }
     throw new KeyStoreError(
       `store_key_in_system = true but the system keychain is unavailable: ${(err as Error).message}` +
       ` (requires the @github/keytar native addon and an OS keychain — not available in Docker/Workers;` +
@@ -234,7 +250,7 @@ export interface UnresolvedKeySentinel {
  *
  * 1. Read the single JSON bundle once. Plaintext api_keys are added under
  *    their logical `<target_model_id>/<base_url>` property.
- * 2. Resolve every `STORE_KEY_IN_SYSTEM` sentinel from the bundle, using the
+ * 2. Resolve every system-key-store sentinel from the bundle, using the
  *    existing best-effort account match on an exact miss. If no bundle exists,
  *    legacy per-account items are read and migrated into the bundle. A slot
  *    whose sentinel cannot be resolved is cleared to `''` and reported without
@@ -263,7 +279,7 @@ export async function applySystemKeyStore(
   const storedSlots: KeySlot[] = [];
   for (const slot of slots) {
     const raw = slot.get();
-    if (!raw || raw === STORE_KEY_IN_SYSTEM) continue;
+    if (!raw || isStoreKeyInSystem(raw)) continue;
     bundle.set(slot.account, raw);
     bundleDirty = true;
     storedRawKeys.push(raw);
@@ -273,7 +289,7 @@ export async function applySystemKeyStore(
   let resolvedCount = 0;
   const unresolved: UnresolvedKeySentinel[] = [];
   for (const slot of slots) {
-    if (slot.get() !== STORE_KEY_IN_SYSTEM) continue;
+    if (!isStoreKeyInSystem(slot.get())) continue;
 
     const bundled = bundle.get(slot.account);
     let resolved: { key: string; account: string } | null = bundled === undefined

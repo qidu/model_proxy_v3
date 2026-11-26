@@ -2213,7 +2213,7 @@ class DashboardApp {
    * openCompositeRoutingPicker convention). When editing, `category` is
    * already known and `getModelTargetFromDashboard` supplies the real
    * (unsanitized) current values, including api_key — which may be the
-   * literal STORE_KEY_IN_SYSTEM sentinel; leaving it untouched keeps it
+   * system-key-store sentinel; leaving it untouched keeps it
    * as-is. When adding, `category` is undefined and the category picker
    * (existing sections + "input new category") runs as the last step.
    */

@@ -108,7 +108,8 @@ jobs:
       # prebuilt NAPI binaries for all six targets here (prebuilds/darwin-x64,
       # darwin-arm64, linux-x64, linux-arm64, win32-x64, win32-arm64), so its
       # install script needs no toolchain and never falls back to node-gyp. The
-      # addon is --external in the bundle and absent from the result either way.
+      # addon stays external to the SEA blob; Windows builds stage its prebuild
+      # beside the exe and package both into the release ZIP.
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
@@ -119,24 +120,26 @@ jobs:
 
       # build-sea.js names the output after the host triple, so looking for that
       # exact name is also what proves the runner really is the architecture the
-      # matrix claims. On Windows the name carries a .exe suffix — Tauri's
-      # externalBin resolves the sidecar to `<name>.exe` — so a missing suffix
-      # fails here, at the build, rather than when the sidecar is staged.
+      # matrix claims. Windows publishes a ZIP containing the .exe, keytar.node,
+      # and keytar's license; the raw exe remains available for the version check.
       - name: Locate the binary
         id: binary
         shell: bash
         run: |
           expected="dist/model-proxy-v3-${{ matrix.triple }}"
+          artifact="$expected"
           if [ "$RUNNER_OS" = "Windows" ]; then
             expected="$expected.exe"
+            artifact="${expected%.exe}.zip"
           fi
-          if [ ! -f "$expected" ]; then
-            echo "::error::expected $expected; dist/ holds:"
+          if [ ! -f "$expected" ] || [ ! -f "$artifact" ]; then
+            echo "::error::expected $expected and $artifact; dist/ holds:"
             ls -l dist/ 2>&1 || true
             exit 1
           fi
           echo "path=$expected" >> "$GITHUB_OUTPUT"
-          echo "$expected"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "$artifact"
 
       - name: Check binary version
         shell: bash
@@ -150,14 +153,23 @@ jobs:
             exit 1
           fi
 
-      - name: Upload the binary
+      - name: Test Windows Credential Vault package
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          rm -rf .sea-build/package-test
+          mkdir -p .sea-build/package-test
+          tar -xf "${{ steps.binary.outputs.artifact }}" -C .sea-build/package-test
+          node tests/integration/windows-keytar-sea.js ".sea-build/package-test/model-proxy-v3-${{ matrix.triple }}.exe"
+
+      - name: Upload the package
         uses: actions/upload-artifact@v4
         with:
           name: model-proxy-v3-${{ matrix.triple }}
-          path: ${{ steps.binary.outputs.path }}
+          path: ${{ steps.binary.outputs.artifact }}
           if-no-files-found: error
 
-      # Every leg uploads its own binary, so a published release collects all six
+      # Every leg uploads its own package, so a published release collects all six
       # without one job having to download the others' artifacts.
       - name: Attach the binary to the release
         if: github.event_name == 'release'
@@ -166,4 +178,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "${{ steps.binary.outputs.path }}" --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" "${{ steps.binary.outputs.artifact }}" --clobber

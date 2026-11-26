@@ -59,8 +59,9 @@ week_start_day = "monday"
 # On the first load every plaintext api_key is saved in one JSON object under
 # the `model_proxy_v3` service and reserved `__api_keys_v1__` account, with
 # properties named "<target_model_id>/<base_url>"; this file is rewritten
-# (backup: .bak) with those keys replaced by the literal STORE_KEY_IN_SYSTEM
-# sentinel. Every later load reads only that one item, avoiding one macOS
+# (backup: .bak) with those keys replaced by the literal __STORE_KEY_IN_SYSTEM__
+# sentinel. The previous STORE_KEY_IN_SYSTEM spelling is accepted for compatibility.
+# Every later load reads only that one item, avoiding one macOS
 # permission prompt per key. Migration from legacy per-account items can still
 # prompt once per old item on its first run. Startup fails loud when the
 # keychain is unavailable. Requires the

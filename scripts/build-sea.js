@@ -51,10 +51,10 @@
  * binary at build time. See readSentinelFuse below for why assuming
  * postject's default (or any hardcoded value) breaks.
  *
- * WHAT IS NOT IN THE BINARY (see EXTERNALS below): two optional integrations
- * are deliberately excluded. Both already fail soft at runtime today, and both
- * are already absent from the Docker image, so the binary matches the
- * container's supported feature set rather than inventing a third one.
+ * WHAT IS NOT IN THE BINARY (see EXTERNALS below): @github/keytar is a native
+ * addon and cannot be embedded in the SEA blob. Windows builds stage its
+ * prebuilt addon beside the exe and package both in a ZIP; other platforms keep
+ * the existing runtime behavior when the addon is absent.
  */
 import { execFileSync } from 'child_process';
 import {
@@ -87,17 +87,10 @@ const BUILD = path.join(ROOT, '.sea-build');
  * `require()` that throws where the source already handles a throw.
  *
  * @github/keytar — a native .node addon, so SEA (one embedded JS blob, no
- *   mechanism for shipping native addons) could never carry it. src/utils/
- *   key-store.ts already loads it through a non-literal specifier and converts
- *   absence into a KeyStoreError, and Dockerfile:20 already installs with
- *   --omit=optional. So in the binary, as in Docker, `store_key_in_system =
- *   true` fails loud with an actionable message — EXCEPT on win32: keytar needs
- *   too many dependencies there (Visual Studio Build Tools with the C++ workload
- *   + Python 3, via node-gyp) to be worth carrying into a single-file
- *   distribution, so loadKeytar falls back to src/utils/body-key-store.ts,
- *   which stores the keys in the executable's own file body (plaintext; see
- *   that file's header). macOS and Linux keep keytar and the OS keychain;
- *   macOS/Linux SEA binaries keep the fatal KeyStoreError.
+ *   mechanism for shipping native addons) cannot carry it. The Windows package
+ *   ships keytar.node beside the exe and key-store.ts loads it relative to
+ *   process.execPath; a standalone exe keeps the plaintext body-store fallback.
+ *   macOS/Linux SEA binaries keep the fatal KeyStoreError when keytar is absent.
  */
 const EXTERNALS = ['@github/keytar'];
 
@@ -276,6 +269,27 @@ function readSentinelFuse(binaryPath) {
   );
 }
 
+function packageWindowsBinary(executablePath) {
+  const keytarPackage = path.join(ROOT, 'node_modules', '@github', 'keytar');
+  const prebuild = path.join(keytarPackage, 'prebuilds', `win32-${os.arch()}`, 'keytar.node');
+  copyFileSync(prebuild, path.join(DIST, 'keytar.node'));
+  copyFileSync(path.join(keytarPackage, 'LICENSE.md'), path.join(DIST, 'keytar-LICENSE.md'));
+
+  const archivePath = path.join(DIST, `${path.basename(executablePath, '.exe')}.zip`);
+  rmSync(archivePath, { force: true });
+  run('tar', [
+    '-a',
+    '-cf',
+    archivePath,
+    '-C',
+    DIST,
+    path.basename(executablePath),
+    'keytar.node',
+    'keytar-LICENSE.md',
+  ]);
+  return archivePath;
+}
+
 function main() {
   // Everything below assumes an official, self-contained Node, and the two
   // ways that assumption breaks both fail later with a message that does not
@@ -407,18 +421,18 @@ function main() {
     run('codesign', ['--sign', '-', outPath]);
   }
 
+  const archivePath = os.platform() === 'win32' ? packageWindowsBinary(outPath) : null;
   console.error(`[build-sea] built ${outPath}`);
+  if (archivePath) console.error(`[build-sea] packaged ${archivePath}`);
   console.error(
     '[build-sea] note: proxy_config.toml is still read at runtime (PROXY_CONFIG_PATH;\n' +
       '            when unset: ./proxy_config.toml, then\n' +
       '            ~/.config/model-proxy-v3/proxy_config.toml) — it is not\n' +
       '            embedded in the binary.\n' +
-      '[build-sea] excluded from this binary: system keychain (@github/keytar).\n' +
-      '            keytar needs too many dependencies on Windows, so the\n' +
-      '            win32 build substitutes an in-binary body store for\n' +
-      '            store_key_in_system (plaintext in the .exe, needs a writable\n' +
-      '            directory); macOS/Linux SEA binaries keep the fatal KeyStoreError,\n' +
-      '            and a `node dist/server.js` run on those platforms keeps keytar.'
+      '[build-sea] @github/keytar is external to the SEA blob. Windows ZIPs include\n' +
+      '            keytar.node for Credential Vault; a standalone Windows exe keeps\n' +
+      '            the plaintext body-store fallback. macOS/Linux SEA binaries keep\n' +
+      '            the fatal KeyStoreError when keytar is unavailable.'
   );
 }
 

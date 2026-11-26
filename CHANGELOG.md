@@ -5,6 +5,14 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(config): make the double-underscore system-key-store sentinel the default
+
+New config writes and dashboard normalization now use `__STORE_KEY_IN_SYSTEM__`. The previous `STORE_KEY_IN_SYSTEM` spelling remains accepted everywhere as a compatibility fallback, including local keychain resolution, remote-config rejection, dashboard edits, and sibling-entry inheritance; neither sentinel is ever stored as a plaintext API key.
+
+### feat(build): package Windows native apps with Credential Vault support
+
+Windows SEA builds now produce a ZIP containing the executable, the matching prebuilt `keytar.node`, and keytar's license. The app loads the sibling addon for Windows Credential Vault; a standalone exe retains the plaintext body-store fallback and now warns when that fallback engages. Windows CI extracts the release ZIP and verifies credential storage, retrieval after an app restart, and deletion before publishing the package.
+
 ### fix(build): preserve the esbuild version literal on Windows
 
 The native build now passes `__BUILD_VERSION__` as a single-quoted JavaScript literal with escaped backslashes and single quotes. This prevents `cmd.exe` from stripping the double quotes previously supplied to esbuild, which caused both Windows matrix legs to reject the version as an invalid define value.

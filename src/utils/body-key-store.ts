@@ -1,23 +1,19 @@
 /**
  * In-binary key store for the win32 single-executable build.
  *
- * `@github/keytar` needs too many dependencies on Windows (Visual Studio Build
- * Tools with the "Desktop development with C++" workload + Python 3, via
- * node-gyp) to be worth carrying into a self-contained single-file
- * distribution, so the win32 SEA binary marks it `--external` and
- * `store_key_in_system = true` is fatal there. This module supplies the
- * replacement for that one platform: a `KeytarLike` implementation
- * whose backing store is the executable's own file body
- * (`process.execPath`): each `setPassword` appends one record via
- * body-record.ts, and reads walk the record chain backwards. macOS and Linux
- * keep the OS keychain through `@github/keytar`.
+ * The Windows release ZIP includes a sibling `keytar.node` for Credential
+ * Vault. This module keeps a standalone exe functional when that addon is
+ * absent or cannot load: each `setPassword` appends one record to the
+ * executable's own file body (`process.execPath`) via body-record.ts, and reads
+ * walk the record chain backwards. macOS and Linux keep the OS keychain through
+ * `@github/keytar`.
  *
  * SECURITY: records are plaintext inside the exe. That is NOT secrecy — anyone
- * who can read the binary can read the keys. The gain is a self-contained
- * single-file distribution whose keys travel with the binary instead of
- * sitting in `proxy_config.toml`; it is a downgrade from an OS keychain and is
- * only used where an OS keychain is not the packaging choice. Keys also do not survive a
- * rebuild (a fresh blob is injected into a fresh copy of node).
+ * who can read the binary can read the keys. The fallback keeps a standalone
+ * executable's keys with the binary instead of sitting in `proxy_config.toml`;
+ * it is a downgrade from Credential Vault and logs a warning when engaged.
+ * Keys also do not survive a rebuild (a fresh blob is injected into a fresh
+ * copy of node).
  *
  * Scope is deliberately narrow (see tryBodyKeyStore): win32 + a real SEA
  * binary + an execPath basename that is not `node`/`node.exe`. Any gate
@@ -97,7 +93,7 @@ export function createBodyKeyStore(binaryPath: string): KeytarLike {
  *  resolve `node:sea`, and older Node without the module yields false. */
 const SEA_MODULE = 'node:sea';
 
-async function isSea(): Promise<boolean> {
+export async function isSea(): Promise<boolean> {
   try {
     const sea = (await import(SEA_MODULE)) as { isSea?: () => boolean };
     return typeof sea.isSea === 'function' && sea.isSea();

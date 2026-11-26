@@ -752,7 +752,11 @@ The output is named `<name>-<host target triple>` (e.g.
 On Windows the name carries a `.exe` suffix
 (`model-proxy-v3-x86_64-pc-windows-msvc.exe`), appended by `scripts/build-sea.js`
 because that is the name Tauri resolves an `externalBin` sidecar to on Windows —
-worth knowing before you rename or hand-copy an artifact.
+worth knowing before you rename or hand-copy an artifact. Windows builds also
+produce `dist/model-proxy-v3-<host-triple>.zip` containing the exe,
+`keytar.node`, and `keytar-LICENSE.md`. Keep `keytar.node` beside the exe to use
+Windows Credential Vault. A standalone exe without the addon still works, but
+warns and falls back to plaintext key storage inside the executable.
 A ready-to-use system tray for this proxy lives in
 `git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
 its sidecar and supervises it over the `--rpc` JSON-RPC control channel
@@ -787,13 +791,15 @@ release; pull requests keep only the ubuntu typecheck/build/test job.
 | `windows-latest` | `x86_64-pc-windows-msvc` |
 | `windows-11-arm` | `aarch64-pc-windows-msvc` |
 
-The two Windows outputs end in `.exe`
+The raw Windows outputs end in `.exe`
 (`model-proxy-v3-x86_64-pc-windows-msvc.exe`, `model-proxy-v3-aarch64-pc-windows-msvc.exe`),
-and the workflow fails the leg if the `model-proxy-v3-<triple>.exe` file it expects
-is absent — the same name check also proves each runner is the architecture its
-matrix entry claims. Every binary is uploaded as the artifact
-`model-proxy-v3-<target triple>`, and publishing a GitHub release attaches all six
-to it.
+and their release packages use the corresponding `.zip` names. The workflow
+fails a Windows leg if either the exe or ZIP is absent — the exe name check also
+proves each runner is the architecture its matrix entry claims. Every target is
+uploaded as the artifact `model-proxy-v3-<target triple>`: a binary on macOS and
+Linux, or the ZIP on Windows. Publishing a GitHub release attaches all six
+packages. Windows CI also extracts the ZIP and verifies Credential Vault
+storage, retrieval after an app restart, and test-credential deletion.
 
 These targets are deliberately not built. All three come down to "no runner
 produces them, and SEA cannot stand in for one":
@@ -850,18 +856,19 @@ The full field-by-field reference lives in
 - **OS keychain key storage** — `[general] store_key_in_system = true` moves every
   config `api_key` into the OS keychain — macOS Keychain, Windows Credential Vault, Linux
   Secret Service (`gnome-keyring`/KWallet + `libsecret`) — and rewrites each key in
-  `proxy_config.toml` to the literal `STORE_KEY_IN_SYSTEM` sentinel. Where no OS keychain
-  exists (Docker, Cloudflare Workers) the proxy refuses to start.
+  `proxy_config.toml` to the literal `__STORE_KEY_IN_SYSTEM__` sentinel. The previous
+  `STORE_KEY_IN_SYSTEM` spelling remains accepted as a compatibility fallback.
+  Where no OS keychain exists (Docker, Cloudflare Workers) the proxy refuses to start.
 - **System & toolchain requirements for `store_key_in_system = true`** — the feature needs an OS
-  keychain backend at run time; a native toolchain is needed only for the source-build fallback,
-  and the win32 single-executable build skips keytar entirely:
+  keychain backend at run time; a native toolchain is needed only for the source-build fallback.
+  The Windows native ZIP includes keytar's prebuilt addon:
 
   | Platform | Runtime requirement (OS keychain) | Node build toolchain (node-gyp) |
   |---|---|---|
   | macOS | Keychain Services (built in) | Xcode Command Line Tools (`xcode-select --install`) + Python 3 — only for the source-build fallback |
   | Linux | a Secret Service provider — `gnome-keyring` (or KWallet) daemon running, with `libsecret-1` | `build-essential` (gcc/g++/make) + Python 3 + `libsecret-1-dev` headers — only for the source-build fallback |
   | Windows — `node dist/server.js` | Credential Vault (built in) | Visual Studio Build Tools with the "Desktop development with C++" workload + Python 3 — only for the source-build fallback |
-  | Windows — single-executable build | **not used** — no OS keychain, keys go in the executable's own file body | **not needed** — keytar is not installed |
+  | Windows — native ZIP | Credential Vault via the included `keytar.node`; running the exe alone falls back to plaintext storage in its file body with a warning | **not needed** — the ZIP contains the prebuilt addon |
 - **Environment variables** — core/server (`PORT`, `LOG_LEVEL`, …), config source
   (`PROXY_CONFIG_PATH` / `PROXY_CONFIG_CONSUL` / `PROXY_CONFIG_APOLLO`), token counting &
   upstream, and the privacy-filter / compression / image-encode sidecars.

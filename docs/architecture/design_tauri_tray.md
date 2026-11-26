@@ -275,7 +275,7 @@ The tray ships the proxy, so the build order is fixed: build the SEA binary firs
 
 **Size.** The sidecar is a copy of a full Node binary — on the order of 100 MB before compression — so the bundle is large next to a typical Tauri app. Measure before picking a distribution channel.
 
-**Windows caveat.** The build excludes `@github/keytar`, so `store_key_in_system = true` falls back to the in-binary body store, which keeps keys in plaintext inside the executable and needs a writable directory. That is a real difference from the macOS and Linux builds and belongs in the UI or the README.
+**Windows packaging requirement.** Stage `keytar.node` from the native release ZIP beside the SEA sidecar so `store_key_in_system = true` uses Windows Credential Vault. If the tray ships only the exe or the addon cannot load, the proxy warns and falls back to the in-binary body store, which keeps keys in plaintext inside the executable and needs a writable directory. That security difference belongs in the UI or README.
 
 **Windows inbound rule.** A tray-launched proxy is reachable from other hosts only if Windows Defender allows inbound traffic to it, so a start ensures an inbound allow rule for the bundled `model-proxy-v3.exe` (`src-tauri/src/firewall.rs`, the `windows_firewall` crate; program-scoped, so any port and protocol). Adding a rule needs Administrator and the tray is not elevated, so this is best-effort: the outcome is mirrored to the window's LOG (the `proxy://log` event above) and the proxy starts regardless.
 

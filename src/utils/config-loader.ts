@@ -16,7 +16,7 @@ import { buildConsulKvUrl, parseConsulConfig } from './consul-loader.js';
 import type { ConsulKvEntry } from './consul-loader.js';
 import { parseApolloFile, fetchApolloConfig } from './apollo-loader.js';
 import { createLogger } from './logger.js';
-import { applySystemKeyStore, findSentinelApiKeys, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
+import { applySystemKeyStore, findSentinelApiKeys, isStoreKeyInSystem, KeyStoreError, scoreBaseUrlMatch, STORE_KEY_IN_SYSTEM } from './key-store.js';
 import { UPSTREAM_MODES, EMBEDDING_UPSTREAM_MODES } from './upstream-modes.js';
 import { callDecisionApi, adaptToClefRequest, adaptFromClefResponse, type ClefRequest, type ClefChoiceQuestion } from './tool-judge-sidecar.js';
 
@@ -5022,7 +5022,7 @@ export function upsertModelTarget(
   // it wasn't already that value) has no such entry and would resolve
   // against whatever stale/unrelated keychain item happens to share the
   // account (wrong key, no error) instead of failing loud. See CHANGELOG.
-  if (patch.api_key === STORE_KEY_IN_SYSTEM && existingApiKey !== STORE_KEY_IN_SYSTEM) {
+  if (isStoreKeyInSystem(patch.api_key) && !isStoreKeyInSystem(existingApiKey)) {
     throw new Error(
       `api_key cannot be the literal "${STORE_KEY_IN_SYSTEM}" — that sentinel is only written by the system key store` +
       ` after it stores a real key; type the actual key instead.`,
@@ -5036,14 +5036,14 @@ export function upsertModelTarget(
   // best-effort resolver uses, target name intentionally not considered.
   // If found, adopt the sentinel so this entry resolves from the same
   // keychain account instead of silently landing on category api_key.
-  let apiKey = patch.api_key;
+  let apiKey = isStoreKeyInSystem(patch.api_key) ? STORE_KEY_IN_SYSTEM : patch.api_key;
   if (!apiKey.trim()) {
     const categoryBaseUrl = nextCategory.base_url ?? '';
     const wantedBaseUrl = patch.base_url || categoryBaseUrl;
     let bestScore = -1;
     for (const [siblingKey, siblingEntry] of Object.entries(nextCategory)) {
       if (siblingKey === key || !Array.isArray(siblingEntry) || siblingEntry.length < 3) continue;
-      if (siblingEntry[2] !== STORE_KEY_IN_SYSTEM) continue;
+      if (!isStoreKeyInSystem(siblingEntry[2])) continue;
       const siblingBaseUrl = (siblingEntry[1] as string) || categoryBaseUrl;
       const score = scoreBaseUrlMatch(wantedBaseUrl, siblingBaseUrl);
       if (score > bestScore) bestScore = score;

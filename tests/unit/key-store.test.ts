@@ -21,6 +21,7 @@ import {
   KEY_STORE_BUNDLE_ACCOUNT,
   KEY_STORE_SERVICE,
   STORE_KEY_IN_SYSTEM,
+  STORE_KEY_IN_SYSTEM_ALIAS,
   KeyStoreError,
   applySystemKeyStore,
   findSentinelApiKeys,
@@ -85,6 +86,11 @@ describe('findSentinelApiKeys', () => {
     const toml = SAMPLE_TOML.replace('sk-cat-111', STORE_KEY_IN_SYSTEM); // category key → sentinel
     const config = parseSimpleToml(toml);
     assert.deepEqual(findSentinelApiKeys(config), ['models.claude.api_key']);
+  });
+
+  it('recognizes the legacy sentinel spelling as a compatibility fallback', () => {
+    const toml = SAMPLE_TOML.replace('sk-cat-111', STORE_KEY_IN_SYSTEM_ALIAS);
+    assert.deepEqual(findSentinelApiKeys(parseSimpleToml(toml)), ['models.claude.api_key']);
   });
 
   it('returns empty when all keys are plaintext', () => {
@@ -229,6 +235,29 @@ openai = {base = "https://api.openai.example", mode = "openai-completions", key 
     assert.equal(gpt['claude-opus']![2], 'sk-entry-222');
     const defaultCat = config.models!.default as { api_key?: string };
     assert.equal(defaultCat.api_key, 'sk-default-000');
+    assert.deepEqual(keytar.calls, [
+      { op: 'get', service: KEY_STORE_SERVICE, account: KEY_STORE_BUNDLE_ACCOUNT },
+    ]);
+  });
+
+  it('resolves the legacy spelling without storing it as a plaintext key', async () => {
+    const sentinelToml = SAMPLE_TOML
+      .replace('sk-default-000', STORE_KEY_IN_SYSTEM)
+      .replace('sk-cat-111', STORE_KEY_IN_SYSTEM_ALIAS)
+      .replace('sk-entry-222', STORE_KEY_IN_SYSTEM);
+    const keytar = makeMockKeytar(new Map([
+      [`${KEY_STORE_SERVICE}/${KEY_STORE_BUNDLE_ACCOUNT}`, JSON.stringify({
+        'claude/https://api.claude.dev': 'sk-cat-111',
+        'claude-opus-4/https://override.gpt.dev': 'sk-entry-222',
+        'default/https://api.default.dev': 'sk-default-000',
+      })],
+    ]));
+    const config = parseSimpleToml(sentinelToml);
+
+    const { unresolved } = await applySystemKeyStore(config, { keytarImpl: keytar });
+
+    assert.deepEqual(unresolved, []);
+    assert.equal((config.models!.claude as { api_key?: string }).api_key, 'sk-cat-111');
     assert.deepEqual(keytar.calls, [
       { op: 'get', service: KEY_STORE_SERVICE, account: KEY_STORE_BUNDLE_ACCOUNT },
     ]);

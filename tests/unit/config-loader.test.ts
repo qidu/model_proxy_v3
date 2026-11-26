@@ -2226,6 +2226,19 @@ describe('upsertModelTarget', () => {
     );
   });
 
+  it('throws when api_key is a hand-typed default system-store sentinel', () => {
+    assert.throws(
+      () =>
+        upsertModelTarget(baseConfig, 'free', 'new-model', {
+          target: 't',
+          base_url: 'https://x',
+          api_key: '__STORE_KEY_IN_SYSTEM__',
+          mode: 'anthropic-messages',
+        }),
+      /STORE_KEY_IN_SYSTEM/,
+    );
+  });
+
   it('throws when api_key is a hand-typed STORE_KEY_IN_SYSTEM sentinel (edit, entry was not already the sentinel)', () => {
     assert.throws(
       () =>
@@ -2239,7 +2252,7 @@ describe('upsertModelTarget', () => {
     );
   });
 
-  it('allows STORE_KEY_IN_SYSTEM when left unchanged from the existing entry (edit, already stored)', () => {
+  it('accepts the legacy sentinel from an existing entry and normalizes it on edit', () => {
     const cfg: ProxyConfig = {
       models: {
         free: {
@@ -2255,7 +2268,26 @@ describe('upsertModelTarget', () => {
       mode: 'anthropic-messages',
     });
     const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
-    assert.equal(entry[2], 'STORE_KEY_IN_SYSTEM');
+    assert.equal(entry[2], '__STORE_KEY_IN_SYSTEM__');
+  });
+
+  it('allows an existing default sentinel on edit', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://x',
+          'm1': ['t1', 'https://x', '__STORE_KEY_IN_SYSTEM__', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'm1', {
+      target: 't1',
+      base_url: 'https://y',
+      api_key: '__STORE_KEY_IN_SYSTEM__',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['m1'] as string[];
+    assert.equal(entry[2], '__STORE_KEY_IN_SYSTEM__');
   });
 
   it('adopts STORE_KEY_IN_SYSTEM from a sibling entry with the same base_url when api_key is left blank', () => {
@@ -2274,7 +2306,26 @@ describe('upsertModelTarget', () => {
       mode: 'anthropic-messages',
     });
     const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
-    assert.equal(entry[2], 'STORE_KEY_IN_SYSTEM');
+    assert.equal(entry[2], '__STORE_KEY_IN_SYSTEM__');
+  });
+
+  it('adopts the default system-store sentinel from a sibling', () => {
+    const cfg: ProxyConfig = {
+      models: {
+        free: {
+          base_url: 'https://default.example',
+          'existing': ['existing-target', 'https://shared.example', '__STORE_KEY_IN_SYSTEM__', 'anthropic-messages'],
+        } as any,
+      },
+    };
+    const next = upsertModelTarget(cfg, 'free', 'new-model', {
+      target: 'new-target',
+      base_url: 'https://shared.example',
+      api_key: '',
+      mode: 'anthropic-messages',
+    });
+    const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
+    assert.equal(entry[2], '__STORE_KEY_IN_SYSTEM__');
   });
 
   it('adopts STORE_KEY_IN_SYSTEM from a sibling entry falling back to category base_url when both blank', () => {
@@ -2293,7 +2344,7 @@ describe('upsertModelTarget', () => {
       mode: 'anthropic-messages',
     });
     const entry = (next.models!.free as Record<string, unknown>)['new-model'] as string[];
-    assert.equal(entry[2], 'STORE_KEY_IN_SYSTEM');
+    assert.equal(entry[2], '__STORE_KEY_IN_SYSTEM__');
   });
 
   it('leaves api_key blank when no sibling entry shares the base_url (falls through to category api_key at resolve time)', () => {

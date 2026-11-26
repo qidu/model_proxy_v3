@@ -1,8 +1,7 @@
 /**
  * In-binary record store: appends self-describing records into a file's own
- * body (used by the win32 SEA fallback in body-key-store.ts to keep
- * keychain-style secrets inside the single-file executable's body, since
- * @github/keytar needs too many dependencies on Windows).
+ * body (used by the win32 SEA fallback in body-key-store.ts when the sibling
+ * keytar.node addon is absent or cannot load).
  *
  * Format is byte-compatible with ../store-in-body: each record is
  * `payload || RecTail` where RecTail is 40 bytes —

@@ -583,7 +583,7 @@ export function handleDashboardPage(env: Env): Response {
     </style>
   </head>
   <body>
-    <h1>Proxy Dashboard <span id="keyStoreLock" hidden title="All config api_keys are STORE_KEY_IN_SYSTEM (stored in the system keychain)" style="font-size:16px;">🔒</span> <span style="color:#9e9e9e;font-size:14px;font-weight:normal;">(ver ${env.VERSION || 'dev'})</span></h1>
+    <h1>Proxy Dashboard <span id="keyStoreLock" hidden title="All config api_keys use the system-key-store sentinel (stored in the system keychain)" style="font-size:16px;">🔒</span> <span style="color:#9e9e9e;font-size:14px;font-weight:normal;">(ver ${env.VERSION || 'dev'})</span></h1>
 
     <div id="compositeAliasWizard" class="modal-overlay" hidden>
       <div class="modal" role="dialog" aria-labelledby="wizTitle" aria-modal="true">
