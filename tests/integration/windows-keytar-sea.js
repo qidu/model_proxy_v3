@@ -33,7 +33,7 @@ const tempDir = mkdtempSync(join(tmpdir(), 'windows-keytar-sea-'));
 const configPath = join(tempDir, 'proxy_config.toml');
 writeFileSync(
   configPath,
-  `[general]\nstore_key_in_system = true\n\n[models.ci]\nbase_url = "https://example.invalid"\n"${runId}" = { target = "gpt-4o-mini", api_key = "${secret}" }\n`,
+  `[general]\nstore_key_in_system = true\n\n[models.ci]\nbase_url = "https://example.invalid"\n"${runId}" = { target = "${runId}", api_key = "${secret}" }\n`,
 );
 
 let active = null;
