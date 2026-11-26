@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### fix(build): preserve the esbuild version literal on Windows
+
+The native build now passes `__BUILD_VERSION__` as a single-quoted JavaScript literal with escaped backslashes and single quotes. This prevents `cmd.exe` from stripping the double quotes previously supplied to esbuild, which caused both Windows matrix legs to reject the version as an invalid define value.
+
 ### feat(build): embed Git version metadata in native binaries
 
 Node and native builds now support `--version` and report `model-proxy-v3@<tag>-<ordinal-commit-distance>-g<commit>` using metadata from `git describe --tags --long --always --dirty`. The regular build writes the version to `dist/version.js`; the native build embeds it with esbuild. The same build version flows through `env.VERSION` to the dashboard, TUI, RPC, startup log, and API responses. CI checkouts fetch full tag history, and every native binary is executed with `--version` to verify its embedded metadata. Docker builds use the `VERSION` build argument because their build context has no Git metadata.

@@ -297,6 +297,8 @@ function main() {
 
   const bundlePath = path.join(BUILD, 'bundle.js');
   const buildVersion = getBuildVersion(ROOT);
+  // cmd.exe strips double quotes; single quotes reach esbuild as part of the JS literal.
+  const buildVersionLiteral = `'${buildVersion.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
   console.error(`[build-sea] build version: ${buildVersion}`);
 
   // --- 1. Bundle ---------------------------------------------------------
@@ -340,7 +342,7 @@ function main() {
     '--format=cjs',
     '--loader:.json=json',
     '--define:import.meta.url=__SEA_IMPORT_META_URL__',
-    `--define:__BUILD_VERSION__=${JSON.stringify(buildVersion)}`,
+    `--define:__BUILD_VERSION__=${buildVersionLiteral}`,
     "--banner:js=const __SEA_IMPORT_META_URL__ = require('node:url').pathToFileURL(process.execPath).href;",
     ...EXTERNALS.map((m) => `--external:${m}`),
     `--outfile=${bundlePath}`,
