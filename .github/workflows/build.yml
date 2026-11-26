@@ -159,7 +159,7 @@ jobs:
         run: |
           rm -rf .sea-build/package-test
           mkdir -p .sea-build/package-test
-          tar -xf "${{ steps.binary.outputs.artifact }}" -C .sea-build/package-test
+          C:/Windows/System32/tar.exe -xf "${{ steps.binary.outputs.artifact }}" -C .sea-build/package-test
           node tests/integration/windows-keytar-sea.js ".sea-build/package-test/model-proxy-v3-${{ matrix.triple }}.exe"
 
       - name: Upload the package
