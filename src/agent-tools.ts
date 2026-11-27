@@ -1,5 +1,5 @@
 /**
- * Hand-authored tools for the interactive AGENT=true session (see src/agent-session.ts).
+ * Hand-authored tools for the built-in agent sessions (see src/agent-session.ts).
  *
  * Deliberately minimal — read_file/write_file/bash, plus find_skill/add_skill when the
  * `skills` CLI (vercel-labs/skills, npm package "skills") is available. No speculative

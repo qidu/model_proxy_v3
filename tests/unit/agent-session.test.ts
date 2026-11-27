@@ -1216,3 +1216,122 @@ describe('startAgentSession startup validation', () => {
     }
   });
 });
+
+describe('startAgentSession non-TUI mode', () => {
+  it('runs the requested model and prompt over loopback HTTP and prints only the reply to stdout', { timeout: 5000 }, async () => {
+    const { createServer } = await import('node:http');
+    const { chmodSync } = await import('node:fs');
+    const { ProcessTerminal } = await import('@earendil-works/pi-tui');
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalWrite = process.stdout.write;
+    const originalTerminalStart = ProcessTerminal.prototype.start;
+    const originalPath = process.env.PATH;
+    const originalTraj = process.env.TRAJ;
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const output: string[] = [];
+    const requests: Array<{ path: string; body: any }> = [];
+    let terminalStarts = 0;
+
+    const mockBin = join(workDir, 'mock-bin');
+    mkdirSync(mockBin);
+    const npxPath = join(mockBin, process.platform === 'win32' ? 'npx.cmd' : 'npx');
+    writeFileSync(npxPath, process.platform === 'win32' ? '@echo off\r\nexit /b 1\r\n' : '#!/bin/sh\nexit 1\n');
+    chmodSync(npxPath, 0o755);
+    process.env.PATH = `${mockBin}${process.platform === 'win32' ? ';' : ':'}${originalPath ?? ''}`;
+    process.env.TRAJ = '0';
+
+    const upstream = createServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        requests.push({ path: req.url ?? '', body: JSON.parse(body) });
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.end([
+          'event: message_start',
+          'data: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"sample","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}',
+          '',
+          'event: content_block_start',
+          'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+          '',
+          'event: content_block_delta',
+          'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one-shot ok"}}',
+          '',
+          'event: content_block_stop',
+          'data: {"type":"content_block_stop","index":0}',
+          '',
+          'event: message_delta',
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}',
+          '',
+          'event: message_stop',
+          'data: {"type":"message_stop"}',
+          '',
+        ].join('\n'));
+      });
+    });
+    await new Promise<void>((resolveListen) => upstream.listen(0, '127.0.0.1', resolveListen));
+    const address = upstream.address();
+    assert.ok(address && typeof address === 'object');
+
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+    process.stdout.write = ((chunk: unknown, ...args: unknown[]) => {
+      if (chunk === 'one-shot ok' || chunk === '\n') {
+        output.push(chunk);
+        const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === 'function');
+        callback?.();
+        return true;
+      }
+      return (originalWrite as (this: NodeJS.WriteStream, value: unknown, ...rest: unknown[]) => boolean).call(process.stdout, chunk, ...args);
+    }) as typeof process.stdout.write;
+    ProcessTerminal.prototype.start = function () {
+      terminalStarts += 1;
+      throw new Error('non-TUI mode must not start a terminal');
+    };
+
+    try {
+      const { startAgentSession } = await import('../../src/agent-session.js');
+      await startAgentSession({
+        env: {},
+        port: address.port,
+        model: 'sample',
+        prompt: 'Run this task',
+        loadConfig: async () => ({
+          models: {
+            default: {
+              base_url: 'http://127.0.0.1:1',
+              upstream_mode: 'anthropic-messages',
+              api_key: 'test-key',
+              sample: { target: 'sample-upstream' },
+            },
+          },
+        }),
+      });
+
+      assert.equal(output.join(''), 'one-shot ok\n');
+      assert.equal(terminalStarts, 0);
+      assert.deepEqual(errors, []);
+      assert.equal(requests.length, 1);
+      assert.equal(new URL(requests[0].path, 'http://loopback').pathname, '/v1/messages');
+      assert.equal(requests[0].body.model, 'sample');
+      assert.equal(requests[0].body.messages.at(-1).content[0].text, 'Run this task');
+      assert.ok(requests[0].body.tools.some((tool: { name: string }) => tool.name === 'read_file'));
+      assert.ok(logs.some((line) => line.includes('No OS-level sandbox')));
+    } finally {
+      ProcessTerminal.prototype.start = originalTerminalStart;
+      console.log = originalLog;
+      console.error = originalError;
+      process.stdout.write = originalWrite;
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalTraj === undefined) delete process.env.TRAJ;
+      else process.env.TRAJ = originalTraj;
+      await new Promise<void>((resolveClose, rejectClose) => {
+        upstream.close((error) => error ? rejectClose(error) : resolveClose());
+        upstream.closeAllConnections();
+      });
+    }
+  });
+});

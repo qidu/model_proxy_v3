@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runCli } from '../../src/cli.js';
+import { extractHeadlessAgentArgs, runCli } from '../../src/cli.js';
 import { PROXY_PROVIDER_ID, buildProxyPiModel, proxyLoopbackBaseUrl } from '../../src/utils/pi-model-catalog.js';
 import type { Env } from '../../src/types/shared.js';
 
@@ -123,7 +123,7 @@ describe('runCli argument handling', () => {
   it('--help exits 0 and documents every command', () => {
     const result = capture(['--help'], envFor(goodPath));
     assert.equal(result.code, 0);
-    for (const command of ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--validate-config', '--version', '--default-model']) {
+    for (const command of ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--validate-config', '--version', '--default-model', '--model', '--prompt']) {
       assert.ok(result.out.includes(command), `help must mention ${command}`);
     }
     assert.ok(result.out.includes('~/.pi/agent/models.json'), 'help must point --export-pi-models at the pi models file');
@@ -190,6 +190,35 @@ describe('runCli argument handling', () => {
     const result = capture(['--export-pi-models', '--default-model', '--validate-config'], envFor(goodPath));
     assert.equal(result.code, 2, 'a flag-shaped value must be rejected, not treated as a command');
     assert.match(result.err, /--default-model requires a model id/);
+  });
+});
+
+describe('extractHeadlessAgentArgs', () => {
+  it('extracts the model and prompt while preserving --agent and other arguments', () => {
+    const result = extractHeadlessAgentArgs(['--agent', '--dashboard', '--model', 'smart', '--prompt', 'Explain this repo']);
+    assert.deepEqual(result, {
+      rest: ['--agent', '--dashboard'],
+      options: { model: 'smart', prompt: 'Explain this repo' },
+    });
+  });
+
+  it('leaves ordinary server arguments untouched', () => {
+    assert.deepEqual(extractHeadlessAgentArgs(['--agent']), { rest: ['--agent'] });
+  });
+
+  it('rejects missing, empty, or flag-shaped values', () => {
+    assert.match(extractHeadlessAgentArgs(['--model']).error!, /requires a non-empty string value/);
+    assert.match(extractHeadlessAgentArgs(['--prompt', '']).error!, /requires a non-empty string value/);
+    assert.match(extractHeadlessAgentArgs(['--model', '--prompt', 'task']).error!, /requires a non-empty string value/);
+  });
+
+  it('requires both flags and rejects duplicates', () => {
+    assert.match(extractHeadlessAgentArgs(['--model', 'smart']).error!, /must be used together/);
+    assert.match(extractHeadlessAgentArgs(['--prompt', 'task']).error!, /must be used together/);
+    assert.match(
+      extractHeadlessAgentArgs(['--model', 'one', '--model', 'two', '--prompt', 'task']).error!,
+      /may only be given once/,
+    );
   });
 });
 

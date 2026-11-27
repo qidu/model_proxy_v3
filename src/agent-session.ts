@@ -1,9 +1,9 @@
 /**
- * Interactive pi-agent session that uses model_proxy_v3's own HTTP server as
- * its LLM provider (loopback /v1/messages). Started via AGENT=true, mirroring
- * the TUI=true convention in server.ts.
+ * Pi-agent sessions that use model_proxy_v3's own HTTP server as their LLM
+ * provider (loopback /v1/messages). AGENT=true starts the interactive flow;
+ * --model/--prompt runs one task without a TUI and exits.
  *
- * Flow: pick working directory -> pick model -> verify with "hi, which model
+ * Interactive flow: pick working directory -> pick model -> verify with "hi, which model
  * and agent are right here?" -> set a budget (tokens or turns) -> state the
  * task -> run -> summarize file changes
  * -> prompt for a follow-up task (same agent/budget) until blank/budget hit.
@@ -52,6 +52,8 @@ export interface AgentSessionSource {
   env: Env;
   loadConfig: (forceReload?: boolean) => Promise<ProxyConfig>;
   port: number;
+  model?: string;
+  prompt?: string;
 }
 
 // Dark gray (ANSI 90) wrapper for this session's own status/notice output
@@ -1500,6 +1502,57 @@ export function buildModelPickerItems(aliases: string[], config: ProxyConfig): S
   return [...composite, ...schedule, ...targets];
 }
 
+async function writeAgentOutput(text: string): Promise<void> {
+  await new Promise<void>((resolveWrite, rejectWrite) => {
+    process.stdout.write(text, (error) => error ? rejectWrite(error) : resolveWrite());
+  });
+}
+
+async function runHeadlessAgentTask(agent: Agent, prompt: string, budget: Budget): Promise<void> {
+  let hasText = false;
+  let endsWithNewline = true;
+  let turns = 0;
+  let tokens = 0;
+  let budgetReached = false;
+  let agentError: string | undefined;
+
+  const unsubscribe = agent.subscribe(async (event) => {
+    if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
+      const delta = event.assistantMessageEvent.delta;
+      if (delta.trim()) hasText = true;
+      endsWithNewline = delta.endsWith('\n');
+      await writeAgentOutput(delta);
+    }
+    if (event.type === 'turn_end') {
+      turns += 1;
+      const message = event.message as { role?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number } };
+      if (message.role === 'assistant' && message.usage) {
+        tokens += message.usage.input + message.usage.output + message.usage.cacheRead + message.usage.cacheWrite;
+      }
+      if ((budget.turns !== undefined && turns >= budget.turns) || (budget.tokens !== undefined && tokens >= budget.tokens)) {
+        budgetReached = true;
+        agent.abort();
+      }
+    }
+    if (event.type === 'agent_end') {
+      const last = agent.state.messages[agent.state.messages.length - 1] as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+      if (last?.role === 'assistant' && last.stopReason === 'error') {
+        agentError = last.errorMessage ?? 'unknown agent error';
+      }
+    }
+  });
+
+  try {
+    await agent.prompt(prompt);
+    if (budgetReached) throw new Error(`Agent stopped after reaching the budget (${formatUsage(tokens, turns, budget)}).`);
+    if (agentError) throw new Error(agentError);
+    if (!hasText) throw new Error('Agent completed without a text reply.');
+  } finally {
+    unsubscribe();
+    if (!endsWithNewline) await writeAgentOutput('\n');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -1550,6 +1603,7 @@ export async function startAgentSession(source: AgentSessionSource): Promise<voi
   try {
     await runAgentSession(source);
   } finally {
+    if (source.prompt !== undefined) clearAgentTitle();
     if (trajectoryEnabled) {
       console.log = originalConsoleLog;
       console.error = originalConsoleError;
@@ -1564,6 +1618,10 @@ export async function startAgentSession(source: AgentSessionSource): Promise<voi
  *  at each return. */
 async function runAgentSession(source: AgentSessionSource): Promise<void> {
   const { env, loadConfig, port } = source;
+  const headless = source.model !== undefined || source.prompt !== undefined;
+  if (headless && (!source.model?.trim() || !source.prompt?.trim())) {
+    throw new Error('Non-TUI agent mode requires non-empty --model and --prompt values.');
+  }
   const sessionId = randomUUID();
 
     // Label the terminal window with the agent's own identity so it's
@@ -1589,7 +1647,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   console.log('[WARN] No OS-level sandbox — bash/write_file run with this user\'s full privileges,')
   console.log(dim('confined only by this session\'s own path/command checks (see README "Tool safety limits").'));
 
-  const dirInputRaw = await promptText('\nWorking directory (default: current dir):', process.cwd());
+  const dirInputRaw = headless ? process.cwd() : await promptText('\nWorking directory (default: current dir):', process.cwd());
   if (dirInputRaw === null) {
     console.log(dim('Cancelled — exiting agent session.\nbye!'));
     return;
@@ -1600,8 +1658,8 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     console.log(dim(fallbackNotice));
   }
   const baseSystemPrompt = await loadSystemPrompt(workDir);
-  console.log(dim('[proxy] checking global/project skills...'));
-  const skillCandidates = await gatherSkillCandidates(workDir);
+  if (!headless) console.log(dim('[proxy] checking global/project skills...'));
+  const skillCandidates = headless ? [] : await gatherSkillCandidates(workDir);
   let startupSkills = '';
   // skillsUsed/selected are module-scope (updateStatusBar renders them in the
   // TUI status bar) — reset, don't redeclare. Redeclaring shadowed them and
@@ -1635,6 +1693,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   const config = await loadConfig();
   const aliases = getConfiguredModelIds(config);
   if (aliases.length === 0) {
+    if (headless) throw new Error('No models configured in proxy_config.toml.');
     console.error('[proxy] No models configured in proxy_config.toml — nothing to select. Aborting agent session.');
     return;
   }
@@ -1654,7 +1713,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   // test green in the dashboard yet fail verification here.
   const devNoKey = env.DEV_NO_KEY === 'true' || env.DEV_NO_KEY === '1';
   const agentMode = env.AGENT === 'true' || env.AGENT === '1';
-  const defaultAgentKey = agentMode ? 'sk-hi-agent-launched-in-proxy-v3' : undefined;
+  const defaultAgentKey = agentMode || headless ? 'sk-hi-agent-launched-in-proxy-v3' : undefined;
   const defaultCategory = config.models?.default;
   const defaultApiKey = defaultCategory && !Array.isArray(defaultCategory) ? defaultCategory.api_key : undefined;
   // Composite aliases resolve per-target keys proxy-side, so like the
@@ -1667,6 +1726,8 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   const hasAnyKey = !!(env.PROXY_CLIENT_API_KEY || defaultApiKey || defaultAgentKey
     || aliases.some((alias) => routeApiKeyFor(alias)));
   if (!hasAnyKey && !devNoKey) {
+    const message = 'Cannot start an agent session: no client API key available to authenticate the loopback /v1/messages call. Set PROXY_CLIENT_API_KEY, configure an api_key on the model or [models.default] in proxy_config.toml, or set DEV_NO_KEY=true.';
+    if (headless) throw new Error(message);
     console.error(
       '[proxy] Cannot start an agent session: no client API key available to authenticate the loopback\n' +
         dim(' /v1/messages call. Set PROXY_CLIENT_API_KEY, configure an api_key on the model or\n') +
@@ -1727,13 +1788,18 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   let agent: Agent | null = null;
 
   while (!selectedAlias) {
-    const choice = await pickFromList(
+    const choice = headless ? source.model! : await pickFromList(
       '\nSelect a model (Esc to cancel):',
       buildModelPickerItems(aliases, config),
     );
     if (!choice) {
       console.log(dim('No model selected — exiting agent session.\nbye!'));
       return;
+    }
+    if (!aliases.includes(choice)) {
+      if (headless) throw new Error(`Model "${choice}" is not configured. Available: ${aliases.join(', ')}`);
+      console.error(`[proxy] Model "${choice}" is not configured.`);
+      continue;
     }
     activeAlias = choice;
     const model = models.getModel(PROVIDER_ID, choice);
@@ -1765,6 +1831,12 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
       sessionId,
     });
     candidateRef.current = candidate;
+
+    if (headless) {
+      selectedAlias = choice;
+      agent = candidate;
+      break;
+    }
 
     console.log(dim(`[proxy] checking proxy v3 and model `) + choice + dim(` with prompt "${VERIFY_PROMPT}"`));
     let replyText = '';
@@ -1836,14 +1908,14 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     { value: 'open-responses' as ProxyApiType, label: 'Open Responses', description: '/v1/responses (Open Responses spec)' },
     { value: 'google-generative-ai' as ProxyApiType, label: 'Google Generative AI', description: '/v1beta/models/{model}:generateContent (Gemini format)' },
   ];
-  const apiChoice = await pickFromList(
+  const apiChoice = headless ? null : await pickFromList(
     `\nSelect endpoint schema for ${selectedAlias} (default: Anthropic Messages):`,
     apiChoices,
   ) as ProxyApiType | null;
   if (apiChoice) {
     selectedApi = apiChoice;
   }
-  console.log(dim(`[proxy] using endpoint schema: ${selectedApi}`));
+  if (!headless) console.log(dim(`[proxy] using endpoint schema: ${selectedApi}`));
 
   // Build the selected endpoint's model while retaining the same session ID.
   const sessionModel = buildSelfModel(selectedAlias, port, sessionId, selectedApi);
@@ -1874,7 +1946,7 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
   candidateRef.current = agent;
 
   // -- Budget prompt --
-  let budget: Budget | null = null;
+  let budget: Budget | null = headless ? DEFAULT_BUDGET : null;
   while (!budget) {
     const raw = await promptText(
       `\n[π budget] Set task budget (e.g. 1000000 or 1m for tokens, e.g. 40 for turns), /quit or /exit to end.\nOr leave blank as DEFAULT budget (${formatBudget(DEFAULT_BUDGET)}):`,
@@ -1898,6 +1970,10 @@ async function runAgentSession(source: AgentSessionSource): Promise<void> {
     if (!budget) {
       console.error(`[π budget] Could not parse "${raw}" — enter a bare integer for turns (e.g. 20) or a k/m-suffixed value for tokens (e.g. 50k), or leave blank for the default.`);
     }
+  }
+  if (headless) {
+    await runHeadlessAgentTask(agent, source.prompt!, budget);
+    return;
   }
   console.log(dim(`[budget: ${formatBudget(budget)}]`));
 

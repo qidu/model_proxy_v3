@@ -14,7 +14,7 @@ import type { Env } from './types/shared.js';
 import { loadProxyConfig, clearProxyConfigCache, loadProxyConfigFromPath, parseHumanTokenLimit, resolveDefaultProxyConfigPath } from './utils/config-loader.js';
 import { consumeActiveRequestRelease, loadTokenStatsFromLog, getWindowMs, setStatsPersistenceEnabled, setTokenRetentionWindow, isEnvFlagEnabled } from './utils/dashboard-stats.js';
 import { consumeStreamFailureReporter } from './utils/stream-failure.js';
-import { runCli } from './cli.js';
+import { extractHeadlessAgentArgs, runCli } from './cli.js';
 import { BUILD_VERSION } from './version.js';
 
 // Import the Workers fetch handler
@@ -269,19 +269,35 @@ function main(): void {
   // --dashboard into the TUI/AGENT/DASHBOARD env vars that the rest of this file reads.
   const argv = process.argv.slice(2);
   const rpcEnabled = argv.includes('--rpc');
+  const headlessArgs = extractHeadlessAgentArgs(argv);
+  const informationalCommand = argv.includes('--help') || argv.includes('-h') || argv.includes('--version');
+  if (headlessArgs.error && !informationalCommand) {
+    console.error(`[FATAL] ${headlessArgs.error}`);
+    process.exit(2);
+  }
+  const headlessAgentOptions = headlessArgs.options;
 
   // CLI subcommands exit before the server starts. No args (runCli returns null)
   // preserves the previous behavior of starting the HTTP server.
-  const cliExitCode = runCli(argv.filter((arg) => !(MODE_FLAGS as readonly string[]).includes(arg)), env);
+  const cliExitCode = runCli(headlessArgs.rest.filter((arg) => !(MODE_FLAGS as readonly string[]).includes(arg)), env);
   if (cliExitCode !== null) {
     process.exit(cliExitCode);
   }
 
+  const interactiveStdoutMode = env.AGENT === 'true' || env.AGENT === '1' || process.env.TUI === 'true' || process.env.TUI === '1';
+  if (headlessAgentOptions && (rpcEnabled || process.env.TUI === 'true' || process.env.TUI === '1')) {
+    console.error('[FATAL] --model/--prompt cannot be combined with --rpc or --tui.');
+    process.exit(2);
+  }
+
   // --rpc, TUI and AGENT all want stdout (RPC frames vs. TUI rendering vs. agent
   // output), so combining them is a startup error rather than a silent winner.
-  if (rpcEnabled && (env.AGENT === 'true' || env.AGENT === '1' || process.env.TUI === 'true' || process.env.TUI === '1')) {
+  if (rpcEnabled && interactiveStdoutMode) {
     console.error('[FATAL] --rpc cannot be combined with AGENT or TUI: all three own stdout.');
     process.exit(2);
+  }
+  if (headlessAgentOptions && !process.env.LOG_LEVEL) {
+    env.LOG_LEVEL = 'warn';
   }
 
   // A stray rejection from a response stream must not kill the proxy. Node's
@@ -302,6 +318,7 @@ function main(): void {
   let stopTui: (() => void) | undefined;
   let stopRpc: (() => void) | undefined;
   let agentSessionPromise: Promise<void> | undefined;
+  let headlessAgentFailed = false;
 
   server.listen(port, '0.0.0.0', async () => {
     console.log(`Server running on http://0.0.0.0:${port} (version: ${env.VERSION})`);
@@ -363,7 +380,7 @@ function main(): void {
       loadTokenStatsFromLog(retentionDays);
     }
 
-    if (agentEnabled && process.stdin.isTTY && process.stdout.isTTY) {
+    if (headlessAgentOptions || (agentEnabled && process.stdin.isTTY && process.stdout.isTTY)) {
       // Lazy import: pi-agent-core/pi-tui/pi-ai are devDependencies, not shipped in the production image
       const { startAgentSession } = await import('./agent-session.js');
       agentSessionPromise = startAgentSession({
@@ -373,7 +390,9 @@ function main(): void {
           return loadProxyConfig(env);
         },
         port,
+        ...headlessAgentOptions,
       }).catch((err) => {
+        headlessAgentFailed = headlessAgentOptions !== undefined;
         console.error('Agent session failed:', (err as Error).message);
       }).finally(() => {
         // The agent session owns the terminal for its whole lifetime; once it
@@ -381,7 +400,7 @@ function main(): void {
         // for this process, and nothing else was keeping the server open on
         // its behalf — shut down the same way SIGINT does instead of leaving
         // an orphaned server with no one attached to it.
-        shutdown();
+        shutdown(headlessAgentFailed ? 1 : 0);
       });
     } else if (tuiEnabled && process.stdin.isTTY && process.stdout.isTTY) {
       console.log = () => {};
@@ -426,7 +445,7 @@ function main(): void {
   });
 
   let shuttingDown = false;
-  function shutdown(): void {
+  function shutdown(exitCode = 0): void {
     if (shuttingDown) {
       // Second shutdown trigger (e.g. Ctrl+C during close): force-quit without
       // waiting for in-flight requests
@@ -435,7 +454,7 @@ function main(): void {
     shuttingDown = true;
     stopTui?.();
     stopRpc?.();
-    server.close(() => process.exit(0));
+    server.close(() => process.exit(exitCode));
     server.closeAllConnections();
   }
   process.on('SIGINT', shutdown);

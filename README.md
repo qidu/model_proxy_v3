@@ -967,7 +967,20 @@ responses. Protect it accordingly. This is the model-visible trajectory: hidden
 model reasoning and client-side state or tool execution that never returns to the
 proxy cannot be recorded.
 
-## Interactive agent session (optional)
+## Agent sessions (optional)
+
+Run one agent task without a TUI by passing a configured model or alias and a prompt. The
+command starts the loopback proxy, runs the task in the current directory, streams the
+assistant's text reply to stdout, and exits when the task finishes. Diagnostics go to stderr.
+
+```bash
+npm run server -- --model smart-coder --prompt "Summarize this project"
+```
+
+Both flags are required. `--agent` is optional and does not change the one-shot behavior;
+this mode cannot be combined with `--tui` or `--rpc`. It uses the default
+50,000,000-token / 100-turn budget and the same tools and safety limits
+as the interactive session below, but skips model verification and all interactive pickers.
 
 Start an interactive [`pi-agent-core`](https://github.com/earendil-works/pi-agent-core)
 agent session that uses the proxy's own `/v1/messages` endpoint (loopback) as its LLM

@@ -5,6 +5,10 @@ Historical changes to `model_proxy_v3`. For current usage documentation, see
 
 ## Latest Changes
 
+### feat(agent): add one-shot non-TUI model and prompt flags
+
+`--model <id> --prompt <text>` now starts the loopback proxy, runs one agent task in the current directory without interactive prompts, streams the assistant reply to stdout, and exits. The mode validates the configured model, uses the existing agent tools and default budget, reports failures with a nonzero exit code, optionally accepts `--agent`, and rejects combinations with `--tui` or `--rpc`.
+
 ### feat(config): make the double-underscore system-key-store sentinel the default
 
 New config writes and dashboard normalization now use `__STORE_KEY_IN_SYSTEM__`. The previous `STORE_KEY_IN_SYSTEM` spelling remains accepted everywhere as a compatibility fallback, including local keychain resolution, remote-config rejection, dashboard edits, and sibling-entry inheritance; neither sentinel is ever stored as a plaintext API key.

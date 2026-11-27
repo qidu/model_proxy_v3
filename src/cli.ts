@@ -49,6 +49,8 @@ Modes:
   --agent                      Start the interactive agent session alongside the
                                HTTP server (same as AGENT=true). Requires a TTY,
                                and takes precedence over --tui.
+  --model <id> --prompt <text> Run one agent task in the current directory without
+                               a TUI, print the assistant reply, and exit.
   --dashboard                  Persist token stats to model_proxy_tokens.jsonl and
                                restore them at startup (same as DASHBOARD=true).
                                Implied by --tui and --agent; composes with any mode.
@@ -77,6 +79,49 @@ Exit codes:
 
 const COMMANDS = ['--list-models', '--export-pi-models', '--export-openclaw-providers', '--export-dsh', '--validate-config'] as const;
 type Command = (typeof COMMANDS)[number];
+
+export interface HeadlessAgentOptions {
+  model: string;
+  prompt: string;
+}
+
+export function extractHeadlessAgentArgs(argv: string[]): {
+  rest: string[];
+  options?: HeadlessAgentOptions;
+  error?: string;
+} {
+  const rest: string[] = [];
+  let model: string | undefined;
+  let prompt: string | undefined;
+  let error: string | undefined;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg !== '--model' && arg !== '--prompt') {
+      rest.push(arg);
+      continue;
+    }
+    const value = argv[i + 1];
+    if (value === undefined || value.startsWith('--') || !value.trim()) {
+      error ??= `${arg} requires a non-empty string value`;
+      continue;
+    }
+    if (arg === '--model') {
+      if (model !== undefined) error ??= '--model may only be given once';
+      model = value;
+    } else {
+      if (prompt !== undefined) error ??= '--prompt may only be given once';
+      prompt = value;
+    }
+    i++;
+  }
+
+  if ((model === undefined) !== (prompt === undefined)) {
+    error ??= '--model and --prompt must be used together';
+  }
+  if (error) return { rest, error };
+  return model !== undefined && prompt !== undefined ? { rest, options: { model, prompt } } : { rest };
+}
 
 /**
  * Parse argv and run the selected command.
