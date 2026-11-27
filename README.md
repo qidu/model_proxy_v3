@@ -757,6 +757,15 @@ produce `dist/model-proxy-v3-<host-triple>.zip` containing the exe,
 `keytar.node`, and `keytar-LICENSE.md`. Keep `keytar.node` beside the exe to use
 Windows Credential Vault. A standalone exe without the addon still works, but
 warns and falls back to plaintext key storage inside the executable.
+The build currently does not re-sign Windows executables after SEA injection, so
+Smart App Control may block them; see
+[Windows native signing options](./docs/contributing/windows-native-signing-options.md)
+for the proposed Azure Artifact Signing and CA/PFX release-signing choices.
+If Windows blocks an unsigned executable, you may open **Windows Security →
+App & browser control → Smart App Control settings** and change **On** to **Off**.
+**Warning:** this reduces protection for all applications, not only this proxy,
+and Windows does not let you turn Smart App Control back on through Settings
+after turning it off. Prefer a properly signed release where available.
 A ready-to-use system tray for this proxy lives in
 `git@github.com:qidu/proxy_tray.git`: a Tauri v2 app that stages the binary as
 its sidecar and supervises it over the `--rpc` JSON-RPC control channel
